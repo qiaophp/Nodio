@@ -113,8 +113,10 @@ int wmain(int argc, wchar_t** argv)
             return 2;
         }
 
+        // the base dir drives $"path" embedding and import resolution, so
+        // it must be derived from whichever separator the path uses
         std::wstring strDir = szRunFile;
-        size_t nSlash = strDir.find_last_of(L'\\');
+        size_t nSlash = strDir.find_last_of(L"\\/");
         strDir = nSlash != std::wstring::npos && nSlash > 0
                      ? strDir.substr(0, nSlash) : L"";
 

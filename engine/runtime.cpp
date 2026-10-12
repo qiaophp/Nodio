@@ -11,7 +11,26 @@ Value Interp::Eval(const PNode& n, Env* env)
             switch (n->k)
             {
             case Node::Num: return Value::Num_(n->num);
-            case Node::Str: return Value::Str_(n->str);
+            case Node::Str:
+            {
+                // $"~\path" that had no file to inline at parse time carries
+                // the EMBED marker: resolve it now from the runtime embed
+                // map (a published payload's res\), falling back to the
+                // path text when the payload does not carry it.
+                const wstring& s = n->str;
+                if (s.size() > 12 && s.compare(0, 12, L"$NODIOEMBED$") == 0)
+                {
+                    wstring key = s.substr(12);
+                    if (g_interpCurrent)
+                    {
+                        auto eit = g_interpCurrent->embedded.find(key);
+                        if (eit != g_interpCurrent->embedded.end())
+                            return Value::Str_(eit->second);
+                    }
+                    return Value::Str_(key);
+                }
+                return Value::Str_(s);
+            }
             case Node::Bool: return Value::Bool_(n->num != 0);
             case Node::NullK: return Value();
             case Node::Ident:

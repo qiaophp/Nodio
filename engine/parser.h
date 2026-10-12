@@ -1570,7 +1570,16 @@ namespace NodioVM
 
             FILE* pf = nullptr;
             if (_wfopen_s(&pf, cand.c_str(), L"rb") != 0 || !pf)
+            {
+                // Unresolved. A "~\" path that exists neither on disk nor
+                // in the aardio root is a published-payload resource: the
+                // embed map only exists at runtime, so mark the path for
+                // deferred resolution instead of inlining the path text
+                // (which would make raw.loadDll fail on a nonexistent file).
+                if (rel != strPath && strPath.size() > 2)
+                    return L"$NODIOEMBED$" + rel;
                 return cand;   // unresolved — surface the path in errors
+            }
             fseek(pf, 0, SEEK_END);
             long cb = ftell(pf);
             fseek(pf, 0, SEEK_SET);
@@ -1579,13 +1588,23 @@ namespace NodioVM
             fclose(pf);
             raw.resize(rd);
 
-            // binary sniff: NUL byte in the first 4KB → payload, not text
+            // binary sniff: NUL byte in the first 4KB → payload, not text.
+            // Binary files (DLL/ICO/PNG/...) embed their RAW BYTES as a
+            // byte string (one byte per wchar, the engine's byte-string
+            // convention) so raw.loadDll can map them from memory without
+            // the source file — this is what a published exe needs.
             bool bBinary = false;
             size_t nSniff = min(rd, (size_t)4096);
             for (size_t k = 0; k < nSniff; k++)
                 if (raw[k] == 0) { bBinary = true; break; }
             if (bBinary)
-                return cand;
+            {
+                wstring w;
+                w.resize(rd);
+                for (size_t k = 0; k < rd; k++)
+                    w[k] = (wchar_t)(unsigned char)raw[k];
+                return w;
+            }
 
             // UTF-8 (BOM or bare) → wide text content
             size_t off = (rd >= 3 && (unsigned char)raw[0] == 0xEF &&
@@ -1614,9 +1633,8 @@ namespace NodioVM
             if (t.t == TNum) { p++; PNode n = New(Node::Num); n->num = t.num; return n; }
             // compile-time file embed: $"path" — official aardio inlines
             // the file at parse time. Text files embed their content;
-            // binary payloads (dll/ico/...) embed the RESOLVED ABSOLUTE
-            // PATH so raw.loadDll(path) keeps working (memory-DLL loading
-            // arrives with the Phase 2 publisher).
+            // binary payloads (dll/ico/...) embed their raw bytes as a
+            // byte string so raw.loadDll maps them from memory.
             // '$' lexes as an identifier character (IsIdentChar), so the
             // embed marker arrives as TIdent "$" (or TPunct "$" when
             // adjacent to a quote in some lexer paths) — accept both

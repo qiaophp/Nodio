@@ -15,6 +15,7 @@ add_library(engine STATIC
     engine/value.cpp
     engine/util.cpp
     engine/ffi.cpp
+    engine/memdll.cpp
     engine/regex.cpp
     engine/json.cpp
     engine/runtime.cpp

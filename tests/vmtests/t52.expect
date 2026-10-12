@@ -1,0 +1,8 @@
+embedded:true
+dll:true
+add(2,3):5
+add(-5,10):5
+hello:hello-from-mem-dll
+handle:true
+freed:true
+kernel32:true

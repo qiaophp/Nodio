@@ -640,6 +640,25 @@ namespace NodioVM
     void* StructSerialize(const Value& vTab, int* pOutTotal = nullptr);
     void StructDeserialize(Value& vTab, const void* pBuf);
 
+    // memdll.cpp — memory DLL loading (raw.loadDll with in-memory bytes).
+    // MemDll owns the mapped image and its import dependencies; it must
+    // outlive the module because free() releases everything.
+    struct MemDll
+    {
+        void* pImage = nullptr;      // mapped image base
+        size_t cbImage = 0;
+        HMODULE hSelf = nullptr;     // same as pImage for a mapped module
+        std::vector<HMODULE> vDeps;  // libraries loaded for imports
+        bool bOk = false;
+    };
+    bool MemDllLoad(const wstring& bytes, void** phMod, MemDll* pOut);
+    void MemDllUnload(MemDll* p);
+    // Resolves an export from a manually mapped image by walking its
+    // export directory. GetProcAddress only works for loader-mapped
+    // modules, so memory DLLs must resolve this way. Returns null when
+    // the image has no exports or the name is absent.
+    FARPROC MemDllGetProc(void* pImage, const char* szName);
+
     // regex.cpp
     bool RECompile(const wstring& pat, vector<vector<RE>>& branches,
                    bool* pAnchored, int* pGroups, wstring* err);

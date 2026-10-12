@@ -1,0 +1,44 @@
+// M10: memory DLL loading — $"path" embeds the raw bytes, raw.loadDll maps
+// the PE image into memory and resolves exports from its export directory
+// (GetProcAddress only works on loader-mapped modules).
+// Regression: binary $"path" used to return the resolved path, and
+// loadDll(bytes) was unsupported, so a DLL shipped inside a published
+// payload could never be used.
+import raw;
+
+// Try the architecture-matched DLL. The image carries its machine type,
+// so try both and keep whichever maps: x64 needs test64, x86 needs
+// test86 (a wrong-width image is rejected by the mapper). loadDll raises
+// on failure, so the first attempt is guarded.
+// NB: aardio strings are 1-based, so bytes[1] is the first byte ('M').
+var bytes = $"res\test64.dll";
+var dll = null;
+try {
+    dll = raw.loadDll(bytes, "test64");
+} catch {
+}
+if (dll == null)
+{
+    bytes = $"res\test86.dll";
+    dll = raw.loadDll(bytes, "test86");
+}
+// the embedded byte count is architecture-dependent (x86 and x64 images
+// differ in size), so assert the embed is non-empty, not an exact length
+io.print("embedded:", #bytes > 1000);
+io.print("dll:", dll != null);
+
+var add = dll.api("AddNums", "int(int a, int b)");
+io.print("add(2,3):", add(2, 3));
+io.print("add(-5,10):", add(-5, 10));
+
+var hello = dll.api("Hello", "str()");
+io.print("hello:", hello());
+
+io.print("handle:", dll.gethandle() != null);
+dll.free();
+io.print("freed:true");
+
+// a disk path must still go through LoadLibraryW
+var sys = raw.loadDll("kernel32.dll");
+var gm = sys.api("GetModuleHandleA", "int(str)");
+io.print("kernel32:", gm(null) != null);

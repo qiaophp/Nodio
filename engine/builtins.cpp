@@ -981,28 +981,89 @@ void Interp::InitBuiltins()
                     -> Value {
                     HMODULE hMod = nullptr;
                     bool bIsMainMod = false;
-                    if (a.empty() || a[0].t == Value::Null || (a[0].t == Value::Str && a[0].s.empty()))
+                    // A memory DLL keeps its mapped image alive for the
+                    // lifetime of the dll object; free() releases it.
+                    auto memDll = std::make_shared<MemDll>();
+                    if (a.empty() || a[0].t == Value::Null ||
+                        (a[0].t == Value::Str && a[0].s.empty()))
                     {
                         hMod = GetModuleHandleW(nullptr);
                         bIsMainMod = true;
                     }
-                    else
+                    else if (a[0].t == Value::Str)
                     {
-                        hMod = LoadLibraryW(BStr(a[0]).c_str());
+                        wstring strArg = BStr(a[0]);
+                        // A payload-embedded DLL: the published exe carries
+                        // res\ under its embedded FS, and $"~\path" only
+                        // resolves at publish time (EmbedRoot needs
+                        // NODIO_LIBDIR). Resolve it here from the embedded
+                        // map, the same way io.readFile does, so a DLL
+                        // shipped in a payload loads without a disk file.
+                        if (!strArg.empty() && strArg[0] == L'~' &&
+                            g_interpCurrent)
+                        {
+                            wstring key = strArg.substr(1);
+                            if (!key.empty() &&
+                                (key[0] == L'\\' || key[0] == L'/'))
+                                key = key.substr(1);
+                            auto eit = g_interpCurrent->embedded.find(key);
+                            if (eit == g_interpCurrent->embedded.end() &&
+                                key != strArg)
+                                eit = g_interpCurrent->embedded.find(strArg);
+                            if (eit != g_interpCurrent->embedded.end())
+                                strArg = eit->second;
+                        }
+                        // Order matters: LoadLibraryW first, because a bare
+                        // name like "user32.dll" must go through the normal
+                        // DLL search path (GetFileAttributesW would reject
+                        // it when the CWD is elsewhere). Only when that
+                        // fails — or the argument is clearly not a path —
+                        // treat the string as mapped image bytes.
+                        if (!strArg.empty())
+                        {
+                            // A mapped image starts with 'MZ' and is full of
+                            // NULs in its headers; a path is short and
+                            // NUL-free. Try the disk path first so bare
+                            // names ("user32.dll") go through the normal
+                            // DLL search path, then fall back to mapping.
+                            bool bLooksMapped =
+                                strArg.size() >= 2 && strArg[0] == L'M' &&
+                                strArg[1] == L'Z' &&
+                                strArg.find(L'\0') != wstring::npos;
+                            if (!bLooksMapped)
+                                hMod = LoadLibraryW(strArg.c_str());
+                            if (!hMod && bLooksMapped)
+                            {
+                                void* pMemMod = nullptr;
+                                if (MemDllLoad(strArg, &pMemMod,
+                                               memDll.get()))
+                                    hMod = (HMODULE)pMemMod;
+                            }
+                        }
                         if (!hMod)
                         {
-                            (*err) = L"运行错误: 无法加载 DLL: " + BStr(a[0]);
+                            (*err) = L"运行错误: 无法加载 DLL: " + strArg;
                             return Value();
                         }
+                    }
+                    else
+                    {
+                        (*err) = L"运行错误: raw.loadDll(路径或内存数据)";
+                        return Value();
                     }
                     auto dll = std::make_shared<Table>();
                     dll->map[L"_h"] =
                         Value::Pointer_(hMod);
+                    dll->map[L"_memdll"] =
+                        Value::Pointer_(memDll->bOk ? memDll.get() : nullptr);
                     dll->map[L"gethandle"] = NF([hMod](vector<Value>&) {
                         return Value::Pointer_(hMod);
                     });
-                    dll->map[L"free"] = NF([hMod, bIsMainMod](vector<Value>&) {
-                        if (!bIsMainMod) FreeLibrary(hMod);
+                    dll->map[L"free"] = NF([hMod, bIsMainMod, memDll](
+                        vector<Value>&) -> Value {
+                        if (bIsMainMod) return Value();
+                        if (memDll->bOk) MemDllUnload(memDll.get());
+                        else FreeLibrary(hMod);
                         return Value(); });
                     bool bDllCdecl = false;
                     bool bDllUni = false;
@@ -1016,7 +1077,7 @@ void Interp::InitBuiltins()
                     dll->map[L"_cdecl"] = Value::Bool_(bDllCdecl);
                     dll->map[L"_unicode"] = Value::Bool_(bDllUni);
                     // api(name, signature) -> callable function value
-                    dll->map[L"api"] = NF([this, hMod](
+                    dll->map[L"api"] = NF([this, hMod, memDll](
                         vector<Value>& a2) -> Value {
                         if (a2.empty())
                         {
@@ -1051,6 +1112,15 @@ void Interp::InitBuiltins()
                                     strName.c_str(), (int)strName.size(),
                                     &strNameA[0], (int)strNameA.size(),
                                     nullptr, nullptr);
+                            if (memDll->bOk)
+                            {
+                                // memory DLL: GetProcAddress does not work
+                                // on a manually mapped image
+                                fp = MemDllGetProc(memDll->pImage,
+                                                   strNameA.c_str());
+                            }
+                            else
+                            {
                             fp = ::GetProcAddress(hMod,
                                 strNameA.c_str());
                             // Win32 dual exports: bare name -> W -> A, and
@@ -1069,6 +1139,7 @@ void Interp::InitBuiltins()
                                 std::string bare = strNameA.substr(0,
                                     strNameA.size() - 1);
                                 fp = ::GetProcAddress(hMod, bare.c_str());
+                            }
                             }
                             if (!fp)
                             {

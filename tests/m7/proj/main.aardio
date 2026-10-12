@@ -1,6 +1,29 @@
 import mylib;
+import raw;
 io.print("entry=main");
 io.print("lib:", mylib.tag);
 io.print("res:", ..io.readFile("~\res\hello.txt"));
-var raw = ..io.readFile("~\res\blob.bin", "raw");
-io.print("blob:", #raw);
+var blob = ..io.readFile("~\res\blob.bin", "raw");
+io.print("blob:", #blob);
+
+// M10: a DLL shipped inside the payload must be loadable from memory.
+// $"~\path" inlines the raw bytes, and raw.loadDll maps the PE image
+// directly — no temp file, no disk dependency.
+var bytes = $"~\res\test64.dll";
+var dll = null;
+try {
+    dll = raw.loadDll(bytes, "test64");
+} catch {
+}
+if (dll == null) {
+    bytes = $"~\res\test86.dll";
+    dll = raw.loadDll(bytes, "test86");
+}
+io.print("memdll:", dll != null);
+if (dll != null) {
+    var add = dll.api("AddNums", "int(int a, int b)");
+    io.print("memdll.add(100,23):", add(100, 23));
+    var hello = dll.api("Hello", "str()");
+    io.print("memdll.hello:", hello());
+    dll.free();
+}

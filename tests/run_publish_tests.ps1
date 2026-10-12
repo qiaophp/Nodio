@@ -61,7 +61,10 @@ $want = @(
     'entry=main',
     'lib:mylib-embedded',
     'res:hello from embedded resource',
-    'blob:776'
+    'blob:776',
+    'memdll:true',
+    'memdll.add(100,23):123',
+    'memdll.hello:hello-from-mem-dll'
 )
 
 $fail = 0
