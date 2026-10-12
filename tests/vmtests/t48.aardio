@@ -1,0 +1,15 @@
+// M5: import a real-shaped win lib
+import win;
+
+// create a real window via the raw API path to feed getStyle
+var user32 = ::User32;
+var cw = user32.api("CreateWindowExW", "int(INT,ustring,ustring,INT,int,int,int,int,addr,addr,pointer,ptr)");
+var hwnd = cw(0, "STATIC", "m5probe", 0x80000000, 0, 0, 100, 60, 0, 0, null, null);
+io.print("hwnd" ++ (hwnd > 0));
+
+// getStyle with default params + bitwise + ~0 mask: WS_POPUP is set
+io.print("s" ++ win.getStyle(hwnd, 0x80000000));
+
+// modifyStyle round-trip: add 0x100, read it back
+win.modifyStyle(hwnd, 0, 0x100);
+io.print("m" ++ win.getStyle(hwnd, 0x100));

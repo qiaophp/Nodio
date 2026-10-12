@@ -1,0 +1,12 @@
+// round 40: setInterval/ontimer/killTimer
+var f = win.form("定时", 200, 100);
+var n = 0;
+var id = 0;
+f.ontimer = function(tid) {
+    n = n + 1;
+    if (n == 1) { io.print("tick" ++ tid); }
+    if (n >= 3) { f.killTimer(id); f.close(); }
+};
+id = f.setInterval(100);
+f.doModal();
+io.print("end" ++ n);

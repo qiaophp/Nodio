@@ -1,0 +1,5 @@
+
+var background = true;
+var this = { state = { active = true } };
+var x, y = 0, 0;
+if( ( background ? this.state[["active"]] ? (!this[["(progress-range)"]])  ) ) { x++;y++; };

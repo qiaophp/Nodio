@@ -1,0 +1,5 @@
+var f = function(a,...){
+	if(...!==null) io.print("ne");
+	else io.print("eq");
+};
+f("x", 1, 2);

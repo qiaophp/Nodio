@@ -1,0 +1,9 @@
+import json;
+import string;
+import time;
+var obj = json.parse('{"name":"aardio","n":43,"arr":[1,2,3]}');
+io.print(obj.name, obj.n, obj.arr[2]);
+io.print(json.stringify(obj));
+io.print(#time.date("%Y"));
+io.print(string.hex("AB"), string.unhex(string.hex("AB")));
+io.print(string.base64("hi"));

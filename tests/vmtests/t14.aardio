@@ -1,0 +1,7 @@
+try {
+    error("inner boom");
+}
+catch(e) {
+    io.print("caught:" ++ e);
+}
+io.print("continues");

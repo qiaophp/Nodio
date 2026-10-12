@@ -1,0 +1,5 @@
+var t = {5, 2, 8};
+table.sort(t);
+io.print(table.concat(t, ","));
+table.sort(t, function(a, b) { return a > b; });
+io.print(table.concat(t, ","));

@@ -1,0 +1,17 @@
+// M3-c: callback thunk — aardio function passed to an API
+// EnumWindows-style: EnumChildWindows with our callback counting children
+var user32 = raw.loadDll("user32.dll");
+var f = win.form("cbtest", 300, 200);
+f.add("b1", "button", "one", 10, 10, 80, 24);
+f.add("b2", "button", "two", 10, 44, 80, 24);
+f.add("e1", "edit", "", 100, 10, 150, 24);
+
+var nCount = 0;
+var cb = raw.callback(function(h, l) {
+    nCount = nCount + 1;
+    return 1;
+}, "int(pointer, pointer)");
+
+var ew = user32.api("EnumChildWindows", "int(pointer, pointer, pointer)");
+ew(f.hwnd, cb, 0);
+io.print("children" ++ nCount);

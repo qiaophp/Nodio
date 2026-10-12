@@ -1,0 +1,7 @@
+import win.ui;
+io.print("type(win.form):", type(win.form));
+var f = win.form();
+io.print("f:", f);
+for(k,v in f){
+    io.print("key:", k);
+}

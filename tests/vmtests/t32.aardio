@@ -1,0 +1,13 @@
+var f = win.form("测试窗体", 320, 240);
+var btn = f.add("ok", "button", "确定", 20, 20, 100, 28);
+var ed = f.add("inp", "edit", "初始文本", 20, 60, 200, 24);
+var hit = null;
+btn.oncommand = function() {
+    hit = ed.text();
+    f.endModal(7);
+};
+btn.click();
+var code = f.doModal();
+io.print(hit);
+io.print(code);
+io.print(f.text());

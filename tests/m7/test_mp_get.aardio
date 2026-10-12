@@ -1,0 +1,22 @@
+﻿import util.metaProperty;
+
+class TestClass {
+    ctor() {
+    };
+    @_metaProperty;
+}
+namespace TestClass {
+    _metaProperty = ..util.metaProperty(
+        foo = {
+            _get = function() {
+                return "hello foo";
+            };
+        };
+        bar = "hello bar";
+    );
+}
+
+var obj = TestClass();
+io.print("obj created");
+io.print("obj.bar =", obj.bar);
+io.print("obj.foo =", obj.foo);

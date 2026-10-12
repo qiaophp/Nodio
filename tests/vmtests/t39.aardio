@@ -1,0 +1,19 @@
+// round 43: table array ops
+var t = {5, 2, 8, 1, 9};
+table.sort(t);
+io.print(table.concat(t, ","));
+table.sort(t, function(a, b) { return a > b; });
+io.print(table.concat(t, ","));
+table.insert(t, 1, 100);
+io.print(table.concat(t, ","));
+table.insert(t, "tail");
+io.print(table.concat(t, ","));
+var v = table.remove(t, 1);
+io.print(v ++ "|" ++ table.concat(t, ","));
+table.reverse(t);
+io.print(table.concat(t, ","));
+io.print(table.find(t, 8));
+io.print(table.find(t, "nope"));
+var w = {3, 1, 2};
+table.sort(w);
+io.print(table.concat(w, "-"));

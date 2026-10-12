@@ -1,0 +1,4 @@
+import string;
+win.clip.write("hello-clip");
+var s = win.clip.read();
+io.print(s ++ "!" ++ string.upper("ok"));

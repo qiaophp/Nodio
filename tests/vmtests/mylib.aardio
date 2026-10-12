@@ -1,0 +1,1 @@
+return { greet = function(name) { return "hi " ++ name; } };

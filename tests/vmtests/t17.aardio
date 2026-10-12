@@ -1,0 +1,4 @@
+try {
+    error("unhandled");
+}
+io.print("nope");

@@ -1,0 +1,11 @@
+import win.ui;
+var winform = win.form(text="test";right=400;bottom=300);
+var res = winform.add(
+    button={cls="button";text="点击";left=50;top=50;right=150;bottom=90}
+);
+io.print("res:", res != null, "res.button:", res.button != null);
+io.print("btn:", winform.button != null, "btn.hwnd:", winform.button.hwnd);
+io.print("btn keys:");
+for k,v in winform.button {
+    io.print("  k=", k, "v=", v);
+}

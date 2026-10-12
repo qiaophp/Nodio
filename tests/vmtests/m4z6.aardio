@@ -1,0 +1,4 @@
+var f = function(a,...){
+	if(...) io.print(2);
+};
+f("x");

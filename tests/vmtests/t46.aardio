@@ -1,0 +1,30 @@
+// M3-d: api.aardio-shape acceptance — the exact declaration style from
+// D:\aardio\lib\win\api.aardio lines 1-12, running end to end
+::User32 = raw.loadDll("user32.dll");
+::GetSystemMetrics = ::User32.api("GetSystemMetrics","int(int)")
+::CreateWindowEx = ::User32.api( "CreateWindowExW", " int(INT exStyle,ustring className,ustring windowName,INT style,int x,int y,int width,int height,addr hwndParent,addr hMenu,pointer hlnstance,ptr lpParam)" )
+::DestroyWindow = ::User32.api( "DestroyWindow", "int(addr hwnd )" );
+::GetWindowRect = ::User32.api( "GetWindowRect", " int(addr hwnd,struct &lpRect ) " )
+::MoveWindow = ::User32.api( "MoveWindow", "int( addr hwnd, int x,int y,int w,int h,bool repaint)" )
+::PostMessage = ::User32.api("PostMessageW","addr(addr hwnd,INT msg,ADDR wParam,addr lParam)")
+
+var f = win.form("ms2", 300, 200);
+// GetSystemMetrics through the aliased name
+io.print("sm" ++ (::GetSystemMetrics(0x10) >= 0));
+
+// struct& via raw.buffer: GetWindowRect fills a 16-byte RECT
+var rc = raw.buffer(16);
+var ok = ::GetWindowRect(f.hwnd, rc);
+var nLeft = raw.read(rc + 0, 4);
+io.print("gr" ++ (ok != false));
+
+// post a WM_CLOSE to ourselves through PostMessage + close loop
+::PostMessage(f.hwnd, 0x10, 0, 0);
+f.setInterval(300);
+var nTicks = 0;
+f.ontimer = function() {
+    nTicks = nTicks + 1;
+    if (nTicks >= 2) { f.killTimer(1); f.close(); }
+};
+f.doModal();
+io.print("done");

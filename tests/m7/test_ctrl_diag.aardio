@@ -1,0 +1,11 @@
+import win.ui;
+var winform = win.form(text="test";right=400;bottom=300);
+var opt = {cls="button";text="点击";left=50;top=50;right=150;bottom=90};
+var ctrl_factory = win.ui.ctrl.factory;
+var ctrl = ctrl_factory.create(opt);
+io.print("ctrl:", ctrl != null, "ctrl.cls:", ctrl.cls, "ctrl.hwnd:", ctrl.hwnd);
+io.print("opt.exstyle:", opt.exstyle, "opt.cls:", opt.cls, "opt.text:", opt.text, "opt.style:", opt.style);
+io.print("opt.left:", opt.left, "opt.top:", opt.top, "opt.right:", opt.right, "opt.bottom:", opt.bottom);
+io.print("parent.hwnd:", winform.hwnd, "opt.id:", opt.id, "opt.hInstance:", opt.hInstance);
+var h = ::CreateWindowEx(opt.exstyle, opt.cls, opt.text, opt.style, opt.left, opt.top, opt.right - opt.left, opt.bottom - opt.top, winform.hwnd, opt.id, opt.hInstance);
+io.print("h:", h, "lastErr:", ::Kernel32.GetLastError());

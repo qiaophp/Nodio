@@ -1,0 +1,68 @@
+// Milestone 2: language core from the original source's shapes
+// 1. class with ctor + struct member declarations + @_meta
+class ::RECT {
+	ctor(left=0, top=0, right=0, bottom=0){
+		this.left = left;
+		this.top = top;
+		this.right = right;
+		this.bottom = bottom;
+	}
+	int left;
+	int top;
+	int right;
+	int bottom;
+	@_meta;
+}
+
+::RECT._meta = {
+	inflate = function(dx,dy){
+		owner.left = owner.left - dx;
+		owner.top = owner.top - dy;
+		owner.right = owner.right + dx;
+		owner.bottom = owner.bottom + dy;
+		return owner;
+	};
+	width = function(){
+		return owner.right - owner.left;
+	};
+};
+
+// 2. instance: template copy + ctor + owner-bound meta methods
+var rc = ::RECT(10, 10, 50, 40);
+rc.inflate(5);
+io.print("w" ++ rc.width());
+
+// 3. property-style two-level meta (_get as table of {._get=fn})
+var point = {
+	x = 1;
+	y = 2;
+	_meta = {
+		_get = {
+			sum = {
+				_get = function(){
+					return owner.x + owner.y;
+				}
+			}
+		}
+	};
+};
+io.print("s" ++ point.sum);
+
+// 4. varargs
+var adder = function(head, ...) {
+	var t = 0;
+	for (i, v in ...) { t = t + v; }
+	return head ++ t;
+};
+io.print(adder("n", 1, 2, 3));
+
+// 5. lambda
+var dbl = lambda(x) x * 2;
+io.print("l" ++ dbl(21));
+
+// 6. coalesce
+var cfg = null;
+io.print("c" ++ (cfg : "def"));
+
+// 7. bitwise
+io.print("b" ++ (0xF0 | 0x0F) ++ (0xFF & 0x0F) ++ (1 << 4));

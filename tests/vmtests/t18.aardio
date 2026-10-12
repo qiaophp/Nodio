@@ -1,0 +1,9 @@
+var s = "2026-10-11 abc123";
+var m = string.match(s, "(\d{4})-(\d{2})-(\d{2})");
+io.print(m[1], m[2], m[3]);
+io.print(string.match(s, "\w+@?"));
+var f = string.find(s, "\d+");
+io.print(f[1], f[2]);
+io.print(string.gsub(s, "\d+", "N"));
+io.print(string.count(s, "\d"));
+io.print(string.gsub("aXbXc", "X(?)", ""));

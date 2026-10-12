@@ -1,0 +1,4 @@
+import win.ui;
+var winform = win.form(text="test";right=400;bottom=300);
+var hBtn = ::CreateWindowEx(0, "button", "ok", 0x50000000/*_WS_CHILD|_WS_VISIBLE*/, 10, 10, 100, 30, winform.hwnd, 1, _HINSTANCE, null);
+io.print("hBtn:", hBtn, "lastErr:", ::Kernel32.GetLastError());

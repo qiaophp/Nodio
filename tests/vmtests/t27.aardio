@@ -1,0 +1,4 @@
+io.print(web.get("http://127.0.0.1:8123/data.txt"));
+io.print(web.post("http://127.0.0.1:8123/echo", "x=1&y=2"));
+io.print(web.encode("a b"));
+io.print(web.decode("a+b%20c"));

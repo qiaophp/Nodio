@@ -1,0 +1,31 @@
+// Milestone 1 acceptance: original-style ::globals + api aliases + &
+// out-params + default params + ~ — the shape lib/win/api.aardio uses
+::User32 = raw.loadDll("user32.dll");
+::Kernel32 = raw.loadDll("kernel32.dll");
+
+::GetWindowTextA = ::User32.api("GetWindowTextA", "int(addr hwnd, string &lpString, int cchMax)");
+::SetWindowTextW = ::User32.api("SetWindowTextW", "int(addr hwnd, ustring lpString)");
+::GetTickCount64 = ::Kernel32.api("GetTickCount64", "int64()");
+
+var f = win.form("ms1", 220, 100);
+
+// by-ref string out-param: pass raw.buffer pointer, read back
+var buf = raw.buffer(256);
+var n = ::GetWindowTextA(f.hwnd, buf, 256);
+io.print("t=" ++ raw.read(buf, n));
+
+// ustring param (UTF-16) through the W entry point
+::SetWindowTextW(f.hwnd, "renamed2");
+io.print(f.text());
+
+// ~ bitwise-not defaults (aardio style=~0 idiom)
+var styleMask = ~0;
+io.print("mask=" ++ (styleMask == -1));
+io.print("tick" ++ (::GetTickCount64() > 0));
+
+// default params + !==
+f.oncommand = function(id, flags=0) {
+    io.print("def" ++ flags);
+};
+f.oncommand(7);
+io.print("ne" ++ (1 !== 2));

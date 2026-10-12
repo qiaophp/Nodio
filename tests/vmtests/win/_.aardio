@@ -1,0 +1,33 @@
+// M5/M6 mimic of lib\win\_.aardio (original 1119 lines; minimal shape)
+import win.api;
+
+namespace win;
+
+var u = ::User32;
+getWindow = u.api( "GetWindow", "int( addr hwnd,INT uCmd)" )
+getAncestor = u.api( "GetAncestor", "int(addr hwnd,INT flag)" )
+
+getStyle = function(hwnd,style=~0,nStyle=0 ){
+	var s = ( ::GetWindowLong(hwnd,0xFFFFFFF0/*_GWL_STYLE*/) & style ) & ~nStyle;
+	if( s & nStyle)
+		return 0;
+	return s;
+}
+
+modifyStyle = function(hwnd,remove=0,add=0,flags,gwl=0xFFFFFFF0/*_GWL_STYLE*/ ){
+	var style = ( ::GetWindowLong(hwnd,gwl) & ~remove ) | add ;
+	if( !::SetWindowLong(hwnd,gwl,style ) ) return;
+	if(flags!==null)
+		::PostMessage(hwnd,0,0,0)
+	return style
+}
+
+loopMessage = function(){
+	import raw;
+	var msg = raw.buffer(28);
+	while( ::GetMessageW(msg,0,0,0) > 0 ){
+		::TranslateMessage(msg);
+		::DispatchMessageW(msg);
+	}
+	raw.free(msg);
+}

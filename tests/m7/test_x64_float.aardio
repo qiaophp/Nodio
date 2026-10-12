@@ -1,0 +1,12 @@
+// Phase 1.1 acceptance — x64 ABI: forward calls with double/float args
+// (XMM0/XMM1 register passing) and cdecl float return decode.
+import raw;
+var msvcrt = raw.loadDll("msvcrt.dll");
+var pow = msvcrt.api("pow", "double(double,double)", "cdecl");
+var r = pow(2, 10);
+io.print("pow2_10=", r);
+// float delta: declare fabs(double)->double and sqrt
+var fabs = msvcrt.api("fabs", "double(double)", "cdecl");
+io.print("abs-3_5=", fabs(-3.5));
+var sqrt = msvcrt.api("sqrt", "double(double)", "cdecl");
+io.print("sqrt2=", sqrt(2));

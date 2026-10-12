@@ -1,0 +1,19 @@
+// round 43: fromto transcoding + encoded file IO
+var s = "中文ABC";
+var bs = string.fromto(s, "", "gbk");
+io.print(#bs);
+var back = string.fromto(bs, "gbk", "");
+io.print(back == s);
+var u8 = string.fromto(s, "", "utf8");
+io.print(#u8);
+io.writeFile("r43test.txt", s, "gbk");
+var raw = io.readFile("r43test.txt", "raw");
+io.print(#raw);
+var txt = io.readFile("r43test.txt", "gbk");
+io.print(txt == s);
+io.writeFile("r43u8.txt", s, "utf8");
+var txt2 = io.readFile("r43u8.txt");
+io.print(txt2 == s);
+var ansi = string.fromto(s, "", "ansi");
+io.print(#ansi > 3);
+io.print(string.fromto("plain", "utf8", "gbk") == "plain");

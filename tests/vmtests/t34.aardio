@@ -1,0 +1,19 @@
+// round 40: gdi onpaint — draw and read back pixels
+var f = win.form("绘图", 220, 220);
+var nCount = 0;
+f.onpaint = function(gdc) {
+    nCount = nCount + 1;
+    gdc.clear(0xFFFFFF);
+    gdc.setPen(0x0000FF, 3);
+    gdc.line(10, 20, 110, 120);
+    gdc.setBrush(0x00FF00);
+    gdc.rect(130, 20, 190, 80);
+    gdc.ellipse(130, 100, 190, 160);
+    var c1 = gdc.pixel(60, 70);
+    var c2 = gdc.pixel(160, 50);
+    var c3 = gdc.pixel(160, 130);
+    io.print("p" ++ nCount ++ ":" ++ c1 ++ ":" ++ c2 ++ ":" ++ c3 ++ ":" ++ gdc.width() ++ "x" ++ gdc.height());
+    if (nCount < 2) { f.invalidate(); } else { f.close(); }
+};
+f.doModal();
+io.print("end" ++ nCount);

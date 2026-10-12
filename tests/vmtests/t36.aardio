@@ -1,0 +1,35 @@
+// round 41: listbox/combobox/groupbox
+var f = win.form("列表", 320, 260);
+var gb = f.add("gb", "groupbox", "分组", 170, 10, 120, 120);
+var lb = f.add("lb", "listbox", "", 10, 10, 150, 120);
+var cb = f.add("cb", "combobox", "", 10, 140, 150, 80);
+var log = "";
+lb.onselchange = function() {
+    log = log ++ "L" ++ lb.selText();
+};
+cb.onselchange = function() {
+    log = log ++ "C" ++ cb.selText();
+};
+lb.add("苹果");
+lb.add("香蕉");
+lb.add("橘子");
+cb.add("红");
+cb.add("蓝");
+io.print(gb.text());
+io.print("cnt" ++ lb.count() ++ "/" ++ cb.count());
+lb.setSel(2);
+cb.setSel(1);
+io.print("sel" ++ lb.sel() ++ ":" ++ lb.selText() ++ ":" ++ cb.selText());
+io.print("txt" ++ lb.getText(1) ++ "|" ++ cb.getText(2));
+f.ontimer = function() {
+    lb.del(1);
+    io.print("del" ++ lb.count() ++ ":" ++ lb.getText(1));
+    lb.clear();
+    io.print("clr" ++ lb.count());
+    f.close();
+};
+f.setInterval(150);
+lb.notifySel();
+cb.notifySel();
+f.doModal();
+io.print("log=" ++ log);

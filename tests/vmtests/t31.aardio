@@ -1,0 +1,6 @@
+var r = process.run("cmd /c echo hello");
+io.print(r.out);
+io.print(r.code);
+var q = process.run("cmd /c exit /b 7");
+io.print(q.code);
+io.print(process.execute("cmd", "/c exit"));

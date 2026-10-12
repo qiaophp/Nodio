@@ -1,0 +1,4 @@
+var h = thread.create(function(x) {
+    return x * 2;
+}, 21);
+io.print(h.join());

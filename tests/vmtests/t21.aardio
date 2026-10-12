@@ -1,0 +1,7 @@
+io.print(string.count("aXbXc", "X"));
+io.print(string.count("aXbXc", "X(?)"));
+io.print(string.count("aXbXc", "(?)"));
+io.print(string.match("foo123bar", "[0-9]+|bar"));
+io.print(string.match("abc", "^abc$"));
+io.print(string.match("aXXb", "X+?"));
+io.print(string.gsub("a1b22", "\d", "#"));

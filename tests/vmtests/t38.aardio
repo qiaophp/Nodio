@@ -1,0 +1,41 @@
+// round 42: common dialogs — cancel path + IDOK-with-prefilled-file.
+// The modal dialog pumps our form timers, so ontimer re-enters and drives
+// the dialog via win.postMessage. Path uses \ backslash escapes
+// (forward slashes are rejected by the dialog init validation).
+var f = win.form("dlg42", 200, 100);
+var inDlg = false;
+var nPhase = 0;
+var nTick = 0;
+var id = 0;
+var sTitle = "";
+f.ontimer = function() {
+    if (inDlg) {
+        nTick = nTick + 1;
+        var h = win.findWindow("#32770", sTitle);
+        if (h && nTick > 2) {
+            win.postMessage(h, 0x111, nPhase == 0 ? 2 : 1, 0);
+        }
+        return;
+    }
+    if (nPhase == 0) {
+        inDlg = true;
+        sTitle = "dlg42o";
+        var p1 = win.dlg.open(f, sTitle, "所有|*.*", "", "");
+        inDlg = false;
+        io.print("p1=" ++ (p1 == null ? "null" : "got"));
+        nPhase = 1;
+        nTick = 0;
+        sTitle = "dlg42s";
+    } else {
+        inDlg = true;
+        var p = 'D:' ++ '\x5c' ++ 'aardio.re\x5cscripts\x5cvmtests\x5ct36.aardio';
+        var p2 = win.dlg.open(f, sTitle, "所有|*.*", "", p);
+        inDlg = false;
+        io.print("p2=" ++ p2);
+        f.killTimer(id);
+        f.close();
+    }
+};
+id = f.setInterval(150);
+f.doModal();
+io.print("done");

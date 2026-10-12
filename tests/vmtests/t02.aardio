@@ -1,0 +1,2 @@
+var x = 6 * 7;
+io.print("x=" .. x);

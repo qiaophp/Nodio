@@ -1,0 +1,10 @@
+# build outputs
+build*/
+out/
+.vs/
+*.user
+*.aps
+
+# editor/scratch
+*.log
+Thumbs.db

@@ -1,0 +1,5 @@
+io.print("a" ++ type(::User32));
+namespace zzz;
+io.print("b" ++ type(::User32));
+var q = ::User32;
+io.print("c" ++ type(q));

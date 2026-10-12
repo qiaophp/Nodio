@@ -1,0 +1,6 @@
+var push = function(a,...){
+	if(...!==null) for(i=1;#...) table.append(a,...[i]);
+	else return #a + 1;
+	return #a;
+};
+io.print(push({}, 5));

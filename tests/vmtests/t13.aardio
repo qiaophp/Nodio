@@ -1,0 +1,3 @@
+io.print("before");
+error("boom");
+io.print("after");

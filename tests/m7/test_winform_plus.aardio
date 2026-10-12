@@ -1,0 +1,7 @@
+import win.ui;
+import win.ui.ctrl.plus;
+var winform = win.form(text="plus test";right=400;bottom=300);
+winform.add(
+    plus={cls="plus";text="自绘按钮";left=50;top=50;right=150;bottom=90}
+);
+io.print("plus hwnd:", winform.plus.hwnd != null);

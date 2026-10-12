@@ -1,0 +1,3 @@
+import mytable;
+io.print(mytable.push);
+io.print(mytable.tostring);

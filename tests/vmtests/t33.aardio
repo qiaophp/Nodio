@@ -1,0 +1,21 @@
+var f = win.form("事件测试", 300, 200);
+var chk = f.add("c", "checkbox", "选项", 20, 20, 120, 24);
+var ed = f.add("e", "edit", "", 20, 60, 200, 24);
+var btn = f.add("b", "button", "切换", 20, 100, 120, 28);
+var log = "";
+chk.oncommand = function() {
+    log = log ++ "C";
+};
+ed.onchange = function() {
+    log = log ++ "E";
+};
+btn.oncommand = function() {
+    chk.setChecked(chk.checked() ? 0 : 1);
+    log = log ++ chk.checked();
+    ed.setText("abc");
+    f.endModal(1);
+};
+btn.click();
+f.doModal();
+io.print(log);
+io.print(chk.checked());

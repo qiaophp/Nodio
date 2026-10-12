@@ -1,0 +1,2 @@
+import gdip.core;
+io.print("gdip.core loaded successfully");

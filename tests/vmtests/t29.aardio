@@ -1,0 +1,11 @@
+var t0 = time.tick();
+var h1 = thread.create(function() {
+    sleep(400);
+    return 1;
+});
+var h2 = thread.create(function() {
+    sleep(400);
+    return 2;
+});
+io.print(h1.join() + h2.join());
+io.print(time.tick() - t0 < 700);

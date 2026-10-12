@@ -1,0 +1,12 @@
+var t = {name="aardio"; ver=43};
+var s = 0;
+for k, v in t {
+    s = s ++ k ++ "=" ++ v ++ ";";
+}
+io.print(s);
+var arr = {};
+arr[1] = "x";
+arr[2] = "y";
+var acc = "";
+for v in arr { acc = acc ++ v; }
+io.print(acc);

@@ -1,0 +1,23 @@
+// round 44: raw API — P/Invoke into user32/kernel32 with typed signatures
+var user32 = raw.loadDll("user32.dll");
+var kernel32 = raw.loadDll("kernel32.dll");
+var f = win.form("rawapi", 220, 100);
+// ANSI out-buffer via raw.buffer
+var gwA = user32.api("GetWindowTextA", "int(pointer, pointer, int)");
+var buf = raw.buffer(256);
+var n = gwA(f.hwnd, buf, 256);
+io.print("t=" ++ raw.read(buf, n));
+// wide variant: wstr out-param is a raw pointer we read back ourselves
+var gwW = user32.api("GetWindowTextW", "int(pointer, pointer, int)");
+var bufW = raw.buffer(256);
+var nW = gwW(f.hwnd, bufW, 256);
+io.print("w=" ++ raw.readW(bufW, nW));
+// str param converts text -> ANSI automatically
+var swA = user32.api("SetWindowTextA", "int(pointer, str)");
+swA(f.hwnd, "renamed");
+io.print(f.text());
+// 64-bit integer return from kernel32
+var tk = kernel32.api("GetTickCount64", "int64()");
+io.print("tick" ++ (tk() > 0));
+raw.free(buf);
+raw.free(bufW);

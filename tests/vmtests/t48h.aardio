@@ -1,0 +1,2 @@
+var u = raw.loadDll("User32.dll");
+io.print(u);

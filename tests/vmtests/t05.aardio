@@ -1,0 +1,2 @@
+var t = {name = "aardio"; version = 43};
+io.print(t.name);

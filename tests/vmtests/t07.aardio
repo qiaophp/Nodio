@@ -1,0 +1,5 @@
+function f() {
+    return 7;
+}
+io.print(f());
+io.print(f);

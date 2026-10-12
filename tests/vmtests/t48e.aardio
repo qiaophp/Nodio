@@ -1,0 +1,4 @@
+import win;
+io.print(win);
+io.print(win.getAncestor);
+io.print(::GetWindowLong);

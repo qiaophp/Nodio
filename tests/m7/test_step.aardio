@@ -1,0 +1,29 @@
+io.print("STEP 0: start");
+import win;
+io.print("STEP 1: imported win");
+import win.ui;
+io.print("STEP 2: imported win.ui");
+import win.ui.background;
+io.print("STEP 3: imported win.ui.background");
+
+var clsName = win.registerFormClass("AARDIO_FORM");
+io.print("STEP 4: registered clsName =", clsName);
+
+var hwnd = ::CreateWindowEx(0, clsName, "test", 0x10cf0000, 100, 100, 300, 200, 0, 0, _HINSTANCE, 0);
+io.print("STEP 5: created hwnd =", hwnd);
+
+var fakeForm = {
+    hwnd = hwnd;
+    getClientRect = function() {
+        return ::RECT(0, 0, 300, 200);
+    };
+    hasDirectDrawBackground = function() { return false; };
+};
+io.print("STEP 6: created fakeForm");
+
+io.print("STEP 7: calling win.ui.background(fakeForm)...");
+var bg = win.ui.background(fakeForm);
+io.print("STEP 8: bg created:", bg != null);
+
+::DestroyWindow(hwnd);
+io.print("STEP 9: Destroyed");

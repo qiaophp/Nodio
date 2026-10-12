@@ -1,0 +1,11 @@
+class point {
+    ctor(x, y) {
+        this.x = x;
+        this.y = y;
+    };
+    show = function() { return this.x ++ "," ++ this.y; };
+    kind = "point";
+};
+var p = point(3, 4);
+io.print(p.x, p.y, p.kind);
+io.print(p.show());

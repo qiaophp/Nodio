@@ -1,0 +1,5 @@
+var x = null;
+io.print(x?.name);
+var t = {n = 5};
+io.print(t?.n, t?.missing);
+io.print(t.n > 3 ? "big" : "small");

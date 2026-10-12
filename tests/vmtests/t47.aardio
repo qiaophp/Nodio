@@ -1,0 +1,12 @@
+// M4-b: aardio-source library (original builtin shape) via import
+import mytable;
+
+var a = {1, 2};
+mytable.push(a, 3);
+io.print("n" ++ #a ++ ":" ++ table.concat(a, ","));
+mytable.unshift(a, 0);
+io.print("u" ++ table.concat(a, ","));
+var v = mytable.remove(a, 1);
+io.print("r" ++ v ++ ":" ++ table.concat(a, ","));
+var m = {x = 1; y = "z"};
+io.print(mytable.tostring(m));

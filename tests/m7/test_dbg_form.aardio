@@ -1,0 +1,4 @@
+import win;
+io.print("before import win.ui, win.form:", type(win.form));
+import win.ui;
+io.print("after import win.ui, win.form:", type(win.form));

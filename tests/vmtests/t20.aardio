@@ -1,0 +1,4 @@
+io.print(string.gsub("aXbXc", "X", ""));
+io.print(string.match("aXbXc", "X(?)"));
+io.print(string.gsub("aXbXc", "X(.)", ""));
+io.print(string.gsub("aXbXc", "(X)", "[$1]"));

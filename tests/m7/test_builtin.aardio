@@ -1,0 +1,2 @@
+import builtin;
+io.print("builtin loaded");

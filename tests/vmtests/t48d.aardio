@@ -1,0 +1,3 @@
+import win;
+io.print(win.getStyle);
+io.print(::GetWindowLong);

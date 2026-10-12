@@ -1,0 +1,9 @@
+import win.ui;
+var winform = win.form(text="aardio test";right=400;bottom=300);
+io.print("winform hwnd:", winform.hwnd != null, winform.hwnd);
+winform.add(
+    button={cls="button";text="点击";left=50;top=50;right=150;bottom=90};
+    edit={cls="edit";text="输入框";left=50;top=110;right=250;bottom=150}
+)
+io.print("button hwnd:", winform.button.hwnd != null);
+io.print("edit hwnd:", winform.edit.hwnd != null);

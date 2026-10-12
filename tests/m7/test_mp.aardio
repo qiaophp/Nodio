@@ -1,0 +1,9 @@
+import util.metaProperty;
+io.print("type(util):", type(util));
+io.print("type(util.metaProperty):", type(util.metaProperty));
+for(k,v in util) {
+    io.print("util member:", k, type(v));
+}
+for(k,v in util.metaProperty) {
+    io.print("util.metaProperty member:", k, type(v));
+}

@@ -1,0 +1,15 @@
+var dir = fsys.tmpDir() ++ "aardio-fsys-test";
+fsys.delete(dir);
+io.print(fsys.createDir(dir ++ "\\sub"));
+io.print(fsys.isDir(dir ++ "\\sub"));
+io.print(io.writeFile(dir ++ "\\a.txt", "hello"));
+io.print(fsys.exists(dir ++ "\\a.txt"));
+io.print(fsys.copy(dir ++ "\\a.txt", dir ++ "\\sub\\b.txt"));
+io.print(io.readFile(dir ++ "\\sub\\b.txt"));
+var list = fsys.list(dir);
+io.print(list[1].name);
+io.print(list[2].dir);
+io.print(fsys.move(dir ++ "\\a.txt", dir ++ "\\m.txt"));
+io.print(fsys.exists(dir ++ "\\m.txt"));
+io.print(fsys.delete(dir));
+io.print(fsys.exists(dir));

@@ -1,0 +1,18 @@
+//api 全局 WinAPI (M5 acceptance copy of lib/win/api.aardio head)
+
+namespace win.api{}
+
+/*intellisense(::)*/
+::GetSystemMetrics = ::User32.api("GetSystemMetrics","int(int)")
+::GetWindowRect = ::User32.api( "GetWindowRect", " int(addr hwnd,struct &lpRect ) " )
+::GetClientRect = ::User32.api( "GetClientRect", " int(addr hwnd,struct &lpRect ) " )
+::MoveWindow = ::User32.api( "MoveWindow", "int( addr hwnd, int x,int y,int w,int h,bool repaint)" )
+::PostMessage = ::User32.api("PostMessageW","addr(addr hwnd,INT msg,ADDR wParam,addr lParam)")
+::SendMessage = ::User32.api("SendMessageW","addr(addr hwnd,INT msg,ptr wParam,ptr lParam)")
+::SetWindowLong = ::User32.api("SetWindowLong","int(addr hwnd,int nIndex,int dwNewLong)" )
+::GetWindowLong = ::User32.api("GetWindowLong","int(addr hwnd,int nIndex)" )
+/*end intellisense*/
+::GetMessageW = ::User32.api("GetMessageW","int(struct lpMsg,addr hwnd,INT min,INT max)")
+::TranslateMessage = ::User32.api("TranslateMessage","int(struct lpMsg)")
+::DispatchMessageW = ::User32.api("DispatchMessageW","addr(struct lpMsg)")
+::PostQuitMessage = ::User32.api("PostQuitMessage","int(int)")

@@ -1,0 +1,5 @@
+namespace calc {
+    base = 10;
+    add = function(x) { return base + x; };
+};
+io.print(calc.add(5));

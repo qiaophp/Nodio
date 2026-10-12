@@ -1,0 +1,4 @@
+namespace helper2 {
+    plus = function(a, b) { return a + b; };
+    tag = "ns";
+};

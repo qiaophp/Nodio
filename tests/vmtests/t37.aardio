@@ -1,0 +1,24 @@
+// round 41: menu bar — addMenu/add/sep/click dispatch
+var f = win.form("菜单", 300, 200);
+var log = "";
+var mFile = f.addMenu("文件");
+var mOpen = mFile.add("打开");
+mFile.sep();
+var mQuit = mFile.add("退出");
+var mHelp = f.addMenu("帮助");
+var mAbout = mHelp.add("关于");
+var mSub = mFile.addMenu("导出");
+var mPdf = mSub.add("PDF");
+mOpen.oncommand = function() { log = log ++ "O"; };
+mAbout.oncommand = function() { log = log ++ "A"; };
+mPdf.oncommand = function() { log = log ++ "P"; };
+mQuit.oncommand = function() { f.close(); };
+mOpen.enable(true);
+mOpen.check(true);
+mOpen.click();
+mAbout.click();
+mPdf.click();
+mQuit.click();
+f.doModal();
+io.print("log=" ++ log);
+io.print("t=" ++ mOpen.text() ++ mPdf.text());

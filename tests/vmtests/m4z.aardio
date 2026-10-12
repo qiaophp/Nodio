@@ -1,0 +1,5 @@
+var f = function(a,...){
+	var e = ... !== null;
+	io.print(e);
+};
+f("x", 1, 2);

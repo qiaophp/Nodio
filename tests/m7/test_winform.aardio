@@ -1,0 +1,3 @@
+import win.ui;
+var winform = win.form(text="aardio test");
+io.print("winform created:", winform != null);

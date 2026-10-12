@@ -1,0 +1,12 @@
+namespace gdip{
+    GdiplusStartupInput = class{
+        int GdiplusVersion;
+    }
+    function open(){
+        io.print("GdiplusStartupInput is: ", tostring(GdiplusStartupInput));
+        var u = GdiplusStartupInput();
+        u.GdiplusVersion = 1;
+        io.print("u is: ", tostring(u), " ver=", u.GdiplusVersion);
+    }
+    open();
+}

@@ -1,0 +1,5 @@
+import string;
+import math;
+var s = string.split("a,b,c", ",");
+io.print(s[1], string.upper("ab"), math.max(3, 9));
+console.log("console works", 42);

@@ -1,0 +1,5 @@
+var f = function(a){
+	if(a) return 1;
+	return 2;
+};
+io.print(f(1), f(null));

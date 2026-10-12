@@ -1,0 +1,5 @@
+import string;
+var s = "a" ++ "b" ++ string.upper("c");
+io.print(s, string.format("n=%d x=%.2f", 7, 1.5));
+var t = string.split("x,y,z", ",");
+console.log("arr2=" ++ t[2]);

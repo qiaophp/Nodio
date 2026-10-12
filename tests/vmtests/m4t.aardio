@@ -1,0 +1,6 @@
+var f = function(a,...){
+	if(...!==null) for(i=1;#...) io.print(...[i]);
+	else return #a + 1;
+	return #a;
+};
+f("x", 1, 2);

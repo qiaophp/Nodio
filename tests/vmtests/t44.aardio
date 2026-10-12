@@ -1,0 +1,12 @@
+// M3 acceptance: multi-return + by-ref writeback
+var f = function() { return 7, "str"; };
+var a, b = f();
+io.print(a ++ "|" ++ b);
+
+// & out-params write back as extra return values
+var kernel32 = raw.loadDll("kernel32.dll");
+var gc = kernel32.api("GetComputerNameW", "bool(ustring &lpBuffer, int &nSize)");
+var buf = raw.buffer(520);
+var name, n = gc(buf, null);
+io.print("n" ++ n);
+io.print("ok" ++ (n > 0));

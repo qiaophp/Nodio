@@ -1,0 +1,4 @@
+import builtin.struct;
+import win.api;
+import win.ui;
+io.print("win.ui loaded with builtin.struct!");

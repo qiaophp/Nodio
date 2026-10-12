@@ -1,0 +1,15 @@
+// round 43: setFont visual demo
+var f = win.form("字体", 320, 160);
+f.onpaint = function(gdc) {
+    gdc.clear(0xFFFFFF);
+    gdc.setTextColor(0x000000);
+    gdc.setFont(14, "宋体", false, false);
+    gdc.text(10, 15, "14px SimSun normal");
+    gdc.setFont(24, "宋体", true, false);
+    gdc.setTextColor(0x800000);
+    gdc.text(10, 45, "24px bold");
+    gdc.setFont(28, "黑体", false, false);
+    gdc.setTextColor(0xFF0000);
+    gdc.text(10, 85, "28px HeiTi");
+};
+f.doModal();
