@@ -25,7 +25,7 @@ Decisions locked with the project owner:
      blobs (original opcode encodings remain unrecovered).
 
 ## Phase 1 — engine (this repo)
-- [x] Tree-walking interpreter, 48-test regression suite green (x86 + x64)
+- [x] Tree-walking interpreter, 52-test regression suite green (x86 + x64)
 - [x] MFC-free extraction (`engine/` + console `host/`)
 - [x] x64 callback trampoline rewrite (shadow-slot spill + XMM save,
       RCX=ctx contract) — fixes the 0xC0000005 in EnumChildWindows-style
@@ -35,17 +35,22 @@ Decisions locked with the project owner:
       bit-cast from RAX
 - [x] x64 struct `cbSize` auto-sync (WNDCLASSEX 48→80) + dangling-pointer
       fix in `StructSerialize`
-- [ ] UTF-8 byte-string value model (`#s` = bytes, `s[1]` = byte code)
-- [ ] Real-library import gate: `win`, `win.ui`, `gdi`, `gdip`, `sqlite`,
+- [x] UTF-8 byte-string value model (`#s` = bytes, `s[1]` = byte code)
+- [x] Real-library import gate: `win`, `win.ui`, `gdi`, `gdip`, `sqlite`,
       `JSON` parse clean end-to-end
-- [ ] Known x64-only defect: child-control creation inside
-      `test_winform_ctrl.aardio` (`form.add` error) — x86 path unaffected
+- [x] x64 `winform.add` named-argument table (`name={cls;text;left;top;
+      right;bottom}`) — was a 7-positional-arg signature that crashed x64
+- [x] `arg` varargs binding (the engine bound `...` only) + empty-varargs
+      reads as null so `if(!...)` recursion guards terminate
+- [x] Memory DLL loading: `$"path"` binary inline + manual PE mapper
+      (TLS callbacks unsupported, matching aardio's own limitation)
 
 ## Phase 2 — publisher (this repo, `publish/`)
-- [ ] Binary-safe payload embedder + `.aproj` embed/ignored/local rules
-- [ ] PE stamping: icon / version info / DPI-aware manifest / UAC
-- [ ] Publish-time syntax gate + dependency closure for `lib/`
-- [ ] Re-add publish fixtures (`tests/vmtests/proj`, t49)
+- [x] Binary-safe payload embedder + `.aproj` embed/ignored/local rules
+- [x] PE stamping: icon / version info / DPI-aware manifest / UAC
+- [x] Publish-time syntax gate + dependency closure for `lib/`
+- [x] Publish fixtures (`tests/m7/proj`, t49) + memory-DLL-from-payload
+      assertions (x64 + x86 green)
 
 ## Phase 3 — IDE shell (`ide/`, WTL + Scintilla)
 - [ ] Tabbed MDI frame, docking panes (project tree / output console)
