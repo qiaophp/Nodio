@@ -155,21 +155,28 @@ namespace NodioVM
                 {
                     p++;
                     PNode n = New(Node::VarDecl);
-                    if (Peek().t == TIdent)
-                        n->names.push_back(Next().text);
-                    else
+                    // var a = 6, b = 3, c = 9 — collect name/value pairs.
+                    // names[0] pairs with n->a; names[k] (k>0) pairs with
+                    // n->b->list[k-1].
+                    auto ReadName = [&]() {
+                        if (Peek().t == TIdent) { n->names.push_back(Next().text); return true; }
                         n->names.push_back(L"");
+                        return false;
+                    };
+                    ReadName();
+                    // trailing names with no initializer: var a, b, c
                     while (true)
                     {
                         size_t saveComma = p;
                         SkipNL();
-                        if (EatPunct(L",") && !PeekIsAssignEnd())
+                        if (EatPunct(L",") && Peek().t == TIdent &&
+                            Peek(1).t == TPunct &&
+                            (Peek(1).text == L"," || Peek(1).text == L";" ||
+                             Peek(1).text == L"=" || Peek(1).t == TNL ||
+                             Peek(1).t == TEnd))
                         {
                             SkipNL();
-                            if (Peek().t == TIdent)
-                                n->names.push_back(Next().text);
-                            else
-                                n->names.push_back(L"");
+                            ReadName();
                         }
                         else
                         {
@@ -182,30 +189,45 @@ namespace NodioVM
                     {
                         SkipNL();
                         n->a = ParseExpr();
-                        // var a,b = e1,e2 — init list per name; when the
-                        // first expr yields multi-returns the extras fill
-                        // the remaining names (VarDecl eval)
-                        if (!n->b) n->b = New(Node::Block);
-                        while (true)
+                    }
+                    // additional ", name = expr" pairs (and bare expr items
+                    // for the multi-return unpack form var a,b = f())
+                    if (!n->b) n->b = New(Node::Block);
+                    while (true)
+                    {
+                        size_t saveVal = p;
+                        SkipNL();
+                        if (EatPunct(L","))
                         {
-                            size_t saveVal = p;
                             SkipNL();
-                            if (EatPunct(L","))
+                            if (PeekIsStmtEnd()) break;
+                            if (IsPunct(L","))
                             {
+                                n->b->list.push_back(New(Node::NullK));
+                                continue;
+                            }
+                            // "name = expr" pair → new name + its value
+                            if (Peek().t == TIdent)
+                            {
+                                size_t saveName = p;
+                                wstring nm = Next().text;
                                 SkipNL();
-                                if (PeekIsStmtEnd()) break;
-                                if (IsPunct(L","))
+                                if (Peek().t == TPunct && Peek().text == L"=")
                                 {
-                                    n->b->list.push_back(New(Node::NullK));
+                                    p++;
+                                    SkipNL();
+                                    n->names.push_back(nm);
+                                    n->b->list.push_back(ParseExpr());
                                     continue;
                                 }
-                                n->b->list.push_back(ParseExpr());
+                                p = saveName;   // not a pair — plain expr
                             }
-                            else
-                            {
-                                p = saveVal;
-                                break;
-                            }
+                            n->b->list.push_back(ParseExpr());
+                        }
+                        else
+                        {
+                            p = saveVal;
+                            break;
                         }
                     }
                     return n;
@@ -509,7 +531,8 @@ namespace NodioVM
             PNode e = ParseExpr();
             bInAssignLhs = false;
             const wchar_t* ops[] = { L"=", L"::=", L":=", L"+=", L"-=",
-                                     L"*=", L"/=", L"%=", L"^=", nullptr };
+                                     L"*=", L"/=", L"%=", L"^=", L"|=",
+                                     L"&=", L"^^=", L"<<=", L">>=", nullptr };
             for (int k = 0; ops[k]; k++)
             {
                 if (Peek().t == TPunct && Peek().text == ops[k])
@@ -1135,12 +1158,16 @@ namespace NodioVM
         PNode ParseBitOr()
         {
             PNode l = ParseBitXor();
-            while (IsPunct(L"|") || IsPunct(L"|="))
+            // "|=" is a statement-level compound assignment; while parsing
+            // an assign LHS it must reach the assignment handler instead
+            while (IsPunct(L"|") || (!bInAssignLhs && IsPunct(L"|=")))
             {
                 wstring op = Next().text;
                 if (op == L"|=")
                 {
-                    PNode n = New(Node::Bin);
+                    // compound assignment: build an Assign node so DoAssign
+                    // applies the op and stores through the LHS target
+                    PNode n = New(Node::Assign);
                     n->str = L"|=";
                     n->a = l;
                     n->b = ParseBitXor();
@@ -1164,7 +1191,7 @@ namespace NodioVM
             {
                 p++;
                 PNode n = New(Node::Bin);
-                n->str = L"^x";
+                n->str = L"^";   // aardio: ^ is bitwise XOR (** is exponent)
                 n->a = l;
                 n->b = ParseBitAnd();
                 l = n;
@@ -1174,10 +1201,11 @@ namespace NodioVM
         PNode ParseBitAnd()
         {
             PNode l = ParseShift();
-            while (IsPunct(L"&") || IsPunct(L"&="))
+            // "&=" is a statement-level compound assignment (see ParseBitOr)
+            while (IsPunct(L"&") || (!bInAssignLhs && IsPunct(L"&=")))
             {
                 wstring op = Next().text;
-                PNode n = New(Node::Bin);
+                PNode n = New(op == L"&=" ? Node::Assign : Node::Bin);
                 n->str = op;
                 n->a = l;
                 n->b = ParseShift();
@@ -1192,14 +1220,18 @@ namespace NodioVM
             {
                 size_t save = p;
                 SkipNL();
+                // "<<=" / ">>=" are statement-level compound assignments
+                // (see ParseBitOr); the plain shifts stay binary here
                 if (!(IsPunct(L"<<") || IsPunct(L">>") || IsPunct(L">>>") ||
-                      IsPunct(L"<<=") || IsPunct(L">>=")))
+                      (!bInAssignLhs && IsPunct(L"<<=")) ||
+                      (!bInAssignLhs && IsPunct(L">>="))))
                 {
                     p = save;
                     break;
                 }
                 wstring op = Next().text;
-                PNode n = New(Node::Bin);
+                bool bCompound = (op == L"<<=" || op == L">>=");
+                PNode n = New(bCompound ? Node::Assign : Node::Bin);
                 n->str = op;
                 n->a = l;
                 SkipNL();
@@ -1331,7 +1363,8 @@ namespace NodioVM
         PNode ParsePow()
         {
             PNode l = ParsePostfix();
-            if (IsPunct(L"^") || IsPunct(L"**"))
+            // aardio: ** is exponent; ^ is bitwise XOR (ParseBitXor)
+            if (IsPunct(L"**"))
             {
                 wstring op = Next().text;
                 PNode n = New(Node::Bin);

@@ -946,17 +946,17 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             if (op == L"*") return Value::Num_(a * b);
             if (op == L"/") return Value::Num_(b != 0 ? a / b : 0);
             if (op == L"%" || op == L"%=") return Value::Num_(b != 0 ? fmod(a, b) : 0);
-            if (op == L"^" || op == L"**") return Value::Num_(pow(a, b));
             // M2: bitwise (32-bit width, aardio DWORD semantics)
             unsigned int ua = (unsigned int)(INT_PTR)(long long)a;
             unsigned int ub = (unsigned int)(INT_PTR)(long long)b;
             if (op == L"&") return Value::Num_((double)(int)(ua & ub));
             if (op == L"|") return Value::Num_((double)(int)(ua | ub));
-            if (op == L"^x") return Value::Num_((double)(int)(ua ^ ub));
+            if (op == L"^") return Value::Num_((double)(int)(ua ^ ub));   // aardio: ^ is XOR
             if (op == L"<<") return Value::Num_((double)(int)(ua << (ub & 31)));
             if (op == L">>") return Value::Num_((double)(int)(ua >> (ub & 31)));
             if (op == L">>>")
                 return Value::Num_((double)((long long)(ua >> (ub & 31))));
+            if (op == L"**") return Value::Num_(pow(a, b));   // aardio: ** is exponent
             if (op == L"<") return Value::Bool_(a < b && l.t == r.t ? true : CmpLess(l, r));
             if (op == L">") return Value::Bool_(CmpLess(r, l));
             if (op == L"<=") return Value::Bool_(!CmpLess(r, l));
@@ -990,7 +990,18 @@ Value Interp::ApplyOp(const wstring& op, const Value& l, const Value& r)
             if (op == L"*") return Value::Num_(a * b);
             if (op == L"/") return Value::Num_(b != 0 ? a / b : 0);
             if (op == L"%" || op == L"%=") return Value::Num_(b != 0 ? fmod(a, b) : 0);
-            if (op == L"^" || op == L"**") return Value::Num_(pow(a, b));
+            // aardio: ** is exponent, ^ is bitwise XOR (32-bit)
+            if (op == L"**") return Value::Num_(pow(a, b));
+            if (op == L"^") return Value::Num_((double)(int)(((int)(INT_PTR)(long long)a) ^ ((int)(INT_PTR)(long long)b)));
+            // bitwise: 32-bit width, aardio DWORD semantics (matches EvalBin)
+            unsigned int ua = (unsigned int)(INT_PTR)(long long)a;
+            unsigned int ub = (unsigned int)(INT_PTR)(long long)b;
+            if (op == L"&") return Value::Num_((double)(int)(ua & ub));
+            if (op == L"|") return Value::Num_((double)(int)(ua | ub));
+            if (op == L"<<") return Value::Num_((double)(int)(ua << (ub & 31)));
+            if (op == L">>") return Value::Num_((double)(int)(ua >> (ub & 31)));
+            if (op == L">>>")
+                return Value::Num_((double)((long long)(ua >> (ub & 31))));
             if (op == L"==") return Value::Bool_(l.ToString() == r.ToString() &&
                                                 l.t == r.t);
             if (op == L"!=") return Value::Bool_(!(l.ToString() == r.ToString() &&

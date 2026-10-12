@@ -1,0 +1,30 @@
+// M9: multi-declarator var declarations and bitwise operators.
+// Regression: `var a = 6, b = 3` used to swallow the second pair so
+// a|b evaluated against an unset b, and |/&/^ compound assignments were
+// unimplemented. Both broke every win.ui control, which builds window
+// style flags with |=. Also pins aardio's operator mapping: ^ is XOR
+// and ** is exponent.
+var a = 6, b = 3;
+io.print("or:", a|b);          // 7
+io.print("and:", a&b);         // 2
+io.print("xor:", a^b);         // 5
+io.print("shl:", a<<b);        // 48
+io.print("shr:", 256>>b);      // 32
+io.print("pow:", a**b);        // 216
+io.print("not:", ~0);          // -1
+
+var p = 1, q = 2, r = 3;
+io.print("triple:", p, q, r);  // 123
+
+var flags = 0;
+flags |= 0x40000000;
+flags |= 0x10000000;
+io.print("style:", flags);     // 0x50000000 = 1342177280
+
+var x, y, z;
+io.print("unset:", x, y, z);   // null null null
+
+var m = 0x100, n = 0x100;
+m &= 0xFF;
+n |= 0xFF;
+io.print("andassign:", m, "orassign:", n);  // 0 511
