@@ -418,6 +418,9 @@ namespace NodioVM
         bool bCdecl = false;
         bool bRetFloat = false;   // declared "float" return (x64 XMM decode)
     };
+    // aardio root for compile-time embed paths ("~/...") — parent of
+    // NODIO_LIBDIR; defined near RunSource, used by DoImport
+    static wstring EmbedRoot();
     static int ApiTypeOf(const wstring& tRaw, bool* pByRef)
     {
         // tokens arrive as "INT", "addr", "ustring&", "struct &lpRect",
@@ -664,11 +667,21 @@ namespace NodioVM
     {
         size_t pl = sig.find(L'(');
         size_t pr = sig.rfind(L')');
-        if (pl == wstring::npos || pr == wstring::npos || pr < pl)
+        if (pl == wstring::npos)
             return false;
         wstring strRet = sig.substr(0, pl);
-        wstring strArgs = sig.substr(pl + 1, pr - pl - 1);
-        wstring tail = sig.substr(pr + 1);
+        wstring strArgs, tail;
+        if (pr != wstring::npos && pr > pl)
+        {
+            strArgs = sig.substr(pl + 1, pr - pl - 1);
+            tail = sig.substr(pr + 1);
+        }
+        else
+        {
+            // official lib quirk: truncated signatures ship without the
+            // closing paren ("INT(POINTER hProcess") — tolerate them
+            strArgs = sig.substr(pl + 1);
+        }
         {
             // returns share the alias table but map to ApiRet ids —
             // ApiTypeOf's numeric ids are PARAM types (0=int...) and
@@ -2175,6 +2188,11 @@ namespace NodioVM
         vector<Tok> toks;
         size_t p = 0;
         wstring* err;
+        // compile-time file embedding ($"path"): resolution bases —
+        // strEmbedBase = directory of the file being parsed,
+        // strEmbedRoot = aardio root (parent of NODIO_LIBDIR) for "~/"
+        wstring strEmbedBase;
+        wstring strEmbedRoot;
 
         const Tok& Peek(int off = 0) const { return toks[min(p + off, toks.size() - 1)]; }
         Tok Next()
@@ -2288,7 +2306,8 @@ namespace NodioVM
                     if (!PeekIsStmtEnd())
                     {
                         n->a = ParseExpr();
-                        // aardio multi-return: return a, b, c
+                        // aardio multi-return: return a, b, c — empty
+                        // slots ("return a,,b" / ",,,addr") are null
                         while (true)
                         {
                             size_t saveR = p;
@@ -2297,7 +2316,10 @@ namespace NodioVM
                             {
                                 SkipNL();
                                 if (PeekIsStmtEnd()) break;
-                                n->list.push_back(ParseExpr());
+                                if (IsPunct(L","))
+                                    n->list.push_back(New(Node::NullK));
+                                else
+                                    n->list.push_back(ParseExpr());
                             }
                             else
                             {
@@ -2372,8 +2394,11 @@ namespace NodioVM
                 if (t.text == L"import")
                 {
                     // import a.b.c — builtin roots or <scriptdir>\a\b\c.aardio
+                    // import ..a.b — root-prefixed form (library root)
                     p++;
                     PNode n = New(Node::Import);
+                    while (IsPunct(L".."))
+                        p++;   // root prefixes resolve absolutely anyway
                     n->names.push_back(ExpectIdent());
                     while (IsPunct(L".") && Peek(1).t == TIdent)
                     {
@@ -3661,6 +3686,68 @@ namespace NodioVM
             }
             return e;
         }
+        // $"path" compile-time embed — resolve the path, read the file.
+        // Text files embed their content; binary payloads embed the
+        // resolved absolute path (raw.loadDll keeps loading by path).
+        wstring ResolveEmbedPath(const wstring& strPath)
+        {
+            wstring rel = strPath;
+            wstring rootForm;
+            if (!rel.empty() && rel[0] == L'~' &&
+                rel.size() > 1 && (rel[1] == L'/' || rel[1] == L'\\'))
+            {
+                rootForm = strEmbedRoot.empty() ? L""
+                    : strEmbedRoot + L"\\" + rel.substr(2);
+                rel = rel.substr(2);
+            }
+            // candidates: ~ root first, then the parsing file's dir,
+            // then verbatim (absolute paths hit this last branch)
+            wstring cand;
+            if (!rootForm.empty() && _waccess(rootForm.c_str(), 0) == 0)
+                cand = rootForm;
+            else if (!strEmbedBase.empty() &&
+                     _waccess((strEmbedBase + L"\\" + rel).c_str(), 0) == 0)
+                cand = strEmbedBase + L"\\" + rel;
+            else if (_waccess(rel.c_str(), 0) == 0)
+                cand = rel;
+            else if (!rootForm.empty())
+                cand = rootForm;
+            else
+                cand = strEmbedBase.empty() ? rel
+                       : strEmbedBase + L"\\" + rel;
+
+            FILE* pf = nullptr;
+            if (_wfopen_s(&pf, cand.c_str(), L"rb") != 0 || !pf)
+                return cand;   // unresolved — surface the path in errors
+            fseek(pf, 0, SEEK_END);
+            long cb = ftell(pf);
+            fseek(pf, 0, SEEK_SET);
+            std::vector<char> raw((size_t)cb);
+            size_t rd = cb > 0 ? fread(raw.data(), 1, (size_t)cb, pf) : 0;
+            fclose(pf);
+            raw.resize(rd);
+
+            // binary sniff: NUL byte in the first 4KB → payload, not text
+            bool bBinary = false;
+            size_t nSniff = min(rd, (size_t)4096);
+            for (size_t k = 0; k < nSniff; k++)
+                if (raw[k] == 0) { bBinary = true; break; }
+            if (bBinary)
+                return cand;
+
+            // UTF-8 (BOM or bare) → wide text content
+            size_t off = (rd >= 3 && (unsigned char)raw[0] == 0xEF &&
+                          (unsigned char)raw[1] == 0xBB &&
+                          (unsigned char)raw[2] == 0xBF) ? 3 : 0;
+            int w = MultiByteToWideChar(CP_UTF8, 0, raw.data() + off,
+                                        (int)(rd - off), nullptr, 0);
+            std::vector<wchar_t> wide((size_t)max(w, 0) + 1, 0);
+            if (w > 0)
+                MultiByteToWideChar(CP_UTF8, 0, raw.data() + off,
+                                    (int)(rd - off), wide.data(), w);
+            return wstring(wide.data(), (size_t)w);
+        }
+
         PNode ParsePrimary()
         {
             const Tok& t = Peek();
@@ -3673,6 +3760,23 @@ namespace NodioVM
                 return n;
             }
             if (t.t == TNum) { p++; PNode n = New(Node::Num); n->num = t.num; return n; }
+            // compile-time file embed: $"path" — official aardio inlines
+            // the file at parse time. Text files embed their content;
+            // binary payloads (dll/ico/...) embed the RESOLVED ABSOLUTE
+            // PATH so raw.loadDll(path) keeps working (memory-DLL loading
+            // arrives with the Phase 2 publisher).
+            // '$' lexes as an identifier character (IsIdentChar), so the
+            // embed marker arrives as TIdent "$" (or TPunct "$" when
+            // adjacent to a quote in some lexer paths) — accept both
+            if ((t.t == TIdent || t.t == TPunct) && t.text == L"$" &&
+                Peek(1).t == TStr)
+            {
+                wstring strPath = Peek(1).text;
+                p += 2;
+                PNode n = New(Node::Str);
+                n->str = ResolveEmbedPath(strPath);
+                return n;
+            }
             if (t.t == TStr) { p++; PNode n = New(Node::Str); n->str = t.text; return n; }
             if (t.t == TIdent)
             {
@@ -3936,11 +4040,20 @@ namespace NodioVM
                         EatPunct(L";");
                         continue;
                     }
-                    // ctor: function name(params){...} or ctor(...) - reuse
-                    // the function-assignment path by falling back to
-                    // ParseStatement for this member
-                    PNode st = ParseStatement();
-                    if (st) n->a->list.push_back(st);
+                    // ctor: ctor(params){...} — the constructor body is
+                    // stored on n->b (FuncLit); without this branch the
+                    // block after ctor(...) would close the class early
+                    if (Peek().t == TIdent && Peek().text == L"ctor" &&
+                        Peek(1).t == TPunct && Peek(1).text == L"(")
+                    {
+                        p++;                     // 'ctor'
+                        n->b = ParseFuncRest();  // FuncLit: params+body
+                    }
+                    else
+                    {
+                        PNode st = ParseStatement();
+                        if (st) n->a->list.push_back(st);
+                    }
                     SkipNL();
                 }
                 Expect(L"}");
@@ -6132,10 +6245,7 @@ namespace NodioVM
                     wstring msg = *err;
                     err->clear();
                     if (!n->b)
-                    {
-                        (*err) = msg;   // no handler: re-raise
-                        return Value();
-                    }
+                        return Value();   // catch-less try{}: swallow
                     Env cEnv;
                     cEnv.parent = env;
                     if (!n->names.empty())
@@ -6439,6 +6549,8 @@ namespace NodioVM
                 wstring modErr;
                 vector<Tok> toks = Lex(src, &modErr);
                 Parser ps{ toks, 0, &modErr };
+                ps.strEmbedBase = baseDir;
+                ps.strEmbedRoot = EmbedRoot();
                 PNode prog = ps.ParseBlock();
                 if (!modErr.empty())
                 {
@@ -6608,6 +6720,12 @@ namespace NodioVM
             wstring modErr;
             vector<Tok> toks = Lex(src, &modErr);
             Parser ps{ toks, 0, &modErr };
+            {
+                size_t sl = file.find_last_of(L"\\/");
+                ps.strEmbedBase = (sl == wstring::npos) ? wstring()
+                    : file.substr(0, sl);
+                ps.strEmbedRoot = EmbedRoot();
+            }
             PNode prog = ps.ParseBlock();
             if (!modErr.empty())
             {
@@ -7530,6 +7648,17 @@ namespace NodioVM
                                 (int)(raw3.size() - off3), &s3[0], w3);
                     }
                     return Value::Str_(s3); });
+                // io.fullpath("/") — current working directory with a
+                // trailing separator kept (process lib reads workDir)
+                tb->map[L"fullpath"] = NF([](vector<Value>& a) -> Value {
+                    wchar_t szCwd[MAX_PATH] = L".";
+                    GetCurrentDirectoryW(MAX_PATH, szCwd);
+                    wstring s3 = szCwd;
+                    wstring rel = a.empty() ? L"" : BStr(a[0]);
+                    if (!rel.empty() &&
+                        (rel[0] == L'/' || rel[0] == L'\\'))
+                        return Value::Str_(s3 + L"\\");
+                    return Value::Str_(s3 + L"\\" + rel); });
                 // M6: io.exist — embedded payload first, then disk
                 // ("~" maps to the exe directory)
                 tb->map[L"exist"] = NF([](vector<Value>& a) -> Value {
@@ -7916,6 +8045,9 @@ namespace NodioVM
                         }
                         if (!fp)
                         {
+                            // official aardio quirk: api() on a missing
+                            // export returns null (callers guard with
+                            // try/catch — process/_.aardio WoW64 block)
                             if (a2.size() == 1)
                                 return Value();
                             (*err) = L"运行错误: 找不到 API: " + strName;
@@ -9915,6 +10047,21 @@ namespace NodioVM
         return EXCEPTION_EXECUTE_HANDLER;
     }
 
+    // aardio root for compile-time embed paths ("~/...") — the parent of
+    // NODIO_LIBDIR (install-root\lib). Empty when no lib dir is set.
+    static wstring EmbedRoot()
+    {
+        wchar_t szLib[MAX_PATH] = L"";
+        GetEnvironmentVariableW(L"NODIO_LIBDIR", szLib, MAX_PATH);
+        wstring strLib = szLib;
+        if (strLib.size() < 2) return L"";
+        while (strLib.size() > 1 &&
+               (strLib.back() == L'\\' || strLib.back() == L'/'))
+            strLib.pop_back();
+        size_t sl = strLib.find_last_of(L"\\/");
+        return sl == wstring::npos ? wstring() : strLib.substr(0, sl);
+    }
+
     int RunSource(const wstring& src, wstring* strError,
                   const wstring* pBaseDir,
                   const std::unordered_map<wstring, wstring>* pEmbedded,
@@ -9926,6 +10073,9 @@ namespace NodioVM
         wstring localErr;
         vector<Tok> toks = Lex(src, &localErr);
         Parser ps{ toks, 0, &localErr };
+        if (pBaseDir)
+            ps.strEmbedBase = *pBaseDir;
+        ps.strEmbedRoot = EmbedRoot();
         PNode prog = ps.ParseBlock();   // whole program as a block
         if (!localErr.empty())
         {

@@ -1,4 +1,6 @@
+// official try semantics (docs/language-reference/statements/try.md):
+// try{} alone absorbs the error and execution continues; catch is optional
 try {
-    error("unhandled");
+    error("swallowed");
 }
 io.print("nope");

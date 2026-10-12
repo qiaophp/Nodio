@@ -1,0 +1,28 @@
+// Phase 1.3 acceptance: import each real official library and report OK.
+// sqlite ships a 32-bit-only sqlite3.dll in the official lib — on x64 it
+// hits the documented OS boundary and must degrade gracefully.
+import win;
+io.print("win OK");
+import win.ui;
+io.print("win.ui OK");
+import gdi;
+io.print("gdi OK");
+import gdip;
+io.print("gdip OK");
+try {
+	import sqlite;
+	io.print("sqlite OK");
+}
+catch(e){
+	io.print("sqlite SKIP-32bit-only");
+}
+import JSON;
+io.print("JSON OK");
+import process;
+io.print("process OK");
+import inet;
+io.print("inet OK");
+import thread;
+io.print("thread OK");
+import fsys;
+io.print("fsys OK");
