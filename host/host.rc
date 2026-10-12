@@ -1,0 +1,46 @@
+// host/host.rc — gives the host exe a resource section.
+//
+// The publisher rewrites the manifest and version resources in place
+// (UpdateResourceW corrupts the section when replacing entries), so each
+// slot must be large enough for the user-supplied values. The version
+// strings below are padded with long filler values to reserve space; the
+// publisher overwrites them with real content and zeroes the slack.
+// The manifest id is CREATEPROCESS_MANIFEST_RESOURCE_ID (1) — the only id
+// the Windows loader reads. CMake's default-manifest merge is disabled in
+// CMakeLists so it cannot collide here.
+#include <windows.h>
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "host/host.manifest"
+
+// Filler width the publisher's version strings must fit in (bytes).
+#define NODIO_VER_FIELD_PAD 64
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Nodio                                                                "
+            VALUE "FileDescription", "Nodio host                                                        "
+            VALUE "FileVersion", "1.0                                                                "
+            VALUE "InternalName", "nodio                                                              "
+            VALUE "LegalCopyright", "                                                                  "
+            VALUE "OriginalFilename", "nodio.exe                                                        "
+            VALUE "ProductName", "Nodio                                                               "
+            VALUE "ProductVersion", "1.0                                                                "
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+

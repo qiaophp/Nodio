@@ -38,7 +38,7 @@ set_target_properties(engine PROPERTIES
 
 add_executable(nodio
     host/main.cpp
-    host/host.manifest
+    host/host.rc
     publish/publish.cpp
     publish/publish.h
     publish/payload.h
@@ -47,5 +47,12 @@ target_compile_options(nodio PRIVATE /utf-8)
 target_compile_definitions(nodio PRIVATE
     _UNICODE UNICODE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(nodio PRIVATE engine)
+# host.rc embeds the manifest + version info as real PE resources at the
+# ids the Windows loader reads. The VS generator also emits its own default
+# manifest and merges it at link time (CVT1100 duplicate on RT_MANIFEST
+# id 1), so disable that merge with the linker switch.
 set_target_properties(nodio PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+if(MSVC)
+    target_link_options(nodio PRIVATE "/MANIFEST:NO")
+endif()

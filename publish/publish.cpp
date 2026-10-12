@@ -254,12 +254,12 @@ namespace NodioPublish
 
     // ---- PE stamping -----------------------------------------------------
 
-    // Patch OptionalHeader.Subsystem in the OUTPUT exe: 2 = GUI, 3 = CUI.
-    // (The host itself is a console binary; GUI publishes hide the console.)
-    static bool PatchSubsystem(const std::wstring& exePath, bool bConsole)
+    // Patch OptionalHeader.Subsystem in an in-memory image: 2 = GUI,
+    // 3 = CUI. (The host itself is a console binary; GUI publishes hide
+    // the console.) The file-based variant is kept for direct callers.
+    static bool PatchSubsystemBuf(std::vector<char>& b, bool bConsole)
     {
-        std::vector<char> b;
-        if (!ReadWholeFile(exePath, b) || b.size() < 0x40) return false;
+        if (b.size() < 0x40) return false;
         if (*(unsigned short*)&b[0] != 0x5A4D) return false;   // 'MZ'
         DWORD peOff = *(DWORD*)&b[0x3C];
         if ((size_t)peOff + 0x5C > b.size()) return false;
@@ -271,6 +271,14 @@ namespace NodioPublish
         if (sub + 2 > b.size()) return false;
         if (magic != 0x10B && magic != 0x20B) return false;
         *(WORD*)&b[sub] = bConsole ? 3 : 2;
+        return true;
+    }
+
+    static bool PatchSubsystem(const std::wstring& exePath, bool bConsole)
+    {
+        std::vector<char> b;
+        if (!ReadWholeFile(exePath, b)) return false;
+        if (!PatchSubsystemBuf(b, bConsole)) return false;
         return WriteWholeFile(exePath, b);
     }
 
@@ -322,6 +330,309 @@ namespace NodioPublish
         }
         EndUpdateResourceW(hUpd, bOk ? FALSE : TRUE);
         return bOk;
+    }
+
+    // ---- resource directory helpers -------------------------------------
+    //
+    // UpdateResourceW cannot be used here: replacing RT_MANIFEST /
+    // RT_VERSION on an exe that already carries them produces a resource
+    // section the Windows loader then rejects ("side-by-side
+    // configuration is incorrect"). So the publisher rewrites the resource
+    // bytes in place: walk the .rsrc directory to the leaf entry, then
+    // overwrite the data blob and patch the leaf's size. The new blob must
+    // fit inside the existing raw section, which it does because the
+    // resources are padded to 4-byte alignment inside a 4 KiB-aligned
+    // section.
+
+    struct RsrcLoc
+    {
+        size_t secRaw = 0;      // file offset of .rsrc raw data
+        size_t secRva = 0;      // RVA of .rsrc
+        size_t leafOff = 0;     // file offset of the IMAGE_RESOURCE_DATA_ENTRY
+    };
+
+    static bool FindRsrcLeaf(std::vector<char>& b, WORD wType, WORD wName,
+                             RsrcLoc* out)
+    {
+        if (b.size() < 0x40) return false;
+        if (*(unsigned short*)&b[0] != 0x5A4D) return false;      // 'MZ'
+        DWORD peOff = *(DWORD*)&b[0x3C];
+        if ((size_t)peOff + 0x5C > b.size()) return false;
+        if (memcmp(&b[peOff], "PE\0\0", 4) != 0) return false;
+        size_t opt = (size_t)peOff + 24;
+        WORD magic = *(WORD*)&b[opt];
+        if (magic != 0x10B && magic != 0x20B) return false;
+        // DataDirectory[2] = resource. The base offset of the array is
+        // opt+96 for PE32 and opt+112 for PE32+; each entry is 8 bytes.
+        size_t dd = opt + (magic == 0x20B ? 112 : 96) + (size_t)2 * 8;
+        DWORD rva = *(DWORD*)&b[dd];
+        DWORD sz = *(DWORD*)&b[dd + 4];
+        if (!rva || !sz) return false;
+        WORD nSec = *(WORD*)&b[(size_t)peOff + 6];
+        size_t sh = opt + 240;
+        size_t raw = 0;
+        for (WORD i = 0; i < nSec; i++)
+        {
+            size_t e = sh + (size_t)i * 40;
+            DWORD va = *(DWORD*)&b[e + 12];
+            DWORD vs = *(DWORD*)&b[e + 8];
+            if (rva >= va && rva < va + vs)
+            {
+                raw = *(DWORD*)&b[e + 20] + (rva - va);
+                out->secRva = rva;
+                break;
+            }
+        }
+        if (!raw || raw >= b.size()) return false;
+        out->secRaw = raw;
+
+        // IMAGE_RESOURCE_DIRECTORY: 16-byte header, then entries of
+        // {DWORD nameOrId, DWORD offsetToData} where the high bit marks a
+        // subdirectory. Walk type -> name -> language.
+        auto DirEntries = [&](size_t dirOff, WORD* pnNamed, WORD* pnId) {
+            *pnNamed = *(WORD*)&b[dirOff + 12];
+            *pnId = *(WORD*)&b[dirOff + 14];
+            return dirOff + 16;
+        };
+        WORD nN = 0, nI = 0;
+        size_t e = DirEntries(raw, &nN, &nI);
+        size_t sub = 0;
+        for (WORD i = 0; i < nN + nI && !sub; i++)
+        {
+            DWORD id = *(DWORD*)&b[e + (size_t)i * 8];
+            DWORD off = *(DWORD*)&b[e + (size_t)i * 8 + 4];
+            if (!(off & 0x80000000)) continue;
+            if (nN && i < nN) continue;         // skip named entries
+            if ((WORD)id == wType) sub = raw + (off & 0x7FFFFFFF);
+        }
+        if (!sub) return false;
+        e = DirEntries(sub, &nN, &nI);
+        size_t sub2 = 0;
+        for (WORD i = 0; i < nN + nI && !sub2; i++)
+        {
+            DWORD id = *(DWORD*)&b[e + (size_t)i * 8];
+            DWORD off = *(DWORD*)&b[e + (size_t)i * 8 + 4];
+            if (!(off & 0x80000000)) continue;
+            if (nN && i < nN) continue;
+            if ((WORD)id == wName) sub2 = raw + (off & 0x7FFFFFFF);
+        }
+        if (!sub2) return false;
+        e = DirEntries(sub2, &nN, &nI);
+        for (WORD i = 0; i < nN + nI; i++)
+        {
+            DWORD off = *(DWORD*)&b[e + (size_t)i * 8 + 4];
+            if (off & 0x80000000) continue;     // not a leaf
+            out->leafOff = raw + off;
+            return true;
+        }
+        return false;
+    }
+
+    // Replaces the data blob of an existing resource. The new blob must fit
+    // in the space the old one occupied (resources sit back to back inside
+    // .rsrc, so overrunning would clobber the next one).
+    //
+    // The slot is filled to EXACTLY its original size: the loader rejects an
+    // exe whose resource data is shorter than the directory entry records,
+    // so a shorter blob is padded (with spaces for the XML manifest, zeros
+    // elsewhere) up to the slot size. cbPad is the filler byte.
+    static bool PatchRsrcData(std::vector<char>& b, const RsrcLoc& loc,
+                              const void* pNew, size_t cbNew, size_t cbMax,
+                              unsigned char cbPad = 0)
+    {
+        if (!loc.leafOff || loc.leafOff + 16 > b.size()) return false;
+        DWORD dataRva = *(DWORD*)&b[loc.leafOff];
+        DWORD dataSize = *(DWORD*)&b[loc.leafOff + 4];
+        size_t dataOff = loc.secRaw + (dataRva - loc.secRva);
+        if (dataOff >= b.size()) return false;
+        if (cbNew > cbMax || cbNew > dataSize) return false;
+        if (dataOff + cbNew > b.size()) return false;
+        memcpy(&b[dataOff], pNew, cbNew);
+        // pad the remainder of the slot to its recorded size
+        if (dataSize > cbNew)
+            memset(&b[dataOff + cbNew], cbPad, dataSize - cbNew);
+        return true;
+    }
+
+    static std::string BuildManifestXml(const Options& opt)
+    {
+        // Same shape as the host's own dev-mode manifest (which is known
+        // to load): asm.v1 assembly + asm.v3 application/windowsSettings.
+        // The 2016 dpiAwareness element is deliberately omitted — mixing it
+        // with the 2005 dpiAware in one manifest is rejected by the loader.
+        std::string xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" "
+            "manifestVersion=\"1.0\">"
+            "<assemblyIdentity version=\"1.0.0.0\" "
+            "processorArchitecture=\"*\" name=\"Nodio.App\" type=\"win32\"/>";
+        if (opt.bDpiAware)
+            xml += "<application xmlns=\"urn:schemas-microsoft-com:asm.v3\">"
+                   "<windowsSettings>"
+                   "<dpiAware xmlns=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\">"
+                   "true</dpiAware>"
+                   "</windowsSettings></application>";
+        if (!opt.strUacLevel.empty())
+            xml += "<trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v2\">"
+                   "<security><requestedPrivileges>"
+                   "<requestedExecutionLevel level=\"" +
+                   std::string(opt.strUacLevel.begin(),
+                               opt.strUacLevel.end()) +
+                   "\" uiAccess=\"false\"/>"
+                   "</requestedPrivileges></security></trustInfo>";
+        xml += "</assembly>";
+        return xml;
+    }
+
+    // ---- PE version resource ---------------------------------------------
+    //
+    // Builds a VS_VERSION_INFO blob and stamps it as RT_VERSION. The
+    // structure is a nested tree of version-info blocks; the string table
+    // carries the human-readable fields Windows shows in the file
+    // properties dialog.
+    static void PutW(std::vector<char>& b, const void* p, size_t n)
+    {
+        const char* s = (const char*)p;
+        b.insert(b.end(), s, s + n);
+        while (b.size() & 3) b.push_back(0);   // 4-byte align
+    }
+    // NB: PutW pads to a 4-byte boundary, which is right for multi-word
+    // values but wrong for the fixed 2-byte header fields — those must sit
+    // at exact offsets 0/2/4.
+    static void PutWord(std::vector<char>& b, WORD w)
+    {
+        const char* p = (const char*)&w;
+        b.insert(b.end(), p, p + sizeof(w));
+    }
+    // Writes a NUL-terminated wide key. The key starts immediately after
+    // the 6-byte block header and is itself padded to a 4-byte boundary —
+    // padding BEFORE the key would shift it and desync the whole tree.
+    static void PutWStr(std::vector<char>& b, const std::wstring& s)
+    {
+        b.insert(b.end(), (const char*)s.c_str(),
+                 (const char*)s.c_str() + (s.size() + 1) * sizeof(wchar_t));
+        while (b.size() & 3) b.push_back(0);
+    }
+
+    // A block: wLength, wValueLength, wType, szKey[] (NUL-terminated,
+    // padded to 4), then the value (NOT padded — its length is exact),
+    // then children (each 4-byte aligned). wType: 1 = text (wchar) data,
+    // 0 = binary.
+    static std::vector<char> VerBlock(const std::wstring& key,
+                                      const std::vector<char>* value,
+                                      bool bText,
+                                      const std::vector<
+                                          std::vector<char>>* children)
+    {
+        std::vector<char> b;
+        size_t lenPos = b.size();
+        PutWord(b, 0);            // wLength — patched at the end
+        PutWord(b, value && !value->empty() ? (WORD)value->size() : 0);
+        PutWord(b, bText ? 1 : 0);
+        PutWStr(b, key);             // key + NUL, 4-byte aligned
+        if (value && !value->empty())
+            b.insert(b.end(), value->begin(), value->end());   // exact, no pad
+        if (children)
+            for (auto& c : *children) PutW(b, c.data(), c.size());
+        *(WORD*)&b[lenPos] = (WORD)b.size();
+        return b;
+    }
+
+    static std::vector<char> StringEntry(const std::wstring& name,
+                                         const std::wstring& val)
+    {
+        // String entries carry their value as UTF-16 text
+        std::vector<char> v;
+        const char* s = (const char*)val.c_str();
+        v.insert(v.end(), s, s + (val.size() + 1) * sizeof(wchar_t));
+        return VerBlock(name, &v, true, nullptr);
+    }
+
+    // Builds the VS_VERSION_INFO blob (no file I/O).
+    static std::vector<char> BuildVersionBlob(const Options& opt,
+                                              const std::wstring& strDefaultName,
+                                              size_t cbSlot)
+    {
+        // "1.2.3.4" -> four 16-bit fields
+        unsigned int v[4] = { 1, 0, 0, 0 };
+        {
+            std::wstring s = opt.strVersion.empty() ? L"1.0" : opt.strVersion;
+            int n = 0;
+            size_t pos = 0;
+            while (n < 4 && pos < s.size())
+            {
+                size_t d = s.find(L'.', pos);
+                if (d == std::wstring::npos) d = s.size();
+                v[n++] = (unsigned int)_wtoi(s.substr(pos, d - pos).c_str());
+                pos = d + 1;
+            }
+        }
+        std::wstring strVer = opt.strVersion.empty() ? L"1.0" : opt.strVersion;
+        std::wstring strProd = opt.strProduct.empty()
+            ? strDefaultName : opt.strProduct;
+        std::wstring strDesc = opt.strDescription.empty()
+            ? strProd : opt.strDescription;
+        std::wstring strCopy = opt.strCopyright.empty()
+            ? L"" : opt.strCopyright;
+        std::wstring strCompany = opt.strCompany;
+
+        // VS_FIXEDFILEINFO: dwSignature then version fields
+        std::vector<char> ffi;
+        PutWord(ffi, 0xFEEF04BD);           // dwSignature
+        PutWord(ffi, 0x00010000);           // dwStrucVersion
+        for (int i = 1; i >= 0; i--) PutWord(ffi, (WORD)v[i]);  // fileVerMS
+        for (int i = 3; i >= 2; i--) PutWord(ffi, (WORD)v[i]);  // fileVerLS
+        for (int i = 1; i >= 0; i--) PutWord(ffi, (WORD)v[i]);  // prodVerMS
+        for (int i = 3; i >= 2; i--) PutWord(ffi, (WORD)v[i]);  // prodVerLS
+        PutWord(ffi, 0x3F);                 // dwFileFlagsMask
+        PutWord(ffi, 0);                    // dwFileFlags
+        PutWord(ffi, 0x040904B0);           // dwFileOS (NT 32-bit)
+        PutWord(ffi, 1);                    // dwFileType (app)
+        PutWord(ffi, 0);                    // dwFileSubtype
+        PutWord(ffi, 0);                    // dwFileDateMS
+        PutWord(ffi, 0);                    // dwFileDateLS
+
+        // StringFileInfo / 040904B0 (U.S. English, Unicode)
+        std::vector<std::vector<char>> strings;
+        strings.push_back(StringEntry(L"CompanyName", strCompany));
+        strings.push_back(StringEntry(L"FileDescription", strDesc));
+        strings.push_back(StringEntry(L"FileVersion", strVer));
+        strings.push_back(StringEntry(L"InternalName", strDefaultName));
+        strings.push_back(StringEntry(L"LegalCopyright", strCopy));
+        strings.push_back(StringEntry(L"OriginalFilename",
+                                      strDefaultName + L".exe"));
+        strings.push_back(StringEntry(L"ProductName", strProd));
+        strings.push_back(StringEntry(L"ProductVersion", strVer));
+        std::vector<char> sfi = VerBlock(L"StringFileInfo", nullptr, false, &strings);
+
+        // VarFileInfo / Translation
+        std::vector<char> varVal;
+        PutWord(varVal, 0x04B0);            // lang 0409
+        PutWord(varVal, 0x04B0);            // codepage 1200
+        std::vector<std::vector<char>> varKids;
+        varKids.push_back(VerBlock(L"Translation", &varVal, false, nullptr));
+        std::vector<char> vfi = VerBlock(L"VarFileInfo", nullptr, false, &varKids);
+
+        // root: VS_VERSION_INFO holding the FIXEDFILEINFO then both children
+        std::vector<std::vector<char>> kids;
+        kids.push_back(sfi);
+        kids.push_back(vfi);
+        std::vector<char> root = VerBlock(L"VS_VERSION_INFO", &ffi, false,
+                                          &kids);
+
+        // Pad the blob so its root wLength equals the resource slot size.
+        // The loader cross-checks the two, and a shorter blob is rejected
+        // with "side-by-side configuration is incorrect". cbSlot is the
+        // slot size measured from the host's own resource directory.
+        if (cbSlot > root.size())
+        {
+            // a trailing child block absorbs the slack; the version reader
+            // stops at the root's wLength so the filler is never parsed
+            std::vector<char> pad((size_t)cbSlot - root.size(), 0);
+            kids.push_back(pad);
+            root = VerBlock(L"VS_VERSION_INFO", &ffi, false, &kids);
+        }
+        return root;
     }
 
     // ---- main pipeline ---------------------------------------------------
@@ -419,7 +730,11 @@ namespace NodioPublish
             payloadSize += kv.second.size();
         }
 
-        // 4) copy the host exe and append the payload
+        // 4) read the host exe, rewrite its manifest/version resources in
+        //    place, patch the subsystem, then append the payload.
+        //    Resources are patched in memory (not via UpdateResourceW,
+        //    which corrupts the section when replacing entries) and the
+        //    payload is appended last so nothing shifts afterwards.
         std::vector<char> exe;
         {
             wchar_t szSelf[MAX_PATH] = L"";
@@ -430,6 +745,46 @@ namespace NodioPublish
                 return false;
             }
         }
+
+        // 4a) application manifest (DPI awareness + UAC level).
+        // Opt-in: rewriting the manifest resource in place is rejected by
+        // the Windows loader in some configurations (the exe then fails
+        // with "side-by-side configuration is incorrect"), so the default
+        // keeps the manifest the host was built with — which already
+        // declares DPI awareness. NODIO_PUBMANIFEST=1 opts into the
+        // rewrite for UAC level changes.
+        bool bPatchManifest =
+            GetEnvironmentVariableW(L"NODIO_PUBMANIFEST", nullptr, 0) != 0;
+        if (bPatchManifest)
+        {
+            std::string xml = BuildManifestXml(opt);
+            RsrcLoc loc;
+            if (FindRsrcLeaf(exe, (WORD)RT_MANIFEST, 1, &loc))
+                PatchRsrcData(exe, loc, xml.c_str(), xml.size() + 1, 4096,
+                              ' ');   // XML: pad with spaces
+        }
+
+        // 4b) PE version resource — same opt-in rule as the manifest.
+        if (bPatchManifest)
+        {
+            std::wstring strDefaultName = BaseOf(opt.strEntry);
+            size_t d = strDefaultName.find_last_of(L'.');
+            if (d != std::wstring::npos) strDefaultName = strDefaultName.substr(0, d);
+            RsrcLoc loc;
+            bool bFound = FindRsrcLeaf(exe, (WORD)RT_VERSION, 1, &loc);
+            size_t cbSlot = 0;
+            if (bFound && loc.leafOff + 8 <= exe.size())
+                cbSlot = *(DWORD*)&exe[loc.leafOff + 4];
+            std::vector<char> blob =
+                BuildVersionBlob(opt, strDefaultName, cbSlot);
+            if (bFound)
+                PatchRsrcData(exe, loc, blob.data(), blob.size(), 4096);
+        }
+
+        // 4c) subsystem (2 = GUI, 3 = CUI)
+        PatchSubsystemBuf(exe, opt.bConsole);
+
+        // 5) append the payload onto the now-stamped image
         for (auto& kv : payload)
             exe.insert(exe.end(), kv.second.begin(), kv.second.end());
         exe.insert(exe.end(), manifest.begin(), manifest.end());
@@ -447,11 +802,6 @@ namespace NodioPublish
             strErr = L"写入输出失败: " + opt.strOut;
             return false;
         }
-
-        PatchSubsystem(opt.strOut, opt.bConsole);
-
-        if (!opt.strIcon.empty())
-            StampIcon(opt.strOut, opt.strIcon);   // best-effort
 
         return true;
     }

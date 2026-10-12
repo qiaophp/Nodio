@@ -13,6 +13,21 @@
 //   NODIO_PUBLISH=<main.aardio>   build a standalone exe
 //   NODIO_PUBOUT=<out.exe>        output path (default <dir>\dist\<name>.exe)
 //   NODIO_ICON=<icon.ico>         optional icon stamped into the output
+//   NODIO_PUBVER="1.2.3.4"        PE version resource (needs NODIO_PUBMANIFEST=1)
+//   NODIO_PUBCOMPANY=...          version strings
+//   NODIO_PUBPRODUCT=...
+//   NODIO_PUBDESC=...
+//   NODIO_PUBCOPYRIGHT=...
+//   NODIO_PUBMANIFEST=1           rewrite the manifest resource in place to
+//                                 apply the values below. Off by default:
+//                                 the loader rejects some rewritten
+//                                 manifests, so the host's own manifest
+//                                 (already DPI-aware) is kept unless asked.
+//   NODIO_PUBUAC=<level>          asInvoker | requireAdministrator |
+//                                 highestAvailable (with NODIO_PUBMANIFEST=1)
+//   NODIO_PUBNODPI=1              informational only — the host manifest is
+//                                 always DPI-aware; there is no per-publish
+//                                 opt-out in this build.
 
 #include <windows.h>
 #include "engine/NodioVM.h"
@@ -154,6 +169,22 @@ int wmain(int argc, wchar_t** argv)
             // publishes opt in with NODIO_PUBGUI=1
             opt.bConsole = !(GetEnvironmentVariableW(L"NODIO_PUBGUI", szGui, 8) > 0 &&
                              szGui[0] == L'1');
+        }
+        {
+            auto Rd = [](const wchar_t* k, wchar_t* buf, DWORD n) {
+                return GetEnvironmentVariableW(k, buf, n) > 0 ? buf : L"";
+            };
+            wchar_t b[MAX_PATH];
+            opt.strVersion     = Rd(L"NODIO_PUBVER", b, MAX_PATH);
+            opt.strCompany     = Rd(L"NODIO_PUBCOMPANY", b, MAX_PATH);
+            opt.strProduct     = Rd(L"NODIO_PUBPRODUCT", b, MAX_PATH);
+            opt.strDescription = Rd(L"NODIO_PUBDESC", b, MAX_PATH);
+            opt.strCopyright   = Rd(L"NODIO_PUBCOPYRIGHT", b, MAX_PATH);
+            opt.strUacLevel    = Rd(L"NODIO_PUBUAC", b, MAX_PATH);
+            wchar_t szNoDpi[8];
+            opt.bDpiAware = !(GetEnvironmentVariableW(L"NODIO_PUBNODPI",
+                                                      szNoDpi, 8) > 0 &&
+                              szNoDpi[0] == L'1');
         }
         if (opt.strOut.empty())
         {
