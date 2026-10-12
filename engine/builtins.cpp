@@ -623,26 +623,12 @@ void Interp::InitBuiltins()
                         if (eit != g_interpCurrent->embedded.end())
                         {
                             bHit = true;
-                            if (enc3 == L"raw")
-                            {
-                                // byte string over the payload's UTF-8
-                                int nb = WideCharToMultiByte(CP_UTF8, 0,
-                                    eit->second.c_str(),
-                                    (int)eit->second.size(), nullptr, 0,
-                                    nullptr, nullptr);
-                                std::string b8((size_t)(nb > 0 ? nb : 0), 0);
-                                if (nb > 0)
-                                    WideCharToMultiByte(CP_UTF8, 0,
-                                        eit->second.c_str(),
-                                        (int)eit->second.size(), &b8[0],
-                                        nb, nullptr, nullptr);
-                                s3.resize(b8.size());
-                                for (size_t k = 0; k < b8.size(); k++)
-                                    s3[k] = (wchar_t)
-                                        (unsigned char)b8[k];
-                            }
-                            else
-                                s3 = eit->second;   // already wide text
+                            // The embedded map already stores payload bytes
+                            // one-per-wchar (the engine's byte-string
+                            // convention), so "raw" is a straight copy —
+                            // re-encoding through UTF-8 would inflate
+                            // multi-byte sequences and corrupt binaries.
+                            s3 = eit->second;
                         }
                     }
                     if (!bHit)
