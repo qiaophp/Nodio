@@ -6,8 +6,26 @@ project(Nodio LANGUAGES CXX)
 # WTL + Scintilla front end. This file builds ONLY the engine + console
 # host (zero MFC, zero managed dependencies).
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 add_library(engine STATIC
-    engine/NodioVM.cpp
+    engine/lexer.cpp
+    engine/parser.h
+    engine/value.cpp
+    engine/util.cpp
+    engine/ffi.cpp
+    engine/regex.cpp
+    engine/json.cpp
+    engine/runtime.cpp
+    engine/import.cpp
+    engine/builtins.cpp
+    engine/debug.cpp
+    engine/gdi.cpp
+    engine/entry.cpp
+    engine/common.h
+    engine/interp.h
+    engine/pch.h
 )
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(engine PRIVATE /utf-8)
@@ -21,6 +39,9 @@ set_target_properties(engine PROPERTIES
 add_executable(nodio
     host/main.cpp
     host/host.manifest
+    publish/publish.cpp
+    publish/publish.h
+    publish/payload.h
 )
 target_compile_options(nodio PRIVATE /utf-8)
 target_compile_definitions(nodio PRIVATE

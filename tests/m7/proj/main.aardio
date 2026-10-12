@@ -1,0 +1,6 @@
+import mylib;
+io.print("entry=main");
+io.print("lib:", mylib.tag);
+io.print("res:", ..io.readFile("~\res\hello.txt"));
+var raw = ..io.readFile("~\res\blob.bin", "raw");
+io.print("blob:", #raw);

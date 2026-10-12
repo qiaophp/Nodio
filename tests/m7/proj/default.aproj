@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+	<file path="main.aardio" />
+	<file path="res\hello.txt" embed="true" />
+	<file path="res\blob.bin" embed="true" />
+	<file path="res\secret.txt" embed="true" ignored="true" />
+</project>
