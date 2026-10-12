@@ -1,0 +1,9 @@
+// round 50: UTF-8 byte-string model — #s counts BYTES, s[i] reads bytes
+var s = "中";
+io.print(#s);
+io.print(s[1]);
+var ascii = "AB";
+io.print(#ascii, ascii[1], ascii[2]);
+var mixed = "a中b";
+io.print(#mixed, mixed[1], mixed[2], mixed[4]);
+io.print(mixed[99] === null);

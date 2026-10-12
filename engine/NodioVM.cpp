@@ -4366,6 +4366,45 @@ namespace NodioVM
                 if (n->bSafe && obj.t == Value::Null)
                     return Value();   // '?[': null short-circuits
                 Value idx = Eval(n->b, env);
+                // aardio byte-string model: s[i] reads the i-th BYTE
+                // (1-based) as a number — the official string library is
+                // built on this primitive. Byte-per-wchar strings (from
+                // fromto/raw IO, all chars <= 0xFF) index directly; real
+                // text indexes its UTF-8 encoding.
+                if (obj.t == Value::Str && idx.t == Value::Num)
+                {
+                    bool bFake = true;
+                    for (wchar_t c : obj.s)
+                        if ((unsigned int)c > 0xFF) { bFake = false; break; }
+                    std::vector<char> buf;
+                    size_t cb;
+                    if (bFake)
+                    {
+                        cb = obj.s.size();
+                        buf.resize(cb);
+                        for (size_t k = 0; k < cb; k++)
+                            buf[k] = (char)(unsigned char)obj.s[k];
+                    }
+                    else
+                    {
+                        cb = (size_t)WideCharToMultiByte(CP_UTF8, 0,
+                                                         obj.s.c_str(),
+                                                         (int)obj.s.size(),
+                                                         nullptr, 0,
+                                                         nullptr, nullptr);
+                        buf.resize(cb);
+                        if (cb)
+                            WideCharToMultiByte(CP_UTF8, 0, obj.s.c_str(),
+                                                (int)obj.s.size(),
+                                                buf.data(), (int)cb,
+                                                nullptr, nullptr);
+                    }
+                    long long i = (long long)idx.n;
+                    if (i >= 1 && i <= (long long)cb)
+                        return Value::Num_(
+                            (double)(unsigned char)buf[(size_t)(i - 1)]);
+                    return Value();
+                }
                 return GetMember(obj, idx.ToString(), n->bDirect);
             }
             case Node::Call: return EvalCall(n, env);
@@ -4392,7 +4431,26 @@ namespace NodioVM
                 }
                 if (n->str == L"#")
                 {
-                    if (v.t == Value::Str) return Value::Num_((double)v.s.size());
+                    if (v.t == Value::Str)
+                    {
+                        // aardio byte-string model: #s = UTF-8 BYTE length.
+                        // Storage is wstring, so raw byte strings produced
+                        // by fromto/io.readFile("raw") live as one byte
+                        // per wchar (all chars <= 0xFF) — for those the
+                        // wchar count IS the byte count; real text (any
+                        // char > 0xFF) counts its UTF-8 encoding.
+                        bool bFake = true;
+                        for (wchar_t c : v.s)
+                            if ((unsigned int)c > 0xFF) { bFake = false; break; }
+                        if (bFake)
+                            return Value::Num_((double)v.s.size());
+                        int cb = WideCharToMultiByte(CP_UTF8, 0,
+                                                     v.s.c_str(),
+                                                     (int)v.s.size(),
+                                                     nullptr, 0, nullptr,
+                                                     nullptr);
+                        return Value::Num_((double)cb);
+                    }
                     if (v.t == Value::TableT) return Value::Num_((double)v.tab->arr.size());
                 }
                 return Value();
