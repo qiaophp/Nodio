@@ -429,11 +429,20 @@ Value Interp::CallOwner(const Value& f, const Value& obj,
                     auto tbV = std::make_shared<Table>();
                     for (size_t k = f.params.size() - 1; k < args.size(); k++)
                         tbV->arr.push_back(args[k]);
-                    local.vars[L"..."] = Value::Table_(tbV);
+                    // aardio scripts read varargs through `arg`, while the
+                    // `...` spelling expands them at a call site — bind both
+                    // names to the same table. An EMPTY table must read as
+                    // null: library code guards recursion with `if(!...)`,
+                    // and an empty table is truthy in aardio.
+                    Value vDots = tbV->arr.empty() ? Value()
+                                                   : Value::Table_(tbV);
+                    local.vars[L"..."] = vDots;
+                    local.vars[L"arg"] = vDots;
                 }
                 else
                 {
                     local.vars[L"..."] = Value();
+                    local.vars[L"arg"] = Value();
                 }
             }
             Value old = ret;
@@ -770,11 +779,19 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                             auto tbV = std::make_shared<Table>();
                             for (size_t k = f.fn->names.size() - 1; k < args.size(); k++)
                                 tbV->arr.push_back(args[k]);
-                            local.vars[L"..."] = Value::Table_(tbV);
+                            // `arg` is aardio's spelling for the varargs
+                            // table; `...` expands it at call sites. An
+                            // empty table reads as null so `if(!...)`
+                            // recursion guards work.
+                            Value vDots = tbV->arr.empty() ? Value()
+                                                           : Value::Table_(tbV);
+                            local.vars[L"..."] = vDots;
+                            local.vars[L"arg"] = vDots;
                         }
                         else
                         {
                             local.vars[L"..."] = Value();
+                            local.vars[L"arg"] = Value();
                         }
                     }
                     Value oldRet = ret;
@@ -874,21 +891,22 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 else
                     local.vars[f.params[i]] = Value();
             }
-            // "..." varargs: leftover arguments as a 1-based table
+            // "..." varargs: leftover arguments as a 1-based table. aardio
+            // spells the table `arg` in scripts and `...` at call sites, so
+            // bind both names.
             if (f.params.size() && f.params.back() == L"..." &&
                 f.fn)
             {
-                if (args.size() > f.params.size() - 1)
-                {
-                    auto tbV = std::make_shared<Table>();
-                    for (size_t k = f.params.size() - 1; k < args.size(); k++)
-                        tbV->arr.push_back(args[k]);
-                    local.vars[L"..."] = Value::Table_(tbV);
-                }
-                else
-                {
-                    local.vars[L"..."] = Value();
-                }
+                auto tbV = std::make_shared<Table>();
+                for (size_t k = f.params.size() - 1; k < args.size(); k++)
+                    tbV->arr.push_back(args[k]);
+                // An EMPTY varargs table must read as null: library code
+                // guards recursion with `if(!...)`, and an empty table is
+                // truthy in aardio.
+                Value vDots = tbV->arr.empty() ? Value()
+                                               : Value::Table_(tbV);
+                local.vars[L"..."] = vDots;
+                local.vars[L"arg"] = vDots;
             }
             Value old = ret;
             int oldR = nReturn;
@@ -1771,7 +1789,10 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
                 auto tbV = std::make_shared<Table>();
                 for (size_t k = f.params.size() - 1; k < args.size(); k++)
                     tbV->arr.push_back(args[k]);
+                // `arg` is aardio's spelling for the varargs table;
+                // `...` expands it at call sites.
                 local.vars[L"..."] = Value::Table_(tbV);
+                local.vars[L"arg"] = Value::Table_(tbV);
             }
             Value oldRet = ret;
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;

@@ -1,0 +1,39 @@
+// M11: `arg` — aardio's spelling for the varargs table. The engine bound
+// `...` but not `arg`, so every library function that reads `arg` (and
+// every user function written the official way) saw null. An empty
+// varargs table must read as null, because library code guards recursion
+// with `if(!...)` and an empty table is truthy.
+var f = function(...) {
+    io.print("count:", #arg);
+    io.print("first:", arg[1]);
+    io.print("last:", arg[#arg]);
+}
+f(10, 20, 30);
+
+// default params plus varargs: the table starts after the named ones
+var g = function(a, b, ...) {
+    io.print("g:", a, b, #arg, arg[1]);
+}
+g(1, 2, 3, 4);
+
+// forward: f(...) expands the table back into arguments
+var sum = function(a, b, c) { return a + b + c; }
+var fwd = function(...) { return sum(...); }
+io.print("fwd:", fwd(7, 8, 9));
+
+// {...} collects the same table
+var tbl = function(...) { return {...}; }
+var t = tbl(5, 6);
+io.print("collect:", #t, t[1], t[2]);
+
+// an empty varargs must be falsy so recursion guards terminate
+var countdown = function(n, ...) {
+    if (n <= 0) return 0;
+    if (!...) return n;          // no varargs -> stop here
+    return countdown(n - 1, ...);
+}
+io.print("empty-is-null:", countdown(3));
+
+// #arg on a no-vararg call
+var h = function(a) { return #arg; }
+io.print("no-varargs:", h(1));

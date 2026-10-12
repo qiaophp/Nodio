@@ -2557,14 +2557,77 @@ void Interp::InitBuiltins()
                         return Value::Table_(popup); });
                     form->map[L"add"] = NF([form, fs, hwnd, this, hGui](
                         vector<Value>& a2) -> Value {
-                        if (a2.size() < 7)
+                    // aardio: winform.add(name={cls="button";text=..;left=..},
+                    // name2={...}) — the named-argument syntax collapses all
+                    // of them into ONE table whose keys are the control
+                    // names and whose values are the init tables. Accept
+                    // that shape, plus the legacy positional form
+                    // (name, cls, text, x, y, w, h).
+                    struct CtrlInit { wstring strName; Value vInit; };
+                    vector<CtrlInit> vCtls;
+                    if (a2.size() == 1 && a2[0].t == Value::TableT &&
+                        a2[0].tab && !a2[0].tab->map.empty())
+                    {
+                        for (auto& kv : a2[0].tab->map)
                         {
-                            (*err) = L"运行错误: form.add(name, cls, text, "
-                                     L"x, y, w, h)";
-                            return Value();
+                            if (kv.second.t != Value::TableT)
+                            {
+                                (*err) = L"运行错误: form.add 控件参数表无效: "
+                                         + kv.first;
+                                return Value();
+                            }
+                            vCtls.push_back({ kv.first, kv.second });
                         }
-                        wstring strName = BStr(a2[0]);
-                        wstring strCls = BStr(a2[1]);
+                    }
+                    else if (a2.size() >= 7)
+                    {
+                        // legacy positional form: name, cls, text, x, y, w, h
+                        // — synthesize the init table so one code path
+                        // handles both shapes.
+                        auto tb = std::make_shared<Table>();
+                        tb->map[L"cls"] = Value::Str_(BStr(a2[1]));
+                        tb->map[L"text"] = Value::Str_(BStr(a2[2]));
+                        tb->map[L"left"] = Value::Num_(BNum(a2[3]));
+                        tb->map[L"top"] = Value::Num_(BNum(a2[4]));
+                        tb->map[L"width"] = Value::Num_(BNum(a2[5]));
+                        tb->map[L"height"] = Value::Num_(BNum(a2[6]));
+                        vCtls.push_back({ BStr(a2[0]), Value::Table_(tb) });
+                    }
+                    else
+                    {
+                        (*err) = L"运行错误: form.add(name={cls;text;left;top;"
+                                 L"right;bottom}, ...)";
+                        return Value();
+                    }
+                    // map iteration order is unordered; keep source order
+                    // stable by sorting nothing (names are unique keys)
+                    for (auto& ci : vCtls)
+                    {
+                        wstring strName = ci.strName;
+                        auto itCls = ci.vInit.tab
+                            ? ci.vInit.tab->map.find(L"cls") : ci.vInit.tab->map.end();
+                        wstring strCls = itCls != ci.vInit.tab->map.end() &&
+                                         itCls->second.t == Value::Str
+                            ? BStr(itCls->second) : L"static";
+                        auto GetI = [&](const wchar_t* k, double dDef) -> double {
+                            if (!ci.vInit.tab) return dDef;
+                            auto it = ci.vInit.tab->map.find(k);
+                            return it != ci.vInit.tab->map.end() &&
+                                   it->second.t == Value::Num
+                                ? it->second.n : dDef; };
+                        auto GetS = [&](const wchar_t* k) -> wstring {
+                            if (!ci.vInit.tab) return L"";
+                            auto it = ci.vInit.tab->map.find(k);
+                            return it != ci.vInit.tab->map.end() &&
+                                   it->second.t == Value::Str
+                                ? BStr(it->second) : L""; };
+                        // aardio geometry: left/top/right/bottom in client
+                        // coordinates; width/height are derived from them
+                        double dL = GetI(L"left", 0), dT = GetI(L"top", 0);
+                        double dR = GetI(L"right", 0), dB = GetI(L"bottom", 0);
+                        double dW = GetI(L"width", 0), dH = GetI(L"height", 0);
+                        if (dW == 0 && dR > 0) dW = dR - dL;
+                        if (dH == 0 && dB > 0) dH = dB - dT;
                         const wchar_t* szCls = nullptr;
                         DWORD dwCtlStyle = 0;
                         if (strCls == L"button") szCls = L"BUTTON";
@@ -2605,13 +2668,12 @@ void Interp::InitBuiltins()
                         }
                         int nId = fs->nNextId++;
                         HWND hC = CreateWindowExW(0, szCls,
-                            BStr(a2[2]).c_str(),
+                            GetS(L"text").c_str(),
                             WS_CHILD | WS_VISIBLE | dwCtlStyle |
                                 (strCls == L"button" ? BS_PUSHBUTTON :
                                  strCls == L"edit" ?
                                      ES_LEFT | WS_BORDER : 0),
-                            (int)BNum(a2[3]), (int)BNum(a2[4]),
-                            (int)BNum(a2[5]), (int)BNum(a2[6]),
+                            (int)dL, (int)dT, (int)dW, (int)dH,
                             hwnd, (HMENU)(INT_PTR)nId,
                             GetModuleHandle(nullptr), nullptr);
                         if (!hC)
@@ -2715,6 +2777,9 @@ void Interp::InitBuiltins()
                                     (LPARAM)hC);
                                 return Value(); });
                         }
+                        // every aardio control exposes its HWND
+                        ctrl->map[L"hwnd"] = Value::Num_(
+                            (double)(INT_PTR)hC);
                         ctrl->map[L"text"] = NF([hC](vector<Value>&)
                             -> Value {
                             wchar_t buf[512] = L"";
@@ -2769,7 +2834,15 @@ void Interp::InitBuiltins()
                             vector<Value> noArgs;
                             return this->CallVmFunc(ib->second, noArgs); });
                         form->map[strName] = Value::Table_(ctrl);
-                        return Value::Table_(ctrl); });
+                    }
+                    // aardio returns the LAST added control
+                    Value vLast;
+                    if (!vCtls.empty() && form->map.size())
+                    {
+                        auto itL = form->map.find(vCtls.back().strName);
+                        if (itL != form->map.end()) vLast = itL->second;
+                    }
+                    return vLast; });
                     return Value::Table_(form); });
             }
 

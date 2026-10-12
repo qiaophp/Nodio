@@ -1,0 +1,8 @@
+count:3
+first:10
+last:30
+g:1223
+fwd:24
+collect:256
+empty-is-null:3
+no-varargs:null
