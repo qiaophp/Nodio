@@ -50,7 +50,7 @@ Decisions locked with the project owner:
 ## Phase 3 — IDE shell (`ide/`, WTL + Scintilla)
 - [ ] Tabbed MDI frame, docking panes (project tree / output console)
 - [ ] Scintilla integrated with a custom aardio lexer (UTF-8 native)
-- [ ] Real-time run/debug output plumbing over the `AARDIO_*` contract
+- [ ] Real-time run/debug output plumbing over the `NODIO_*` contract
 
 ## Phase 4 — visual form designer (`designer/`)
 - [ ] Native HWND design canvas + 8-handle resize tracker

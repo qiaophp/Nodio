@@ -8,10 +8,10 @@ front end (Phase 3).
 
 | Directory | Contents |
 |---|---|
-| `engine/` | `AardioVM.cpp/.h` — the self-contained tree-walking aardio interpreter (Win32 + CRT only, **zero MFC**), with: unified Microsoft x64 ABI call path (shadow space, XMM float/double marshalling), per-signature JIT call stubs, rewritten callback trampolines |
-| `host/` | tiny console host (`AARDIO_RUN` / `AARDIO_DEBUG` / `AARDIO_BREAK` / `AARDIO_LIBDIR` / `AARDIO_PAUSE` env contract) that stands in for the F5 runtime and the regression harness |
+| `engine/` | `NodioVM.cpp/.h` — the self-contained tree-walking aardio interpreter (Win32 + CRT only, **zero MFC**), with: unified Microsoft x64 ABI call path (shadow space, XMM float/double marshalling), per-signature JIT call stubs, rewritten callback trampolines |
+| `host/` | tiny console host (`NODIO_RUN` / `NODIO_DEBUG` / `NODIO_BREAK` / `NODIO_LIBDIR` / `NODIO_PAUSE` env contract) that stands in for the F5 runtime and the regression harness |
 | `tests/vmtests/` | the 48-test language/stdlib regression suite (`run_vm_tests.ps1 -Exe <host>`) |
-| `tests/m7/` | GUI/plus-control acceptance scripts (run against the official `D:\aardio\lib` via `AARDIO_LIBDIR`) |
+| `tests/m7/` | GUI/plus-control acceptance scripts (run against the official `D:\aardio\lib` via `NODIO_LIBDIR`) |
 | `docs/` | roadmap and the reverse-engineering audit trail |
 
 ## Build
@@ -37,3 +37,15 @@ library-import cases (never redistributed here).
 
 See `docs/roadmap.md` for the phase ledger (engine / publisher / IDE /
 form designer) and the current 100%-compatibility boundary.
+
+## File extensions
+
+`import` resolves modules with both extensions, in this priority order
+per search root (script directory first, then `NODIO_LIBDIR`):
+
+1. `rel\_.aardio` (official folder-module layout)
+2. `rel.aardio`
+3. `rel\_.nodio`
+4. `rel.nodio`
+
+Scripts themselves may be `.aardio` or `.nodio` interchangeably.

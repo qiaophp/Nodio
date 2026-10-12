@@ -1,10 +1,10 @@
-// AardioVM.cpp — lexer, parser and evaluator for the aardio subset
-// described in AardioVM.h. Tree-walking, reference-counted AST via
+// NodioVM.cpp — lexer, parser and evaluator for the aardio subset
+// described in NodioVM.h. Tree-walking, reference-counted AST via
 // shared_ptr; values are a small variant. Builtins cover io.print and
 // scalar conversions.
 
 #include "pch.h"
-#include "engine/AardioVM.h"
+#include "engine/NodioVM.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,7 +17,7 @@
 #include <mutex>
 #include <wininet.h>
 
-namespace AardioVM
+namespace NodioVM
 {
     using std::wstring;
     using std::shared_ptr;
@@ -2220,7 +2220,7 @@ namespace AardioVM
                     context += L" [" + toks[k].text + L"]";
                     if (k == (int)p) context += L"<<< ";
                 }
-                (*err) = L"语法错误: 期望 " + wstring(op) + L" (from AardioVM.cpp:" + std::to_wstring(srcLine) + L", context:" + context + L") @ 行 " +
+                (*err) = L"语法错误: 期望 " + wstring(op) + L" (from NodioVM.cpp:" + std::to_wstring(srcLine) + L", context:" + context + L") @ 行 " +
                          std::to_wstring(Peek().line);
             }
         }
@@ -6261,20 +6261,29 @@ namespace AardioVM
         {
             (void)env;
             // M7: global lib root — the ORIGINAL aardio install's lib\
-            // (plaintext source), enabled via AARDIO_LIBDIR; resolution
+            // (plaintext source), enabled via NODIO_LIBDIR; resolution
             // order: project baseDir first, then the lib root
             static const wstring strLibDir = []
             {
                 wchar_t szLib[MAX_PATH] = L"";
-                GetEnvironmentVariableW(L"AARDIO_LIBDIR", szLib, MAX_PATH);
+                GetEnvironmentVariableW(L"NODIO_LIBDIR", szLib, MAX_PATH);
                 return wstring(szLib);
             }();
-            auto LibCand = [&](const wstring& relX, bool bAlt)
-                -> wstring
+            // import resolution accepts both .aardio (official ecosystem)
+            // and .nodio (native) extensions; each root prefers the
+            // folder-module layout (rel\_.ext) over the flat file
+            // (rel.ext), and the aardio extension over nodio
+            auto LibCand = [&](const wstring& relX, bool bAlt,
+                               const wchar_t* ext) -> wstring
             {
                 if (strLibDir.empty()) return L"";
                 return strLibDir + L"\\" + relX +
-                    (bAlt ? L"\\_.aardio" : L".aardio");
+                    (bAlt ? (wstring(L"\\_.") + ext)
+                          : (wstring(L".") + ext));
+            };
+            auto Exists = [](const wstring& p) -> bool
+            {
+                return !p.empty() && _waccess(p.c_str(), 0) == 0;
             };
             // 1) pre-bound builtin namespaces resolve immediately —
             // but a matching lib FILE merges into the namespace first
@@ -6286,18 +6295,25 @@ namespace AardioVM
                     if (i) relT += L"\\";
                     relT += n->names[i];
                 }
-                wstring fileT = baseDir.empty() ? relT + L".aardio"
-                    : baseDir + L"\\" + relT + L".aardio";
-                wstring fileT2 = baseDir.empty()
-                    ? relT + L"\\_.aardio"
-                    : baseDir + L"\\" + relT + L"\\_.aardio";
+                bool bAnyFile =
+                    Exists(baseDir.empty() ? relT + L".aardio"
+                                           : baseDir + L"\\" + relT + L".aardio") ||
+                    Exists(baseDir.empty() ? relT + L".nodio"
+                                           : baseDir + L"\\" + relT + L".nodio") ||
+                    Exists(baseDir.empty() ? relT + L"\\_.aardio"
+                                           : baseDir + L"\\" + relT + L"\\_.aardio") ||
+                    Exists(baseDir.empty() ? relT + L"\\_.nodio"
+                                           : baseDir + L"\\" + relT + L"\\_.nodio") ||
+                    Exists(LibCand(relT, false, L"aardio")) ||
+                    Exists(LibCand(relT, false, L"nodio")) ||
+                    Exists(LibCand(relT, true, L"aardio")) ||
+                    Exists(LibCand(relT, true, L"nodio"));
                 if (roots.count(n->names[0]) &&
                     !embedded.count(relT + L".aardio") &&
                     !embedded.count(relT + L"\\_.aardio") &&
-                    _waccess(fileT.c_str(), 0) != 0 &&
-                    _waccess(fileT2.c_str(), 0) != 0 &&
-                    _waccess(LibCand(relT, false).c_str(), 0) != 0 &&
-                    _waccess(LibCand(relT, true).c_str(), 0) != 0)
+                    !embedded.count(relT + L".nodio") &&
+                    !embedded.count(relT + L"\\_.nodio") &&
+                    !bAnyFile)
                     return roots[n->names[0]];
             }
             // 2) file module: baseDir\a\b\c.aardio for `import a.b.c`
@@ -6307,24 +6323,34 @@ namespace AardioVM
                 if (i) rel += L"\\";
                 rel += n->names[i];
             }
-            wstring file = baseDir.empty() ? rel + L".aardio"
-                                           : baseDir + L"\\" + rel + L".aardio";
-            // aardio lib layout: import win -> win\_.aardio preferred
-            wstring fileAlt = baseDir.empty() ? rel + L"\\_.aardio"
-                                              : baseDir + L"\\" + rel + L"\\_.aardio";
-            if (_waccess(fileAlt.c_str(), 0) == 0)
-                file = fileAlt;
-            // M7: fall through to the original lib root (baseDir wins)
-            if (baseDir.empty() ||
-                (_waccess(file.c_str(), 0) != 0 &&
-                 _waccess(fileAlt.c_str(), 0) != 0))
+            // candidate priority: baseDir first, then the lib root;
+            // within a root: rel\_.aardio > rel.aardio >
+            //                rel\_.nodio > rel.nodio
+            wstring file;
             {
-                wstring libT = LibCand(rel, false);
-                wstring libA = LibCand(rel, true);
-                if (_waccess(libA.c_str(), 0) == 0)
-                    file = libA;
-                else if (_waccess(libT.c_str(), 0) == 0)
-                    file = libT;
+                wstring c0 = baseDir.empty() ? wstring()
+                    : baseDir + L"\\" + rel + L"\\_.aardio";
+                wstring c1 = baseDir.empty() ? wstring()
+                    : baseDir + L"\\" + rel + L".aardio";
+                wstring c2 = baseDir.empty() ? wstring()
+                    : baseDir + L"\\" + rel + L"\\_.nodio";
+                wstring c3 = baseDir.empty() ? wstring()
+                    : baseDir + L"\\" + rel + L".nodio";
+                if (Exists(c0)) file = c0;
+                else if (Exists(c1)) file = c1;
+                else if (Exists(c2)) file = c2;
+                else if (Exists(c3)) file = c3;
+                else if (Exists(LibCand(rel, true, L"aardio")))
+                    file = LibCand(rel, true, L"aardio");
+                else if (Exists(LibCand(rel, false, L"aardio")))
+                    file = LibCand(rel, false, L"aardio");
+                else if (Exists(LibCand(rel, true, L"nodio")))
+                    file = LibCand(rel, true, L"nodio");
+                else if (Exists(LibCand(rel, false, L"nodio")))
+                    file = LibCand(rel, false, L"nodio");
+                else
+                    file = baseDir.empty() ? rel + L".aardio"
+                                           : baseDir + L"\\" + rel + L".aardio";
             }
             static bool bDbg = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
             if (bDbg)
@@ -6340,10 +6366,15 @@ namespace AardioVM
             }
             // payload v2: embedded project files resolve before disk
             // (published exe: libEmbed closure ships under lib-relative
-            // keys — "win\_.aardio" — so try both lib layouts)
+            // keys — "win\_.aardio" — so try both lib layouts, both
+            // extensions)
             auto itE = embedded.find(rel + L".aardio");
             if (itE == embedded.end())
                 itE = embedded.find(rel + L"\\_.aardio");
+            if (itE == embedded.end())
+                itE = embedded.find(rel + L".nodio");
+            if (itE == embedded.end())
+                itE = embedded.find(rel + L"\\_.nodio");
             if (itE != embedded.end())
             {
                 wstring src = itE->second;
@@ -6452,6 +6483,9 @@ namespace AardioVM
                     if (base.size() > 7 &&
                         base.substr(base.size() - 7) == L".aardio")
                         base = base.substr(0, base.size() - 7);
+                    if (base.size() > 6 &&
+                        base.substr(base.size() - 6) == L".nodio")
+                        base = base.substr(0, base.size() - 6);
                     if (mod2.t == Value::TableT && mod2.tab)
                     {
                         auto im = mod2.tab->map.find(base);
@@ -6621,6 +6655,9 @@ namespace AardioVM
                 if (base.size() > 7 &&
                     base.substr(base.size() - 7) == L".aardio")
                     base = base.substr(0, base.size() - 7);
+                if (base.size() > 6 &&
+                    base.substr(base.size() - 6) == L".nodio")
+                    base = base.substr(0, base.size() - 6);
                 // folder-module convention: a/b/C/_.aardio binds C
                 // (the class declared inside), not '_'
                 if (base == L"_")
@@ -9860,7 +9897,27 @@ namespace AardioVM
             }
         }
         it.InitBuiltins();
-        it.ExecBlock(prog, &it.globals);
+        try
+        {
+            it.ExecBlock(prog, &it.globals);
+        }
+        catch (const std::exception& e)
+        {
+            // an STL/CRT escape (bad_function_call, out_of_range, ...) —
+            // surface the reason instead of dying as 0xE06D7363
+            int nW = MultiByteToWideChar(CP_UTF8, 0, e.what(), -1,
+                                         nullptr, 0);
+            wstring whatW((size_t)max(nW, 1), 0);
+            if (nW > 1)
+                MultiByteToWideChar(CP_UTF8, 0, e.what(), -1, &whatW[0], nW);
+            localErr = L"运行错误: C++ 异常 " + whatW + L" @ 行 " +
+                       std::to_wstring(it.nErrLine);
+        }
+        catch (...)
+        {
+            localErr = L"运行错误: 未知 C++ 异常 @ 行 " +
+                       std::to_wstring(it.nErrLine);
+        }
         if (!localErr.empty())
         {
             // runtime errors carry the innermost statement line; parse errors

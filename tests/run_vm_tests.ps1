@@ -1,5 +1,5 @@
 # One-shot VM regression: runs every scripts\vmtests\tNN.aardio through the
-# AARDIO_RUN harness and compares merged stdout+stderr with tNN.expect.
+# NODIO_RUN harness and compares merged stdout+stderr with tNN.expect.
 # Usage: powershell -File run_vm_tests.ps1 [path\to\aardio_re.exe] [-Only tNN[,tMM...]]
 param($Exe = 'D:\aardio.re\skeleton\build-win32\Release\aardio_re.exe',
       [string]$Only = '')
@@ -41,18 +41,18 @@ Get-ChildItem $tests -Filter 't??.aardio' | Sort-Object Name | ForEach-Object {
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
     $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
-    $psi.EnvironmentVariables['AARDIO_RUN'] = $_.FullName
-    $psi.EnvironmentVariables['AARDIO_PAUSE'] = '0'
-    # $psi.EnvironmentVariables['AARDIO_LIBDIR'] = 'D:\aardio\lib'
+    $psi.EnvironmentVariables['NODIO_RUN'] = $_.FullName
+    $psi.EnvironmentVariables['NODIO_PAUSE'] = '0'
+    # $psi.EnvironmentVariables['NODIO_LIBDIR'] = 'D:\aardio\lib'
     # optional tNN.stdin -> piped to the process (debugger command channel);
-    # optional tNN.brk -> AARDIO_BREAK breakpoint lines (implies AARDIO_DEBUG=1)
+    # optional tNN.brk -> NODIO_BREAK breakpoint lines (implies NODIO_DEBUG=1)
     $stdinFile = Join-Path $tests ($name + '.stdin')
     $brkFile = Join-Path $tests ($name + '.brk')
     $hasStdin = Test-Path $stdinFile
     if ($hasStdin) { $psi.RedirectStandardInput = $true }
     if (Test-Path $brkFile) {
-        $psi.EnvironmentVariables['AARDIO_DEBUG'] = '1'
-        $psi.EnvironmentVariables['AARDIO_BREAK'] =
+        $psi.EnvironmentVariables['NODIO_DEBUG'] = '1'
+        $psi.EnvironmentVariables['NODIO_BREAK'] =
             (Get-Content $brkFile -Raw -Encoding UTF8).Trim()
     }
     $p = [System.Diagnostics.Process]::Start($psi)
@@ -69,7 +69,7 @@ Get-ChildItem $tests -Filter 't??.aardio' | Sort-Object Name | ForEach-Object {
     else { $fail++; $failed += $name; Write-Host "FAIL $name got=[$out] want=[$expect]" }
 }
 
-# t49: two-phase publish acceptance — AARDIO_PUBLISH the proj\ fixture into
+# t49: two-phase publish acceptance — NODIO_PUBLISH the proj\ fixture into
 # dist\t49app.exe, then run THAT exe and compare its merged output. The
 # published exe resolves imports from the embedded libEmbed closure and
 # res/ from the payload (~\ prefix), so this exercises the M6 pipeline.
@@ -86,9 +86,9 @@ if ($projOk -and $t49Selected) {
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
     $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
-    $psi.EnvironmentVariables['AARDIO_PUBLISH'] =
+    $psi.EnvironmentVariables['NODIO_PUBLISH'] =
         (Join-Path $projDir 'main.aardio')
-    $psi.EnvironmentVariables['AARDIO_PAUSE'] = '0'
+    $psi.EnvironmentVariables['NODIO_PAUSE'] = '0'
     $p = [System.Diagnostics.Process]::Start($psi)
     if (-not $p.WaitForExit(30000)) { $p.Kill() }
     $pubOut = ($p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd())
@@ -101,7 +101,7 @@ if ($projOk -and $t49Selected) {
         $psi2.RedirectStandardError = $true
         $psi2.StandardOutputEncoding = [Text.Encoding]::UTF8
         $psi2.StandardErrorEncoding = [Text.Encoding]::UTF8
-        $psi2.EnvironmentVariables['AARDIO_PAUSE'] = '0'
+        $psi2.EnvironmentVariables['NODIO_PAUSE'] = '0'
         $p2 = [System.Diagnostics.Process]::Start($psi2)
         if (-not $p2.WaitForExit(20000)) { $p2.Kill() }
         $out = ($p2.StandardOutput.ReadToEnd() + $p2.StandardError.ReadToEnd())

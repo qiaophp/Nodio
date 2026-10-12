@@ -7,7 +7,7 @@ project(Nodio LANGUAGES CXX)
 # host (zero MFC, zero managed dependencies).
 
 add_library(engine STATIC
-    engine/AardioVM.cpp
+    engine/NodioVM.cpp
 )
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(engine PRIVATE /utf-8)
@@ -18,13 +18,13 @@ target_link_libraries(engine PUBLIC
 set_target_properties(engine PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
-add_executable(host
+add_executable(nodio
     host/main.cpp
     host/host.manifest
 )
-target_compile_options(host PRIVATE /utf-8)
-target_compile_definitions(host PRIVATE
+target_compile_options(nodio PRIVATE /utf-8)
+target_compile_definitions(nodio PRIVATE
     _UNICODE UNICODE _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(host PRIVATE engine)
-set_target_properties(host PROPERTIES
+target_link_libraries(nodio PRIVATE engine)
+set_target_properties(nodio PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")

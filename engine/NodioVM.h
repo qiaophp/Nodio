@@ -1,4 +1,4 @@
-// AardioVM.h — a self-contained tree-walking interpreter for the aardio
+// NodioVM.h — a self-contained tree-walking interpreter for the aardio
 // language (round 17). NOT the original VM: the original's bytecode
 // dispatch (FUN_005149a0 family, '=' prefix format) is the residual
 // unknown; this interpreter executes SOURCE directly so that published
@@ -21,7 +21,7 @@
 #include <string>
 #include <set>
 
-namespace AardioVM
+namespace NodioVM
 {
     // Run a source string; returns the value of a top-level `return n` as
     // an int (0 when none), or -1 on a runtime error (strError filled).
