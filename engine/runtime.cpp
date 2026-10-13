@@ -934,10 +934,12 @@ Value Interp::EvalBin(const PNode& n, Env* env)
                 Value l = Eval(n->a, env);
                 return l.Truthy() ? Eval(n->b, env) : l;
             }
-            if (op == L":")   // aardio null coalesce
+            if (op == L":")   // aardio falsy coalescing: a:b returns b when
+                             // a is falsy (null/false/0/""), else a — see
+                             // docs/language-reference/operator/logical.md
             {
                 Value l = Eval(n->a, env);
-                return l.t == Value::Null ? Eval(n->b, env) : l;
+                return l.Truthy() ? l : Eval(n->b, env);
             }
             if (op == L"||")
             {

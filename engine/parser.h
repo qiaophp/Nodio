@@ -1122,6 +1122,9 @@ namespace NodioVM
                 PNode n = New(Node::Bin);
                 n->str = L"||";
                 n->a = l;
+                // the right operand may start on the next line (the library
+                // writes '(...) or\n    (...)')
+                SkipNL();
                 n->b = ParseAnd();
                 l = n;
             }
@@ -1142,6 +1145,9 @@ namespace NodioVM
                 PNode n = New(Node::Bin);
                 n->str = L":";
                 n->a = l;
+                // the right operand may start on the next line (the library
+                // splits loadDll( exist(...) : $"dll" ) across lines)
+                SkipNL();
                 n->b = ParseAnd();
                 l = n;
             }

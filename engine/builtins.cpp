@@ -2,6 +2,19 @@
 
 namespace NodioVM
 {
+    // wide string -> ANSI bytes (the raw.* memory helpers work on bytes)
+    static std::string ToA(const wstring& w)
+    {
+        if (w.empty()) return std::string();
+        int n = WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(),
+                                    nullptr, 0, nullptr, nullptr);
+        if (n <= 0) return std::string();
+        std::string s((size_t)n, 0);
+        WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(),
+                            &s[0], n, nullptr, nullptr);
+        return s;
+    }
+
 // ---- InitBuiltins ----
 void Interp::InitBuiltins()
         {
@@ -1616,6 +1629,181 @@ void Interp::InitBuiltins()
                     return Value::Num_((double)CalcStructTotalSize(a[0]));
                 });
                 tb->map[L"sizeof"] = tb->map[L"sizeOf"];
+                // raw.len: string byte length, or the struct's total size.
+                // builtin/raw.aardio relies on it for equal()/typeOfArray.
+                tb->map[L"len"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t == Value::Null) return Value();
+                    if (a[0].t == Value::Str)
+                        return Value::Num_((double)BStr(a[0]).size());
+                    if (a[0].t == Value::TableT || a[0].t == Value::Class)
+                    {
+                        auto is = a[0].tab ? a[0].tab->map.find(L"_struct")
+                                           : a[0].tab->map.end();
+                        if (is != a[0].tab->map.end() && is->second.t == Value::Str)
+                            return Value::Num_(
+                                (double)CalcStructTotalSize(a[0]));
+                    }
+                    return Value(); });
+                // raw.uint / raw.int / raw.word / raw.byte — read a little-
+                // endian integer of the given width from a pointer/string.
+                // Used as raw.uint(,true) to allocate an out-parameter.
+                auto mkReader = [](int nWidth) {
+                    return [nWidth](vector<Value>& a) -> Value {
+                        bool bZero = !a.empty() &&
+                                     (a[0].t == Value::Null ||
+                                      (a[0].t == Value::Num && a[0].n == 0));
+                        if (bZero)
+                        {
+                            // raw.uint(,true): allocate an out-parameter
+                            // buffer of this width and return a table
+                            // wrapper exposing .value
+                            auto tb = std::make_shared<Table>();
+                            std::vector<char> z((size_t)nWidth, 0);
+                            tb->map[L"_bytes"] = Value::Str_(
+                                wstring(z.begin(), z.end()));
+                            tb->map[L"value"] = Value::Num_(0);
+                            return Value::Table_(tb);
+                        }
+                        const char* p = nullptr;
+                        std::string held;
+                        if (!a.empty() && a[0].t == Value::Str)
+                        {
+                            held = ToA(BStr(a[0]));
+                            p = held.c_str();
+                        }
+                        else if (!a.empty() && a[0].t == Value::Pointer)
+                            p = (const char*)a[0].ptr;
+                        else if (!a.empty() && a[0].t == Value::Num)
+                            p = (const char*)(INT_PTR)(long long)a[0].n;
+                        if (!p) return Value::Num_(0);
+                        unsigned long long v = 0;
+                        for (int k = 0; k < nWidth; k++)
+                            v |= ((unsigned long long)(unsigned char)p[k]) << (8 * k);
+                        return Value::Num_((double)v);
+                    };
+                };
+                tb->map[L"uint"] = NF(mkReader(4));
+                tb->map[L"int"] = NF(mkReader(4));
+                tb->map[L"word"] = NF(mkReader(2));
+                tb->map[L"byte"] = NF(mkReader(1));
+                tb->map[L"ushort"] = NF(mkReader(2));
+                tb->map[L"short"] = NF(mkReader(2));
+                tb->map[L"ulong"] = NF(mkReader(4));
+                tb->map[L"long"] = NF(mkReader(4));
+                // raw.topointer / raw.tonumber — pointer <-> integer
+                tb->map[L"topointer"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t == Value::Null)
+                        return Value::Pointer_(nullptr);
+                    if (a[0].t == Value::Pointer) return a[0];
+                    if (a[0].t == Value::Num)
+                        return Value::Pointer_((void*)(INT_PTR)(long long)a[0].n);
+                    if (a[0].t == Value::Str)
+                        return Value::Pointer_((void*)a[0].s.c_str());
+                    return Value::Pointer_(nullptr); });
+                tb->map[L"tonumber"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value::Num_(0);
+                    if (a[0].t == Value::Pointer)
+                        return Value::Num_((double)(INT_PTR)a[0].ptr);
+                    return Value::Num_(BNum(a[0])); });
+                // raw.tostring(ptr,len) — read len bytes from a pointer
+                tb->map[L"tostring"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value::Str_(L"");
+                    const char* p = nullptr;
+                    if (a[0].t == Value::Pointer) p = (const char*)a[0].ptr;
+                    else if (a[0].t == Value::Num)
+                        p = (const char*)(INT_PTR)(long long)a[0].n;
+                    else if (a[0].t == Value::Str)
+                    {
+                        wstring w = BStr(a[0]);
+                        return Value::Str_(w);
+                    }
+                    if (!p) return Value::Str_(L"");
+                    size_t n = a.size() > 1 ? (size_t)BNum(a[1]) : 0;
+                    if (!n)
+                    {
+                        // no length: read to the first NUL
+                        n = 0;
+                        while (n < (1u << 20) && p[n]) n++;
+                    }
+                    wstring w;
+                    w.resize(n);
+                    for (size_t k = 0; k < n; k++)
+                        w[k] = (wchar_t)(unsigned char)p[k];
+                    return Value::Str_(w); });
+                // raw.copy(dst,src,size) — raw memory copy, returns dst
+                tb->map[L"copy"] = NF([](vector<Value>& a) -> Value {
+                    if (a.size() < 3) return a.empty() ? Value() : a[0];
+                    void* d = nullptr; const char* s = nullptr;
+                    std::string held;
+                    if (a[0].t == Value::Pointer) d = a[0].ptr;
+                    else if (a[0].t == Value::Num)
+                        d = (void*)(INT_PTR)(long long)a[0].n;
+                    if (a[1].t == Value::Str) { held = ToA(BStr(a[1])); s = held.c_str(); }
+                    else if (a[1].t == Value::Pointer) s = (const char*)a[1].ptr;
+                    else if (a[1].t == Value::Num)
+                        s = (const char*)(INT_PTR)(long long)a[1].n;
+                    size_t n = (size_t)BNum(a[2]);
+                    if (d && s && n) memcpy(d, s, n);
+                    return a[0]; });
+                // raw.concat(dst,src,len) — append src bytes to a buffer
+                tb->map[L"concat"] = NF([](vector<Value>& a) -> Value {
+                    if (a.size() < 2) return a.empty() ? Value() : a[0];
+                    std::string held;
+                    const char* s = nullptr; size_t n = 0;
+                    if (a[1].t == Value::Str)
+                    {
+                        held = ToA(BStr(a[1]));
+                        s = held.c_str();
+                        n = a.size() > 2 ? (size_t)BNum(a[2]) : held.size();
+                    }
+                    else if (a[1].t == Value::Pointer)
+                    {
+                        s = (const char*)a[1].ptr;
+                        n = a.size() > 2 ? (size_t)BNum(a[2]) : 0;
+                    }
+                    if (a[0].t == Value::Str && s)
+                    {
+                        // string form: append the bytes
+                        wstring w = BStr(a[0]);
+                        for (size_t k = 0; k < n && s[k]; k++)
+                            w.push_back((wchar_t)(unsigned char)s[k]);
+                        return Value::Str_(w);
+                    }
+                    return a[0]; });
+                // raw.closehandle(h) — CloseHandle
+                tb->map[L"closehandle"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value::Bool_(false);
+                    HANDLE h = nullptr;
+                    if (a[0].t == Value::Pointer) h = a[0].ptr;
+                    else if (a[0].t == Value::Num)
+                        h = (HANDLE)(INT_PTR)(long long)a[0].n;
+                    if (!h) return Value::Bool_(false);
+                    return Value::Bool_(CloseHandle(h) != FALSE); });
+                // raw.realloc(p,size) — heap reallocate
+                tb->map[L"realloc"] = NF([](vector<Value>& a) -> Value {
+                    if (a.size() < 2) return Value();
+                    size_t n = (size_t)BNum(a[1]);
+                    void* p = nullptr;
+                    if (a[0].t == Value::Pointer) p = a[0].ptr;
+                    else if (a[0].t == Value::Num && a[0].n != 0)
+                        p = (void*)(INT_PTR)(long long)a[0].n;
+                    if (!n) { if (p) HeapFree(GetProcessHeap(), 0, p);
+                              return Value::Pointer_(nullptr); }
+                    void* q = p ? HeapReAlloc(GetProcessHeap(), 0, p, n)
+                                : HeapAlloc(GetProcessHeap(), 0, n);
+                    return Value::Pointer_(q); });
+                tb->map[L"malloc"] = tb->map[L"realloc"];
+                // raw.equal(a,b,size) — byte comparison
+                tb->map[L"equal"] = NF([](vector<Value>& a) -> Value {
+                    if (a.size() < 2) return Value::Bool_(true);
+                    std::string x, y;
+                    if (a[0].t == Value::Str) x = ToA(BStr(a[0]));
+                    if (a[1].t == Value::Str) y = ToA(BStr(a[1]));
+                    if (x.empty() || y.empty()) return Value::Bool_(x == y);
+                    size_t n = a.size() > 2 ? (size_t)BNum(a[2])
+                                            : min(x.size(), y.size());
+                    if (n > x.size() || n > y.size()) return Value::Bool_(false);
+                    return Value::Bool_(memcmp(x.data(), y.data(), n) == 0); });
                 tb->map[L"toPointer"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t == Value::Null) return Value::Pointer_(nullptr);
                     if (a[0].t == Value::Pointer) return a[0];
