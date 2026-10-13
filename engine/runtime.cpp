@@ -857,7 +857,19 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             if (f.t != Value::Func)
             {
-                (*err) = L"运行错误: 尝试调用非函数值";
+                // name the callee: without it a missing builtin is an
+                // untraceable "尝试调用非函数值" buried in library code
+                wstring strCallee;
+                if (n->a->k == Node::Ident)
+                    strCallee = n->a->str;
+                else if (n->a->k == Node::Member)
+                    strCallee = L"." + n->a->str;
+                else if (n->a->k == Node::Index && n->a->b &&
+                         n->a->b->k == Node::Str)
+                    strCallee = L"[\"" + n->a->b->str + L"\"]";
+                (*err) = L"运行错误: 尝试调用非函数值" +
+                         (strCallee.empty() ? L""
+                                            : (L" (" + strCallee + L")"));
                 return Value();
             }
             vector<Value> args = evalCallArgs(n->list);

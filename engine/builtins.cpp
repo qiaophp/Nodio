@@ -1,7 +1,91 @@
 #include "engine/interp.h"
+#include "engine/parser.h"
+#include <clocale>
 
 namespace NodioVM
 {
+    // ---- runtime compilation (eval / loadcode / loadcodex) ----
+    // Compiles 'src' into an anonymous function: the code becomes the body
+    // and '...' collects the arguments, because in aardio a loaded code
+    // string or file behaves exactly like an anonymous function.
+    static PNode CompileToFunc(const wstring& src, wstring* err)
+    {
+        wstring e;
+        vector<Tok> toks = Lex(src, &e);
+        if (!e.empty())
+        {
+            if (err) *err = e;
+            return nullptr;
+        }
+        Parser ps{ toks, 0, &e };
+        if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
+            ps.strEmbedBase = g_interpCurrent->baseDir;
+        ps.strEmbedRoot = EmbedRoot();
+        PNode blk = ps.ParseBlock();
+        if (!e.empty())
+        {
+            if (err) *err = e;
+            return nullptr;
+        }
+        PNode fn = std::make_shared<Node>();
+        fn->k = Node::FuncLit;
+        fn->a = blk;
+        fn->names.push_back(L"...");
+        fn->defaults.push_back(nullptr);
+        return fn;
+    }
+
+    // aardio loadcode/loadcodex accept either a code string or a file path.
+    // Root-relative ('/x') resolves against the app root, '~' against the
+    // installation root; a multi-line argument is always code.
+    static bool ReadCodeFile(const wstring& s, wstring* out)
+    {
+        if (s.empty() || s.find(L'\n') != wstring::npos ||
+            s.find(L'\r') != wstring::npos)
+            return false;
+        wstring p = s;
+        if (p[0] == L'/' || p[0] == L'\\')
+        {
+            wstring root;
+            if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
+                root = g_interpCurrent->baseDir;
+            if (root.empty())
+            {
+                wchar_t szExe[MAX_PATH] = L"";
+                GetModuleFileNameW(nullptr, szExe, MAX_PATH);
+                wchar_t* q = wcsrchr(szExe, L'\\');
+                if (q) *q = 0;
+                root = szExe;
+            }
+            p = root + L"\\" + p.substr(1);
+        }
+        else if (p[0] == L'~')
+            p = ResolveTildeDisk(p);
+        FILE* pf = nullptr;
+        if (_wfopen_s(&pf, p.c_str(), L"rb") != 0 || !pf)
+            return false;
+        fseek(pf, 0, SEEK_END);
+        long sz = ftell(pf);
+        fseek(pf, 0, SEEK_SET);
+        std::string raw;
+        if (sz > 0)
+        {
+            raw.resize((size_t)sz);
+            fread(&raw[0], 1, (size_t)sz, pf);
+        }
+        fclose(pf);
+        size_t off = (raw.size() >= 3 && (unsigned char)raw[0] == 0xEF &&
+                      (unsigned char)raw[1] == 0xBB &&
+                      (unsigned char)raw[2] == 0xBF) ? 3 : 0;
+        int w = MultiByteToWideChar(CP_UTF8, 0, raw.data() + off,
+                                    (int)(raw.size() - off), nullptr, 0);
+        wstring r((size_t)(w > 0 ? w : 0), 0);
+        if (w > 0)
+            MultiByteToWideChar(CP_UTF8, 0, raw.data() + off,
+                                (int)(raw.size() - off), &r[0], w);
+        *out = r;
+        return true;
+    }
     // wide string -> ANSI bytes (the raw.* memory helpers work on bytes)
     static std::string ToA(const wstring& w)
     {
@@ -62,6 +146,32 @@ void Interp::InitBuiltins()
             // ---- string (1-based, aardio/Lua style) ----
             {
                 auto tb = GetRoot(L"string").tab;
+                // string.repeat(s,n) — repeat the string n times
+                tb->map[L"repeat"] = NF([](vector<Value>& a) -> Value {
+                    wstring s = BStr(a[0]);
+                    long long n = a.size() > 1 ? (long long)BNum(a[1]) : 1;
+                    wstring out;
+                    for (long long i = 0; i < n; i++)
+                        out += s;
+                    return Value::Str_(out); });
+                // string.sub(s,i,j) — 1-based substring, negative = from end
+                tb->map[L"sub"] = NF([](vector<Value>& a) -> Value {
+                    wstring s = BStr(a[0]);
+                    long long n = (long long)s.size();
+                    long long st = a.size() > 1 ? (long long)BNum(a[1]) : 1;
+                    long long en = a.size() > 2 ? (long long)BNum(a[2]) : n;
+                    if (st < 0) st = n + st + 1;
+                    if (en < 0) en = n + en + 1;
+                    if (st < 1) st = 1;
+                    if (en > n) en = n;
+                    if (en < st) return Value::Str_(L"");
+                    return Value::Str_(s.substr((size_t)(st - 1),
+                                                (size_t)(en - st + 1))); });
+                // string.reverse(s)
+                tb->map[L"reverse"] = NF([](vector<Value>& a) -> Value {
+                    wstring s = BStr(a[0]);
+                    std::reverse(s.begin(), s.end());
+                    return Value::Str_(s); });
                 tb->map[L"len"] = NF([](vector<Value>& a) {
                     return Value::Num_((double)BStr(a[0]).size()); });
                 tb->map[L"left"] = NF([](vector<Value>& a) {
@@ -544,6 +654,46 @@ void Interp::InitBuiltins()
             // ---- io ----
             {
                 auto tb = GetRoot(L"io").tab;
+                // io.joinpath(...) — join path parts with '\'
+                tb->map[L"joinpath"] = NF([](vector<Value>& a) -> Value {
+                    wstring out;
+                    for (size_t i = 0; i < a.size(); i++)
+                    {
+                        if (a[i].t != Value::Str)
+                            continue;
+                        wstring p = BStr(a[i]);
+                        if (p.empty())
+                            continue;
+                        if (!out.empty() && out.back() != L'\\' &&
+                            out.back() != L'/')
+                            out += L'\\';
+                        else if (out.empty())
+                        {
+                            out = p;
+                            continue;
+                        }
+                        if (!p.empty() && (p[0] == L'\\' || p[0] == L'/'))
+                            p = p.substr(1);
+                        out += p;
+                    }
+                    return Value::Str_(out); });
+                // io.splitpath(path) — returns a table of path parts
+                tb->map[L"splitpath"] = NF([](vector<Value>& a) -> Value {
+                    wstring p = BStr(a[0]);
+                    auto out = std::make_shared<Table>();
+                    size_t slash = p.find_last_of(L"\\/");
+                    wstring name = (slash == wstring::npos) ? p
+                                                            : p.substr(slash + 1);
+                    size_t dot = name.find_last_of(L'.');
+                    out->map[L"name"] = Value::Str_(
+                        dot == wstring::npos ? name : name.substr(0, dot));
+                    out->map[L"ext"] = Value::Str_(
+                        dot == wstring::npos ? L"" : name.substr(dot + 1));
+                    out->map[L"file"] = Value::Str_(name);
+                    out->map[L"dir"] = Value::Str_(
+                        slash == wstring::npos ? L"" : p.substr(0, slash + 1));
+                    out->map[L"path"] = Value::Str_(p);
+                    return Value::Table_(out); });
                 auto writer = [](vector<Value>& a, const wchar_t* sep,
                                  bool nl) -> Value {
                     wstring out;
@@ -895,6 +1045,59 @@ void Interp::InitBuiltins()
                     wchar_t buf[256];
                     wcsftime(buf, 256, fmt.c_str(), &tmb);
                     return Value::Str_(buf); });
+                // time.stamp() — seconds since the epoch, as a number
+                tb->map[L"stamp"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value::Num_((double)time(nullptr));
+                    wstring fmt = BStr(a[0]);
+                    time_t t = a.size() > 1 ? (time_t)BNum(a[1]) : time(nullptr);
+                    tm tmb;
+                    localtime_s(&tmb, &t);
+                    wchar_t buf[256];
+                    wcsftime(buf, 256, fmt.c_str(), &tmb);
+                    return Value::Str_(buf); });
+                // time.ole() — OLE automation date (days since 1899-12-30)
+                tb->map[L"ole"] = NF([](vector<Value>& a) -> Value {
+                    SYSTEMTIME st;
+                    if (a.empty())
+                        GetLocalTime(&st);
+                    else
+                    {
+                        FILETIME ft;
+                        SYSTEMTIME stIn;
+                        stIn.wYear = (WORD)BNum(a[0]);
+                        stIn.wMonth = (WORD)(a.size() > 1 ? BNum(a[1]) : 1);
+                        stIn.wDay = (WORD)(a.size() > 2 ? BNum(a[2]) : 1);
+                        stIn.wHour = (WORD)(a.size() > 3 ? BNum(a[3]) : 0);
+                        stIn.wMinute = (WORD)(a.size() > 4 ? BNum(a[4]) : 0);
+                        stIn.wSecond = (WORD)(a.size() > 5 ? BNum(a[5]) : 0);
+                        stIn.wMilliseconds = 0;
+                        if (a.empty())
+                            st = stIn;
+                        else if (!SystemTimeToTzSpecificLocalTime(nullptr,
+                                                                 &stIn, &st))
+                            st = stIn;
+                        (void)ft;
+                    }
+                    // days from 1899-12-30 plus the fraction of the day
+                    double dSerial = 0;
+                    {
+                        FILETIME ft;
+                        SYSTEMTIME base;
+                        memset(&base, 0, sizeof(base));
+                        base.wYear = 1899; base.wMonth = 12; base.wDay = 30;
+                        ULARGE_INTEGER ul, ulBase;
+                        SystemTimeToFileTime(&st, &ft);
+                        ul.HighPart = ft.dwHighDateTime;
+                        ul.LowPart = ft.dwLowDateTime;
+                        SystemTimeToFileTime(&base, &ft);
+                        ulBase.HighPart = ft.dwHighDateTime;
+                        ulBase.LowPart = ft.dwLowDateTime;
+                        dSerial = (double)(long long)
+                            ((ul.QuadPart - ulBase.QuadPart) / 10000000) /
+                            86400.0;
+                    }
+                    return Value::Num_(dSerial); });
             }
             // ---- json (round 30) ----
             {
@@ -915,6 +1118,17 @@ void Interp::InitBuiltins()
                 auto tb = GetRoot(L"win").tab;
                 auto clip = std::make_shared<Table>();
                 tb->map[L"clip"] = Value::Table_(clip);
+                // win.getMessagePos(lParam) — the mouse position packed into
+                // an lParam (WM_MOUSEMOVE & friends), returned as x,y
+                tb->map[L"getMessagePos"] = NF([](vector<Value>& a) -> Value {
+                    long long lp = a.empty() ? 0 : (long long)BNum(a[0]);
+                    short x = (short)(lp & 0xFFFF);
+                    short y = (short)((lp >> 16) & 0xFFFF);
+                    Value vx = Value::Num_((double)x);
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Num_((double)y));
+                    vx.mrets = ex;
+                    return vx; });
                 tb->map[L"msgbox"] = NF([](vector<Value>& a) {
                     wstring text = a.empty() ? L"" : a[0].ToString();
                     wstring title = a.size() > 1 ? a[1].ToString() : L"aardio";
@@ -1992,6 +2206,31 @@ void Interp::InitBuiltins()
             // ---- table ----
             {
                 auto tb = GetRoot(L"table").tab;
+                // table.slice(array,start,end) — aardio 1-based slice
+                tb->map[L"slice"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                        return Value();
+                    auto& src = a[0].tab->arr;
+                    auto out = std::make_shared<Table>();
+                    long long n = (long long)src.size();
+                    long long s = a.size() > 1 ? (long long)BNum(a[1]) : 1;
+                    long long e = a.size() > 2 && a[2].t != Value::Null
+                                      ? (long long)BNum(a[2]) : n;
+                    if (s < 0) s = n + s + 1;
+                    if (e < 0) e = n + e + 1;
+                    if (s < 1) s = 1;
+                    if (e > n) e = n;
+                    for (long long i = s; i <= e; i++)
+                        out->arr.push_back(src[(size_t)i - 1]);
+                    return Value::Table_(out); });
+                // table.clone(t) — shallow copy including the array part
+                tb->map[L"clone"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                        return Value();
+                    auto out = std::make_shared<Table>();
+                    out->map = a[0].tab->map;
+                    out->arr = a[0].tab->arr;
+                    return Value::Table_(out); });
                 // table.assign(target, src...) - copy key-values from
                 // each source table into the target (metaProperty ctor)
                 tb->map[L"assign"] = NF([](vector<Value>& a) -> Value {
@@ -2352,6 +2591,97 @@ void Interp::InitBuiltins()
                 tb->map[L"getId"] = NF([](vector<Value>&) -> Value {
                     return Value::Num_((double)::GetCurrentThreadId());
                 });
+                // thread.status(handle) — 0 = still running ("active")
+                tb->map[L"status"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value::Str_(L"active");
+                    HANDLE h = (HANDLE)(INT_PTR)(long long)BNum(a[0]);
+                    if (!h)
+                        return Value::Str_(L"active");
+                    DWORD rc = WaitForSingleObject(h, 0);
+                    if (rc == WAIT_OBJECT_0)
+                    {
+                        DWORD code = 0;
+                        GetExitCodeThread(h, &code);
+                        return Value::Num_((double)code);
+                    }
+                    return Value::Str_(L"active"); });
+                // thread.suspend(handle) / thread.resume(handle)
+                tb->map[L"suspend"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value::Bool_(false);
+                    HANDLE h = (HANDLE)(INT_PTR)(long long)BNum(a[0]);
+                    if (!h)
+                        return Value::Bool_(false);
+                    return Value::Bool_(SuspendThread(h) != (DWORD)-1); });
+                tb->map[L"resume"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value::Bool_(false);
+                    HANDLE h = (HANDLE)(INT_PTR)(long long)BNum(a[0]);
+                    if (!h)
+                        return Value::Bool_(false);
+                    return Value::Bool_(ResumeThread(h) != (DWORD)-1); });
+                tb->map[L"waitOne"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value();
+                    HANDLE h = (HANDLE)(INT_PTR)(long long)BNum(a[0]);
+                    DWORD ms = a.size() > 1 ? (DWORD)BNum(a[1]) : INFINITE;
+                    if (!h)
+                        return Value();
+                    DWORD rc = WaitForSingleObject(h, ms);
+                    return Value::Bool_(rc == WAIT_OBJECT_0); });
+                // thread.lock(name[,fn,...]) — named inter-thread lock. With
+                // a function it runs under the lock and returns its results;
+                // without one it acquires the lock until thread.unlock(name).
+                static std::mutex g_lockMapMutex;
+                static std::map<wstring, std::shared_ptr<std::mutex>>
+                    g_namedLocks;
+                tb->map[L"lock"] = NF([this](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value();
+                    wstring nm = BStr(a[0]);
+                    std::shared_ptr<std::mutex> m;
+                    {
+                        std::lock_guard<std::mutex> g(g_lockMapMutex);
+                        auto it = g_namedLocks.find(nm);
+                        if (it == g_namedLocks.end())
+                        {
+                            m = std::make_shared<std::mutex>();
+                            g_namedLocks[nm] = m;
+                        }
+                        else
+                            m = it->second;
+                    }
+                    if (a.size() > 1 && a[1].t == Value::Func)
+                    {
+                        std::lock_guard<std::mutex> g(*m);
+                        vector<Value> args;
+                        for (size_t i = 2; i < a.size(); i++)
+                            args.push_back(a[i]);
+                        return this->CallVmFunc(a[1], args);
+                    }
+                    m->lock();          // manual acquire
+                    return Value::Bool_(true); });
+                tb->map[L"unlock"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value::Bool_(false);
+                    std::shared_ptr<std::mutex> m;
+                    {
+                        std::lock_guard<std::mutex> g(g_lockMapMutex);
+                        auto it = g_namedLocks.find(BStr(a[0]));
+                        if (it == g_namedLocks.end())
+                            return Value::Bool_(false);
+                        m = it->second;
+                    }
+                    m->unlock();
+                    return Value::Bool_(true); });
+                tb->map[L"close"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value::Bool_(false);
+                    HANDLE h = (HANDLE)(INT_PTR)(long long)BNum(a[0]);
+                    if (!h)
+                        return Value::Bool_(false);
+                    return Value::Bool_(CloseHandle(h) != 0); });
                 tb->map[L"get"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
                     std::lock_guard<std::mutex> lock(g_threadSharedMutex);
@@ -2433,6 +2763,8 @@ void Interp::InitBuiltins()
             // ---- round 37: fsys (file system) ----
             {
                 auto tb = GetRoot(L"fsys").tab;
+                tb->map[L"joinpath"] = GetRoot(L"io").tab->map[L"joinpath"];
+                tb->map[L"splitpath"] = GetRoot(L"io").tab->map[L"splitpath"];
                 tb->map[L"exists"] = NF([](vector<Value>& a) -> Value {
                     return Value::Bool_(
                         GetFileAttributesW(BStr(a[0]).c_str()) !=
@@ -3160,6 +3492,336 @@ void Interp::InitBuiltins()
             globals.vars[L"_HINSTANCE"] = Value::Pointer_(GetModuleHandleW(nullptr));
             globals.vars[L"_HAPPICON"] = Value::Pointer_(LoadIconW(nullptr, IDI_APPLICATION));
             globals.vars[L"_INVALID_HANDLE_VALUE"] = Value::Pointer_(INVALID_HANDLE_VALUE);
+
+            // ---- documented reserved builtins (docs/language-reference/
+            //      builtin-function/index.md). Their absence was the single
+            //      largest cause of "尝试调用非函数值" in the shipped examples.
+            auto MakeVmFunc = [](PNode fn) -> Value {
+                Value f;
+                f.t = Value::Func;
+                f.fn = fn->a;
+                f.params = fn->names;
+                f.pdefaults = std::make_shared<vector<PNode>>(fn->defaults);
+                return f;
+            };
+            // print(...) — each argument through tostring, then io.print
+            globals.vars[L"print"] = NF([](vector<Value>& a) -> Value {
+                wstring out;
+                for (size_t i = 0; i < a.size(); i++)
+                {
+                    if (i) out += L"\t";
+                    out += a[i].t == Value::Null ? L"null" : a[i].ToString();
+                }
+                out += L"\n";
+                int n = WideCharToMultiByte(CP_UTF8, 0, out.c_str(),
+                                            (int)out.size(), nullptr, 0,
+                                            nullptr, nullptr);
+                if (n > 0)
+                {
+                    std::string u8((size_t)n, 0);
+                    WideCharToMultiByte(CP_UTF8, 0, out.c_str(),
+                                        (int)out.size(), &u8[0], n,
+                                        nullptr, nullptr);
+                    fwrite(u8.data(), 1, u8.size(), stdout);
+                    fflush(stdout);
+                }
+                return Value(); });
+            // assert(value,message,...) — truthy: return all arguments;
+            // falsy: throw @message
+            globals.vars[L"assert"] = NF([this](vector<Value>& a) -> Value {
+                if (!a.empty() && a[0].Truthy())
+                {
+                    if (a.size() > 1)
+                    {
+                        auto ex = std::make_shared<vector<Value>>();
+                        for (size_t i = 1; i < a.size(); i++)
+                            ex->push_back(a[i]);
+                        Value r = a.size() > 1 ? a[1] : a[0];
+                        r.mrets = ex;
+                        return r;
+                    }
+                    return a.empty() ? Value() : a[0];
+                }
+                wstring msg = a.size() > 1 ? BStr(a[1])
+                                          : L"assertion failed!";
+                (*err) = L"运行错误: " + msg;
+                return Value(); });
+            // assert2(level,value,message,...)
+            globals.vars[L"assert2"] = NF([this](vector<Value>& a) -> Value {
+                size_t base = a.empty() ? 0 : 1;   // skip the level argument
+                if (a.size() > base && a[base].Truthy())
+                {
+                    if (a.size() > base + 1)
+                    {
+                        auto ex = std::make_shared<vector<Value>>();
+                        for (size_t i = base + 1; i < a.size(); i++)
+                            ex->push_back(a[i]);
+                        Value r = a[base + 1];
+                        r.mrets = ex;
+                        return r;
+                    }
+                    return a[base];
+                }
+                wstring msg = a.size() > base + 1 ? BStr(a[base + 1])
+                                                  : L"assertion failed!";
+                (*err) = L"运行错误: " + msg;
+                return Value(); });
+            // assertf — inverse assertion: throws when the value is truthy
+            globals.vars[L"assertf"] = NF([this](vector<Value>& a) -> Value {
+                if (!a.empty() && a[0].Truthy())
+                {
+                    wstring msg = a.size() > 1 ? BStr(a[1])
+                                              : L"assertion failed!";
+                    (*err) = L"运行错误: " + msg;
+                    return Value();
+                }
+                return a.empty() ? Value() : a[0]; });
+            // eval(codeString) — compiles and runs an expression immediately
+            globals.vars[L"eval"] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
+                if (a.empty() || a[0].t != Value::Str)
+                    return Value();
+                wstring src = BStr(a[0]);
+                wstring e;
+                PNode fn = CompileToFunc(L"return " + src, &e);
+                if (!fn)
+                {
+                    e.clear();
+                    fn = CompileToFunc(src, &e);
+                    if (!fn)
+                    {
+                        (*err) = L"运行错误: eval: " + e;
+                        return Value();
+                    }
+                }
+                Value f = MakeVmFunc(fn);
+                vector<Value> args;
+                Value r = this->CallVmFunc(f, args);
+                if (!err->empty())
+                    return Value();
+                return r; });
+            // loadcode(code|filepath) — a function object, or null + message
+            globals.vars[L"loadcode"] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
+                if (a.empty() || a[0].t != Value::Str)
+                    return Value();
+                wstring src = BStr(a[0]), text;
+                if (ReadCodeFile(src, &text))
+                    src = text;
+                wstring e;
+                PNode fn = CompileToFunc(src, &e);
+                if (!fn)
+                {
+                    // null + error message, exactly as the docs specify
+                    Value nullV;
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Str_(L"编译失败: " + e));
+                    nullV.mrets = ex;
+                    return nullV;
+                }
+                return MakeVmFunc(fn); });
+            // loadcodex(code|filepath|function,...) — run now, return values
+            globals.vars[L"loadcodex"] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
+                if (a.empty())
+                    return Value();
+                Value f;
+                if (a[0].t == Value::Func)
+                    f = a[0];
+                else if (a[0].t == Value::Str)
+                {
+                    wstring src = BStr(a[0]), text;
+                    if (ReadCodeFile(src, &text))
+                        src = text;
+                    wstring e;
+                    PNode fn = CompileToFunc(src, &e);
+                    if (!fn)
+                    {
+                        (*err) = L"运行错误: loadcodex: " + e;
+                        return Value();
+                    }
+                    f = MakeVmFunc(fn);
+                }
+                else
+                    return Value();
+                vector<Value> args;
+                for (size_t i = 1; i < a.size(); i++)
+                    args.push_back(a[i]);
+                return this->CallVmFunc(f, args); });
+            // reduce(array,reducer,initialValue)
+            globals.vars[L"reduce"] = NF([this](vector<Value>& a) -> Value {
+                if (a.size() < 2 || a[0].t != Value::TableT || !a[0].tab)
+                    return Value();
+                auto& arr = a[0].tab->arr;
+                bool bInit = (a.size() > 2 && a[2].t != Value::Null);
+                Value prev;
+                size_t start = 1;
+                if (bInit)
+                    prev = a[2];
+                else
+                {
+                    if (arr.empty())
+                    {
+                        (*err) = L"运行错误: reduce 空数组且未指定初始值";
+                        return Value();
+                    }
+                    prev = arr[0];
+                    start = 2;
+                }
+                for (size_t i = start; i <= arr.size(); i++)
+                {
+                    vector<Value> args;
+                    args.push_back(prev);
+                    args.push_back(arr[i - 1]);
+                    args.push_back(Value::Num_((double)i));
+                    args.push_back(a[0]);
+                    prev = this->CallVmFunc(a[1], args);
+                    if (!err->empty())
+                        return Value();
+                }
+                return prev; });
+            // switch(switchValue,caseTable,default,...)
+            globals.vars[L"switch"] = NF([this](vector<Value>& a) -> Value {
+                if (a.size() < 2 || a[1].t != Value::TableT || !a[1].tab)
+                {
+                    (*err) = L"运行错误: switch 参数@2必须是表对象";
+                    return Value();
+                }
+                Value fn;
+                if (a[0].t == Value::Num)
+                {
+                    double n = a[0].n;
+                    if (n >= 1 && (size_t)n <= a[1].tab->arr.size())
+                        fn = a[1].tab->arr[(size_t)n - 1];
+                }
+                if (fn.t == Value::Null)
+                {
+                    auto it = a[1].tab->map.find(a[0].ToString());
+                    if (it != a[1].tab->map.end())
+                        fn = it->second;
+                }
+                if (fn.t != Value::Func)
+                    fn = (a.size() > 2) ? a[2] : Value();
+                if (fn.t != Value::Func)
+                    return Value();
+                vector<Value> args;
+                for (size_t i = 3; i < a.size(); i++)
+                    args.push_back(a[i]);
+                return this->CallVmFunc(fn, args); });
+            // invoke(f,owner,...) — call with an explicit owner, errors throw
+            globals.vars[L"invoke"] = NF([this](vector<Value>& a) -> Value {
+                if (a.empty())
+                    return Value();
+                Value owner = a.size() > 1 ? a[1] : Value();
+                vector<Value> args;
+                for (size_t i = 2; i < a.size(); i++)
+                    args.push_back(a[i]);
+                return this->CallOwner(a[0], owner, args); });
+            // callex(f,owner,errHandler,...) — errors go to the handler
+            globals.vars[L"callex"] = NF([this](vector<Value>& a) -> Value {
+                if (a.empty())
+                    return Value();
+                Value owner = a.size() > 1 ? a[1] : Value();
+                Value handler = a.size() > 2 ? a[2] : Value();
+                vector<Value> args;
+                for (size_t i = 3; i < a.size(); i++)
+                    args.push_back(a[i]);
+                wstring keep = *err;
+                err->clear();
+                Value r = this->CallOwner(a[0], owner, args);
+                if (!err->empty())
+                {
+                    wstring msg = *err;
+                    err->clear();
+                    if (handler.t == Value::Func)
+                    {
+                        vector<Value> ha;
+                        ha.push_back(Value::Str_(msg));
+                        r = this->CallVmFunc(handler, ha);
+                    }
+                    else
+                        r = Value();
+                }
+                if (keep.empty() == false && err->empty())
+                    *err = keep;
+                return r; });
+            // rget(n,...) — pick the n-th of the trailing values
+            globals.vars[L"rget"] = NF([](vector<Value>& a) -> Value {
+                if (a.size() < 2 || a[0].t != Value::Num)
+                    return a.empty() ? Value() : a[0];
+                size_t n = (size_t)a[0].n;
+                if (n < 1 || n >= a.size())
+                    return Value();
+                return a[n]; });
+            // execute(commandLine) — run a system command and wait
+            globals.vars[L"execute"] = NF([](vector<Value>& a) -> Value {
+                if (a.empty() || a[0].t != Value::Str)
+                    return Value();
+                int rc = _wsystem(BStr(a[0]).c_str());
+                return Value::Num_((double)rc); });
+            // errput(message) — report without throwing
+            globals.vars[L"errput"] = NF([](vector<Value>& a) -> Value {
+                wstring out;
+                for (size_t i = 0; i < a.size(); i++)
+                {
+                    if (i) out += L"\t";
+                    out += a[i].t == Value::Null ? L"null" : a[i].ToString();
+                }
+                out += L"\n";
+                int n = WideCharToMultiByte(CP_UTF8, 0, out.c_str(),
+                                            (int)out.size(), nullptr, 0,
+                                            nullptr, nullptr);
+                if (n > 0)
+                {
+                    std::string u8((size_t)n, 0);
+                    WideCharToMultiByte(CP_UTF8, 0, out.c_str(),
+                                        (int)out.size(), &u8[0], n,
+                                        nullptr, nullptr);
+                    fwrite(u8.data(), 1, u8.size(), stderr);
+                    fflush(stderr);
+                }
+                return Value(); });
+            globals.vars[L"collectgarbage"] = NF([](vector<Value>&) -> Value {
+                return Value(); });
+            globals.vars[L"setlocale"] = NF([](vector<Value>& a) -> Value {
+                int cat = LC_ALL;
+                if (a.size() > 1 && a[0].t == Value::Num)
+                    cat = (int)a[0].n;
+                const wchar_t* loc = L"";
+                if (!a.empty() && a.back().t == Value::Str)
+                    loc = BStr(a.back()).c_str();
+                wchar_t buf[256] = L"";
+                _wsetlocale(cat, loc);
+                if (wcscpy_s(buf, loc ? loc : L"") == 0)
+                    return Value::Str_(buf);
+                return Value(); });
+            // setprivilege(name,enable) — enable/disable a process privilege
+            globals.vars[L"setprivilege"] = NF([](vector<Value>& a) -> Value {
+                if (a.empty() || a[0].t != Value::Str)
+                    return Value::Bool_(false);
+                bool bEnable = !(a.size() > 1 && !a[1].Truthy());
+                HANDLE hTok = nullptr;
+                if (!OpenProcessToken(GetCurrentProcess(),
+                                      TOKEN_ADJUST_PRIVILEGES |
+                                      TOKEN_QUERY, &hTok))
+                    return Value::Bool_(false);
+                LUID luid;
+                if (!LookupPrivilegeValueW(nullptr, BStr(a[0]).c_str(),
+                                           &luid))
+                {
+                    CloseHandle(hTok);
+                    return Value::Bool_(false);
+                }
+                TOKEN_PRIVILEGES tp;
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Luid = luid;
+                tp.Privileges[0].Attributes =
+                    bEnable ? SE_PRIVILEGE_ENABLED : 0;
+                BOOL ok = AdjustTokenPrivileges(hTok, FALSE, &tp,
+                                                sizeof(tp), nullptr, nullptr);
+                DWORD e = GetLastError();
+                CloseHandle(hTok);
+                return Value::Bool_(ok && e == ERROR_SUCCESS); });
+            // dumpcode — no bytecode emitter yet
+            globals.vars[L"dumpcode"] = NF([](vector<Value>&) -> Value {
+                return Value(); });
             // Preload builtin (official aardio VM preloads builtin on startup)
             {
                 PNode nImp = std::make_shared<Node>();

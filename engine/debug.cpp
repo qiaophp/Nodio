@@ -34,7 +34,11 @@ void Interp::DumpVars(Env* env)
                 bool bNativ = false;
                 for (auto* p : kScalarNatives)
                     if (kv.first == p) { bNativ = true; break; }
-                if (bNativ) continue;
+                // engine-provided native builtins are not script variables.
+                // Filtering on the value instead of a hard-coded name list
+                // keeps this dump stable as more builtins are added.
+                if (bNativ || (kv.second.native && kv.first != L"type"))
+                    continue;
                 if (n++ >= 20) { WriteU8(stdout, L"  ...\n"); break; }
                 wstring val = kv.second.ToString();
                 if (val.size() > 60) val = val.substr(0, 60) + L"...";
