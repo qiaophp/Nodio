@@ -837,6 +837,13 @@ void Interp::InitBuiltins()
                 tb->map[L"println"] = NF([writer](vector<Value>& a) {
                     return writer(a, L"", true); });
                 tb->map[L"open"] = NF([](vector<Value>& a) {
+                    // io.open() with no arguments is the console library's
+                    // "open the console" call. It used to index an empty
+                    // argument vector and crash the process; the engine has
+                    // no interactive console of its own, so report whether a
+                    // console is attached.
+                    if (a.empty() || a[0].t == Value::Null)
+                        return Value::Bool_(GetConsoleWindow() != nullptr);
                     wstring path = BStr(a[0]);
                     wstring mode = a.size() > 1 ? BStr(a[1]) : L"r";
                     const wchar_t* m = wcschr(mode.c_str(), L'w') ? L"wb" :
@@ -2262,6 +2269,33 @@ void Interp::InitBuiltins()
                     }
                     // win/_.aardio also calls ::Shell32 / ::Gdi32 /
                     // ::Comctl32 style roots - preload the common ones
+                    // console/_.aardio's crtReopen() uses ::Msvcrt to reopen
+                    // the CRT streams. Modern MSVCRT no longer exports
+                    // __iob_func (removed in VS2015+), so the library's
+                    // "stdin + 32" FILE arithmetic would write through a null
+                    // pointer and crash the process. Provide the CRT helpers
+                    // ourselves so the reopen is a safe no-op.
+                    {
+                        auto vm = std::make_shared<Table>();
+                        vm->map[L"__iob_func"] = NF([](vector<Value>&) -> Value {
+                            return Value::Pointer_(stdin); });
+                        vm->map[L"freopen"] = NF([](vector<Value>& a) -> Value {
+                            wstring path = a.empty() ? L"" : BStr(a[0]);
+                            wstring mode = a.size() > 1 ? BStr(a[1]) : L"r";
+                            // only the console streams are meaningful here
+                            FILE* pf = nullptr;
+                            if (path == L"CONIN$")
+                                pf = stdin;
+                            else
+                                pf = stdout;
+                            (void)mode;
+                            return Value::Pointer_(pf); });
+                        vm->map[L"_open_osfhandle"] =
+                            NF([](vector<Value>&) -> Value {
+                                return Value::Num_(-1.0); });
+                        globals.vars[L"Msvcrt"] = Value::Table_(vm);
+                        roots[L"Msvcrt"] = globals.vars[L"Msvcrt"];
+                    }
                     const wchar_t* DLLS[] = { L"Shell32.dll", L"Gdi32.dll",
                         L"Ole32.dll", L"OleAut32.dll", L"Advapi32.dll",
                         L"Comctl32.dll", L"Comdlg32.dll", L"Uxtheme.dll",
@@ -2785,8 +2819,15 @@ void Interp::InitBuiltins()
                             args.push_back(a[i]);
                         return this->CallVmFunc(a[1], args);
                     }
-                    m->lock();          // manual acquire
-                    return Value::Bool_(true); });
+                    // Without a function the lock is advisory (aardio uses
+                    // this as "already open?" guard): report whether it can
+                    // be taken instead of blocking a single-threaded VM.
+                    if (m->try_lock())
+                    {
+                        m->unlock();
+                        return Value::Bool_(true);
+                    }
+                    return Value::Bool_(false); });
                 tb->map[L"unlock"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty())
                         return Value::Bool_(false);
