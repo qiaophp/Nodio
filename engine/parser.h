@@ -1353,26 +1353,43 @@ namespace NodioVM
         PNode ParseConcat()   // '..'/'++' bind below + (concat level), right assoc
         {
             PNode l = ParseAdd();
-            // aardio postfix 'expr++' (increment statement): when '++' is
-            // followed by a statement/argument end it binds to the left
-            // expr, not concat. ')' and ',' matter for the for(...) step
-            // slot and call argument lists.
-           if ((IsPunct(L"++") || IsPunct(L"--")) &&
-                (Peek(1).t == TNL || Peek(1).t == TEnd ||
-                 (Peek(1).t == TPunct && (Peek(1).text == L";" ||
-                                          Peek(1).text == L"}" ||
-                                          Peek(1).text == L")" ||
-                                          Peek(1).text == L","))))
-                return l;
-            if (IsPunct(L"..") || IsPunct(L"++"))
+            while (true)
             {
-                PNode n = New(Node::Bin);
-                n->str = Next().text;
-                n->a = l;
-                n->b = ParseConcat();
-                return n;
+                // a binary '++' may start the NEXT line (the library splits
+                // long SQL/XML assembly across lines with a leading '++').
+                // '..' must NOT be treated that way: a '..' at the start of
+                // a line is the root-namespace accessor (`..thread.delay =
+                // delay;`), not the concat operator.
+                size_t save = p;
+                SkipNL();
+                bool bSkippedNL = (p != save);
+                // aardio postfix 'expr++' (increment statement): when '++'
+                // is followed by a statement/argument end it binds to the
+                // left expr, not concat. ')' and ',' matter for the
+                // for(...) step slot and call argument lists.
+                if (IsPunct(L"++") || IsPunct(L"--"))
+                {
+                    const Tok& nx = Peek(1);
+                    bool bEnd = nx.t == TNL || nx.t == TEnd ||
+                                (nx.t == TPunct &&
+                                 (nx.text == L";" || nx.text == L"}" ||
+                                  nx.text == L")" || nx.text == L","));
+                    if (bEnd)
+                        return l;   // leave the operator for the statement
+                }
+                if (IsPunct(L"++") || (!bSkippedNL && IsPunct(L"..")))
+                {
+                    PNode n = New(Node::Bin);
+                    n->str = Next().text;
+                    n->a = l;
+                    SkipNL();
+                    n->b = ParseConcat();
+                    l = n;
+                    continue;
+                }
+                p = save;
+                return l;
             }
-            return l;
         }
         PNode ParseAdd()
         {

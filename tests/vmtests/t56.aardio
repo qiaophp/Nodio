@@ -1,0 +1,31 @@
+// M14: a '++' concat operator may start the next line — the library
+// assembles XML/SQL that way. A '..' at the start of a line must NOT be
+// treated as concat: there it is the root-namespace accessor
+// (`..thread.delay = delay;`), and conflating the two silently corrupts
+// every statement that begins with a root member access.
+var xml = '<?xml version="1.0" encoding="UTF-8"?>'
+    ++ '<D:propfind xmlns:D="DAV:"><D:allprop/></D:propfind>';
+io.print("concatlen:", #xml);
+io.print("haspropfind:", ..string.find(xml, "propfind") != null);
+
+// '++' on the same line still works
+var a = "x" ++ "y";
+io.print("inline:", a);
+
+// a chain across several lines
+var b = "1"
+    ++ "2"
+    ++ "3";
+io.print("chain:", b);
+
+// '..' at line start is the root accessor, and must not be eaten as concat
+var abs = ..math.abs(-5);
+io.print("root-access:", abs);
+var c = "p" ++ "q";
+io.print("after-root:", c);
+
+// '++' as a postfix increment statement still works
+var i = 0;
+i++;
+i++;
+io.print("postfix:", i);
