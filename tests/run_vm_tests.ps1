@@ -117,6 +117,10 @@ if ($projOk -and $t49Selected) {
     }
 }
 Write-Host "== $pass passed, $fail failed =="
-if ($srvProc -and -not $srvProc.HasExited) { $srvProc.Kill() }
+# _srv.py spawns a child, so killing the wrapper PID alone can leave a
+# listener behind; kill the whole tree by PID.
+if ($srvProc -and -not $srvProc.HasExited) {
+    & taskkill /PID $srvProc.Id /T /F 2>$null | Out-Null
+}
 if ($fail -gt 0) { exit 1 }
 exit 0

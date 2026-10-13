@@ -1,0 +1,38 @@
+// M13: comment-string — a block comment immediately right of an
+// assignment operator `=` IS a string literal, not a comment
+// (docs/language-reference/datatype/string.md §4). Its body is real data
+// (CSS/SQL/HTML). Delimiter star counts must match, newlines normalize to
+// CRLF, the blank line adjacent to the stars is dropped, and no escapes
+// are processed. Getting this wrong makes `var x = /** ... **/` parse as a
+// comment, leaving the assignment with no initializer.
+var css = /**
+body{margin:0}
+div{padding:1px}
+**/
+io.print("len:", #css);
+io.print("hasbody:", ..string.find(css, "body") != null);
+io.print("hasdiv:", ..string.find(css, "div") != null);
+
+// exact content: the first blank line right after the opening stars is
+// dropped, line endings normalize to CRLF, and no escapes are processed.
+// Compared with a single-quoted (escape-processing) string.
+var want = 'body{margin:0}\r\ndiv{padding:1px}';
+io.print("exact:", css == want);
+
+// single line form
+var one = /**abc**/
+io.print("one:", one);
+
+// matching star count with three stars
+var three = /***x***/
+io.print("three:", three);
+
+// a plain /* comment */ right of '=' still behaves as a comment
+var n = 5 /* not a string */;
+io.print("plain:", n);
+
+// a standalone block comment is still just a comment
+/**
+this is a comment, not assigned anywhere
+**/
+io.print("standalone:ok");
