@@ -118,6 +118,22 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     Exists(LibCand(relT, false, L"nodio")) ||
                     Exists(LibCand(relT, true, L"aardio")) ||
                     Exists(LibCand(relT, true, L"nodio"));
+                // 0) engine-provided modules with no backing file
+                if (n->names.size() == 1)
+                {
+                    auto itN = namedModules.find(n->names[0]);
+                    if (itN != namedModules.end())
+                        return itN->second;
+                }
+                static bool bDbgI = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
+                if (bDbgI)
+                {
+                    wstring full2;
+                    for (size_t i = 0; i < n->names.size(); ++i) { if (i) full2 += L"."; full2 += n->names[i]; }
+                    fwprintf(stderr, L"[IMPORT] %s inRoots=%d anyFile=%d\n", full2.c_str(),
+                             (int)roots.count(n->names[0]), (int)bAnyFile);
+                    fflush(stderr);
+                }
                 if (roots.count(n->names[0]) &&
                     !embedded.count(relT + L".aardio") &&
                     !embedded.count(relT + L"\\_.aardio") &&

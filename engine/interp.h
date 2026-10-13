@@ -25,6 +25,9 @@ namespace NodioVM
         std::set<int> breakpoints;      // armed lines
         std::unordered_map<wstring, Value> roots;    // string/math/io/...
         std::unordered_map<wstring, Value> modules;  // import cache by path
+        // engine-provided modules with no backing file, keyed by the name
+        // passed to import (aardio's "(debug)" introspection module)
+        std::unordered_map<wstring, Value> namedModules;
         wstring baseDir;                             // import file resolution
         std::unordered_map<wstring, wstring> embedded;   // payload v2 files
 

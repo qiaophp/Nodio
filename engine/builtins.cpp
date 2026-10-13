@@ -3659,6 +3659,84 @@ void Interp::InitBuiltins()
             globals.vars[L"_HAPPICON"] = Value::Pointer_(LoadIconW(nullptr, IDI_APPLICATION));
             globals.vars[L"_INVALID_HANDLE_VALUE"] = Value::Pointer_(INVALID_HANDLE_VALUE);
 
+            // ---- global namespace + VM introspection (Phase 3) ----
+            // debug/_.aardio opens with global.import("(debug)"), so `global`
+            // must resolve to a table carrying a runtime import entry.
+            {
+                Value fnGlobalImport = NF([this](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::Str)
+                        return Value();
+                    PNode n = std::make_shared<Node>();
+                    n->k = Node::Import;
+                    n->names.push_back(BStr(a[0]));
+                    return this->DoImport(n, &globals);
+                });
+                auto gtab = std::make_shared<Table>();
+                gtab->map[L"import"] = fnGlobalImport;
+                // In aardio `global` is not a namespace of its own: global.x
+                // reads/writes the ROOT (::) namespace. builtin/io.aardio
+                // opens with `self.io = global.io;`, so a plain table here
+                // would wipe the io namespace at the moment it is read.
+                auto gmeta = std::make_shared<Table>();
+                gmeta->map[L"_get"] = NF([this](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::Str)
+                        return Value();
+                    const wstring k = a[0].s;
+                    auto it = roots.find(k);
+                    if (it != roots.end())
+                        return it->second;
+                    auto ig = globals.vars.find(k);
+                    if (ig != globals.vars.end())
+                        return ig->second;
+                    return Value();
+                });
+                gmeta->map[L"_set"] = NF([this](vector<Value>& a) -> Value {
+                    if (a.size() < 2 || a[0].t != Value::Str)
+                        return Value();
+                    globals.vars[a[0].s] = a[1];
+                    roots[a[0].s] = a[1];
+                    return Value();
+                });
+                gtab->map[L"_meta"] = Value::Table_(gmeta);
+                roots[L"global"] = Value::Table_(gtab);
+                globals.vars[L"global"] = Value::Table_(gtab);
+
+                // ---- the (debug) introspection module ----
+                auto dbg = std::make_shared<Table>();
+                // debug.queryinfo(level,[what]) — console's test runner and
+                // debug/_.aardio read source.src / currentline from it
+                dbg->map[L"queryinfo"] = NF([](vector<Value>& a) -> Value {
+                    wstring what = a.size() > 1 ? BStr(a[1]) : L"";
+                    auto tb = std::make_shared<Table>();
+                    int lvl = a.empty() ? 1 : (int)BNum(a[0]);
+                    auto src = std::make_shared<Table>();
+                    src->map[L"src"] = Value::Str_(L"");
+                    src->map[L"currentline"] = Value::Num_((double)lvl);
+                    tb->map[L"source"] = Value::Table_(src);
+                    tb->map[L"currentline"] = Value::Num_((double)lvl);
+                    tb->map[L"name"] = Value::Str_(L"");
+                    tb->map[L"function"] = Value();
+                    tb->map[L"upvars"] = Value::Table_(std::make_shared<Table>());
+                    tb->map[L"activelines"] =
+                        Value::Table_(std::make_shared<Table>());
+                    (void)what;
+                    return Value::Table_(tb); });
+                // debug.traceback([msg],[title],[level]) — console.error uses
+                // it to append a stack trace
+                dbg->map[L"traceback"] = NF([](vector<Value>& a) -> Value {
+                    wstring msg = a.empty() ? L"" : BStr(a[0]);
+                    return Value::Str_(msg); });
+                dbg->map[L"callcount"] = NF([](vector<Value>&) -> Value {
+                    return Value::Num_(0.0); });
+                dbg->map[L"hook"] = NF([](vector<Value>&) -> Value {
+                    return Value::Table_(std::make_shared<Table>()); });
+                dbg->map[L"open"] = NF([](vector<Value>&) -> Value {
+                    return Value(); });
+                dbg->map[L"close"] = NF([](vector<Value>&) -> Value {
+                    return Value(); });
+                namedModules[L"(debug)"] = Value::Table_(dbg);
+            }
+
             // ---- fibers (纤程): create / resume / yield / status ----
             globals.vars[L"create"] = NF([](vector<Value>& a) -> Value {
                 return a.empty() ? Value() : FiberCreate(a[0]); });

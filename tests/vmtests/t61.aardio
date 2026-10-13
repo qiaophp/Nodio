@@ -1,0 +1,15 @@
+// t61: `global` must proxy the ROOT (::) namespace, not be a namespace of
+// its own.
+//
+// builtin/io.aardio opens with `self.io = global.io;`. If `global` were a
+// plain table, that read would yield null and wipe the io namespace; the
+// remaining `import builtin.*` statements of builtin/_.aardio then stop
+// silently, ::RECT is never defined, and gdi / win.ui fail with
+// "运行错误: 尝试调用非函数值 (.RECT)".
+io.print("str:" .. type(global.string));
+io.print("io:" .. type(global.io));
+
+// writes through `global` land in the root namespace
+global.marker = 123;
+io.print("set:" .. tostring(marker));
+io.print("get:" .. tostring(global.marker));

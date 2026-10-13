@@ -1,0 +1,4 @@
+str:table
+io:table
+set:123
+get:123
