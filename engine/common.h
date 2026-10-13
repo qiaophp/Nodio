@@ -684,4 +684,26 @@ namespace NodioVM
                   const std::unordered_map<wstring, wstring>* pEmbedded,
                   bool bDebug, const wstring* pBreakLines);
 
+    // Resolve an aardio '~'-rooted path to a real disk path. '~' is the
+    // aardio install root: the parent of NODIO_LIBDIR when set (dev/F5),
+    // otherwise the running exe's own directory (a published app). The
+    // library loads bundled DLLs as raw.loadDll("~\lib\...") — resolving
+    // '~' to the exe dir alone misses them.
+    inline wstring ResolveTildeDisk(const wstring& strPath)
+    {
+        if (strPath.empty() || strPath[0] != L'~') return strPath;
+        wstring rel = strPath.substr(1);
+        while (!rel.empty() && (rel[0] == L'\\' || rel[0] == L'/'))
+            rel = rel.substr(1);
+        wstring root = EmbedRoot();
+        if (root.empty())
+        {
+            wchar_t szExe[MAX_PATH] = L"";
+            GetModuleFileNameW(nullptr, szExe, MAX_PATH);
+            wchar_t* p = wcsrchr(szExe, L'\\');
+            if (p) *p = 0;
+            root = szExe;
+        }
+        return rel.empty() ? root : root + L"\\" + rel;
+    }
 }

@@ -289,7 +289,9 @@ namespace NodioVM
                      rt == L"struct") out->ret = ARPtr;
             else if (rt == L"int" || rt == L"long" || rt == L"dword" ||
                      rt == L"uint") out->ret = ARInt;
-            else return false;
+            // a custom type name in the return slot (py2's "pyObject(...)")
+            // is an opaque machine word — treat it as a pointer
+            else out->ret = ARPtr;
         }
         out->bCdecl = tail.find(L"cdecl") != wstring::npos ||
                       tail.find(L"CDECL") != wstring::npos;
@@ -307,7 +309,11 @@ namespace NodioVM
             {
                 bool bRef = false;
                 int p = ApiTypeOf(t, &bRef);
-                if (p < 0) return false;
+                // aardio api signatures may name custom types (a struct or
+                // opaque handle, e.g. py2's "PyObject o"). They are passed
+                // as a machine word, so treat an unknown type as a pointer
+                // rather than rejecting the whole signature.
+                if (p < 0) p = 5;   // ARPtr
                 out->params.push_back(p | (bRef ? 0x100 : 0));
             }
             pos = comma + 1;

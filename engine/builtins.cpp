@@ -646,21 +646,9 @@ void Interp::InitBuiltins()
                     }
                     if (!bHit)
                     {
-                        // aardio "~" = the exe's own directory (published
-                        // res/ also exist on disk during F5 debugging)
-                        wstring strPath = BStr(a[0]);
-                        if (!strPath.empty() && strPath[0] == L'~')
-                        {
-                            strPath = strPath.substr(1);
-                            if (!strPath.empty() &&
-                                (strPath[0] == L'\\' || strPath[0] == L'/'))
-                                strPath = strPath.substr(1);
-                            wchar_t szExe[MAX_PATH];
-                            GetModuleFileNameW(nullptr, szExe, MAX_PATH);
-                            wchar_t* szCut = wcsrchr(szExe, L'\\');
-                            if (szCut) *szCut = 0;
-                            strPath = wstring(szExe) + L"\\" + strPath;
-                        }
+                        // aardio "~" = the aardio install root (parent of
+                        // NODIO_LIBDIR when set, else the exe's directory)
+                        wstring strPath = ResolveTildeDisk(BStr(a[0]));
                         FILE* pf = nullptr;
                         if (_wfopen_s(&pf, strPath.c_str(), L"rb") != 0 ||
                             !pf)
@@ -724,18 +712,7 @@ void Interp::InitBuiltins()
                             (key != p && g_interpCurrent->embedded.count(p)))
                             return Value::Bool_(true);
                     }
-                    if (!strPath.empty() && strPath[0] == L'~')
-                    {
-                        strPath = strPath.substr(1);
-                        if (!strPath.empty() &&
-                            (strPath[0] == L'\\' || strPath[0] == L'/'))
-                            strPath = strPath.substr(1);
-                        wchar_t szExe[MAX_PATH];
-                        GetModuleFileNameW(nullptr, szExe, MAX_PATH);
-                        wchar_t* szCut = wcsrchr(szExe, L'\\');
-                        if (szCut) *szCut = 0;
-                        strPath = wstring(szExe) + L"\\" + strPath;
-                    }
+                    strPath = ResolveTildeDisk(strPath);
                     return Value::Bool_(
                         _waccess(strPath.c_str(), 0) == 0); });
                 tb->map[L"writeFile"] = NF([](vector<Value>& a) {
@@ -1044,7 +1021,8 @@ void Interp::InitBuiltins()
                                 strArg[1] == L'Z' &&
                                 strArg.find(L'\0') != wstring::npos;
                             if (!bLooksMapped)
-                                hMod = LoadLibraryW(strArg.c_str());
+                                hMod = LoadLibraryW(
+                                    ResolveTildeDisk(strArg).c_str());
                             if (!hMod && bLooksMapped)
                             {
                                 void* pMemMod = nullptr;
