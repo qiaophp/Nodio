@@ -966,17 +966,30 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             }
             if (op == L"++")
                 return Value::Str_(ToStringM(l) + ToStringM(r));  // aardio concat
-            if (op == L"+" && l.t == Value::Str && r.t == Value::Str)
+            // aardio: '+' concatenates whenever either operand is a
+            // non-numeric string, or a string meets a non-string
+            // (docs/operator/concat.md: "引号前后的 + 将自动转换为字符串
+            // 连接运算符 ++"). A numeric string plus a number stays
+            // arithmetic, matching the documented '1 + "2"' -> 3.
+            if (op == L"+")
             {
-                // aardio: arithmetic on two non-numeric strings is an error,
-                // string concat is '++' (or the compat '..' above)
-                wchar_t* e1 = nullptr, *e2 = nullptr;
-                wcstod(l.s.c_str(), &e1);
-                wcstod(r.s.c_str(), &e2);
-                if ((e1 && *e1) || (e2 && *e2))
+                bool bLStr = l.t == Value::Str, bRStr = r.t == Value::Str;
+                if (bLStr || bRStr)
                 {
-                    (*err) = L"运行错误: 字符串连接请使用 ++ 运算符";
-                    return Value();
+                    auto numeric = [](const wstring& s) -> bool {
+                        if (s.empty()) return false;
+                        wchar_t* e = nullptr;
+                        wcstod(s.c_str(), &e);
+                        return e && !*e;
+                    };
+                    bool bLN = bLStr && numeric(l.s);
+                    bool bRN = bRStr && numeric(r.s);
+                    // arithmetic when both sides are numeric (a number, or
+                    // a fully numeric string); concat otherwise
+                    bool bLNum = !bLStr || bLN;
+                    bool bRNum = !bRStr || bRN;
+                    if (!(bLNum && bRNum))
+                        return Value::Str_(ToStringM(l) + ToStringM(r));
                 }
             }
             double a = ToNum(l), b = ToNum(r);
