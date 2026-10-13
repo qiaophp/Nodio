@@ -25,7 +25,7 @@ Decisions locked with the project owner:
      blobs (original opcode encodings remain unrecovered).
 
 ## Phase 1 — engine (this repo)
-- [x] Tree-walking interpreter, 53-test regression suite green (x86 + x64)
+- [x] Tree-walking interpreter, 55-test regression suite green (x86 + x64)
 - [x] MFC-free extraction (`engine/` + console `host/`)
 - [x] x64 callback trampoline rewrite (shadow-slot spill + XMM save,
       RCX=ctx contract) — fixes the 0xC0000005 in EnumChildWindows-style
@@ -52,17 +52,29 @@ Decisions locked with the project owner:
 - [x] Raw-string doubled-quote escape (`` `a``b` `` → ``a`b``, `"a""b"`)
 - [x] `union` members in `class` with forward class references
 - [x] API/struct type aliases (`ustr`, `bstr`, `ptr`, `lpcstr`, ...)
+- [x] Comment string: a block comment right of `=` IS a string literal
+      (`var css = /** ... **/`, docs/datatype/string.md §4) — star counts
+      must match, CRLF normalization, blank edge lines dropped
+- [x] Leading-`++` line continuation for long SQL/XML assembly, while a
+      leading `..` stays the root-namespace accessor
 
-### Library import coverage (measured, 51 top-level namespaces)
+### Library parse coverage (measured over all 869 official `.aardio` files)
+| arch | parsing | note |
+|---|---|---|
+| x64 | **830 / 869 = 95.5%** | `NODIO_CHECK` batch parse sweep |
+| x86 | **830 / 869 = 95.5%** | identical |
+
+### Library import coverage (51 top-level namespaces)
 | arch | importing | note |
 |---|---|---|
 | x64 | **40 / 51** | remaining are runtime-environment or arch limits |
 | x86 | **43 / 51** | |
 
-The 8 namespaces that still fail on x86 are all environmental, not engine
-defects: `System`/`java`/`dotNet` need a .NET/JVM runtime, `py2`/`py3`
-need a Python install, `nodeJs`/`golang` need the external binaries, and
-`debug`/`ide` need the not-yet-built VM introspection API and IDE shell.
+The namespaces that still fail are environmental, not engine defects:
+`System`/`java`/`dotNet` need a .NET/JVM runtime, `py2`/`py3` need a Python
+install, `nodeJs`/`golang` need the external binaries, `base64`/`sqlite`/
+`zlib` ship 32-bit-only DLLs (OS limit on x64), and `debug`/`ide` need the
+not-yet-built VM introspection API and IDE shell.
 
 ## Phase 2 — publisher (this repo, `publish/`)
 - [x] Binary-safe payload embedder + `.aproj` embed/ignored/local rules
