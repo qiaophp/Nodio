@@ -1,0 +1,55 @@
+// M12: numeric for-loop forms. The engine only accepted the fully
+// parenthesized C-style form, so the unparenthesized spelling the official
+// library uses ('for x=x1;x2;step {' — mouse/_.aardio) failed to parse,
+// an empty condition slot ('for(i=0;;i++)') was rejected outright, and a
+// variable step ('step') never advanced the loop variable (infinite loop).
+// Also covers the postfix ++/-- step slot and the ++= compound concat.
+var out = "";
+
+// literal step, parenthesized
+var s = "";
+for (i = 1; 5; 2) s ++= i;
+io.print("lit:", s);
+
+// negative literal step counts down
+s = "";
+for (i = 10; 1; -2) s ++= i;
+io.print("neg:", s);
+
+// i++ step (postfix in the step slot)
+s = "";
+for (i = 0; i < 3; i++) s ++= i;
+io.print("postfix:", s);
+
+// 2-expr form: for(i=n;limit) counts n..limit
+s = "";
+for (i = 1; 4) s ++= i;
+io.print("twoexpr:", s);
+
+// variable step, unparenthesized — the library's own spelling
+var x1 = 1, x2 = 7, step = 2;
+s = "";
+for x = x1; x2; step { s ++= x; }
+io.print("varstep:", s);
+
+// empty condition slot runs until break
+s = "";
+for (i = 0; ; i++) { if (i > 2) break; s ++= i; }
+io.print("emptycond:", s);
+
+// ++= / --= compound concat (used by autos/ and string builders)
+var t = "a";
+t ++= "b";
+t ++= "c";
+io.print("concat:", t);
+
+// postfix ++ as a standalone statement still works
+var n = 0;
+n++;
+n++;
+io.print("postfix-alone:", n);
+
+// nested loops
+var cnt = 0;
+for (a = 0; a < 3; a++) { for (b = 0; b < 3; b++) { cnt++; } }
+io.print("nested:", cnt);

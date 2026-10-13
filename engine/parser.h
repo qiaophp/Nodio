@@ -532,7 +532,8 @@ namespace NodioVM
             bInAssignLhs = false;
             const wchar_t* ops[] = { L"=", L"::=", L":=", L"+=", L"-=",
                                      L"*=", L"/=", L"%=", L"^=", L"|=",
-                                     L"&=", L"^^=", L"<<=", L">>=", nullptr };
+                                     L"&=", L"^^=", L"<<=", L">>=",
+                                     L"++=", L"--=", nullptr };
             for (int k = 0; ops[k]; k++)
             {
                 if (Peek().t == TPunct && Peek().text == ops[k])
@@ -545,10 +546,16 @@ namespace NodioVM
                     return asg;
                 }
             }
+            // postfix ++/-- : the operator follows an expression that is
+            // already parsed. It is a statement on its own, so it must be
+            // followed by a terminator — newline, EOF, ';', '}', or the
+            // ')' that closes a for(...) step slot / a call argument list.
             if ((IsPunct(L"++") || IsPunct(L"--")) && Peek(1).t != TEnd &&
                 (Peek(1).t == TNL || Peek(1).t == TEnd ||
                  (Peek(1).t == TPunct && (Peek(1).text == L";" ||
-                                          Peek(1).text == L"}"))))
+                                          Peek(1).text == L"}" ||
+                                          Peek(1).text == L")" ||
+                                          Peek(1).text == L","))))
             {
                 p++;   // consume the postfix operator
                 PNode asg = New(Node::Assign);
@@ -998,19 +1005,28 @@ namespace NodioVM
                 return n;
             }
             // numeric: for(i=1;cond;step){} — step/cond may be omitted;
-            // 2-expr form for(i=n;limit) counts n..limit (1 if limit<n)
+            // 2-expr form for(i=n;limit) counts n..limit (1 if limit<n).
+            // The parens are optional in the numeric form too: the library
+            // writes 'for x=x1;x2;step { ... }' (mouse/_.aardio).
             PNode n = New(Node::ForNum);
-            if (!paren)
-                Expect(L"(");
+            if (!paren && IsPunct(L"("))
+            {
+                p++;
+                paren = true;
+            }
             n->a = ParseStatement();     // init (assign)
             if (EatPunct(L";")) { /* optional */ }
             SkipNL();
-            n->b = ParseExpr();          // cond
+            // the condition slot may be empty: for(i=0;;i++) runs forever
+            if (!IsPunct(L";") && !IsPunct(L")"))
+                n->b = ParseExpr();      // cond
             if (EatPunct(L";")) { /* optional */ }
             SkipNL();
             if (!IsPunct(L")"))
                 n->c = ParseStatement(); // step (may be absent)
-            Expect(L")");
+            // the unparenthesized form has no closing paren to consume
+            if (paren)
+                Expect(L")");
             n->names.push_back(L"limit");  // tag: middle is a limit
             n->d = ParseBody();
             return n;
@@ -1289,11 +1305,15 @@ namespace NodioVM
         {
             PNode l = ParseAdd();
             // aardio postfix 'expr++' (increment statement): when '++' is
-            // followed by a statement end it binds to the left expr, not concat
+            // followed by a statement/argument end it binds to the left
+            // expr, not concat. ')' and ',' matter for the for(...) step
+            // slot and call argument lists.
            if ((IsPunct(L"++") || IsPunct(L"--")) &&
                 (Peek(1).t == TNL || Peek(1).t == TEnd ||
                  (Peek(1).t == TPunct && (Peek(1).text == L";" ||
-                                          Peek(1).text == L"}"))))
+                                          Peek(1).text == L"}" ||
+                                          Peek(1).text == L")" ||
+                                          Peek(1).text == L","))))
                 return l;
             if (IsPunct(L"..") || IsPunct(L"++"))
             {

@@ -1530,25 +1530,45 @@ Value Interp::Exec(const PNode& n, Env* env)
             case Node::ForNum:
             {
                 Exec(n->a, env);
+                // The "limit" tag means the middle slot is a plain numeric
+                // bound (the 2-expr form 'for i=1;4' or the descending
+                // 'for i=#t;1;-1'), not a boolean condition. Distinguish
+                // them by the condition's shape: a comparison Bin is a
+                // real condition and must be evaluated as written —
+                // treating 'a<3' as a limit collapses it to 1/0 and the
+                // loop exits an iteration early.
+                bool bCmpCond = n->b && n->b->k == Node::Bin &&
+                    (n->b->str == L"==" || n->b->str == L"!=" ||
+                     n->b->str == L"<"  || n->b->str == L">" ||
+                     n->b->str == L"<=" || n->b->str == L">=" ||
+                     n->b->str == L"===" || n->b->str == L"!==");
                 bool bLimitForm = n->names.size() > 0 &&
-                                  n->names[0] == L"limit";
+                                  n->names[0] == L"limit" && n->b &&
+                                  !bCmpCond;
                 double dStep = 1;
-                if (n->c && n->c->k == Node::ExprStmt && n->c->a &&
-                    n->c->a->k == Node::Num)
-                    dStep = n->c->a->num;
                 int nDir = 1;
                 if (n->a && n->a->k == Node::Assign && n->a->a &&
                     n->a->a->k == Node::Ident)
                 {
                     Value* pv = env->Find(n->a->a->str);
-                    Value lim = Eval(n->b, env);
+                    Value lim = n->b ? Eval(n->b, env) : Value();
                     if (pv && pv->t == Value::Num && lim.t == Value::Num)
                     {
                         nDir = BNum(*pv) > BNum(lim) ? -1 : 1;
                     }
                 }
-                if (n->c && n->c->k == Node::ExprStmt && n->c->a &&
-                    n->c->a->k == Node::Un && n->c->a->str == L"-")
+                // A literal numeric step ("for i=1;10;2") is folded; anything
+                // else (a variable, i++, i+=2) is executed as a statement
+                // AFTER the body — but the loop variable must still advance,
+                // so a non-literal step is applied as an explicit +=.
+                bool bNumStep = n->c && n->c->k == Node::ExprStmt &&
+                                n->c->a && n->c->a->k == Node::Num;
+                bool bUnaryStep = n->c && n->c->k == Node::ExprStmt &&
+                                  n->c->a && n->c->a->k == Node::Un &&
+                                  n->c->a->str == L"-";
+                if (bNumStep)
+                    dStep = n->c->a->num;
+                else if (bUnaryStep)
                 {
                     dStep = -BNum(Eval(n->c->a->a, env));
                     nDir = -1;
@@ -1556,6 +1576,8 @@ Value Interp::Exec(const PNode& n, Env* env)
                 if (!n->c)
                     dStep = (double)nDir;   // 2-expr form: derived step
                 auto bContinue = [&]() -> bool {
+                    if (!n->b)
+                        return true;        // empty condition slot: forever
                     if (!bLimitForm)
                         return Eval(n->b, env).Truthy();
                     if (n->a && n->a->k == Node::Assign &&
@@ -1577,18 +1599,39 @@ Value Interp::Exec(const PNode& n, Env* env)
                     if (nBreak) { nBreak--; break; }
                     if (nContinue) nContinue--;
                     if (nReturn) return r;
-                    bool bNumStep = n->c && n->c->k == Node::ExprStmt &&
-                                    n->c->a && n->c->a->k == Node::Num;
-                    if (n->c && !bNumStep)
-                        Exec(n->c, env);
-                    else if (n->a && n->a->k == Node::Assign &&
-                             n->a->a && n->a->a->k == Node::Ident)
+                    // A literal numeric step (or a bare -N) is applied to
+                    // the loop variable directly. A bare identifier step
+                    // (`for x=x1;x2;step`) is the step VALUE, not a
+                    // statement — evaluate it and advance. Everything else
+                    // (i++, i+=2) already mutates the variable itself.
+                    bool bIdentStep = n->c && n->c->k == Node::ExprStmt &&
+                                      n->c->a && n->c->a->k == Node::Ident;
+                    if (bNumStep || bUnaryStep || bIdentStep)
                     {
+                        if (bIdentStep)
+                        {
+                            Value vS = Eval(n->c->a, env);
+                            if (vS.t == Value::Num) dStep = vS.n;
+                        }
+                        if (n->a && n->a->k == Node::Assign && n->a->a &&
+                            n->a->a->k == Node::Ident)
+                        {
+                            Value* pv = env->Find(n->a->a->str);
+                            if (pv && pv->t == Value::Num)
+                                *pv = Value::Num_(pv->n + dStep);
+                        }
+                    }
+                    else if (n->c)
+                    {
+                        Exec(n->c, env);
+                    }
+                    else if (n->a && n->a->k == Node::Assign && n->a->a &&
+                             n->a->a->k == Node::Ident)
+                    {
+                        // 2-expr form: no step slot, derive from direction
                         Value* pv = env->Find(n->a->a->str);
                         if (pv && pv->t == Value::Num)
-                        {
                             *pv = Value::Num_(pv->n + dStep);
-                        }
                     }
                 }
                 return Value();
