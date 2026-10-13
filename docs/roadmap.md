@@ -25,7 +25,7 @@ Decisions locked with the project owner:
      blobs (original opcode encodings remain unrecovered).
 
 ## Phase 1 — engine (this repo)
-- [x] Tree-walking interpreter, 55-test regression suite green (x86 + x64)
+- [x] Tree-walking interpreter, 56-test regression suite green (x86 + x64)
 - [x] MFC-free extraction (`engine/` + console `host/`)
 - [x] x64 callback trampoline rewrite (shadow-slot spill + XMM save,
       RCX=ctx contract) — fixes the 0xC0000005 in EnumChildWindows-style
@@ -61,8 +61,8 @@ Decisions locked with the project owner:
 ### Library parse coverage (measured over all 869 official `.aardio` files)
 | arch | parsing | note |
 |---|---|---|
-| x64 | **830 / 869 = 95.5%** | `NODIO_CHECK` batch parse sweep |
-| x86 | **830 / 869 = 95.5%** | identical |
+| x64 | **837 / 869 = 96.3%** | `NODIO_CHECK` batch parse sweep |
+| x86 | **837 / 869 = 96.3%** | identical |
 
 ### Library import coverage (51 top-level namespaces)
 | arch | importing | note |
