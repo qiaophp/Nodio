@@ -1015,12 +1015,17 @@ namespace NodioVM
                 paren = true;
             }
             n->a = ParseStatement();     // init (assign)
-            if (EatPunct(L";")) { /* optional */ }
+            // slot separators: ';' normally. A dialect spells all three
+            // slots with commas — 'for(i=1,len,1)' (fsys/aar.aardio,
+            // dotNet/_.aardio). Accept ',' where ';' was expected.
+            if (!EatPunct(L";"))
+                EatPunct(L",");
             SkipNL();
             // the condition slot may be empty: for(i=0;;i++) runs forever
-            if (!IsPunct(L";") && !IsPunct(L")"))
+            if (!IsPunct(L";") && !IsPunct(L",") && !IsPunct(L")"))
                 n->b = ParseExpr();      // cond
-            if (EatPunct(L";")) { /* optional */ }
+            if (!EatPunct(L";"))
+                EatPunct(L",");
             SkipNL();
             if (!IsPunct(L")"))
                 n->c = ParseStatement(); // step (may be absent)

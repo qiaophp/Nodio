@@ -20,17 +20,30 @@ namespace NodioVM
         wstring w = t.substr(k, e - k);
         if (w == L"int" || w == L"long" || w == L"dword" || w == L"uint")
             return 0;
-        if (w == L"int64" || w == L"longlong") return 1;
-        if (w == L"word") return 2;
-        if (w == L"byte") return 3;
-        if (w == L"bool" || w == L"boolean") return 4;
+        if (w == L"int64" || w == L"longlong" || w == L"i64" ||
+            w == L"longlong" || w == L"qword")
+            return 1;
+        if (w == L"word" || w == L"ushort" || w == L"short" || w == L"wchar")
+            return 2;
+        if (w == L"byte" || w == L"uchar" || w == L"char" || w == L"int8")
+            return 3;
+        if (w == L"bool" || w == L"boolean")
+            return 4;
         if (w == L"addr" || w == L"ptr" || w == L"pointer" ||
-            w == L"handle") return 5;
-        if (w == L"str" || w == L"strb" || w == L"string") return 6;
-        if (w == L"wstr" || w == L"ustring") return 7;
-        if (w == L"struct") return 8;
-        if (w == L"float") return 9;
-        if (w == L"double") return 10;
+            w == L"handle" || w == L"hwnd" || w == L"hkey" ||
+            w == L"lpvoid")
+            return 5;
+        if (w == L"str" || w == L"strb" || w == L"string" || w == L"lpcstr")
+            return 6;
+        if (w == L"wstr" || w == L"ustring" || w == L"ustr" ||
+            w == L"lpwstr" || w == L"bstr")
+            return 7;
+        if (w == L"struct")
+            return 8;
+        if (w == L"float")
+            return 9;
+        if (w == L"double")
+            return 10;
         return -1;
     }
 
@@ -409,15 +422,18 @@ namespace NodioVM
         wstring t = type;
         for (auto& c : t) c = towlower(c);
         if (arrCount <= 0) arrCount = 1;
-        if (t == L"byte") return 1 * arrCount;
-        if (t == L"word") return 2 * arrCount;
+        if (t == L"byte" || t == L"uchar" || t == L"char" || t == L"int8") return 1 * arrCount;
+        if (t == L"word" || t == L"ushort" || t == L"short" || t == L"wchar") return 2 * arrCount;
         if (t == L"int" || t == L"uint" || t == L"long" || t == L"dword" || t == L"bool") return 4 * arrCount;
-        if (t == L"int64" || t == L"uint64" || t == L"long64") return 8 * arrCount;
+        if (t == L"int64" || t == L"uint64" || t == L"long64" || t == L"i64" || t == L"qword") return 8 * arrCount;
         if (t == L"float") return 4 * arrCount;
         if (t == L"double") return 8 * arrCount;
-        if (t == L"ustring") return bIsArray ? (2 * arrCount) : (int)sizeof(void*);
-        if (t == L"string" || t == L"str") return bIsArray ? (1 * arrCount) : (int)sizeof(void*);
-        if (t == L"pointer" || t == L"ptr" || t == L"addr") return (int)sizeof(void*) * arrCount;
+        if (t == L"ustring" || t == L"ustr" || t == L"wstr" || t == L"bstr")
+            return bIsArray ? (2 * arrCount) : (int)sizeof(void*);
+        if (t == L"string" || t == L"str" || t == L"strb" || t == L"lpcstr")
+            return bIsArray ? (1 * arrCount) : (int)sizeof(void*);
+        if (t == L"pointer" || t == L"ptr" || t == L"addr" || t == L"handle")
+            return (int)sizeof(void*) * arrCount;
         return 4 * arrCount;
     }
 
@@ -558,7 +574,7 @@ namespace NodioVM
                     }
                 }
             }
-            else if (t == L"ustring")
+            else if (t == L"ustring" || t == L"ustr" || t == L"wstr" || t == L"bstr")
             {
                 if (f.bIsArray)
                 {
@@ -581,7 +597,7 @@ namespace NodioVM
                         *(void**)(buf + off) = nullptr;
                 }
             }
-            else if (t == L"string" || t == L"str")
+            else if (t == L"string" || t == L"str" || t == L"strb" || t == L"lpcstr")
             {
                 if (f.bIsArray)
                 {
@@ -660,7 +676,7 @@ namespace NodioVM
                     StructDeserialize(iv->second, buf + off);
                 }
             }
-            else if (t == L"ustring")
+            else if (t == L"ustring" || t == L"ustr" || t == L"wstr" || t == L"bstr")
             {
                 if (f.bIsArray)
                 {
@@ -676,7 +692,7 @@ namespace NodioVM
                         vTab.tab->map[f.name] = Value::Str_(wstring(pw));
                 }
             }
-            else if (t == L"string" || t == L"str")
+            else if (t == L"string" || t == L"str" || t == L"strb" || t == L"lpcstr")
             {
                 if (f.bIsArray)
                 {
