@@ -342,6 +342,44 @@ namespace NodioVM
                             EatPunct(L";");
                             continue;
                         }
+                        // union member: 'union name = { struct x = Cls(); }'
+                        // declares an overlapping sub-struct. The inner
+                        // initializer references classes that may be
+                        // declared later in the file (mouse/_.aardio), so
+                        // it must be stored as a table literal, not
+                        // evaluated at definition time.
+                        if (Peek().t == TIdent && Peek().text == L"union" &&
+                            Peek(1).t == TIdent)
+                        {
+                            p++;                       // 'union'
+                            wstring strUName = Next().text;
+                            structDesc += L"union " + strUName + L";";
+                            PNode keyU = New(Node::Str);
+                            keyU->str = strUName;
+                            n->a->list.push_back(keyU);
+                            if (EatPunct(L"="))
+                            {
+                                // keep the sub-struct table unevaluated:
+                                // build the value lazily via a function so
+                                // forward class references resolve at use
+                                PNode fnU = New(Node::FuncLit);
+                                PNode bodyU = New(Node::Block);
+                                PNode retU = New(Node::Return);
+                                retU->a = ParseExpr();
+                                bodyU->list.push_back(retU);
+                                fnU->a = bodyU;
+                                n->a->list.push_back(fnU);
+                            }
+                            else
+                            {
+                                n->a->list.push_back(New(Node::NullK));
+                            }
+                            SkipNL();
+                            EatPunct(L";");
+                            EatPunct(L",");
+                            SkipNL();
+                            continue;
+                        }
                         // round M2: struct member declaration
                         //   int h;  WORD name[32];  int x = 5;
                         if (Peek().t == TIdent && IsStructType(Peek().text) &&
