@@ -74,8 +74,9 @@ namespace NodioVM
             // strings
             if (c == L'"' || c == L'`')
             {
-                // aardio raw string: 双引号 = 原样字符串，不处理转义符
-                // (original docs: "\" is a literal backslash; `...` same)
+                // aardio raw string: 双引号/反引号 = 原样字符串，不处理反斜杠
+                // 转义 (docs/datatype/string.md)。但两个连续的同类引号表示
+                // 该引号自身，所以 "a""b" 是 a"b，`a``b` 是 a`b。
                 wchar_t q = c;
                 i++;
                 wstring s;
@@ -83,6 +84,17 @@ namespace NodioVM
                 {
                     if (src[i] == L'\n') line++;
                     s += src[i++];
+                }
+                // a doubled quote is an escaped literal quote, not the end
+                while (i + 1 < n && src[i] == q && src[i + 1] == q)
+                {
+                    s += q;
+                    i += 2;
+                    while (i < n && src[i] != q)
+                    {
+                        if (src[i] == L'\n') line++;
+                        s += src[i++];
+                    }
                 }
                 i++;  // closing quote
                 if (i < n && src[i] == L'#')

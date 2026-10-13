@@ -127,9 +127,13 @@ namespace NodioVM
         static const wchar_t* const kTypes[] = {
             L"int", L"INT", L"uint", L"UINT", L"byte", L"BYTE", L"word", L"WORD",
             L"dword", L"DWORD", L"long", L"LONG", L"int64", L"INT64", L"uint64", L"UINT64", L"long64",
-            L"pointer", L"PTR", L"addr", L"ADDR", L"ustring",
+            L"pointer", L"PTR", L"ptr", L"PTR", L"addr", L"ADDR", L"ustring",
             L"string", L"bool", L"BOOL", L"float", L"FLOAT", L"double", L"DOUBLE",
-            L"struct", nullptr };
+            L"struct", L"ustr", L"bstr", L"wstr", L"lpcstr", L"lpwstr",
+            L"short", L"SHORT", L"ushort", L"USHORT", L"wchar", L"char", L"CHAR",
+            L"uchar", L"UCHAR", L"int8", L"i64", L"qword", L"handle",
+            L"hwnd", L"hkey", L"lpvoid", L"strb",
+            nullptr };
         for (int k = 0; kTypes[k]; k++)
             if (w == kTypes[k]) return true;
         return false;
