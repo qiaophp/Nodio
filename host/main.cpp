@@ -79,6 +79,20 @@ static void WriteStderrUtf8(const std::wstring& s)
     fputc('\n', stderr);
 }
 
+// stdout plumbing, also UTF-8 (used by the syntax-check sweep)
+static void WriteStdoutUtf8(const std::wstring& s)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
+                                nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return;
+    std::vector<char> buf((size_t)n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
+                        buf.data(), n, nullptr, nullptr);
+    fwrite(buf.data(), 1, (size_t)n, stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
 static void EnsureConsole(bool bForce)
 {
     if (!GetConsoleWindow() &&
@@ -95,6 +109,56 @@ static void EnsureConsole(bool bForce)
 
 int wmain(int argc, wchar_t** argv)
 {
+    // NODIO_CHECK=<listfile>: parse-only sweep for coverage measurement.
+    // The list file holds one .aardio path per line; each is lexed and
+    // parsed (no execution) and reported as "OK <path>" / "FAIL <path> <err>".
+    wchar_t szCheckList[MAX_PATH];
+    if (GetEnvironmentVariableW(L"NODIO_CHECK", szCheckList, MAX_PATH) > 0)
+    {
+        bool bOk = false;
+        std::wstring lst = ReadFileUtf8ToWide(szCheckList, &bOk);
+        if (!bOk)
+        {
+            WriteStderrUtf8(L"无法读取清单: " + std::wstring(szCheckList));
+            return 2;
+        }
+        size_t nOk = 0, nFail = 0;
+        size_t pos = 0;
+        while (pos <= lst.size())
+        {
+            size_t nl = lst.find(L'\n', pos);
+            if (nl == std::wstring::npos) nl = lst.size();
+            std::wstring line = lst.substr(pos, nl - pos);
+            pos = nl + 1;
+            while (!line.empty() &&
+                   (line.back() == L'\r' || line.back() == L' '))
+                line.pop_back();
+            if (line.empty()) continue;
+            bool bF = false;
+            std::wstring src = ReadFileUtf8ToWide(line.c_str(), &bF);
+            if (!bF)
+            {
+                nFail++;
+                WriteStdoutUtf8(L"FAIL " + line + L" <unreadable>");
+                continue;
+            }
+            std::wstring se;
+            if (NodioVM::CheckSyntax(src, &se) != 0)
+            {
+                nFail++;
+                WriteStdoutUtf8(L"FAIL " + line + L" " + se);
+            }
+            else
+            {
+                nOk++;
+                WriteStdoutUtf8(L"OK " + line);
+            }
+        }
+        WriteStdoutUtf8(L"== check " + std::to_wstring(nOk) + L" ok, " +
+                        std::to_wstring(nFail) + L" fail ==");
+        return nFail ? 1 : 0;
+    }
+
     // NODIO_RUN regression / F5 harness
     wchar_t szRunFile[MAX_PATH];
     if (GetEnvironmentVariableW(L"NODIO_RUN", szRunFile, MAX_PATH) > 0)
