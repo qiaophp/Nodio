@@ -815,9 +815,14 @@ namespace NodioVM
                 SkipNL();
                 if (!IsKw(L"elseif")) break;
                 p++;
-                Expect(L"(");
+                // parens are optional: 'elseif cond {' (inet/file.aardio)
+                // as well as 'elseif (cond) {'
+                bool bElseParen = EatPunct(L"(");
                 n->c->list.push_back(ParseExpr());
-                Expect(L")");
+                // the condition may span lines with the ')' on its own
+                // line (key/ime.stateBar.aardio), so skip newlines first
+                SkipNL();
+                if (bElseParen) Expect(L")");
                 n->c->list.push_back(ParseBody());
                 while (EatPunct(L";")) {}
                 SkipNL();

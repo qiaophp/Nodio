@@ -246,6 +246,12 @@ namespace NodioVM
                     out.push_back({ TNum, std::to_wstring((long long)val), val, line });
                     continue;
                 }
+                // a trailing lowercase 'u' marks a UTF-16 (ustring) string
+                // (docs/datatype/string.md). Values are already wide, so
+                // just consume the marker and emit the string token.
+                if (i < n && src[i] == L'u' &&
+                    !(i + 1 < n && IsIdentChar(src[i + 1])))
+                    i++;
                 out.push_back({ TStr, s, 0, line });
                 continue;
             }
