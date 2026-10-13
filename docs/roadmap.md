@@ -25,7 +25,7 @@ Decisions locked with the project owner:
      blobs (original opcode encodings remain unrecovered).
 
 ## Phase 1 — engine (this repo)
-- [x] Tree-walking interpreter, 52-test regression suite green (x86 + x64)
+- [x] Tree-walking interpreter, 53-test regression suite green (x86 + x64)
 - [x] MFC-free extraction (`engine/` + console `host/`)
 - [x] x64 callback trampoline rewrite (shadow-slot spill + XMM save,
       RCX=ctx contract) — fixes the 0xC0000005 in EnumChildWindows-style
@@ -36,14 +36,33 @@ Decisions locked with the project owner:
 - [x] x64 struct `cbSize` auto-sync (WNDCLASSEX 48→80) + dangling-pointer
       fix in `StructSerialize`
 - [x] UTF-8 byte-string value model (`#s` = bytes, `s[1]` = byte code)
-- [x] Real-library import gate: `win`, `win.ui`, `gdi`, `gdip`, `sqlite`,
-      `JSON` parse clean end-to-end
 - [x] x64 `winform.add` named-argument table (`name={cls;text;left;top;
       right;bottom}`) — was a 7-positional-arg signature that crashed x64
 - [x] `arg` varargs binding (the engine bound `...` only) + empty-varargs
       reads as null so `if(!...)` recursion guards terminate
 - [x] Memory DLL loading: `$"path"` binary inline + manual PE mapper
       (TLS callbacks unsupported, matching aardio's own limitation)
+- [x] Numeric `for`: optional parens, empty condition slot, variable /
+      postfix / comma-separated step slots, `++=` concat assignment
+- [x] Falsy coalescing `:` (`0 : 123` → 123) + multiline `or` operands
+- [x] `raw` primitive namespace completed (`len`/`uint`/`topointer`/
+      `tostring`/`copy`/`concat`/`realloc`/`equal`/...) — `builtin/raw.aardio`
+      and `gdip` depend on these
+- [x] `+` string concatenation per the docs (non-numeric operand → concat)
+- [x] Raw-string doubled-quote escape (`` `a``b` `` → ``a`b``, `"a""b"`)
+- [x] `union` members in `class` with forward class references
+- [x] API/struct type aliases (`ustr`, `bstr`, `ptr`, `lpcstr`, ...)
+
+### Library import coverage (measured, 51 top-level namespaces)
+| arch | importing | note |
+|---|---|---|
+| x64 | **40 / 51** | remaining are runtime-environment or arch limits |
+| x86 | **43 / 51** | |
+
+The 8 namespaces that still fail on x86 are all environmental, not engine
+defects: `System`/`java`/`dotNet` need a .NET/JVM runtime, `py2`/`py3`
+need a Python install, `nodeJs`/`golang` need the external binaries, and
+`debug`/`ide` need the not-yet-built VM introspection API and IDE shell.
 
 ## Phase 2 — publisher (this repo, `publish/`)
 - [x] Binary-safe payload embedder + `.aproj` embed/ignored/local rules
@@ -53,6 +72,8 @@ Decisions locked with the project owner:
       assertions (x64 + x86 green)
 
 ## Phase 3 — IDE shell (`ide/`, WTL + Scintilla)
+- [ ] VM introspection API for `(debug)` (`callcount`/`queryinfo`/`hook`/
+      `getlocalvar`/`traceback`) — blocks `import debug`
 - [ ] Tabbed MDI frame, docking panes (project tree / output console)
 - [ ] Scintilla integrated with a custom aardio lexer (UTF-8 native)
 - [ ] Real-time run/debug output plumbing over the `NODIO_*` contract
