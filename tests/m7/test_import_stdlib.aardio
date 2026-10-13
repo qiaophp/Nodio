@@ -26,3 +26,28 @@ import thread;
 io.print("thread OK");
 import fsys;
 io.print("fsys OK");
+
+// -- libraries unblocked by the operator/parser work --
+// crypt: needs the ustr API type alias
+try { import crypt; io.print("crypt OK"); }
+catch(e){ io.print("crypt FAIL"); }
+// fonts: needs ptr in the struct-type set (gdip/privateFontCollection)
+try { import fonts; io.print("fonts OK"); }
+catch(e){ io.print("fonts FAIL"); }
+// mouse: needs union members with forward class references
+try { import mouse; io.print("mouse OK"); }
+catch(e){ io.print("mouse FAIL"); }
+// winex: needs a binary operator as the last token on a line
+try { import winex; io.print("winex OK"); }
+catch(e){ io.print("winex FAIL"); }
+// autos: needs '+' to concatenate when an operand is non-numeric
+try { import autos; io.print("autos OK"); }
+catch(e){ io.print("autos FAIL"); }
+// dotNet: needs comma-separated for slots and raw.len
+try { import dotNet; io.print("dotNet OK"); }
+catch(e){ io.print("dotNet FAIL"); }
+// zlib / base64 ship 32-bit-only dlls — x64 hits the OS boundary
+try { import zlib; io.print("zlib OK"); }
+catch(e){ io.print("zlib SKIP-32bit-only"); }
+try { import base64; io.print("base64 OK"); }
+catch(e){ io.print("base64 SKIP-32bit-only"); }

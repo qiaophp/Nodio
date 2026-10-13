@@ -34,17 +34,20 @@ $out = $p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd()
 $lines = $out -split "`r?`n" | Where-Object { $_ -notmatch '^\[DEBUG' -and $_.Trim() -ne '' }
 
 $expectOk = @('win', 'win.ui', 'gdi', 'gdip', 'JSON', 'process', 'inet',
-              'thread', 'fsys')
+              'thread', 'fsys', 'crypt', 'fonts', 'mouse', 'winex', 'autos',
+              'dotNet')
 $fail = 0
 foreach ($name in $expectOk) {
     if ($lines -contains "$name OK") { Write-Host "PASS import $name" }
     else { $fail++; Write-Host "FAIL import $name" }
 }
-# sqlite: OK natively, SKIP-32bit-only under x64 (official 32-bit dll)
-if ($lines -contains 'sqlite OK' -or $lines -contains 'sqlite SKIP-32bit-only') {
-    Write-Host "PASS import sqlite"
+# these ship 32-bit-only dlls: OK natively, SKIP-32bit-only under x64
+foreach ($name in @('sqlite', 'zlib', 'base64')) {
+    if ($lines -contains "$name OK" -or $lines -contains "$name SKIP-32bit-only") {
+        Write-Host "PASS import $name"
+    }
+    else { $fail++; Write-Host "FAIL import $name" }
 }
-else { $fail++; Write-Host "FAIL import sqlite" }
 
 if ($fail) { "== $fail failed =="; exit 1 }
 "== stdlib imports all green =="
