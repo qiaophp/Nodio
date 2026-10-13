@@ -1,0 +1,5 @@
+elseif-multiline:ok
+elseif-noparen:ok
+ustring:5hello
+ctor-multiline:5
+fn-multiline:6

@@ -1,0 +1,44 @@
+// M15: if-family and parameter-list forms the official library uses.
+//  - elseif with a multi-line condition whose ')' is on its own line
+//  - elseif without parentheses
+//  - a trailing lowercase 'u' marking a UTF-16 (ustring) literal
+//  - a parameter list split across lines with a LEADING comma
+var a = false, b = 1, c = 1, d = 1;
+
+// multi-line elseif condition, ')' on its own line
+if (a) {
+}
+elseif ((!a) ||
+    ( b == 1 && (c != 3) && (d == 4) )
+    ) {
+    io.print("elseif-multiline:ok");
+}
+
+// elseif without parentheses
+if (a) {
+}
+elseif 1 != 2 {
+    io.print("elseif-noparen:ok");
+}
+
+// trailing 'u' on a single-quoted literal
+var s = 'hello'u;
+io.print("ustring:", #s, s);
+
+// class ctor with a leading-comma, multi-line parameter list
+class Adder {
+    ctor( x
+        ,y = 10
+        ,z
+        ){
+        this.sum = x + y;
+    }
+}
+var inst = Adder(5);
+io.print("ctor-multiline:", inst.sum);
+
+// the same shape on a plain function
+var fn = function( p
+    ,q = 5
+    ){ return p + q; }
+io.print("fn-multiline:", fn(1));

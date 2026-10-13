@@ -645,14 +645,20 @@ namespace NodioVM
                 {
                     // aardio default params: function(a, b=1, c="x") — the
                     // default expression is evaluated at call time when the
-                    // argument is missing
+                    // argument is missing. The list may be split across
+                    // lines with a LEADING comma (fsys/file.aardio's ctor),
+                    // so skip newlines before testing for ','.
                     fn->names.push_back(ExpectIdent());
+                    SkipNL();
                     if (EatPunct(L"="))
                         fn->defaults.push_back(ParseExpr());
                     else
                         fn->defaults.push_back(nullptr);
-                    while (EatPunct(L","))
+                    while (true)
                     {
+                        SkipNL();
+                        if (!EatPunct(L","))
+                            break;
                         SkipNL();
                         if (IsPunct(L"..."))
                         {
@@ -662,6 +668,7 @@ namespace NodioVM
                             break;
                         }
                         fn->names.push_back(ExpectIdent());
+                        SkipNL();
                         if (EatPunct(L"="))
                             fn->defaults.push_back(ParseExpr());
                         else
@@ -669,6 +676,7 @@ namespace NodioVM
                     }
                 }
             }
+            SkipNL();
             Expect(L")");
             SkipNL();
             if (IsPunct(L"{"))
