@@ -122,7 +122,7 @@ int wmain(int argc, wchar_t** argv)
             WriteStderrUtf8(L"无法读取清单: " + std::wstring(szCheckList));
             return 2;
         }
-        size_t nOk = 0, nFail = 0;
+        size_t nOk = 0, nFail = 0, nCompiled = 0;
         size_t pos = 0;
         while (pos <= lst.size())
         {
@@ -143,7 +143,15 @@ int wmain(int argc, wchar_t** argv)
                 continue;
             }
             std::wstring se;
-            if (NodioVM::CheckSyntax(src, &se) != 0)
+            if (NodioVM::IsCompiledModule(src))
+            {
+                // '=aardio' + bytecode: a compiled module, not source text
+                // (lib/ide/aifix.aardio ships this way). Source syntax does
+                // not apply, so it is counted separately from parse failures.
+                nCompiled++;
+                WriteStdoutUtf8(L"COMPILED " + line);
+            }
+            else if (NodioVM::CheckSyntax(src, &se) != 0)
             {
                 nFail++;
                 WriteStdoutUtf8(L"FAIL " + line + L" " + se);
@@ -155,7 +163,8 @@ int wmain(int argc, wchar_t** argv)
             }
         }
         WriteStdoutUtf8(L"== check " + std::to_wstring(nOk) + L" ok, " +
-                        std::to_wstring(nFail) + L" fail ==");
+                        std::to_wstring(nFail) + L" fail, " +
+                        std::to_wstring(nCompiled) + L" compiled ==");
         return nFail ? 1 : 0;
     }
 

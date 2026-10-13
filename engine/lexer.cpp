@@ -22,123 +22,101 @@ namespace NodioVM
             if (c == L'\n') { out.push_back({ TNL, L"", 0, line++ }); i++; continue; }
             if (c == L' ' || c == L'\t') { i++; continue; }
             // comments
+            bool bRightOfAssign = false;
+            {
+                size_t b = out.size();
+                while (b > 0 && out[b - 1].t == TNL) b--;
+                if (b > 0 && out[b - 1].t == TPunct &&
+                    (out[b - 1].text == L"=" || out[b - 1].text == L":="))
+                    bRightOfAssign = true;
+            }
             if (c == L'/' && i + 1 < n && src[i + 1] == L'/')
             {
+                // 注释字符串 (docs/datatype/string.md §4): a '//' comment
+                // immediately right of '=' IS a raw single-line string —
+                // everything to the end of the line, no escapes, no CR/LF.
+                if (bRightOfAssign)
+                {
+                    size_t e = i + 2;
+                    while (e < n && src[e] != L'\n' && src[e] != L'\r') e++;
+                    out.push_back({ TStr, src.substr(i + 2, e - i - 2), 0, line });
+                    i = e;
+                    continue;
+                }
                 while (i < n && src[i] != L'\n') i++;
                 continue;
             }
             if (c == L'/' && i + 1 < n && src[i + 1] == L'*')
             {
-                // count the opening star run after '/': '/**' -> 2,
-                // '/*******' -> 7. nStars==1 is a plain '/*' comment.
+                // Block comment delimited by star-count matching: 块注释首尾
+                // 标记的星号数目必须相同 (docs/datatype/string.md §4). The
+                // closing run must carry EXACTLY the opening count. That is
+                // what lets the shipped libraries nest '/*_ERR_XXX*/'-style
+                // inline comments inside a '/*** … ***/' block, and what makes
+                // '/**intellisense(...)' blocks end at '**/' rather than at
+                // the first inner '*/'.
                 size_t k = 1;
                 while (i + k < n && src[i + k] == L'*') k++;
                 size_t nStars = k - 1;
-
-                // aardio comment string (docs/datatype/string.md §4): a
-                // block comment immediately right of an assignment operator
-                // IS a string literal — its body is real data (CSS/SQL/HTML),
-                // not a comment. The delimiter star counts must match;
-                // newlines normalize to CRLF; the blank line adjacent to the
-                // opening/closing stars is dropped; no escapes are processed.
-                bool bAssign = false;
+                if (i + k < n && src[i + k] == L'/')
                 {
-                    size_t b = out.size();
-                    while (b > 0 && out[b - 1].t == TNL) b--;
-                    if (b > 0 && out[b - 1].t == TPunct &&
-                        (out[b - 1].text == L"=" || out[b - 1].text == L":="))
-                        bAssign = true;
+                    // '/*' + stars + '/' with nothing between: an empty
+                    // comment ('/**/' / '/*/'); the trailing star closes it.
+                    i += k + 1;
+                    continue;
                 }
-                if (bAssign && nStars >= 2)
+                size_t s = i + k;                 // content start
+                size_t j = s, endPos = wstring::npos;
+                while (j + nStars + 1 <= n)
                 {
-                    size_t s = i + k;                 // content start
-                    size_t j = s, endPos = wstring::npos;
-                    while (j + nStars + 1 <= n)
+                    if (src[j] != L'*') { j++; continue; }
+                    size_t q = j;
+                    while (q < n && src[q] == L'*') q++;
+                    if (q - j == nStars && q < n && src[q] == L'/')
+                    { endPos = j; break; }
+                    j = q;
+                }
+                size_t e = (endPos == wstring::npos)
+                               ? n : (endPos + nStars + 1);
+                if (bRightOfAssign && endPos != wstring::npos)
+                {
+                    // 注释字符串: the body is real data (CSS/SQL/HTML), not a
+                    // comment. Newlines normalize to CRLF; the blank line
+                    // hugging the opening/closing stars is dropped; escapes
+                    // are not processed.
+                    wstring content = src.substr(s, endPos - s);
+                    if (!content.empty() && content[0] == L'\n')
+                        content.erase(0, 1);
+                    else if (content.size() >= 2 && content[0] == L'\r' &&
+                             content[1] == L'\n')
+                        content.erase(0, 2);
+                    while (!content.empty() &&
+                           (content.back() == L' ' ||
+                            content.back() == L'\t'))
+                        content.pop_back();
+                    if (!content.empty() && content.back() == L'\n')
                     {
-                        if (src[j] != L'*') { j++; continue; }
-                        size_t q = j;
-                        while (q < n && src[q] == L'*') q++;
-                        if (q - j >= nStars && q < n && src[q] == L'/')
-                        { endPos = q - nStars; break; }
-                        j = q;
-                    }
-                    if (endPos != wstring::npos)
-                    {
-                        wstring content = src.substr(s, endPos - s);
-                        // drop the blank first line right after the stars
-                        if (!content.empty() && content[0] == L'\n')
-                            content.erase(0, 1);
-                        else if (content.size() >= 2 &&
-                                 content[0] == L'\r' && content[1] == L'\n')
-                            content.erase(0, 2);
-                        // drop trailing blanks + the blank line before */ 
-                        while (!content.empty() &&
-                               (content.back() == L' ' ||
-                                content.back() == L'\t'))
+                        content.pop_back();
+                        if (!content.empty() && content.back() == L'\r')
                             content.pop_back();
-                        if (!content.empty() && content.back() == L'\n')
-                        {
-                            content.pop_back();
-                            if (!content.empty() && content.back() == L'\r')
-                                content.pop_back();
-                        }
-                        wstring norm;      // normalize line endings to CRLF
-                        norm.reserve(content.size());
-                        for (size_t q = 0; q < content.size(); q++)
-                        {
-                            if (content[q] == L'\r') continue;
-                            if (content[q] == L'\n') { norm += L"\r\n"; continue; }
-                            norm += content[q];
-                        }
-                        size_t e = endPos + nStars + 1;
-                        for (size_t q = i; q < e && q < n; q++)
-                            if (src[q] == L'\n') line++;
-                        i = e;
-                        out.push_back({ TStr, norm, 0, line });
-                        continue;
                     }
-                }
-
-                i += 2;
-                // '/**intellisense()' doc blocks (shipped lib convention):
-                // bodies contain '*/' (e.g. __/*param*/), so they end only
-                // at the literal terminator 'end intellisense' + '**/'
-                // '/**intellisense(...)' (two stars) = doc block ending at
-                // 'end intellisense'; '/*intellisense(::)*/' = normal block
-                size_t iStar = i;
-                while (iStar < n && src[iStar] == L'*') iStar++;
-                // '/**word(...)' doc blocks (intellisense/details/...)
-                // contain plain '*/' inside; they end at 'end word**/'
-                bool bDoc = (iStar > i && iStar < n &&
-                             src[iStar] >= L'a' && src[iStar] <= L'z');
-                if (bDoc)
-                {
-                    size_t wLen = 0;
-                    while (iStar + wLen < n &&
-                           ((src[iStar + wLen] >= L'a' &&
-                             src[iStar + wLen] <= L'z') ||
-                            src[iStar + wLen] == L'_')) wLen++;
-                    std::wstring word = src.substr(iStar, wLen);
-                    std::wstring endMark = L"end " + word;
-                    while (i + (int)endMark.size() < n)
+                    wstring norm;      // normalize line endings to CRLF
+                    norm.reserve(content.size());
+                    for (size_t q = 0; q < content.size(); q++)
                     {
-                        if (src[i] == L'\n') line++;
-                        if (src[i] == L'e' &&
-                            src.compare(i, (int)endMark.size(),
-                                        endMark.c_str(),
-                                        (int)endMark.size()) == 0)
-                            break;
-                        i++;
+                        if (content[q] == L'\r') continue;
+                        if (content[q] == L'\n') { norm += L"\r\n"; continue; }
+                        norm += content[q];
                     }
-                    while (i + 1 < n && !(src[i] == L'*' && src[i + 1] == L'/'))
-                    { if (src[i] == L'\n') line++; i++; }
+                    for (size_t q = i; q < e && q < n; q++)
+                        if (src[q] == L'\n') line++;
+                    i = e;
+                    out.push_back({ TStr, norm, 0, line });
+                    continue;
                 }
-                else
-                {
-                    while (i + 1 < n && !(src[i] == L'*' && src[i + 1] == L'/'))
-                    { if (src[i] == L'\n') line++; i++; }
-                }
-                i += 2;
+                for (size_t q = i; q < e && q < n; q++)
+                    if (src[q] == L'\n') line++;
+                i = e;
                 continue;
             }
             // strings

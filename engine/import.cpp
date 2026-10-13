@@ -360,7 +360,14 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 MultiByteToWideChar(CP_UTF8, 0, raw.data() + off,
                                     (int)(raw.size() - off), &src[0], w);
             wstring modErr;
-            vector<Tok> toks = Lex(src, &modErr);
+            vector<Tok> toks;
+            if (IsCompiledModule(src))
+            {
+                (*err) = L"库 " + file +
+                    L" 是已编译模块 (字节码)，当前版本不支持加载";
+                return Value();
+            }
+            toks = Lex(src, &modErr);
             Parser ps{ toks, 0, &modErr };
             {
                 size_t sl = file.find_last_of(L"\\/");

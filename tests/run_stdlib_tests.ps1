@@ -28,8 +28,12 @@ $psi.EnvironmentVariables['NODIO_LIBDIR'] = $LibDir
 $psi.EnvironmentVariables['NODIO_PAUSE'] = '0'
 
 $p = [System.Diagnostics.Process]::Start($psi)
-if (-not $p.WaitForExit(60000)) { $p.Kill() }
-$out = $p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd()
+# drain both pipes before waiting (see run_vm_tests.ps1): otherwise a child
+# blocked on a full pipe stalls, and a killed process can lose output.
+$outTask = $p.StandardOutput.ReadToEndAsync()
+$errTask = $p.StandardError.ReadToEndAsync()
+if (-not $p.WaitForExit(60000)) { $p.Kill(); $p.WaitForExit(5000) }
+$out = $outTask.Result + $errTask.Result
 # drop parser debug chatter, keep assertion lines
 $lines = $out -split "`r?`n" | Where-Object { $_ -notmatch '^\[DEBUG' -and $_.Trim() -ne '' }
 

@@ -36,4 +36,8 @@ namespace NodioVM
     // Parse-only syntax check (the F8 编译 command, FUN_0048fee0 family):
     // 0 = clean, -1 = syntax error (strError filled, includes line number).
     int CheckSyntax(const std::wstring& src, std::wstring* strError);
+
+    // A module file that begins with '=aardio' is compiled bytecode, not
+    // source text (lib/ide/aifix.aardio ships this way).
+    bool IsCompiledModule(const std::wstring& src);
 }

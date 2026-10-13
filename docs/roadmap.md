@@ -25,7 +25,7 @@ Decisions locked with the project owner:
      blobs (original opcode encodings remain unrecovered).
 
 ## Phase 1 — engine (this repo)
-- [x] Tree-walking interpreter, 56-test regression suite green (x86 + x64)
+- [x] Tree-walking interpreter, 57-test regression suite green (x86 + x64)
 - [x] MFC-free extraction (`engine/` + console `host/`)
 - [x] x64 callback trampoline rewrite (shadow-slot spill + XMM save,
       RCX=ctx contract) — fixes the 0xC0000005 in EnumChildWindows-style
@@ -52,29 +52,60 @@ Decisions locked with the project owner:
 - [x] Raw-string doubled-quote escape (`` `a``b` `` → ``a`b``, `"a""b"`)
 - [x] `union` members in `class` with forward class references
 - [x] API/struct type aliases (`ustr`, `bstr`, `ptr`, `lpcstr`, ...)
-- [x] Comment string: a block comment right of `=` IS a string literal
-      (`var css = /** ... **/`, docs/datatype/string.md §4) — star counts
-      must match, CRLF normalization, blank edge lines dropped
+- [x] Comment string: a comment right of `=` IS a string literal
+      (`var css = /** ... **/`, `= //line`, docs/datatype/string.md §4)
+- [x] Star-count-matched block comments: `/*** … ***/` may contain
+      `/*_ERR*/`-style inline comments without closing early, and
+      `/**intellisense(…) … **/` ends at its own `**/` rather than the
+      first inner `*/` (`inet/errorMessage`, `autos/skills`, `dotNet/v2`)
+- [x] Keywords are names: `namespace class{…}`, `import java.class;`,
+      `class java.object` (`java/*`)
+- [x] Implicit table argument: `f( name = v; ["k"] = v2 )` — the shipped
+      lib passes named tables through the argument list without braces
+- [x] Statement labels (`EACH:`) and `break LABEL` / `continue LABEL`
+- [x] Multi-target assign with holes and root-qualified targets
+      (`files,,dirs = …`, `..response,..request,..session = …`)
+- [x] `lambda`/`λ` body, `while` without parens, `if(` before a break,
+      `? :` / `&&` / `||` / `|` / `<` operands on the next line
+- [x] `=aardio` compiled bytecode modules are detected and reported as a
+      format error rather than a bogus syntax error (`ide/aifix.aardio`)
 - [x] Leading-`++` line continuation for long SQL/XML assembly, while a
       leading `..` stays the root-namespace accessor
+- [x] `io.exist(path,mode)` returns the **absolute path** (null when
+      missing), not a boolean — the library idiom
+      `io.exist(p) : fallback` only works because the truthy result IS the
+      path (`zlib`/`golang`/`nodeJs`/`py2`/`py3` resolve bundled DLLs so)
+- [x] `io.fullpath` honours the aardio path conventions (`~…` exe root,
+      `/…` `\…` app root, `//…` drive root, `\\…` UNC → null) instead of
+      collapsing every rooted path to the working directory
+- [x] `io.remove(path)` file deletion (the library calls it; it was absent)
 
 ### Library parse coverage (measured over all 869 official `.aardio` files)
 | arch | parsing | note |
 |---|---|---|
-| x64 | **837 / 869 = 96.3%** | `NODIO_CHECK` batch parse sweep |
-| x86 | **837 / 869 = 96.3%** | identical |
+| x64 | **868 / 868 source files (100%)** | `NODIO_CHECK` batch parse sweep; 1 file is `=aardio` bytecode, not source |
+| x86 | **868 / 868 source files (100%)** | identical |
 
-### Library import coverage (51 top-level namespaces)
+### Library import coverage (50 top-level namespaces)
 | arch | importing | note |
 |---|---|---|
-| x64 | **40 / 51** | remaining are runtime-environment or arch limits |
-| x86 | **43 / 51** | |
+| x64 | **41 / 50** | remainder: 32-bit-only DLLs, `global.import`/`(debug)` introspection |
+| x86 | **44 / 50** | same module set, minus the x64 arch limit |
 
-The namespaces that still fail are environmental, not engine defects:
-`System`/`java`/`dotNet` need a .NET/JVM runtime, `py2`/`py3` need a Python
-install, `nodeJs`/`golang` need the external binaries, `base64`/`sqlite`/
-`zlib` ship 32-bit-only DLLs (OS limit on x64), and `debug`/`ide` need the
-not-yet-built VM introspection API and IDE shell.
+The remainder is specific, not vague — and the earlier "environmental
+ceiling" claim was wrong: it hid real engine defects (`~` path resolution,
+the `io.exist` return contract, custom API types).
+
+| namespace | cause | next step |
+|---|---|---|
+| `base64`, `sqlite`, `zlib` | bundle 32-bit-only DLLs | OS limit on x64; all three import on x86 |
+| `golang`, `nodeJs` | x64: chain reaches the 32-bit `zlibwapi.dll`; x86: missing primitive | add the missing primitive |
+| `py2`, `py3` | x64: 32-bit `python27/38.dll` (OS limit); x86: missing primitive at `_.aardio:141` | add the missing primitive |
+| `System` | `dotNet.import(...)` — no CLR host | needs the CLR hosting layer |
+| `debug`, `ide` | `global.import("(debug)")` — no VM introspection API | Phase 3 |
+
+Current state in one line: **source parsing 100%**, **import 44/50 (x86) /
+41/50 (x64)**, residue enumerated above.
 
 ## Phase 2 — publisher (this repo, `publish/`)
 - [x] Binary-safe payload embedder + `.aproj` embed/ignored/local rules

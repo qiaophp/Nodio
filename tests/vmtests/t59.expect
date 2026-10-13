@@ -1,0 +1,8 @@
+exist-type:string
+exist-same:yes
+missing:null
+dir-default:path
+dir-mode4:null
+badarg:null
+emptyarg:null
+gone:null

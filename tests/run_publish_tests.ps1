@@ -34,8 +34,11 @@ $psi.EnvironmentVariables['NODIO_LIBDIR'] = 'D:\aardio\lib'
 $psi.EnvironmentVariables['NODIO_PAUSE'] = '0'
 
 $p = [System.Diagnostics.Process]::Start($psi)
-$stdout = $p.StandardOutput.ReadToEnd()
+# drain both pipes before waiting (see run_vm_tests.ps1)
+$pubTask = $p.StandardOutput.ReadToEndAsync()
+$pubErrTask = $p.StandardError.ReadToEndAsync()
 $p.WaitForExit()
+$stdout = $pubTask.Result + $pubErrTask.Result
 
 if (-not (Test-Path $out)) {
     "FAIL publish: output exe not created"
@@ -53,8 +56,10 @@ $run.RedirectStandardError = $true
 $run.StandardOutputEncoding = [Text.Encoding]::UTF8
 $run.StandardErrorEncoding = [Text.Encoding]::UTF8
 $r = [System.Diagnostics.Process]::Start($run)
-$out2 = $r.StandardOutput.ReadToEnd()
+$runTask = $r.StandardOutput.ReadToEndAsync()
+$runErrTask = $r.StandardError.ReadToEndAsync()
 $r.WaitForExit()
+$out2 = $runTask.Result + $runErrTask.Result
 
 $lines = $out2 -split "`r?`n" | Where-Object { $_ -ne '' }
 $want = @(

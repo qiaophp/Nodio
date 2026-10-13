@@ -60,8 +60,12 @@ Get-ChildItem $tests -Filter 't??.aardio' | Sort-Object Name | ForEach-Object {
         $p.StandardInput.Write((Get-Content $stdinFile -Raw -Encoding UTF8))
         $p.StandardInput.Close()
     }
-    if (-not $p.WaitForExit(20000)) { $p.Kill() }
-    $out = ($p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd())
+    # start draining both pipes before waiting: a child blocked on a full
+    # pipe would never exit, and a timed-out kill can drop buffered output
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(20000)) { $p.Kill(); $p.WaitForExit(5000) }
+    $out = ($outTask.Result + $errTask.Result)
     $out = $out -replace "`r", '' -replace "`n", ''
     $expect = (Get-Content $expectFile -Raw -Encoding UTF8)
     $expect = $expect -replace "`r", '' -replace "`n", ''
@@ -90,8 +94,10 @@ if ($projOk -and $t49Selected) {
         (Join-Path $projDir 'main.aardio')
     $psi.EnvironmentVariables['NODIO_PAUSE'] = '0'
     $p = [System.Diagnostics.Process]::Start($psi)
-    if (-not $p.WaitForExit(30000)) { $p.Kill() }
-    $pubOut = ($p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd())
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(30000)) { $p.Kill(); $p.WaitForExit(5000) }
+    $pubOut = ($outTask.Result + $errTask.Result)
     $exePath = Join-Path $projDir 'dist\t49app.exe'
     if (Test-Path $exePath) {
         $psi2 = New-Object System.Diagnostics.ProcessStartInfo
@@ -103,8 +109,10 @@ if ($projOk -and $t49Selected) {
         $psi2.StandardErrorEncoding = [Text.Encoding]::UTF8
         $psi2.EnvironmentVariables['NODIO_PAUSE'] = '0'
         $p2 = [System.Diagnostics.Process]::Start($psi2)
-        if (-not $p2.WaitForExit(20000)) { $p2.Kill() }
-        $out = ($p2.StandardOutput.ReadToEnd() + $p2.StandardError.ReadToEnd())
+        $outTask2 = $p2.StandardOutput.ReadToEndAsync()
+        $errTask2 = $p2.StandardError.ReadToEndAsync()
+        if (-not $p2.WaitForExit(20000)) { $p2.Kill(); $p2.WaitForExit(5000) }
+        $out = ($outTask2.Result + $errTask2.Result)
         $out = $out -replace "`r", '' -replace "`n", ''
         $expect = (Get-Content $expectFile -Raw -Encoding UTF8)
         $expect = $expect -replace "`r", '' -replace "`n", ''

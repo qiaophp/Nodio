@@ -1,0 +1,92 @@
+// t58: syntax forms the official library relies on.
+// Each block is a form found in shipped lib code (see docs/roadmap.md).
+import string;
+
+// 1. 注释字符串 (docs/datatype/string.md §4): a comment immediately right of
+//    '=' IS a string. Star counts of the two markers must match.
+var css = /*
+#c { color: red; }
+*/
+io.print("css:" ++ #css ++ ":" ++ css);
+
+var line = //raw single line string
+io.print("line:" ++ line);
+
+// 2. star-matched block comment: the inner '/*_x*/' must not close it
+/***
+[1/*_inner*/] = "a";
+***/
+io.print("stars:ok");
+
+// 3. implicit table argument: f( name = v; ["k"] = v )
+var sum = 0;
+var mk = function(k){
+	for(nm, v in k) sum = sum + v;
+	return k;
+};
+var t = mk( a = 1; ["b"] = 2 );
+io.print("tabarg:" ++ sum ++ (t["b"] : 0));
+
+// 4. statement label + break LABEL (lib/protobuf/parser/lex.aardio)
+var k = 0;
+for(i = 1; 5; 1){ LOOP:
+	k = k + i;
+	if(k > 5) break LOOP;
+}
+io.print("label:" ++ k);
+
+// 5. multi-target assign with a hole; the hole consumes a return value
+var f3 = function(){ return 1, 2, 3; };
+var x, , z = f3();
+io.print("holes:" ++ x ++ "," ++ z);
+
+// 6. while without parens
+var w = 0;
+while w < 3 {
+	w = w + 1;
+}
+io.print("while:" ++ w);
+
+// 7. lambda: body may start on the next line
+var add = lambda(a, b)
+	a + b;
+io.print("lambda:" ++ add(2, 3));
+
+// 8. ternary: branches may start on the next line
+var cond = 1;
+var pick = cond ?
+	"yes"
+	: "no";
+io.print("ternary:" ++ pick);
+
+// 9. a binary operator may start the next line
+var flags = 0x10
+	| 0x01
+	| 0x02;
+io.print("bitor:" ++ flags);
+
+var fallback = false
+	|| "fallback";
+io.print("orline:" ++ fallback);
+
+var both = 1
+	&& 2;
+io.print("andline:" ++ both);
+
+// 10. table pair with a string key and a logical value
+var te = { "error": null || "fallback" };
+io.print("tblcol:" ++ (te["error"] : "?"));
+
+// 11. if-condition continuation after the if-( closer
+var neg = -1;
+if(neg) < 0 io.print("ifcont:yes");
+else io.print("ifcont:no");
+
+// 12. newline after 'if(' and after the boolean operator
+var big = 5;
+if(
+	big > 1
+	&& big < 9
+){
+	io.print("ifmulti:yes");
+}

@@ -682,39 +682,124 @@ void Interp::InitBuiltins()
                                 (int)(raw3.size() - off3), &s3[0], w3);
                     }
                     return Value::Str_(s3); });
-                // io.fullpath("/") — current working directory with a
-                // trailing separator kept (process lib reads workDir)
+                // io.fullpath(path) — convert an aardio-style path to an
+                // absolute system path (docs/library-guide/builtin/io/path.md):
+                //   '~…'      → EXE/installation root
+                //   '/…' '\…' → 应用程序根目录 (the running project's dir)
+                //   '//…'     → the first slash is dropped (drive root)
+                //   '\\…'     → UNC, returned as null
+                //   otherwise → resolved against the current directory
                 tb->map[L"fullpath"] = NF([](vector<Value>& a) -> Value {
-                    wchar_t szCwd[MAX_PATH] = L".";
-                    GetCurrentDirectoryW(MAX_PATH, szCwd);
-                    wstring s3 = szCwd;
                     wstring rel = a.empty() ? L"" : BStr(a[0]);
-                    if (!rel.empty() &&
-                        (rel[0] == L'/' || rel[0] == L'\\'))
-                        return Value::Str_(s3 + L"\\");
-                    return Value::Str_(s3 + L"\\" + rel); });
-                // M6: io.exist — embedded payload first, then disk
-                // ("~" maps to the exe directory)
-                tb->map[L"exist"] = NF([](vector<Value>& a) -> Value {
+                    if (!rel.empty() && rel[0] == L'~')
+                        return Value::Str_(ResolveTildeDisk(rel));
+                    // app root: the running script's directory (a published
+                    // exe falls back to its own directory)
+                    wstring appRoot;
+                    if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
+                        appRoot = g_interpCurrent->baseDir;
+                    if (appRoot.empty())
+                    {
+                        wchar_t szExe[MAX_PATH] = L"";
+                        GetModuleFileNameW(nullptr, szExe, MAX_PATH);
+                        wchar_t* pSep = wcsrchr(szExe, L'\\');
+                        if (pSep) *pSep = 0;
+                        appRoot = szExe;
+                    }
+                    if (rel.size() >= 2 &&
+                        (rel[0] == L'/' || rel[0] == L'\\') &&
+                        (rel[1] == L'/' || rel[1] == L'\\'))
+                    {
+                        // '\\' (UNC) is not converted; '//' drops one slash
+                        if (rel[0] == L'\\')
+                            return Value();
+                        rel = rel.substr(1);
+                    }
+                    else if (!rel.empty() &&
+                             (rel[0] == L'/' || rel[0] == L'\\'))
+                    {
+                        wstring rest = rel.substr(1);
+                        while (!rest.empty() &&
+                               (rest[0] == L'/' || rest[0] == L'\\'))
+                            rest = rest.substr(1);
+                        if (rest.empty())
+                            return Value::Str_(appRoot + L"\\");
+                        return Value::Str_(appRoot + L"\\" + rest);
+                    }
+                    wchar_t szFull[MAX_PATH * 2] = L"";
+                    DWORD nFull = GetFullPathNameW(rel.c_str(), MAX_PATH * 2,
+                                                   szFull, nullptr);
+                    if (nFull > 0 && nFull < MAX_PATH * 2)
+                        return Value::Str_(szFull);
+                    return Value::Str_(rel); });
+                // io.remove(path) — delete a file (an empty directory also
+                // works, which makes it forgiving of fsys-level callers)
+                tb->map[L"remove"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t != Value::Str)
                         return Value::Bool_(false);
+                    wstring p = ResolveTildeDisk(BStr(a[0]));
+                    if (p.empty())
+                        return Value::Bool_(false);
+                    // a trailing separator would defeat DeleteFileW
+                    while (p.size() > 3 &&
+                           (p.back() == L'\\' || p.back() == L'/') &&
+                           p[p.size() - 2] != L':')
+                        p.pop_back();
+                    if (DeleteFileW(p.c_str()))
+                        return Value::Bool_(true);
+                    if (RemoveDirectoryW(p.c_str()))
+                        return Value::Bool_(true);
+                    return Value::Bool_(false); });
+                // io.exist(path,mode) — docs/builtin/io/path.md: returns the
+                // ABSOLUTE path when the file exists, otherwise null. The
+                // return value is a path (not a boolean), which is what the
+                // library idiom `io.exist(p) : fallback` relies on
+                // (zlib/nodeJs/golang/py2/py3 resolve their bundled DLL this
+                // way). mode: 2 = writable, 4 = readable, 6 = both; a
+                // directory only satisfies the default mode.
+                tb->map[L"exist"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::Str)
+                        return Value();      // null
                     wstring strPath = BStr(a[0]);
+                    if (strPath.empty())
+                        return Value();
+                    int mode = (a.size() > 1 && a[1].t == Value::Num)
+                                   ? (int)a[1].n : 0;
+                    // embedded payload of a published exe: it ships as data
                     if (g_interpCurrent)
                     {
-                        wstring p = strPath;
-                        wstring key = p;
+                        wstring key = strPath;
                         if (!key.empty() && key[0] == L'~')
                             key = key.substr(1);
                         if (!key.empty() &&
                             (key[0] == L'\\' || key[0] == L'/'))
                             key = key.substr(1);
-                        if (g_interpCurrent->embedded.count(key) ||
-                            (key != p && g_interpCurrent->embedded.count(p)))
-                            return Value::Bool_(true);
+                        if (mode == 0 &&
+                            (g_interpCurrent->embedded.count(key) ||
+                             (key != strPath &&
+                              g_interpCurrent->embedded.count(strPath))))
+                            return Value::Str_(ResolveTildeDisk(strPath));
                     }
-                    strPath = ResolveTildeDisk(strPath);
-                    return Value::Bool_(
-                        _waccess(strPath.c_str(), 0) == 0); });
+                    wstring full = ResolveTildeDisk(strPath);
+                    // make it absolute (a relative path resolves against cwd)
+                    wchar_t szFull[MAX_PATH * 2] = L"";
+                    DWORD nFull = GetFullPathNameW(full.c_str(),
+                                                  MAX_PATH * 2, szFull,
+                                                  nullptr);
+                    if (nFull > 0 && nFull < MAX_PATH * 2)
+                        full = szFull;
+                    int acc = 0;
+                    if (mode == 2 || mode == 6)
+                        acc |= 2;
+                    if (mode == 4 || mode == 6)
+                        acc |= 4;
+                    if (_waccess(full.c_str(), acc) != 0)
+                        return Value();      // null
+                    DWORD attr = GetFileAttributesW(full.c_str());
+                    if (attr != INVALID_FILE_ATTRIBUTES &&
+                        (attr & FILE_ATTRIBUTE_DIRECTORY) && mode != 0)
+                        return Value();      // a directory is not a file
+                    return Value::Str_(full); });
                 tb->map[L"writeFile"] = NF([](vector<Value>& a) {
                     FILE* pf = nullptr;
                     if (_wfopen_s(&pf, BStr(a[0]).c_str(), L"wb") != 0 || !pf)

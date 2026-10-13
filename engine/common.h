@@ -42,6 +42,16 @@ namespace NodioVM
         int line = 1;
     };
 
+    // aardio compiled (bytecode) modules begin with the literal '=aardio'
+    // followed by a binary body — lib/ide/aifix.aardio ships this way. Such
+    // a file is not source text, so a source-syntax check does not apply;
+    // loading it as source must report a format error rather than a
+    // misleading syntax error.
+    inline bool IsCompiledModule(const wstring& src)
+    {
+        return src.size() >= 7 && src.compare(0, 7, L"=aardio") == 0;
+    }
+
     inline const wchar_t* const KEYWORDS[] = {
         L"var", L"function", L"if", L"else", L"elseif", L"while", L"for",
         L"in", L"break", L"continue", L"return", L"null", L"true", L"false",

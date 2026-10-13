@@ -1,0 +1,29 @@
+// t59: io.exist(path,mode) returns the ABSOLUTE PATH when the file exists
+// and null when it does not (docs/library-guide/builtin/io/path.md).
+// The shipped library relies on that: `io.exist(p) : fallback` only works
+// as a path-or-fallback choice because the truthy result IS the path
+// (zlib/nodeJs/golang/py2/py3 resolve their bundled DLLs this way).
+import fsys;
+
+var full = ..io.fullpath("\nodio-t59.tmp");
+..io.writeFile(full, "x");
+
+var got = ..io.exist(full);
+io.print("exist-type:" ++ type(got));
+io.print("exist-same:" ++ (got == full ? "yes" : "no"));
+
+// a missing file yields null, so the coalesce fallback is taken
+var miss = ..io.exist(..io.fullpath("\nodio-t59-absent.tmp"));
+io.print("missing:" ++ (miss : "null"));
+
+// a directory satisfies the default mode but not "readable file" (4)
+var dir = ..io.fullpath("/");
+io.print("dir-default:" ++ (..io.exist(dir) ? "path" : "null"));
+io.print("dir-mode4:" ++ (..io.exist(dir, 4) : "null"));
+
+// non-string / empty arguments return null instead of raising
+io.print("badarg:" ++ (..io.exist(123) : "null"));
+io.print("emptyarg:" ++ (..io.exist("") : "null"));
+
+..io.remove(full);
+io.print("gone:" ++ (..io.exist(full) : "null"));

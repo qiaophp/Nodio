@@ -51,6 +51,12 @@ namespace NodioVM
         {
             if (!EatPunct(op))
             {
+                // keep the FIRST error: it is the deepest one and names the
+                // real token. Recovery paths unwind through several Expect
+                // calls whose tokens are far from the actual fault, and
+                // overwriting buries the cause.
+                if (!err->empty())
+                    return;
                 wstring context;
                 int start = max(0, (int)p - 6);
                 int end = min((int)toks.size(), (int)p + 4);
@@ -85,6 +91,21 @@ namespace NodioVM
         {
             { static bool bT = GetEnvironmentVariableW(L"ATP", nullptr, 0) != 0; if (bT) fwprintf(stderr, L"%d ", Peek().line); }
             SkipNL();
+            if (Peek().t == TEnd)
+                return nullptr;      // trailing newlines/comments at EOF
+            // aardio statement label: 'EACH:' / 'LEXLOOP:' — the target of
+            // 'break NAME' / 'continue NAME'. It labels the statement that
+            // follows, so parse and discard it.
+            if (Peek().t == TIdent && Peek(1).t == TPunct &&
+                Peek(1).text == L":" &&
+                !(Peek(2).t == TPunct && Peek(2).text == L"="))
+            {
+                p += 2;
+                SkipNL();
+                if (IsPunct(L"}") || Peek().t == TEnd)
+                    return nullptr;
+                return ParseStatement();
+            }
             if (IsPunct(L";"))       // empty statement
             {
                 p++;
@@ -149,8 +170,18 @@ namespace NodioVM
                     }
                     return n;
                 }
-                if (t.text == L"break") { p++; return New(Node::Break); }
-                if (t.text == L"continue") { p++; return New(Node::Continue); }
+                if (t.text == L"break" || t.text == L"continue")
+                {
+                    bool bBrk = (t.text == L"break");
+                    p++;
+                    // 'break LABEL' / 'continue LABEL' — the label names the
+                    // loop to leave; execution-wise it is the same as the
+                    // plain form for a single enclosing loop, so the name is
+                    // parsed and dropped.
+                    if (Peek().t == TIdent)
+                        p++;
+                    return bBrk ? New(Node::Break) : New(Node::Continue);
+                }
                 if (t.text == L"var")
                 {
                     p++;
@@ -164,25 +195,39 @@ namespace NodioVM
                         return false;
                     };
                     ReadName();
-                    // trailing names with no initializer: var a, b, c
+                    // more slots, comma separated: 'var a, b, c',
+                    // 'var a, b = 1', and holes — 'var x,,z = f()' keeps the
+                    // middle slot empty so it lines up with the return list
                     while (true)
                     {
-                        size_t saveComma = p;
+                        size_t saveSep = p;
                         SkipNL();
-                        if (EatPunct(L",") && Peek().t == TIdent &&
-                            Peek(1).t == TPunct &&
-                            (Peek(1).text == L"," || Peek(1).text == L";" ||
-                             Peek(1).text == L"=" || Peek(1).t == TNL ||
-                             Peek(1).t == TEnd))
+                        if (!EatPunct(L","))
+                        {
+                            p = saveSep;
+                            break;
+                        }
+                        SkipNL();
+                        if (IsPunct(L",") || IsPunct(L"=") ||
+                            PeekIsStmtEnd())
+                        {
+                            n->names.push_back(L"");   // hole
+                            if (IsPunct(L","))
+                                continue;   // the next round eats it
+                            break;
+                        }
+                        if (Peek().t == TIdent && Peek(1).t == TPunct &&
+                            (Peek(1).text == L"," ||
+                             Peek(1).text == L";" ||
+                             Peek(1).text == L"=" ||
+                             Peek(1).t == TNL || Peek(1).t == TEnd))
                         {
                             SkipNL();
                             ReadName();
+                            continue;
                         }
-                        else
-                        {
-                            p = saveComma;
-                            break;
-                        }
+                        p = saveSep;   // not a plain name list — leave it for
+                        break;         // the '=' / pair handling below
                     }
                     SkipNL();
                     if (EatPunct(L"="))
@@ -241,7 +286,10 @@ namespace NodioVM
                     while (IsPunct(L".."))
                         p++;   // root prefixes resolve absolutely anyway
                     n->names.push_back(ExpectIdent());
-                    while (IsPunct(L".") && Peek(1).t == TIdent)
+                    // path segments may be keywords: 'import java.class;'
+                    // (java/_.aardio) and 'import java.object;'
+                    while (IsPunct(L".") &&
+                           (Peek(1).t == TIdent || Peek(1).t == TKw))
                     {
                         p++;
                         n->names.push_back(Next().text);
@@ -262,7 +310,8 @@ namespace NodioVM
                         n->bRoot = true;
                     }
                     n->names.push_back(ExpectIdent());
-                    while (IsPunct(L".") && Peek(1).t == TIdent)
+                    while (IsPunct(L".") &&
+                           (Peek(1).t == TIdent || Peek(1).t == TKw))
                     {
                         p++;
                         n->names.push_back(Next().text);
@@ -278,8 +327,11 @@ namespace NodioVM
                     {
                         // rest-of-file namespace
                         PNode blk = New(Node::Block);
-                        while (Peek().t != TEnd)
+                        while (true)
                         {
+                            SkipNL();
+                            if (Peek().t == TEnd)
+                                break;
                             PNode st = ParseStatement();
                             if (st) blk->list.push_back(st);
                             SkipNL();
@@ -307,7 +359,8 @@ namespace NodioVM
                         n->bRoot = true;
                     }
                     n->names.push_back(ExpectIdent());
-                    while (IsPunct(L".") && Peek(1).t == TIdent)
+                    while (IsPunct(L".") &&
+                           (Peek(1).t == TIdent || Peek(1).t == TKw))
                     {
                         p++;
                         n->names.push_back(Next().text);
@@ -471,78 +524,83 @@ namespace NodioVM
                 }
             }
             // expression / assignment
-            // multi-target assign: a,b,c = e — aardio names unpack
-            if (Peek().t == TIdent)
+            // multi-target assign: a,b,c = e — aardio target unpack. Targets
+            // may be plain names, member paths, root-qualified names
+            // ('..response,..request,..session = a,b,c'), or empty slots
+            // ('files,,dirs = f()' — a hole still consumes a return value).
+            if (Peek().t == TIdent ||
+                (IsPunct(L"..") && Peek(1).t == TIdent))
             {
                 size_t save = p;
+                std::vector<PNode> tgts;
                 std::vector<wstring> names;
-                names.push_back(Next().text);
-                while (IsPunct(L",") && Peek(1).t == TIdent &&
-                       (Peek(2).t == TIdent || (Peek(2).t == TPunct && Peek(2).text == L"=") || (Peek(2).t == TPunct && Peek(2).text == L"," && Peek(3).t == TIdent)))
+                bool bAllNames = true;
+                bool bOk = true;
+                while (true)
                 {
-                    p++;
-                    names.push_back(Next().text);
-                }
-                // member/index targets: x.dl,x.dt = a,b — aardio unpacks into
-                // member paths too; detect when a target starts with . or [
-                if (names.size() == 1 &&
-                    (IsPunct(L".") || IsPunct(L"[") || IsPunct(L",")))
-                {
-                    PNode first = New(Node::Ident);
-                    first->str = names[0];
-                    first = ParsePostfixFrom(first);
-                    std::vector<PNode> tgts;
-                    tgts.push_back(first);
-                    while (IsPunct(L",") && Peek(1).t == TIdent)
+                    if (IsPunct(L",") || IsPunct(L"=") || PeekIsStmtEnd())
                     {
-                        p++;
-                        PNode t2 = New(Node::Ident);
-                        t2->str = Next().text;
-                        tgts.push_back(ParsePostfixFrom(t2));
+                        tgts.push_back(New(Node::NullK));   // empty slot
+                        names.push_back(L"");
+                        bAllNames = false;
                     }
-                    if (IsPunct(L"=") && tgts.size() > 1)
+                    else if (Peek().t == TIdent)
                     {
-                        p++;
-                        PNode n = New(Node::Assign);
-                        n->str = L"=";
-                        n->a = tgts[0];           // first target
-                        if (!n->b) n->b = New(Node::Block);
-                        // positional extras after the first expr
-                        SkipNL();
-                        n->b->list.push_back(ParseExpr());
-                        while (true)
-                        {
-                            size_t saveVal = p;
-                            SkipNL();
-                            if (EatPunct(L","))
-                            {
-                                SkipNL();
-                                if (PeekIsStmtEnd()) break;
-                                n->b->list.push_back(ParseExpr());
-                            }
-                            else
-                            {
-                                p = saveVal;
-                                break;
-                            }
-                        }
-                        // remaining targets live in c->list
-                        if (!n->c) n->c = New(Node::Block);
-                        for (size_t ti = 1; ti < tgts.size(); ti++)
-                            n->c->list.push_back(tgts[ti]);
-                        return n;
+                        PNode t = New(Node::Ident);
+                        t->str = Next().text;
+                        names.push_back(t->str);
+                        PNode full = ParsePostfixFrom(t);
+                        if (full != t)
+                            bAllNames = false;   // member path target
+                        tgts.push_back(full);
                     }
-                    p = save;
+                    else if (IsPunct(L"..") && Peek(1).t == TIdent)
+                    {
+                        p += 2;
+                        PNode m = New(Node::Member);
+                        m->bRoot = true;
+                        PNode root = New(Node::Ident);
+                        root->str = L"..";
+                        m->a = root;
+                        m->str = Peek(-1).text;
+                        tgts.push_back(ParsePostfixFrom(m));
+                        names.push_back(L"");
+                        bAllNames = false;
+                    }
+                    else
+                    {
+                        bOk = false;
+                        break;
+                    }
+                    size_t saveC = p;
+                    SkipNL();
+                    if (!EatPunct(L","))
+                    {
+                        p = saveC;
+                        break;
+                    }
+                    SkipNL();
                 }
-                if (IsPunct(L"=") && names.size() > 1)
+                if (bOk && tgts.size() > 1 && IsPunct(L"="))
                 {
-                    p++;
+                    p++;   // '='
                     PNode n = New(Node::Assign);
                     n->str = L"=";
-                    n->names = names;
                     SkipNL();
-                    n->a = ParseExpr();
-                    // a,b = e1,e2 — per-name init list
+                    if (bAllNames)
+                    {
+                        // names form — the runtime unpacks multi-returns
+                        n->names = names;
+                        n->a = ParseExpr();
+                    }
+                    else
+                    {
+                        // member form — a = target 1, c->list = targets 2..N,
+                        // b->list = the positional value exprs
+                        n->a = tgts[0];
+                        if (!n->b) n->b = New(Node::Block);
+                        n->b->list.push_back(ParseExpr());
+                    }
                     if (!n->b) n->b = New(Node::Block);
                     while (true)
                     {
@@ -559,6 +617,12 @@ namespace NodioVM
                             p = saveVal;
                             break;
                         }
+                    }
+                    if (!bAllNames)
+                    {
+                        n->c = New(Node::Block);
+                        for (size_t ti = 1; ti < tgts.size(); ti++)
+                            n->c->list.push_back(tgts[ti]);
                     }
                     return n;
                 }
@@ -621,7 +685,10 @@ namespace NodioVM
 
         wstring ExpectIdent()
         {
-            if (Peek().t == TIdent)
+            // aardio's keywords are contextual: shipped library code uses
+            // them as names ('namespace class{...}' in java/class.aardio,
+            // 'import java.class;'). Any keyword is a valid name here.
+            if (Peek().t == TIdent || Peek().t == TKw)
                 return Next().text;
             (*err) = L"语法错误: 期望标识符 @ 行 " + std::to_wstring(Peek().line);
             return L"?";
@@ -629,6 +696,10 @@ namespace NodioVM
 
         PNode ParseFuncRest()
         {
+            // a function body is a fresh expression scope: ':' is the
+            // coalesce operator again inside it, even when the function
+            // literal sits in a ternary's middle branch
+            NcReset ncReset(&bNoCoalesce);
             Expect(L"(");
             PNode fn = New(Node::FuncLit);
             if (!IsPunct(L")"))
@@ -731,6 +802,7 @@ namespace NodioVM
             PNode n = New(Node::If);
             n->c = New(Node::Block);   // elseif/else chain lives here
             bool bHadParen = EatPunct(L"(");
+            SkipNL();          // 'if(' may be followed by a line break
             // aardio lib sources span if-conds across lines with inline
             // `return` (win.ui): sequence exprs; last value is the cond,
             // an inline return unwinds during evaluation
@@ -765,15 +837,32 @@ namespace NodioVM
                     n->a = seq;
                 else
                     n->a = seq->list[0];
-            // aardio allows `if( a ) && ( b ) { }` — the if-( closer is
-            // followed by && / || groups; fold them into the cond
-            while (IsPunct(L")") &&
-                   (Peek(1).t == TPunct && (Peek(1).text == L"&&" ||
-                                            Peek(1).text == L"||")))
+            // aardio allows `if( a ) && ( b ) { }` — after the if-( closer
+            // the condition may continue with a binary operator, on the same
+            // line or the next (`if( x )\n && ( y ) return;`, `if(x)<0
+            // return;`). Only operators that cannot START an expression are
+            // folded: '+', '-', '..', '++' begin a body statement
+            // ('if(f) ..io.remove(x)'), so they are left to the body.
+            while (IsPunct(L")"))
             {
+                size_t saveR = p;
                 p++;   // ')'
+                SkipNL();
+                if (!(Peek().t == TPunct &&
+                      (Peek().text == L"&&" || Peek().text == L"||" ||
+                       Peek().text == L"<" || Peek().text == L">" ||
+                       Peek().text == L"<=" || Peek().text == L">=" ||
+                       Peek().text == L"==" || Peek().text == L"!=" ||
+                       Peek().text == L"===" || Peek().text == L"!==" ||
+                       Peek().text == L"|" || Peek().text == L"&" ||
+                       Peek().text == L"^" || Peek().text == L"<<" ||
+                       Peek().text == L">>")))
+                {
+                    p = saveR;
+                    break;
+                }
                 bIfParenClosed = true;
-                wstring op = Next().text;   // && / ||
+                wstring op = Next().text;   // the continuation operator
                 SkipNL();
                 PNode rhs;
                 if (IsPunct(L"("))
@@ -852,7 +941,15 @@ namespace NodioVM
         {
             p++;
             PNode n = New(Node::While);
-            Expect(L"(");
+            // parens are optional: 'while cond { ... }' as well as
+            // 'while(cond){ ... }'
+            if (!EatPunct(L"("))
+            {
+                SkipNL();
+                n->a = ParseExpr();
+                n->b = ParseBody();
+                return n;
+            }
             SkipNL();
             std::vector<PNode> condStmts;
             while (!IsPunct(L")") && Peek().t != TEnd)
@@ -1051,6 +1148,8 @@ namespace NodioVM
                     return n;
                 }
                 n->a = ParseExpr();
+                // the closing ')' may sit on the next line
+                SkipNL();
                 if (paren) Expect(L")");
                 n->b = ParseBody();
                 return n;
@@ -1081,6 +1180,7 @@ namespace NodioVM
             if (!IsPunct(L")"))
                 n->c = ParseStatement(); // step (may be absent)
             // the unparenthesized form has no closing paren to consume
+            SkipNL();
             if (paren)
                 Expect(L")");
             n->names.push_back(L"limit");  // tag: middle is a limit
@@ -1126,6 +1226,17 @@ namespace NodioVM
         // expressions (precedence climbing)
         bool bNoCoalesce = false;   // inside a ternary's middle branch
         int nIfParenOpen = 0;       // aardio if( cond { } ) sugar
+
+        // A nested expression scope — '(...)', '[...]', '{...}', a function
+        // body — starts fresh, so ':' is the coalesce operator again there.
+        // ('a ? f(x:0) : b', 'a ? f(function(){ r[k] = v : ""; }) : b')
+        struct NcReset
+        {
+            bool* f;
+            bool old;
+            NcReset(bool* p) : f(p), old(*p) { *f = false; }
+            ~NcReset() { *f = old; }
+        };
         bool bInAssignLhs = false;  // top-level statement assignment target
         PNode ParseExpr() { return ParseTernary(); }
         PNode ParseTernary()
@@ -1143,6 +1254,8 @@ namespace NodioVM
                 PNode n = New(Node::Bin);
                 n->str = L"?:";
                 n->a = l;
+                // the middle branch may start on the next line
+                SkipNL();
                 // the middle branch must not swallow the ternary's ':'
                 bool bOld = bNoCoalesce;
                 bNoCoalesce = true;
@@ -1228,6 +1341,8 @@ namespace NodioVM
                 PNode n = New(Node::Bin);
                 n->str = L"&&";
                 n->a = l;
+                // the right operand may start on the next line
+                SkipNL();
                 n->b = ParseEq();
                 l = n;
             }
@@ -1237,9 +1352,18 @@ namespace NodioVM
         {
             PNode l = ParseBitXor();
             // "|=" is a statement-level compound assignment; while parsing
-            // an assign LHS it must reach the assignment handler instead
-            while (IsPunct(L"|") || (!bInAssignLhs && IsPunct(L"|=")))
+            // an assign LHS it must reach the assignment handler instead.
+            // A binary '|' may also start the next line (the library chains
+            // flag expressions that way), so peek past newlines first.
+            while (true)
             {
+                size_t save = p;
+                SkipNL();
+                if (!(IsPunct(L"|") || (!bInAssignLhs && IsPunct(L"|="))))
+                {
+                    p = save;
+                    break;
+                }
                 wstring op = Next().text;
                 if (op == L"|=")
                 {
@@ -1248,6 +1372,7 @@ namespace NodioVM
                     PNode n = New(Node::Assign);
                     n->str = L"|=";
                     n->a = l;
+                    SkipNL();
                     n->b = ParseBitXor();
                     l = n;
                 }
@@ -1256,6 +1381,7 @@ namespace NodioVM
                     PNode n = New(Node::Bin);
                     n->str = L"|";
                     n->a = l;
+                    SkipNL();
                     n->b = ParseBitXor();
                     l = n;
                 }
@@ -1265,12 +1391,20 @@ namespace NodioVM
         PNode ParseBitXor()
         {
             PNode l = ParseBitAnd();
-            while (IsPunct(L"^"))
+            while (true)
             {
+                size_t save = p;
+                SkipNL();
+                if (!IsPunct(L"^"))
+                {
+                    p = save;
+                    break;
+                }
                 p++;
                 PNode n = New(Node::Bin);
                 n->str = L"^";   // aardio: ^ is bitwise XOR (** is exponent)
                 n->a = l;
+                SkipNL();
                 n->b = ParseBitAnd();
                 l = n;
             }
@@ -1280,12 +1414,20 @@ namespace NodioVM
         {
             PNode l = ParseShift();
             // "&=" is a statement-level compound assignment (see ParseBitOr)
-            while (IsPunct(L"&") || (!bInAssignLhs && IsPunct(L"&=")))
+            while (true)
             {
+                size_t save = p;
+                SkipNL();
+                if (!(IsPunct(L"&") || (!bInAssignLhs && IsPunct(L"&="))))
+                {
+                    p = save;
+                    break;
+                }
                 wstring op = Next().text;
                 PNode n = New(op == L"&=" ? Node::Assign : Node::Bin);
                 n->str = op;
                 n->a = l;
+                SkipNL();
                 n->b = ParseShift();
                 l = n;
             }
@@ -1463,16 +1605,20 @@ namespace NodioVM
         {
             PNode l = ParsePostfix();
             // aardio: ** is exponent; ^ is bitwise XOR (ParseBitXor)
-            if (IsPunct(L"**"))
+            size_t save = p;
+            SkipNL();
+            if (!IsPunct(L"**"))
             {
-                wstring op = Next().text;
-                PNode n = New(Node::Bin);
-                n->str = op;
-                n->a = l;
-                n->b = ParseUnary();   // right assoc
-                return n;
+                p = save;
+                return l;
             }
-            return l;
+            wstring op = Next().text;
+            PNode n = New(Node::Bin);
+            n->str = op;
+            n->a = l;
+            SkipNL();
+            n->b = ParseUnary();   // right assoc
+            return n;
         }
         PNode ParsePostfix()
         {
@@ -1581,6 +1727,7 @@ namespace NodioVM
                     SkipNL();
                     bool bOldLhs = bInAssignLhs;
                     bInAssignLhs = false;
+                    NcReset ncReset(&bNoCoalesce);   // ':' works inside f(...)
                     if (!IsPunct(L")"))
                     {
                         // aardio f(,,,,1): leading empty slots
@@ -1588,22 +1735,58 @@ namespace NodioVM
                             c->list.push_back(New(Node::NullK));
                         else if (IsPunct(L")"))
                             c->list.push_back(New(Node::NullK));  // empty slot before )
-                        else if (Peek().t == TIdent && Peek(1).t == TPunct && Peek(1).text == L"=")
+                        else if ((Peek().t == TIdent || Peek().t == TKw ||
+                                  Peek().t == TStr) &&
+                                 Peek(1).t == TPunct &&
+                                 Peek(1).text == L"=")
                         {
-                            // named args: f(name = expr; ...) — one table arg
+                            // aardio passes a table through the argument list
+                            // without braces: f( name = v; ["k"] = v2 ).
+                            // Keys may be names, keywords or string literals,
+                            // and the separator is ';' or ','.
                             PNode tbl = New(Node::TableCtor);
-                            while (Peek().t == TIdent && Peek(1).t == TPunct &&
-                                   Peek(1).text == L"=")
+                            while (true)
                             {
-                                PNode key = New(Node::Str);
-                                key->str = Next().text;
-                                p++;
+                                PNode key;
+                                if (IsPunct(L"["))
+                                {
+                                    p++;
+                                    key = ParseExpr();
+                                    SkipNL();
+                                    Expect(L"]");
+                                }
+                                else if (Peek().t == TIdent ||
+                                         Peek().t == TKw ||
+                                         Peek().t == TStr)
+                                {
+                                    key = New(Node::Str);
+                                    key->str = Next().text;
+                                }
+                                else
+                                    break;
+                                SkipNL();
+                                if (!EatPunct(L"="))
+                                    break;
+                                SkipNL();
                                 tbl->list.push_back(key);
                                 tbl->list.push_back(ParseExpr());
+                                // separator: ';', ',' or just the next line
+                                size_t saveSep = p;
                                 SkipNL();
                                 EatPunct(L";");
+                                EatPunct(L",");
                                 SkipNL();
-                                if (IsPunct(L",")) { p++; SkipNL(); continue; }
+                                if (IsPunct(L")"))
+                                    break;           // trailing separator
+                                if (IsPunct(L"[") ||
+                                    ((Peek().t == TIdent ||
+                                      Peek().t == TKw ||
+                                      Peek().t == TStr) &&
+                                     Peek(1).t == TPunct &&
+                                     Peek(1).text == L"="))
+                                    continue;        // another member
+                                p = saveSep;         // not a member: leave it
+                                break;
                             }
                             c->list.push_back(tbl);
                         }
@@ -1811,7 +1994,7 @@ namespace NodioVM
                 return ParseFuncRest();
             }
             // aardio lambda: lambda(a,b) expr — implicit return
-            if (t.t == TKw && t.text == L"lambda")
+            if (t.t == TKw && (t.text == L"lambda" || t.text == L"λ"))
             {
                 p++;
                 Expect(L"(");
@@ -1853,6 +2036,8 @@ namespace NodioVM
                 Expect(L")");
                 PNode body = New(Node::Block);
                 PNode retSt = New(Node::Return);
+                // the body may start on the next line
+                SkipNL();
                 retSt->a = ParseExpr();
                 // brace-less body may end in an assignment
                 // (function(v) owner.x = v inside a table literal)
@@ -2123,9 +2308,12 @@ namespace NodioVM
                         continue;
                     }
                     // pair: name = expr | name: expr (aardio allows both separators;
-                    // win/_.aardio uses {max: 3;min: 6}) | ["k"] = expr |
+                    // win/_.aardio uses {max: 3;min: 6}) | "name" = expr |
+                    // "name": expr | ["k"] = expr | ["k"]: expr |
                     // expr (array item)
-                    if ((Peek().t == TIdent || Peek().t == TKw) && Peek(1).t == TPunct &&
+                    if ((Peek().t == TIdent || Peek().t == TKw ||
+                         Peek().t == TStr) &&
+                        Peek(1).t == TPunct &&
                         (Peek(1).text == L"=" || Peek(1).text == L":"))
                     {
                         bool bColonPair = (Peek(1).text == L":");
@@ -2149,9 +2337,24 @@ namespace NodioVM
                         p++;
                         PNode key = ParseExpr();
                         Expect(L"]");
-                        Expect(L"=");
+                        bool bColonPair = false;
+                        if (IsPunct(L":"))
+                        {
+                            p++;
+                            bColonPair = true;
+                        }
+                        else
+                            Expect(L"=");
                         n->list.push_back(key);
-                        n->list.push_back(ParseExpr());
+                        if (bColonPair)
+                        {
+                            bool bOld = bNoCoalesce;
+                            bNoCoalesce = true;
+                            n->list.push_back(ParseExpr());
+                            bNoCoalesce = bOld;
+                        }
+                        else
+                            n->list.push_back(ParseExpr());
                     }
                     else
                     {
@@ -2293,6 +2496,7 @@ namespace NodioVM
                     SkipNL();
                     bool bOldLhs = bInAssignLhs;
                     bInAssignLhs = false;
+                    NcReset ncReset(&bNoCoalesce);   // ':' works inside f(...)
                     if (!IsPunct(L")"))
                     {
                         // aardio f(,,,,1): leading empty slots
@@ -2300,22 +2504,58 @@ namespace NodioVM
                             c->list.push_back(New(Node::NullK));
                         else if (IsPunct(L")"))
                             c->list.push_back(New(Node::NullK));  // empty slot before )
-                        else if (Peek().t == TIdent && Peek(1).t == TPunct && Peek(1).text == L"=")
+                        else if ((Peek().t == TIdent || Peek().t == TKw ||
+                                  Peek().t == TStr) &&
+                                 Peek(1).t == TPunct &&
+                                 Peek(1).text == L"=")
                         {
-                            // named args: f(name = expr; ...) — one table arg
+                            // aardio passes a table through the argument list
+                            // without braces: f( name = v; ["k"] = v2 ).
+                            // Keys may be names, keywords or string literals,
+                            // and the separator is ';' or ','.
                             PNode tbl = New(Node::TableCtor);
-                            while (Peek().t == TIdent && Peek(1).t == TPunct &&
-                                   Peek(1).text == L"=")
+                            while (true)
                             {
-                                PNode key = New(Node::Str);
-                                key->str = Next().text;
-                                p++;
+                                PNode key;
+                                if (IsPunct(L"["))
+                                {
+                                    p++;
+                                    key = ParseExpr();
+                                    SkipNL();
+                                    Expect(L"]");
+                                }
+                                else if (Peek().t == TIdent ||
+                                         Peek().t == TKw ||
+                                         Peek().t == TStr)
+                                {
+                                    key = New(Node::Str);
+                                    key->str = Next().text;
+                                }
+                                else
+                                    break;
+                                SkipNL();
+                                if (!EatPunct(L"="))
+                                    break;
+                                SkipNL();
                                 tbl->list.push_back(key);
                                 tbl->list.push_back(ParseExpr());
+                                // separator: ';', ',' or just the next line
+                                size_t saveSep = p;
                                 SkipNL();
                                 EatPunct(L";");
+                                EatPunct(L",");
                                 SkipNL();
-                                if (IsPunct(L",")) { p++; SkipNL(); continue; }
+                                if (IsPunct(L")"))
+                                    break;           // trailing separator
+                                if (IsPunct(L"[") ||
+                                    ((Peek().t == TIdent ||
+                                      Peek().t == TKw ||
+                                      Peek().t == TStr) &&
+                                     Peek(1).t == TPunct &&
+                                     Peek(1).text == L"="))
+                                    continue;        // another member
+                                p = saveSep;         // not a member: leave it
+                                break;
                             }
                             c->list.push_back(tbl);
                         }

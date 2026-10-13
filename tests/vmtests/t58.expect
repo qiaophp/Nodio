@@ -1,0 +1,15 @@
+css:18:#c { color: red; }
+line:raw single line string
+stars:ok
+tabarg:32
+label:6
+holes:1,3
+while:3
+lambda:5
+ternary:yes
+bitor:19
+orline:fallback
+andline:2
+tblcol:fallback
+ifcont:yes
+ifmulti:yes
