@@ -4,6 +4,131 @@
 
 namespace NodioVM
 {
+    // ---- fibers (纤程) ----
+    // docs/language-reference/datatype/datatype.md: a fiber has its own
+    // stack and can be suspended and resumed, but it is not a thread and
+    // fibers never run concurrently. Implemented on Win32 fibers, which is
+    // also how aardio does it.
+    struct VMFiber
+    {
+        void* hFiber = nullptr;
+        Value fn;
+        wstring status = L"suspended";   // suspended | running | dead
+        vector<Value> inArgs;             // arguments for the next resume
+        vector<Value> outVals;            // values yielded or returned
+    };
+    static void* g_mainFiber = nullptr;
+    static VMFiber* g_runningFiber = nullptr;
+
+    static VMFiber* FiberOf(const Value& v)
+    {
+        if (v.t != Value::TableT || !v.tab)
+            return nullptr;
+        auto it = v.tab->map.find(L"__fiber");
+        if (it == v.tab->map.end() || it->second.t != Value::Pointer)
+            return nullptr;
+        return (VMFiber*)it->second.ptr;
+    }
+
+    static Value MakeFiberValue(VMFiber* co)
+    {
+        auto tb = std::make_shared<Table>();
+        tb->map[L"__fiber"] = Value::Pointer_(co);
+        Value v = Value::Table_(tb);
+        // yield() / resume() / status() use the pointer key above
+        return v;
+    }
+
+    static void CALLBACK VMFiberEntry(void* pParam)
+    {
+        VMFiber* co = (VMFiber*)pParam;
+        Interp* it = g_interpCurrent;
+        Value r;
+        if (it && co->fn.t == Value::Func)
+        {
+            vector<Value> args = co->inArgs;
+            r = it->CallVmFunc(co->fn, args);
+        }
+        co->outVals.clear();
+        co->outVals.push_back(r);
+        if (r.mrets)
+            for (auto& v : *r.mrets) co->outVals.push_back(v);
+        co->status = L"dead";
+        SwitchToFiber(g_mainFiber);   // never returns
+    }
+
+    static void FiberMainInit()
+    {
+        if (!g_mainFiber)
+            g_mainFiber = ConvertThreadToFiber(nullptr);
+    }
+
+    // one shared implementation for create / fiber.create
+    static Value FiberCreate(const Value& fn)
+    {
+        if (fn.t != Value::Func)
+            return Value();
+        FiberMainInit();
+        VMFiber* co = new VMFiber();
+        co->fn = fn;
+        co->hFiber = CreateFiber(0, VMFiberEntry, co);
+        if (!co->hFiber)
+        {
+            delete co;
+            return Value();
+        }
+        return MakeFiberValue(co);
+    }
+
+    // resume(fiber, ...) -> true, values... ; on failure: false, message
+    static Value FiberResume(const Value& coV, const vector<Value>& args,
+                             wstring* errMsg)
+    {
+        VMFiber* co = FiberOf(coV);
+        if (!co)
+        {
+            if (errMsg) *errMsg = L"参数不是纤程对象";
+            return Value();
+        }
+        if (co->status == L"dead" || !co->hFiber)
+        {
+            Value f = Value::Bool_(false);
+            auto ex = std::make_shared<vector<Value>>();
+            ex->push_back(Value::Str_(L"cannot resume dead fiber"));
+            f.mrets = ex;
+            return f;
+        }
+        FiberMainInit();
+        co->inArgs = args;
+        co->outVals.clear();
+        co->status = L"running";
+        g_runningFiber = co;
+        SwitchToFiber(co->hFiber);
+        g_runningFiber = nullptr;
+        if (co->status != L"dead")
+            co->status = L"suspended";
+        Value ok = Value::Bool_(true);
+        auto ex = std::make_shared<vector<Value>>();
+        for (auto& v : co->outVals) ex->push_back(v);
+        ok.mrets = ex;
+        return ok;
+    }
+
+    // yield(...) — suspend the running fiber, handing values to resume
+    static Value FiberYield(const vector<Value>& vals)
+    {
+        VMFiber* co = g_runningFiber;
+        if (!co)
+            return Value();
+        co->outVals = vals;
+        co->status = L"suspended";
+        SwitchToFiber(g_mainFiber);
+        // resumed: the values passed to resume become the yield's result
+        if (!co->inArgs.empty())
+            return co->inArgs[0];
+        return Value();
+    }
+
     // ---- runtime compilation (eval / loadcode / loadcodex) ----
     // Compiles 'src' into an anonymous function: the code becomes the body
     // and '...' collects the arguments, because in aardio a loaded code
@@ -3492,6 +3617,71 @@ void Interp::InitBuiltins()
             globals.vars[L"_HINSTANCE"] = Value::Pointer_(GetModuleHandleW(nullptr));
             globals.vars[L"_HAPPICON"] = Value::Pointer_(LoadIconW(nullptr, IDI_APPLICATION));
             globals.vars[L"_INVALID_HANDLE_VALUE"] = Value::Pointer_(INVALID_HANDLE_VALUE);
+
+            // ---- fibers (纤程): create / resume / yield / status ----
+            globals.vars[L"create"] = NF([](vector<Value>& a) -> Value {
+                return a.empty() ? Value() : FiberCreate(a[0]); });
+            globals.vars[L"resume"] = NF([](vector<Value>& a) -> Value {
+                if (a.empty())
+                    return Value();
+                vector<Value> args;
+                for (size_t i = 1; i < a.size(); i++)
+                    args.push_back(a[i]);
+                return FiberResume(a[0], args, nullptr); });
+            globals.vars[L"yield"] = NF([](vector<Value>& a) -> Value {
+                vector<Value> args;
+                for (auto& v : a) args.push_back(v);
+                return FiberYield(args); });
+            {
+                auto tbF = GetRoot(L"fiber").tab;
+                tbF->map[L"create"] = NF([](vector<Value>& a) -> Value {
+                    return a.empty() ? Value() : FiberCreate(a[0]); });
+                tbF->map[L"resume"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value();
+                    vector<Value> args;
+                    for (size_t i = 1; i < a.size(); i++)
+                        args.push_back(a[i]);
+                    return FiberResume(a[0], args, nullptr); });
+                tbF->map[L"yield"] = NF([](vector<Value>& a) -> Value {
+                    vector<Value> args;
+                    for (auto& v : a) args.push_back(v);
+                    return FiberYield(args); });
+                // fiber.status(fib) -> "suspended" | "running" | "dead"
+                tbF->map[L"status"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value();
+                    VMFiber* co = FiberOf(a[0]);
+                    if (!co)
+                        return Value();
+                    return Value::Str_(co->status); });
+                // fiber.generator(fn,...) — iterator factory over a fiber
+                tbF->map[L"generator"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value();
+                    Value v = a[0];
+                    VMFiber* co = FiberOf(v);
+                    Value fibV = v;
+                    if (!co)
+                    {
+                        fibV = FiberCreate(v);
+                        co = FiberOf(fibV);
+                    }
+                    if (!co)
+                        return Value();
+                    vector<Value> args;
+                    for (size_t i = 1; i < a.size(); i++)
+                        args.push_back(a[i]);
+                    auto pFib = std::make_shared<Value>(fibV);
+                    auto pArgs = std::make_shared<vector<Value>>(args);
+                    // iterator: null once the fiber is dead
+                    return NF([pFib, pArgs](vector<Value>&) -> Value {
+                        VMFiber* c2 = FiberOf(*pFib);
+                        if (!c2 || c2->status == L"dead")
+                            return Value();
+                        return FiberResume(*pFib, *pArgs, nullptr); });
+                });
+            }
 
             // ---- documented reserved builtins (docs/language-reference/
             //      builtin-function/index.md). Their absence was the single

@@ -1,0 +1,42 @@
+// t60: fibers (纤程) — docs/language-reference/datatype/datatype.md
+// A fiber has its own stack; it can suspend and resume but never runs
+// concurrently with another fiber.
+var log = "";
+
+var co = create(function(a){
+    log ++= "start:" ++ a ++ ";";
+    var got = yield(10);
+    log ++= "got:" ++ got ++ ";";
+    return "done";
+});
+
+var ok1, v1 = resume(co, "A");
+io.print("resume1:" ++ tostring(ok1) ++ "/" ++ tostring(v1));
+io.print("status1:" .. ..fiber.status(co));
+
+var ok2, v2 = resume(co, "B");
+io.print("resume2:" ++ tostring(ok2) ++ "/" ++ tostring(v2));
+io.print("status2:" .. ..fiber.status(co));
+
+// resuming a dead fiber reports failure instead of running it again
+var ok3 = resume(co);
+io.print("resume3:" ++ tostring(ok3));
+
+io.print("log:" ++ log);
+
+// fiber.status on a plain value is null, not an error
+io.print("bad:" ++ tostring(..fiber.status(1)));
+
+// fiber.generator turns a yielding function into an iterator
+function fib(max){
+    var a, b = 1, 1;
+    while a < max {
+        ..fiber.yield(a);
+        a, b = b, a + b;
+    }
+}
+var sum = 0;
+for v in ..fiber.generator(fib, 100) {
+    sum = sum + v;
+}
+io.print("generated:" ++ sum);
