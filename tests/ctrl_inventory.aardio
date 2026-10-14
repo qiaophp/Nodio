@@ -1,0 +1,126 @@
+// win.ui.ctrl inventory probe: import + instantiate every official
+// ctrl module against the engine, one result line each.
+import win.ui;
+import win.form;
+import win.ui.ctrl._;
+import console;
+
+var wf = win.form(text="probe";right=400;bottom=400;border="none";exmode="toolwindow")
+
+try{ import win.ui.ctrl.button;
+	var c = win.ui.ctrl.button(wf,{left=1;top=1;right=50;bottom=20;text="t"});
+	io.print("button:", c != null); } catch(e){ io.print("button: FAIL", e) }
+
+try{ import win.ui.ctrl.static;
+	var c = win.ui.ctrl.static(wf,{left=1;top=30;right=80;bottom=50;text="s"});
+	io.print("static:", c != null); } catch(e){ io.print("static: FAIL", e) }
+
+try{ import win.ui.ctrl.edit;
+	var c = win.ui.ctrl.edit(wf,{left=1;top=60;right=100;bottom=80;text="e"});
+	io.print("edit:", c != null); } catch(e){ io.print("edit: FAIL", e) }
+
+try{ import win.ui.ctrl.edit;
+	var c = win.ui.ctrl.edit(wf,{left=1;top=90;right=100;bottom=110;text="m";multiline=true});
+	io.print("textbox:", c != null); } catch(e){ io.print("textbox: FAIL", e) }
+
+try{ import win.ui.ctrl.listbox;
+	var c = win.ui.ctrl.listbox(wf,{left=1;top=120;right=100;bottom=180;items={"a";"b"}});
+	io.print("listbox:", c != null); } catch(e){ io.print("listbox: FAIL", e) }
+
+try{ import win.ui.ctrl.combobox;
+	var c = win.ui.ctrl.combobox(wf,{left=110;top=1;right=200;bottom=30;items={"a";"b"}});
+	io.print("combobox:", c != null); } catch(e){ io.print("combobox: FAIL", e) }
+
+try{ import win.ui.ctrl.checkbox;
+	io.print("checklist-import:", true); } catch(e){ io.print("checklist-import: FAIL", e) }
+
+try{ import win.ui.ctrl.listview;
+	var c = win.ui.ctrl.listview(wf,{left=110;top=40;right=300;bottom=150;columns={"c1";"c2"}});
+	io.print("listview:", c != null); } catch(e){ io.print("listview: FAIL", e) }
+
+try{ import win.ui.ctrl.treeview;
+	var c = win.ui.ctrl.treeview(wf,{left=110;top=160;right=300;bottom=280});
+	io.print("treeview:", c != null); } catch(e){ io.print("treeview: FAIL", e) }
+
+try{ import win.ui.ctrl.tab;
+	var c = win.ui.ctrl.tab(wf,{left=1;top=190;right=100;bottom=240;items={"t1";"t2"}});
+	io.print("tab:", c != null); } catch(e){ io.print("tab: FAIL", e) }
+
+try{ import win.ui.ctrl.progress;
+	var c = win.ui.ctrl.progress(wf,{left=1;top=250;right=100;bottom=270;max=100});
+	io.print("progress:", c != null); } catch(e){ io.print("progress: FAIL", e) }
+
+try{ import win.ui.ctrl.trackbar;
+	var c = win.ui.ctrl.trackbar(wf,{left=1;top=280;right=100;bottom=300;max=10});
+	io.print("trackbar:", c != null); } catch(e){ io.print("trackbar: FAIL", e) }
+
+try{ import win.ui.ctrl.spin;
+	var c = win.ui.ctrl.spin(wf,{left=210;top=1;right=240;bottom=25});
+	io.print("spin:", c != null); } catch(e){ io.print("spin: FAIL", e) }
+
+try{ import win.ui.ctrl.datetimepick;
+	var c = win.ui.ctrl.datetimepick(wf,{left=250;top=1;right=380;bottom=25});
+	io.print("datetimepick:", c != null); } catch(e){ io.print("datetimepick: FAIL", e) }
+
+try{ import win.ui.ctrl.hotkey;
+	var c = win.ui.ctrl.hotkey(wf,{left=250;top=30;right=380;bottom=50});
+	io.print("hotkey:", c != null); } catch(e){ io.print("hotkey: FAIL", e) }
+
+try{ import win.ui.ctrl.ipaddress;
+	var c = win.ui.ctrl.ipaddress(wf,{left=250;top=60;right=380;bottom=80});
+	io.print("ipaddress:", c != null); } catch(e){ io.print("ipaddress: FAIL", e) }
+
+try{ import win.ui.ctrl.syslink;
+	var c = win.ui.ctrl.syslink(wf,{left=250;top=90;right=380;bottom=110;text="<a>b</a>"});
+	io.print("syslink:", c != null); } catch(e){ io.print("syslink: FAIL", e) }
+
+try{ import win.ui.ctrl.scrollbar;
+	var c = win.ui.ctrl.scrollbar(wf,{left=250;top=120;right=380;bottom=140});
+	io.print("scrollbar:", c != null); } catch(e){ io.print("scrollbar: FAIL", e) }
+
+try{ import win.ui.ctrl.splitter;
+	var c = win.ui.ctrl.splitter(wf,{left=250;top=150;right=380;bottom=160});
+	io.print("splitter:", c != null); } catch(e){ io.print("splitter: FAIL", e) }
+
+try{ import win.ui.ctrl.picturebox;
+	var c = win.ui.ctrl.picturebox(wf,{left=250;top=170;right=330;bottom=230});
+	io.print("picturebox:", c != null); } catch(e){ io.print("picturebox: FAIL", e) }
+
+try{ import win.ui.ctrl.richedit;
+	var c = win.ui.ctrl.richedit(wf,{left=250;top=240;right=380;bottom=300;text="r"});
+	io.print("richedit:", c != null); } catch(e){ io.print("richedit: FAIL", e) }
+
+try{ import win.ui.ctrl.calendar;
+	var c = win.ui.ctrl.calendar(wf,{left=310;top=40;right=390;bottom=140});
+	io.print("calendar:", c != null); } catch(e){ io.print("calendar: FAIL", e) }
+
+try{ import win.ui.ctrl.plus;
+	var c = win.ui.ctrl.plus(wf,{left=310;top=150;right=390;bottom=200;text="p"});
+	io.print("plus:", c != null); } catch(e){ io.print("plus: FAIL", e) }
+
+try{ import win.ui.ctrl.bkplus;
+	var c = win.ui.ctrl.bkplus(wf,{left=310;top=210;right=390;bottom=260});
+	io.print("bkplus:", c != null); } catch(e){ io.print("bkplus: FAIL", e) }
+
+try{ import win.ui.ctrl.bk;
+	var c = win.ui.ctrl.bk(wf,{left=310;top=270;right=390;bottom=310});
+	io.print("bk:", c != null); } catch(e){ io.print("bk: FAIL", e) }
+
+try{ import win.ui.ctrl.custom;
+	io.print("custom-import:", true); } catch(e){ io.print("custom-import: FAIL", e) }
+
+try{ import win.ui.ctrl.vlistview;
+	var c = win.ui.ctrl.vlistview(wf,{left=120;top=290;right=300;bottom=390});
+	io.print("vlistview:", c != null); } catch(e){ io.print("vlistview: FAIL", e) }
+
+try{ import win.ui.ctrl.atlax;
+	var c = win.ui.ctrl.atlax(wf,{left=120;top=200;right=220;bottom=260});
+	io.print("atlax:", c != null); } catch(e){ io.print("atlax: FAIL", e) }
+
+try{ import win.ui.ctrl.close;
+	io.print("close-import:", true); } catch(e){ io.print("close-import: FAIL", e) }
+
+try{ import win.ui.ctrl.thread;
+	io.print("thread-import:", true); } catch(e){ io.print("thread-import: FAIL", e) }
+
+io.print("PROBE-DONE");

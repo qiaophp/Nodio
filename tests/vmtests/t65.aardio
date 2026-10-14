@@ -1,0 +1,17 @@
+// t65: the dotted-bind must keep the class the module body built when a
+// delegator file re-imports it. Real-world case: win/form.aardio is one
+// `import win.ui;` line while the real "class win.form" lives in
+// win/ui/_.aardio — binding form.aardio's cached module table (the
+// delegatee's namespace TABLE) over the class turned type(win.form)
+// into "table" and killed every GUI program. Both import orders must
+// resolve to the class. Self-contained: mirrors the shape with t65pkg.
+import t65pkg.form;
+io.print("form:" .. type(t65pkg.form));
+io.print("marker:" .. tostring(t65pkg.form.marker));
+
+import t65pkg.host;
+io.print("host:" .. type(t65pkg.host));
+io.print("form-again:" .. type(t65pkg.form));
+
+var f = t65pkg.form();
+io.print("ctor:" .. (f != null));

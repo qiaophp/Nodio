@@ -1,0 +1,4 @@
+// The delegator: same shape as official win/form.aardio — one import
+// line, so the engine caches the delegatee's module table as THIS
+// module's value.
+import t65pkg.host;

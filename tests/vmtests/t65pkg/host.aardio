@@ -1,0 +1,8 @@
+// The real-module shape that mirrors win/ui/_.aardio: the dotted class
+// lives here, and the delegator file (t65pkg/form.aardio) is one import
+// line whose cached module value is this namespace's TABLE.
+namespace t65pkg;
+class t65pkg.form {
+	ctor(){ }
+	marker = 7;
+}

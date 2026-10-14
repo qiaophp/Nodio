@@ -11,7 +11,17 @@ Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
             {
                 wstring full;
                 for (size_t i = 0; i < names.size(); ++i) { if (i) full += L"."; full += names[i]; }
-                fwprintf(stderr, L"[DEBUG BIND] names=%s mod.t=%d\n", full.c_str(), (int)mod.t);
+                int nOldT = -1;
+                bool bSameTab = false;
+                auto itDbg = roots.find(names[0]);
+                if (itDbg != roots.end() && names.size() == 1)
+                {
+                    nOldT = (int)itDbg->second.t;
+                    bSameTab = (itDbg->second.tab && mod.tab &&
+                                itDbg->second.tab == mod.tab);
+                }
+                fwprintf(stderr, L"[DEBUG BIND] names=%s mod.t=%d old.t=%d same=%d\n",
+                         full.c_str(), (int)mod.t, nOldT, (int)bSameTab);
                 fflush(stderr);
             }
             // single-segment import: the module IS the root namespace
@@ -66,10 +76,30 @@ Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
                 if (i + 1 == names.size())
                 {
                     auto itTarget = ns.tab->map.find(names[i]);
-                    if (itTarget != ns.tab->map.end() && itTarget->second.t == Value::TableT && itTarget->second.tab &&
-                        mod.t == Value::TableT && mod.tab && itTarget->second.tab != mod.tab)
+                    if (itTarget != ns.tab->map.end() && itTarget->second.tab &&
+                        mod.t == Value::TableT && mod.tab &&
+                        itTarget->second.tab != mod.tab)
                     {
-                        for (auto& kv : itTarget->second.tab->map)
+                        Value& vT = itTarget->second;
+                        if (vT.t == Value::Class || vT.t == Value::Func)
+                        {
+                            // The existing class/function binding wins:
+                            // the module body already built it (win.form
+                            // is "class win.form" inside win/ui/_.aardio,
+                            // and the delegator file win/form.aardio — one
+                            // `import win.ui;` line — caches the
+                            // delegatee's module table as its own value).
+                            // Binding that table over the class dropped
+                            // it. Merge the module's members in and keep.
+                            for (auto& kv : mod.tab->map)
+                                if (!vT.tab->map.count(kv.first))
+                                    vT.tab->map[kv.first] = kv.second;
+                            for (auto& kv : mod.tab->scopeVars)
+                                if (!vT.tab->scopeVars.count(kv.first))
+                                    vT.tab->scopeVars[kv.first] = kv.second;
+                            return vT;
+                        }
+                        for (auto& kv : vT.tab->map)
                         {
                             if (!mod.tab->map.count(kv.first))
                                 mod.tab->map[kv.first] = kv.second;
