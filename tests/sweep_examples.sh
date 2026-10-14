@@ -21,8 +21,11 @@ LIBDIR="${NODIO_LIBDIR:-D:\\aardio\\lib}"
 OK=0; ERR=0; HANG=0; N=0
 while IFS= read -r -d '' rel; do
   win="${rel//\//\\}"
+  # </dev/null is required: the child would otherwise inherit this loop's
+  # stdin (the NUL-separated manifest) and examples that read stdin would
+  # swallow entries, silently shrinking the denominator.
   out=$(NODIO_RUN="$ROOT\\$win" NODIO_LIBDIR="$LIBDIR" NODIO_CONSOLE=1 \
-        NODIO_PAUSE=0 timeout "$TMO" "$EXE" 2>&1)
+        NODIO_PAUSE=0 timeout "$TMO" "$EXE" </dev/null 2>&1)
   rc=$?
   N=$((N+1))
   if [ $rc -eq 124 ]; then
