@@ -910,6 +910,8 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
             if (!fp)
                 return Value(); // not found
 
+            fp = ResolveLongPtrAlias(hMod, fp, strNameA);
+
             void* fn = (void*)fp;
             bool bCdecl = bDllCdecl;
 

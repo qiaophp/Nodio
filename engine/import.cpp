@@ -306,19 +306,20 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 placeholder2->map[L"self"] = modPlaceholder2;
                 modules[file] = modPlaceholder2;
                 BindModule(n->names, modPlaceholder2);
-                Env modEnv2;
-                modEnv2.parent = &globals;
-                modEnv2.modTable = placeholder2;
-                modEnv2.bNsBody = true;   // module-level vars are members
+                auto modEnv2 = std::make_shared<Env>();
+                modEnv2->self = modEnv2;
+                modEnv2->parent = globals.self;
+                modEnv2->modTable = placeholder2;
+                modEnv2->bNsBody = true;   // module-level vars are members
                 wstring oldModFile2 = g_curModuleFile;
                 g_curModuleFile = file;
                 Value oldRet = ret;
                 int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                 nReturn = nBreak = nContinue = 0;
                 ret = Value();
-                ExecBlock(prog, &modEnv2);
+                ExecBlock(prog, modEnv2.get());
                 bool bTopReturn = (nReturn != 0);
-                for (auto& kv : modEnv2.vars)
+                for (auto& kv : modEnv2->vars)
                     placeholder2->scopeVars[kv.first] = kv.second;
                 g_curModuleFile = oldModFile2;
                 Value mod2 = ret;
@@ -364,7 +365,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                         mod2 = curNs;
                     else
                     {
-                        for (auto& kv : modEnv2.vars)
+                        for (auto& kv : modEnv2->vars)
                             placeholder2->map[kv.first] = kv.second;
                         mod2 = modPlaceholder2;
                     }
@@ -503,19 +504,20 @@ Value Interp::DoImport(const PNode& n, Env* env)
 
             // module runs in a child scope; its `return v` (or its collected
             // top-level globals) becomes the module value
-            Env modEnv;
-            modEnv.parent = &globals;
-            modEnv.modTable = placeholder;
-            modEnv.bNsBody = true;   // module-level vars are members
+            auto modEnv = std::make_shared<Env>();
+            modEnv->self = modEnv;
+            modEnv->parent = globals.self;
+            modEnv->modTable = placeholder;
+            modEnv->bNsBody = true;   // module-level vars are members
             wstring oldModFile = g_curModuleFile;
             g_curModuleFile = file;
             Value oldRet = ret;
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;
             nReturn = nBreak = nContinue = 0;
             ret = Value();
-            ExecBlock(prog, &modEnv);
+            ExecBlock(prog, modEnv.get());
             bool bTopReturn = (nReturn != 0);
-            for (auto& kv : modEnv.vars)
+            for (auto& kv : modEnv->vars)
                 placeholder->scopeVars[kv.first] = kv.second;
             g_curModuleFile = oldModFile;
             Value mod = ret;
@@ -559,7 +561,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     mod = curNs;
                 else
                 {
-                    for (auto& kv : modEnv.vars)
+                    for (auto& kv : modEnv->vars)
                         placeholder->map[kv.first] = kv.second;
                     mod = modPlaceholder;
                 }

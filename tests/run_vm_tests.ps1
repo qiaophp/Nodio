@@ -9,7 +9,7 @@ if (-not (Test-Path $Exe)) { "EXE NOT FOUND: $Exe"; exit 2 }
 
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $tests = Join-Path $dir 'vmtests'
-$pass = 0; $fail = 0; $failed = @()
+$pass = 0; $fail = 0; $skip = 0; $failed = @()
 # -Only tNN[,tMM]: run just the named tests (edit-scoped reruns); a tNN
 # listed here skips the tNN.aardio loop below and the t49 publish phase
 # is likewise gated on 't49' appearing in -Only (empty -Only = all).
@@ -33,6 +33,28 @@ if (Test-Path $srvPy) {
 Get-ChildItem $tests -Filter 't??.aardio' | Sort-Object Name | ForEach-Object {
     $name = $_.BaseName
     if ($onlySet.Count -gt 0 -and -not $onlySet[$name]) { return }
+    # optional tNN.envcheck.aardio — environment gate. Run the probe first;
+    # output starting with SKIP means this machine cannot exercise the test
+    # at all (clipboard denied on a disconnected RDP session, no network,
+    # missing hardware), so the test is skipped rather than failed.
+    $envCheck = Join-Path $tests ($name + '.envcheck.aardio')
+    if (Test-Path $envCheck) {
+        $psiE = New-Object System.Diagnostics.ProcessStartInfo
+        $psiE.FileName = $Exe
+        $psiE.UseShellExecute = $false
+        $psiE.RedirectStandardOutput = $true
+        $psiE.RedirectStandardError = $true
+        $psiE.StandardOutputEncoding = [Text.Encoding]::UTF8
+        $psiE.StandardErrorEncoding = [Text.Encoding]::UTF8
+        $psiE.EnvironmentVariables['NODIO_RUN'] = $envCheck
+        $psiE.EnvironmentVariables['NODIO_PAUSE'] = '0'
+        $pE = [System.Diagnostics.Process]::Start($psiE)
+        $oE = $pE.StandardOutput.ReadToEndAsync()
+        $eE = $pE.StandardError.ReadToEndAsync()
+        if (-not $pE.WaitForExit(10000)) { $pE.Kill(); $pE.WaitForExit(3000) }
+        $probeOut = (($oE.Result + $eE.Result) -replace "`r", '' -replace "`n", '')
+        if ($probeOut -like 'SKIP*') { $skip++; Write-Host "SKIP $name env=[$probeOut]"; return }
+    }
     $expectFile = Join-Path $tests ($name + '.expect')
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
@@ -124,7 +146,7 @@ if ($projOk -and $t49Selected) {
         Write-Host "FAIL $name (publish produced no exe) pub=[$pubOut]"
     }
 }
-Write-Host "== $pass passed, $fail failed =="
+Write-Host "== $pass passed, $fail failed, $skip skipped =="
 # _srv.py spawns a child, so killing the wrapper PID alone can leave a
 # listener behind; kill the whole tree by PID.
 if ($srvProc -and -not $srvProc.HasExited) {

@@ -564,10 +564,31 @@ void Interp::InitBuiltins()
                     return Value::Str_(r); });
                 tb->map[L"toUtf16"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value::Str_(L"");
-                    return Value::Str_(BStr(a[0])); });
+                    wstring w = BStr(a[0]);
+                    // official contract: UTF-16 ENCODED byte string — the
+                    // raw little-endian bytes, so #result is the byte
+                    // length (clipboard GlobalAlloc sizing relies on it)
+                    wstring out;
+                    out.reserve(w.size() * 2);
+                    for (wchar_t ch : w)
+                    {
+                        out += (wchar_t)(unsigned char)(ch & 0xFF);
+                        out += (wchar_t)(unsigned char)((ch >> 8) & 0xFF);
+                    }
+                    return Value::Str_(out); });
                 tb->map[L"fromUtf16"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
-                    if (a[0].t == Value::Str) return a[0];
+                    if (a[0].t == Value::Str)
+                    {
+                        // decode UTF-16 LE bytes back to text
+                        const wstring& s = a[0].s;
+                        wstring w;
+                        w.reserve(s.size() / 2);
+                        for (size_t i = 0; i + 1 < s.size(); i += 2)
+                            w += (wchar_t)(unsigned char)s[i] |
+                                 ((wchar_t)(unsigned char)s[i + 1] << 8);
+                        return Value::Str_(w);
+                    }
                     if (a[0].t == Value::Pointer || a[0].t == Value::Num)
                     {
                         const wchar_t* p = (const wchar_t*)(INT_PTR)(long long)BNum(a[0]);
@@ -1742,6 +1763,51 @@ void Interp::InitBuiltins()
             // ---- round 44: raw — P/Invoke + raw memory ----
             {
                 auto tb = GetRoot(L"raw").tab;
+                // raw.str(ptr, len, cp) — kernel contract: read a C
+                // string from memory. len omitted → ANSI to '\0';
+                // len===true → UTF-16 to '\0\0' (clipboard text);
+                // numeric len → that many bytes decoded per cp
+                // (0=ANSI, 65001=UTF-8)
+                tb->map[L"str"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
+                    const unsigned char* p = nullptr;
+                    if (a[0].t == Value::Pointer)
+                        p = (const unsigned char*)a[0].ptr;
+                    else if (a[0].t == Value::Num)
+                        p = (const unsigned char*)(INT_PTR)(long long)
+                            BNum(a[0]);
+                    if (!p) return Value();
+                    if (a.size() > 1 && a[1].t == Value::Bool && a[1].b)
+                    {
+                        const wchar_t* pw = (const wchar_t*)p;
+                        wstring w;
+                        while (*pw) w += *pw++;
+                        return Value::Str_(w);
+                    }
+                    if (a.size() > 1 && a[1].t == Value::Num)
+                    {
+                        size_t len = (size_t)BNum(a[1]);
+                        UINT cp = (a.size() > 2 && a[2].t == Value::Num)
+                                      ? (UINT)(long long)BNum(a[2])
+                                      : CP_ACP;
+                        int wl = MultiByteToWideChar(cp, 0, (const char*)p,
+                            (int)len, nullptr, 0);
+                        wstring w;
+                        if (wl > 0)
+                        {
+                            w.resize(wl);
+                            MultiByteToWideChar(cp, 0, (const char*)p,
+                                (int)len, &w[0], wl);
+                        }
+                        return Value::Str_(w);
+                    }
+                    // ANSI, NUL-terminated
+                    {
+                        const char* pa = (const char*)p;
+                        wstring w;
+                        while (*pa) w += (wchar_t)(unsigned char)*pa++;
+                        return Value::Str_(w);
+                    } });
                 tb->map[L"loadDll"] = NF([this](vector<Value>& a)
                     -> Value {
                     HMODULE hMod = nullptr;
@@ -1912,6 +1978,8 @@ void Interp::InitBuiltins()
                                 std::string an = strNameA + "A";
                                 fp = ::GetProcAddress(hMod, an.c_str());
                             }
+                            if (fp)
+                                fp = ResolveLongPtrAlias(hMod, fp, strNameA);
                         }
                         if (!fp)
                         {
@@ -2143,6 +2211,15 @@ void Interp::InitBuiltins()
                                 case 5:   // pointer (hwnd / buffer)
                                     if (v.t == Value::Pointer)
                                         slots.push_back((SlotT)(INT_PTR)v.ptr);
+                                    else if (v.t == Value::Str)
+                                        // a string passed to a pointer
+                                        // parameter hands the API its raw
+                                        // buffer (byte strings / UTF-16
+                                        // text alike) — BNum() made every
+                                        // such call a NULL pointer and
+                                        // memcpy'd straight into a crash
+                                        slots.push_back((SlotT)(INT_PTR)
+                                            v.s.c_str());
                                     else
                                         slots.push_back(v.t == Value::Null
                                             ? (SlotT)0
@@ -3002,6 +3079,150 @@ void Interp::InitBuiltins()
                 tb->map[L"unpack"] = fnUnpack;
                 tb->map[L"unpackArgs"] = fnUnpack;
 
+                // table.next(t[, key]) — aardio walks tables in insertion
+                // order; the array part is ordered, the hash part's order
+                // is not recorded yet, so next() covers the array first,
+                // then hash members in unordered_map order (pinned in the
+                // ledger). Returns (key,value), null at the end.
+                tb->map[L"next"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() ||
+                        (a[0].t != Value::TableT && a[0].t != Value::Class) ||
+                        !a[0].tab)
+                        return Value();
+                    Table* t = a[0].tab.get();
+                    vector<Value> keys, vals;
+                    for (size_t i = 0; i < t->arr.size(); i++)
+                    {
+                        keys.push_back(Value::Num_((double)(i + 1)));
+                        vals.push_back(t->arr[i]);
+                    }
+                    for (auto& kv : t->map)
+                    {
+                        keys.push_back(Value::Str_(kv.first));
+                        vals.push_back(kv.second);
+                    }
+                    size_t start = 0;
+                    if (a.size() > 1 && a[1].t != Value::Null)
+                    {
+                        for (size_t i = 0; i < keys.size(); i++)
+                        {
+                            bool eq = a[1].t == keys[i].t &&
+                                      (keys[i].t == Value::Num
+                                           ? BNum(a[1]) == keys[i].n
+                                           : (keys[i].t == Value::Str &&
+                                              a[1].s == keys[i].s));
+                            if (eq) { start = i + 1; break; }
+                        }
+                    }
+                    if (start >= keys.size()) return Value();
+                    Value vK = keys[start];
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(vals[start]);
+                    vK.mrets = ex;
+                    return vK;
+                });
+                // table.pop(t[,n]) — remove n from the array tail (1 by
+                // default), return the last removed value; null when empty
+                tb->map[L"pop"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() ||
+                        (a[0].t != Value::TableT && a[0].t != Value::Class) ||
+                        !a[0].tab)
+                        return Value();
+                    Table* t = a[0].tab.get();
+                    long long n = (a.size() > 1 && a[1].t != Value::Null)
+                                      ? (long long)BNum(a[1]) : 1;
+                    if (n < 1) n = 1;
+                    Value vLast;
+                    bool bGot = false;
+                    while (n-- > 0 && !t->arr.empty())
+                    {
+                        vLast = t->arr.back();
+                        bGot = true;
+                        t->arr.pop_back();
+                    }
+                    return bGot ? vLast : Value();
+                });
+                // table.shift(t) — remove and return the first element
+                tb->map[L"shift"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab ||
+                        a[0].tab->arr.empty())
+                        return Value();
+                    Value v = a[0].tab->arr.front();
+                    a[0].tab->arr.erase(a[0].tab->arr.begin());
+                    return v;
+                });
+                // table.unshift(t,...) — insert at the array front
+                tb->map[L"unshift"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                        return Value::Num_(0);
+                    for (size_t i = 1; i < a.size(); i++)
+                        a[0].tab->arr.insert(
+                            a[0].tab->arr.begin() + (long long)(i - 1), a[i]);
+                    return Value::Num_((double)a[0].tab->arr.size());
+                });
+                // table.eachArgs(t) — iterator over the array part,
+                // yielding (index, value); popen converts codepages with it
+                tb->map[L"eachArgs"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                        return Value();
+                    auto arr =
+                        std::make_shared<vector<Value>>(a[0].tab->arr);
+                    auto idx = std::make_shared<size_t>(0);
+                    return Value::Native_([arr, idx](vector<Value>&) -> Value {
+                        if (*idx >= arr->size()) return Value();
+                        Value v = (*arr)[*idx];
+                        Value k = Value::Num_((double)(*idx + 1));
+                        auto ex = std::make_shared<vector<Value>>();
+                        ex->push_back(v);
+                        k.mrets = ex;
+                        (*idx)++;
+                        return k;
+                    });
+                });
+                // table.each(t) — iterator over the array part and then
+                // the hash members, yielding (key, value)
+                tb->map[L"each"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                        return Value();
+                    auto keys = std::make_shared<vector<Value>>();
+                    auto vals = std::make_shared<vector<Value>>();
+                    for (size_t i = 0; i < a[0].tab->arr.size(); i++)
+                    {
+                        keys->push_back(Value::Num_((double)(i + 1)));
+                        vals->push_back(a[0].tab->arr[i]);
+                    }
+                    for (auto& kv : a[0].tab->map)
+                    {
+                        keys->push_back(Value::Str_(kv.first));
+                        vals->push_back(kv.second);
+                    }
+                    auto idx = std::make_shared<size_t>(0);
+                    return Value::Native_([keys, vals, idx](
+                            vector<Value>&) -> Value {
+                        if (*idx >= keys->size()) return Value();
+                        Value k = (*keys)[*idx];
+                        auto ex = std::make_shared<vector<Value>>();
+                        ex->push_back((*vals)[*idx]);
+                        k.mrets = ex;
+                        (*idx)++;
+                        return k;
+                    });
+                });
+                // table.filter(t,fn) — new array of elements where fn(v)
+                // is truthy (JSON.ndParse consumers)
+                tb->map[L"filter"] = NF([this](vector<Value>& a) -> Value {
+                    auto out = std::make_shared<Table>();
+                    if (a.size() < 2 || a[0].t != Value::TableT || !a[0].tab)
+                        return Value::Table_(out);
+                    for (auto& v : a[0].tab->arr)
+                    {
+                        vector<Value> oneArg{ v };
+                        Value r = CallVmFunc(a[1], oneArg);
+                        if (r.Truthy()) out->arr.push_back(v);
+                    }
+                    return Value::Table_(out);
+                });
+
                 // table.range(array) -> min, max — the smallest and the
                 // largest numeric index of the array part (sparse-array
                 // helper; an ordinary array yields 1, #arr).
@@ -3485,9 +3706,108 @@ void Interp::InitBuiltins()
                 globals.vars[L"__waitForMultipleObjects"] = NF([](vector<Value>& a) -> Value {
                     return Value::Num_(0);
                 });
-                globals.vars[L"__messagePeek"] = NF([](vector<Value>& a) -> Value {
-                    return Value::Bool_(false);
-                });
+                // ---- kernel message-loop primitives (official aardio
+                // injects these as __-prefixed globals; win/_.aardio binds
+                // them at module load: `var getMessage = ..__messageGet`)
+                auto fillMsgTable = [](Value& vMsg, const MSG& m) -> Value {
+                    auto tb = (vMsg.t == Value::TableT && vMsg.tab)
+                                  ? vMsg.tab
+                                  : std::make_shared<Table>();
+                    tb->map[L"hwnd"] =
+                        Value::Num_((double)(INT_PTR)(UINT_PTR)m.hwnd);
+                    tb->map[L"message"] = Value::Num_((double)m.message);
+                    tb->map[L"wParam"] =
+                        Value::Num_((double)(long long)m.wParam);
+                    tb->map[L"lParam"] =
+                        Value::Num_((double)(long long)m.lParam);
+                    tb->map[L"time"] = Value::Num_((double)m.time);
+                    tb->map[L"x"] = Value::Num_((double)m.pt.x);
+                    tb->map[L"y"] = Value::Num_((double)m.pt.y);
+                    return Value::Table_(tb);
+                };
+                auto msgHwnd = [](vector<Value>& a) -> HWND {
+                    return (a.size() > 1 && a[1].t == Value::Num)
+                               ? (HWND)(INT_PTR)(long long)BNum(a[1])
+                               : nullptr;
+                };
+                auto msgRange = [](vector<Value>& a, size_t idx,
+                                   UINT def) -> UINT {
+                    return (a.size() > idx && a[idx].t == Value::Num)
+                               ? (UINT)(long long)BNum(a[idx])
+                               : def;
+                };
+                // peekMessage: non-blocking; option defaults to PM_REMOVE
+                // (resetMessage strips a pending WM_QUIT through it);
+                // returns the MSG table, false when the queue is empty,
+                // null on WM_QUIT (table still filled so callers can read
+                // the exit code)
+                globals.vars[L"__messagePeek"] =
+                    NF([fillMsgTable, msgHwnd, msgRange](
+                           vector<Value>& a) -> Value {
+                        MSG m;
+                        ZeroMemory(&m, sizeof(m));
+                        UINT opt = msgRange(a, 4, PM_REMOVE);
+                        if (!PeekMessageW(&m, msgHwnd(a), msgRange(a, 2, 0),
+                                          msgRange(a, 3, 0), opt))
+                            return Value::Bool_(false);
+                        Value vMsg =
+                            fillMsgTable(a.empty() ? Value() : a[0], m);
+                        if (m.message == WM_QUIT) return Value();
+                        return vMsg;
+                    });
+                // getMessage: blocking GetMessageW; an explicit PM_NOREMOVE
+                // option switches to a non-blocking PeekMessageW that
+                // returns false when no message is queued
+                globals.vars[L"__messageGet"] =
+                    NF([fillMsgTable, msgHwnd, msgRange](
+                           vector<Value>& a) -> Value {
+                        MSG m;
+                        ZeroMemory(&m, sizeof(m));
+                        UINT opt = msgRange(a, 4, PM_REMOVE);
+                        if (!(opt & PM_REMOVE))
+                        {
+                            if (!PeekMessageW(&m, msgHwnd(a),
+                                              msgRange(a, 2, 0),
+                                              msgRange(a, 3, 0), opt))
+                                return Value::Bool_(false);
+                        }
+                        else
+                        {
+                            if (GetMessageW(&m, msgHwnd(a), msgRange(a, 2, 0),
+                                            msgRange(a, 3, 0)) == -1)
+                                return Value::Bool_(false);
+                        }
+                        Value vMsg =
+                            fillMsgTable(a.empty() ? Value() : a[0], m);
+                        if (m.message == WM_QUIT) return Value();
+                        return vMsg;
+                    });
+                // translate+dispatch a MSG table fetched by peek/get
+                globals.vars[L"__messageTranslateDispatch"] =
+                    NF([](vector<Value>& a) -> Value {
+                        if (a.empty() || a[0].t != Value::TableT ||
+                            !a[0].tab)
+                            return Value();
+                        auto& mp = a[0].tab->map;
+                        auto fld = [&mp](const wchar_t* k) -> long long {
+                            auto it = mp.find(k);
+                            return it == mp.end()
+                                       ? 0
+                                       : (long long)BNum(it->second);
+                        };
+                        MSG m;
+                        ZeroMemory(&m, sizeof(m));
+                        m.hwnd = (HWND)(INT_PTR)fld(L"hwnd");
+                        m.message = (UINT)fld(L"message");
+                        m.wParam = (WPARAM)(INT_PTR)fld(L"wParam");
+                        m.lParam = (LPARAM)(INT_PTR)fld(L"lParam");
+                        m.time = (DWORD)fld(L"time");
+                        m.pt.x = (LONG)fld(L"x");
+                        m.pt.y = (LONG)fld(L"y");
+                        TranslateMessage(&m);
+                        DispatchMessageW(&m);
+                        return Value();
+                    });
                 tb->map[L"create"] = NF([this](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t != Value::Func || !a[0].fn)
                     {
@@ -3506,13 +3826,14 @@ void Interp::InitBuiltins()
                             Interp wt{ &threadErr };
                             g_interpCurrent = &wt;
                             wt.InitBuiltins();
-                            Env local;
-                            local.parent = &wt.globals;
+                            auto local = std::make_shared<Env>();
+                            local->self = local;
+                            local->parent = wt.globals.self;
                             for (size_t i = 0; i < params.size(); i++)
-                                local.vars[params[i]] =
+                                local->vars[params[i]] =
                                     i < args.size() ? args[i] : Value();
                             wt.nReturn = 0;
-                            Value r = wt.ExecBlock(fnBody, &local);
+                            Value r = wt.ExecBlock(fnBody, local.get());
                             if (threadErr.empty())
                                 st->result = DeepCopy(r);
                             else
@@ -4402,12 +4723,26 @@ void Interp::InitBuiltins()
                         args.push_back(a[i]);
                     auto pFib = std::make_shared<Value>(fibV);
                     auto pArgs = std::make_shared<vector<Value>>(args);
-                    // iterator: null once the fiber is dead
+                    // iterator: null once the fiber is dead. Strip the ok
+                    // flag from resume's (true, yielded...) — for-in binds
+                    // the first loop variable to the first YIELDED value
+                    // (official fiber.generator semantics)
                     return NF([pFib, pArgs](vector<Value>&) -> Value {
                         VMFiber* c2 = FiberOf(*pFib);
                         if (!c2 || c2->status == L"dead")
                             return Value();
-                        return FiberResume(*pFib, *pArgs, nullptr); });
+                        Value r = FiberResume(*pFib, *pArgs, nullptr);
+                        if (!r.mrets || r.mrets->empty())
+                            return Value();
+                        Value first = (*r.mrets)[0];
+                        if (first.t == Value::Null && r.mrets->size() == 1)
+                            return Value();   // fiber finished, nothing yielded
+                        auto rest = std::make_shared<vector<Value>>();
+                        for (size_t i = 1; i < r.mrets->size(); i++)
+                            rest->push_back((*r.mrets)[i]);
+                        if (!rest->empty())
+                            first.mrets = rest;
+                        return first; });
                 });
             }
 
@@ -4464,24 +4799,28 @@ void Interp::InitBuiltins()
                                           : L"assertion failed!";
                 (*err) = L"运行错误: " + msg;
                 return Value(); });
-            // assert2(level,value,message,...)
+            // assert2(level,value,...) — asserts the value after the error
+            // level; on success returns every argument AFTER it, so
+            // `assert2(2, resume(fib))` yields the resumed values (the
+            // builtin/_.aardio fiber.generator iterator relies on this to
+            // hand for-in the yielded value, not the ok flag)
             globals.vars[L"assert2"] = NF([this](vector<Value>& a) -> Value {
-                size_t base = a.empty() ? 0 : 1;   // skip the level argument
-                if (a.size() > base && a[base].Truthy())
+                if (a.size() > 1 && a[1].Truthy())
                 {
-                    if (a.size() > base + 1)
+                    if (a.size() > 2)
                     {
                         auto ex = std::make_shared<vector<Value>>();
-                        for (size_t i = base + 1; i < a.size(); i++)
+                        for (size_t i = 3; i < a.size(); i++)
                             ex->push_back(a[i]);
-                        Value r = a[base + 1];
-                        r.mrets = ex;
+                        Value r = a[2];
+                        if (!ex->empty())
+                            r.mrets = ex;
                         return r;
                     }
-                    return a[base];
+                    return Value();   // only the ok flag: nothing to yield
                 }
-                wstring msg = a.size() > base + 1 ? BStr(a[base + 1])
-                                                  : L"assertion failed!";
+                wstring msg = a.size() > 2 ? BStr(a[2])
+                                          : L"assertion failed!";
                 (*err) = L"运行错误: " + msg;
                 return Value(); });
             // assertf — inverse assertion: throws when the value is truthy

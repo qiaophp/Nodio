@@ -168,6 +168,13 @@ int wmain(int argc, wchar_t** argv)
         return nFail ? 1 : 0;
     }
 
+    // a script path as the first command-line argument runs it directly
+    // (aardio.exe behaviour): forward it into the NODIO_RUN harness below.
+    // The self-hosted IDE's F5 spawns `nodio.exe <script>` and streams the
+    // child's output through process.popen.
+    if (argc > 1 && argv[1][0])
+        SetEnvironmentVariableW(L"NODIO_RUN", argv[1]);
+
     // NODIO_RUN regression / F5 harness
     wchar_t szRunFile[MAX_PATH];
     if (GetEnvironmentVariableW(L"NODIO_RUN", szRunFile, MAX_PATH) > 0)

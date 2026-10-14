@@ -63,6 +63,7 @@ namespace NodioVM
     struct Node;
     using PNode = shared_ptr<Node>;
 
+    struct Env;
     struct Value;
     struct Table
     {
@@ -84,6 +85,7 @@ namespace NodioVM
         wstring fname;                  // debug
         shared_ptr<Table> tab;
         shared_ptr<Table> nsClosure;    // defining namespace (aardio upvalue)
+        shared_ptr<Env> envUp;          // defining frame chain (closure upvalues)
         shared_ptr<vector<PNode>> pdefaults;  // FuncLit param defaults
         shared_ptr<vector<Value>> mrets;      // aardio extra return values
         shared_ptr<Value> thisVal;            // lexical this captured at function definition
@@ -129,6 +131,34 @@ namespace NodioVM
         return defCp;
     }
     inline Value NF(Value::NativeFn f) { return Value::Native_(std::move(f)); }
+
+    // x64 pointer-width API families: official aardio maps SetWindowLong /
+    // GetWindowLong / SetClassLong / GetClassLong to the *PtrW exports in
+    // 64-bit builds — the 32-bit exports cannot carry a 64-bit window
+    // proc. win/api.aardio subclasses every form through SetWindowPointer
+    // (declared as SetWindowLong with a ptr param); without this alias the
+    // subclass silently fails and NO window message ever reaches aardio.
+    inline bool IsLongPtrFamily(const std::string& n)
+    {
+        return n.rfind("SetWindowLong", 0) == 0 ||
+               n.rfind("GetWindowLong", 0) == 0 ||
+               n.rfind("SetClassLong", 0) == 0 ||
+               n.rfind("GetClassLong", 0) == 0;
+    }
+    inline FARPROC ResolveLongPtrAlias(HMODULE hMod, FARPROC fp,
+                                       const std::string& strNameA)
+    {
+        if (sizeof(void*) == 8 && fp && IsLongPtrFamily(strNameA))
+        {
+            std::string base = strNameA;
+            if (!base.empty() && (base.back() == 'W' || base.back() == 'A'))
+                base.pop_back();
+            if (FARPROC f2 =
+                    ::GetProcAddress(hMod, (base + "PtrW").c_str()))
+                return f2;
+        }
+        return fp;
+    }
 
     // round M2: struct field type names recognized in class/table member
     // declarations (int x; WORD name[32];)
@@ -542,7 +572,13 @@ namespace NodioVM
 
     struct Env
     {
-        Env* parent = nullptr;
+        // Owning frame chain: call/block frames are heap objects so a
+        // closure can keep its defining frames (and their locals —
+        // aardio upvalues) alive after the call returns. `self` is the
+        // owning handle set by the creator; children hold it via parent.
+        // Machine-lifetime envs (globals) use a no-op deleter.
+        std::shared_ptr<Env> parent;
+        std::shared_ptr<Env> self;
         std::unordered_map<wstring, Value> vars;
         shared_ptr<Table> nsTable;   // namespace scope: bare names land here
         shared_ptr<Table> modTable;  // file/module scope table: scopeVars
@@ -551,9 +587,15 @@ namespace NodioVM
         // VarDecl mirrors it into the namespace table's map. Function-call
         // envs leave it false — their locals must stay local.
         bool bNsBody = false;
+        // true when nsTable is an INSTANCE scope (method/ctor call frame,
+        // `local.nsTable = inst`): one instance's members must never be
+        // captured as a function's defining namespace. nsClosure capture
+        // skips these frames so method-defined callbacks (win.form's
+        // wndproc) still resolve namespace members like `_defaultProc`.
+        bool bNsInst = false;
         Value* Find(const wstring& k)
         {
-            for (Env* e = this; e; e = e->parent)
+            for (Env* e = this; e; e = e->parent.get())
             {
                 auto it = e->vars.find(k);
                 if (it != e->vars.end())

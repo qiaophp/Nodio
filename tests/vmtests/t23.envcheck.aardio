@@ -1,0 +1,15 @@
+// Environment gate for t23 (clipboard round-trip): a window station can
+// deny clipboard access entirely — ERROR_ACCESS_DENIED on OpenClipboard,
+// typical of a disconnected RDP session. t23 cannot pass on such a
+// desktop no matter what the engine does, so the harness skips it.
+var u32 = raw.loadDll("User32.dll");
+var k32 = raw.loadDll("kernel32.dll");
+var open = u32.api("OpenClipboard", "int(addr)");
+if( open(null) ){
+    u32.api("CloseClipboard", "int()")();
+    io.print("RUN");
+}
+else {
+    var gle = k32.api("GetLastError", "int()");
+    io.print("SKIP gle=" .. gle());
+}

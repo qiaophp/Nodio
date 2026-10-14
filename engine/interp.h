@@ -31,7 +31,13 @@ namespace NodioVM
         wstring baseDir;                             // import file resolution
         std::unordered_map<wstring, wstring> embedded;   // payload v2 files
 
-        explicit Interp(wstring* e) : err(e) {}
+        explicit Interp(wstring* e) : err(e)
+        {
+            // globals outlives every frame: give it a self handle with a
+            // no-op deleter so child frames can hold it as shared parent
+            globals.self =
+                std::shared_ptr<Env>(&globals, [](Env*) {});
+        }
 
         // ---- runtime.cpp (evaluation core) ----
         Value Eval(const PNode& n, Env* env);
@@ -52,7 +58,6 @@ namespace NodioVM
         Value EvalBin(const PNode& n, Env* env);
         bool CmpLess(const Value& l, const Value& r);
         Value ApplyOp(const wstring& op, const Value& l, const Value& r);
-        void DoAssignSimple(const wstring& name, const Value& v);
         void DoAssign(const PNode& target, const Value& v, Env* env,
                       const wstring& op);
         Value ExecBlock(const PNode& blk, Env* env);
