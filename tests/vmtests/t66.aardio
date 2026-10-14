@@ -1,0 +1,13 @@
+// t66: natural struct alignment (MSVC default packing). A pointer
+// member after a 4-byte member must land at a naturally aligned offset
+// (8 on x64, 4 on x86); the old sequential packing produced size 16 on
+// x64 and Win32 read a garbage lpSecurityDescriptor — CreatePipe with
+// valid attributes failed outright, breaking process.popen.
+var ps = raw.sizeOf({ pointer p });
+io.print("ptr-ok:" .. (ps == 8 or ps == 4));
+var sa = { INT nLength = 12; pointer lpSecurityDescriptor; bool bInheritHandle = true; };
+io.print("sa-ok:" .. (raw.sizeOf(sa) == (ps == 8 ? 24 : 12)));
+var mix = { BYTE a; INT64 b; };
+io.print("mix:" .. raw.sizeOf(mix));
+var seq = { BYTE a; WORD b; INT c; };
+io.print("seq:" .. raw.sizeOf(seq));

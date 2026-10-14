@@ -513,10 +513,66 @@ namespace NodioVM
         return fields;
     }
 
+    // natural member alignment per API type (MSVC default packing) —
+    // without this a pointer after a 4-byte member lands at offset 4 on
+    // x64 and Win32 reads a garbage pointer (SECURITY_ATTRIBUTES broke
+    // CreatePipe exactly so)
+    int GetStructFieldAlign(const wstring& type)
+    {
+        wstring t = type;
+        for (auto& c : t) c = towlower(c);
+        if (t == L"pointer" || t == L"ptr" || t == L"addr" ||
+            t == L"handle" || t == L"ustring" || t == L"ustr" ||
+            t == L"wstr" || t == L"bstr" || t == L"string" || t == L"str" ||
+            t == L"strb" || t == L"lpcstr")
+            return (int)sizeof(void*);
+        if (t == L"int64" || t == L"uint64" || t == L"long64" ||
+            t == L"i64" || t == L"qword" || t == L"double")
+            return 8;
+        if (t == L"word" || t == L"ushort" || t == L"short" || t == L"wchar")
+            return 2;
+        if (t == L"byte" || t == L"uchar" || t == L"char" || t == L"int8")
+            return 1;
+        return 4;
+    }
+
+    // a nested struct aligns to its widest member (recursive, MSVC rule)
+    int CalcStructAlign(const Value& vTab)
+    {
+        int maxA = 1;
+        for (auto& f : ParseStructDef(vTab))
+        {
+            wstring t = f.type;
+            for (auto& c : t) c = towlower(c);
+            int a;
+            if (t == L"struct" && vTab.tab)
+            {
+                auto itM = vTab.tab->map.find(f.name);
+                if (itM != vTab.tab->map.end() &&
+                    (itM->second.t == Value::TableT ||
+                     itM->second.t == Value::Class) &&
+                    itM->second.tab)
+                    a = CalcStructAlign(itM->second);
+                else
+                    a = 1;
+            }
+            else
+                a = GetStructFieldAlign(f.type);
+            if (a > maxA) maxA = a;
+        }
+        return maxA;
+    }
+
+    static int AlignOffset(int off, int al)
+    {
+        return (al > 1) ? ((off + al - 1) / al) * al : off;
+    }
+
     int CalcStructTotalSize(const Value& vTab)
     {
         auto fields = ParseStructDef(vTab);
         int total = 0;
+        int maxA = 1;
         for (auto& f : fields)
         {
             wstring t = f.type;
@@ -527,13 +583,19 @@ namespace NodioVM
                 if (itM != vTab.tab->map.end() && (itM->second.t == Value::TableT || itM->second.t == Value::Class))
                 {
                     int subSz = CalcStructTotalSize(itM->second);
+                    int subA = CalcStructAlign(itM->second);
+                    total = AlignOffset(total, subA);
                     total += (subSz > 0 ? subSz : 4) * (f.arrCount > 0 ? f.arrCount : 1);
+                    if (subA > maxA) maxA = subA;
                     continue;
                 }
             }
+            int al = GetStructFieldAlign(f.type);
+            total = AlignOffset(total, al);
             total += GetStructFieldSize(f.type, f.arrCount, f.bIsArray);
+            if (al > maxA) maxA = al;
         }
-        return total;
+        return AlignOffset(total, maxA);
     }
 
     void* StructSerialize(const Value& vTab, int* pOutTotal)
@@ -558,6 +620,23 @@ namespace NodioVM
             int sz = GetStructFieldSize(f.type, f.arrCount, f.bIsArray);
             wstring lowerName = f.name;
             for (auto& c : lowerName) c = towlower(c);
+            {
+                int al;
+                if (t == L"struct")
+                {
+                    auto itM2 = vTab.tab->map.find(f.name);
+                    if (itM2 != vTab.tab->map.end() &&
+                        (itM2->second.t == Value::TableT ||
+                         itM2->second.t == Value::Class) &&
+                        itM2->second.tab)
+                        al = CalcStructAlign(itM2->second);
+                    else
+                        al = 1;
+                }
+                else
+                    al = GetStructFieldAlign(f.type);
+                off = AlignOffset(off, al);
+            }
             if ((lowerName == L"cbsize" || lowerName == L"dwsize") && (t == L"int" || t == L"uint" || t == L"dword"))
             {
                 if (fv.n != total)
@@ -674,6 +753,22 @@ namespace NodioVM
             int sz = GetStructFieldSize(f.type, f.arrCount, f.bIsArray);
             wstring t = f.type;
             for (auto& c : t) c = towlower(c);
+            {
+                int al;
+                if (t == L"struct")
+                {
+                    if (iv != vTab.tab->map.end() &&
+                        (iv->second.t == Value::TableT ||
+                         iv->second.t == Value::Class) &&
+                        iv->second.tab)
+                        al = CalcStructAlign(iv->second);
+                    else
+                        al = 1;
+                }
+                else
+                    al = GetStructFieldAlign(f.type);
+                off = AlignOffset(off, al);
+            }
             if (t == L"struct")
             {
                 if (iv != vTab.tab->map.end() && (iv->second.t == Value::TableT || iv->second.t == Value::Class) && iv->second.tab)
