@@ -27,6 +27,32 @@ Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
                             mod.tab->map[kv.first] = kv.second;
                     }
                 }
+                // A module body that declares `class X {}` (+ the trailing
+                // `namespace X{}` extension) builds the real namespace in
+                // place: keep that class when the incoming module value is
+                // a placeholder table, merging the module's own members
+                // into it. The re-entrant `import process;` inside
+                // process/job/limitKill used to bind the empty cache
+                // placeholder OVER the class, dropping every member the
+                // namespace declared (PROCESS_INFORMATION, STARTUPINFO...).
+                auto itCl = roots.find(names[0]);
+                if (itCl != roots.end() &&
+                    (itCl->second.t == Value::Class ||
+                     itCl->second.t == Value::Func) &&
+                    itCl->second.tab &&
+                    mod.t == Value::TableT && mod.tab &&
+                    itCl->second.tab != mod.tab)
+                {
+                    Value& vOld = itCl->second;
+                    for (auto& kv : mod.tab->map)
+                        if (!vOld.tab->map.count(kv.first))
+                            vOld.tab->map[kv.first] = kv.second;
+                    for (auto& kv : mod.tab->scopeVars)
+                        if (!vOld.tab->scopeVars.count(kv.first))
+                            vOld.tab->scopeVars[kv.first] = kv.second;
+                    globals.vars[names[0]] = vOld;
+                    return vOld;
+                }
                 roots[names[0]] = mod;
                 globals.vars[names[0]] = mod;
                 return mod;
@@ -261,6 +287,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 nReturn = nBreak = nContinue = 0;
                 ret = Value();
                 ExecBlock(prog, &modEnv2);
+                bool bTopReturn = (nReturn != 0);
                 for (auto& kv : modEnv2.vars)
                     placeholder2->scopeVars[kv.first] = kv.second;
                 g_curModuleFile = oldModFile2;
@@ -269,6 +296,15 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 ret = oldRet;
                 if (!err->empty())
                     return Value();
+                // A module whose top level never executed `return` has no
+                // module value of its own: `ret` here is just the value of
+                // the LAST statement — for process/_.aardio that is
+                // `import process.job.limitKill;`, whose module table then
+                // got bound AS `process`, replacing the class the file
+                // declared. Without a top-level return, resolve the
+                // namespace path instead.
+                if (!bTopReturn)
+                    mod2 = Value();
                 if (mod2.t != Value::TableT)
                 {
                     Value curNs;
@@ -448,6 +484,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             nReturn = nBreak = nContinue = 0;
             ret = Value();
             ExecBlock(prog, &modEnv);
+            bool bTopReturn = (nReturn != 0);
             for (auto& kv : modEnv.vars)
                 placeholder->scopeVars[kv.first] = kv.second;
             g_curModuleFile = oldModFile;
@@ -456,6 +493,13 @@ Value Interp::DoImport(const PNode& n, Env* env)
             ret = oldRet;
             if (!err->empty())
                 return Value();
+            // Without a top-level return the module has no value of its
+            // own — `ret` is just the last statement's value (for
+            // process/_.aardio, the process.job.limitKill module table,
+            // which then got bound AS `process`). Resolve the namespace
+            // path instead.
+            if (!bTopReturn)
+                mod = Value();
             if (mod.t != Value::TableT)
             {
                 Value curNs;
