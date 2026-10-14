@@ -6,7 +6,8 @@ Decisions locked with the project owner:
    (confirmed via RTTI imports of the original `aardio.exe`). Rebuilding
    that shell in C++/MFC is the largest failure mode of the previous
    reconstruction: instead, the VM engine is extracted MFC-free (this
-   repo), and the IDE will be re-built on **WTL + Scintilla** (Phase 3).
+   repo), and the IDE is re-built on **native Win32 + Scintilla**
+   (Phase 3; the v0 shell retired the WTL idea — no framework dependency).
 2. **x64 first, x86 retained for legacy DLL authors.** All new FFI work
    targets the unified Microsoft x64 ABI. The Win32 build stays available
    only because some legacy 32-bit-only third-party DLLs can never load
@@ -23,6 +24,10 @@ Decisions locked with the project owner:
    - OS-physical limits: third-party **32-bit-only native DLLs** (run via
      a published x86 build), and closed pre-compiled `=aardio` bytecode
      blobs (original opcode encodings remain unrecovered).
+5. **Engine and official library must reach 100% behavioural
+   compatibility** (within the boundary in item 4). The gap is
+   enumerated — never estimated — in the completion ledger below; every
+   listed defect is on the critical path to 100%.
 
 ## Phase 1 — engine (this repo)
 - [x] Tree-walking interpreter, 57-test regression suite green (x86 + x64)
@@ -86,11 +91,12 @@ Decisions locked with the project owner:
 | x64 | **868 / 868 source files (100%)** | `NODIO_CHECK` batch parse sweep; 1 file is `=aardio` bytecode, not source |
 | x86 | **868 / 868 source files (100%)** | identical |
 
-### Library import coverage (50 top-level namespaces)
+### Library import coverage (51 top-level namespaces, enumerated by
+### `tests/ns_sweep.sh` from the official tree; measured 2026-10-14)
 | arch | importing | note |
 |---|---|---|
-| x64 | **41 / 50** | remainder: 32-bit-only DLLs, `global.import`/`(debug)` introspection |
-| x86 | **44 / 50** | same module set, minus the x64 arch limit |
+| x64 | **42 / 51** | residue table below |
+| x86 | **45 / 51** | same module set, minus the x64 arch limit |
 
 The remainder is specific, not vague — and the earlier "environmental
 ceiling" claim was wrong: it hid real engine defects (`~` path resolution,
@@ -98,14 +104,53 @@ the `io.exist` return contract, custom API types).
 
 | namespace | cause | next step |
 |---|---|---|
-| `base64`, `sqlite`, `zlib` | bundle 32-bit-only DLLs | OS limit on x64; all three import on x86 |
-| `golang`, `nodeJs` | x64: chain reaches the 32-bit `zlibwapi.dll`; x86: missing primitive | add the missing primitive |
-| `py2`, `py3` | x64: 32-bit `python27/38.dll` (OS limit); x86: missing primitive at `_.aardio:141` | add the missing primitive |
+| `base64`, `sqlite`, `zlib`, `golang`, `nodeJs`, `py2`, `py3` (x64 only) | bundle 32-bit-only DLLs (`zlibwapi.dll`, `python27/38.dll`, MZ payloads) | OS limit on x64; all seven import on x86 |
 | `System` | `dotNet.import(...)` — no CLR host | needs the CLR hosting layer |
-| `debug`, `ide` | `global.import("(debug)")` — no VM introspection API | Phase 3 |
+| `ide` (both arch) | the engine-provided `(debug)` module lacks `getMainId` (`@ 行 24` of the chain) | add the API |
+| `py2`, `py3` (x86) | `string.trimRight` primitive missing (`_.aardio:141`) | add the primitive |
+| `nodeJs` (x86) | hits the `var in_addr = in_addr` self-alias engine defect via its `wsock` chain | engine fix below |
+| `golang` (x86) | its own import guard fires during `import golang` (self-reference) | verify the root-binding contract |
 
-Current state in one line: **source parsing 100%**, **import 44/50 (x86) /
-41/50 (x64)**, residue enumerated above.
+Current state in one line: **source parsing 100%**, **import 42/51 (x64) /
+45/51 (x86)**, residue enumerated above; behaviour-level completion is
+tracked in the ledger below.
+
+### Completion ledger (denominator pinned 2026-10-14)
+
+Aggregation weights are for reporting only and may be re-weighted:
+engine 40 / library 25 / publisher 15 / IDE 15 / designer 5.
+
+| area | weight | score | measured evidence |
+|---|---|---|---|
+| engine (language + VM + FFI) | 40 | **85%** | parse 868/868 both arch; VM regression 60/60 both arch; imports 42/51 x64, 45/51 x86 with the residue above; open semantic defect clusters listed below |
+| official library (behaviour) | 25 | **27%** | headless sweep of the pinned 632-example manifest (`tests/sweep_examples.sh`): 157 clean / 444 error / 31 hang — 24.8% raw, 27% after removing the OS-physical 32-bit-DLL set from the denominator (157/572) |
+| publisher (Phase 2) | 15 | **100%** | closed; fixtures green x64 + x86 |
+| IDE shell (Phase 3) | 15 | **25%** | native Win32 + Scintilla v0: edit / aardio highlight / project tree / F5 run / output pane; black-box smoke test drives the real window. No MDI tabs, completion or debug UI yet |
+| form designer (Phase 4) | 5 | **0%** | not started |
+
+**Overall ≈ 59.5 / 100.** Per decision 5, the engine and the official
+library must reach 100% — the defect list below is that path:
+
+1. `var x = x;` self-alias inside a namespace loses the class value:
+   bare `in_addr()` at `wsock/_.aardio:132` calls a non-function
+   (`Network/wsock/*`, `Network/Manage/inet.adapter.aardio:476`, and
+   x86 `nodeJs` through its `wsock` chain — 15+ examples)
+2. `import process` returns a table that lost the class members declared
+   in the trailing `namespace process{}`; `process.PROCESS_INFORMATION` /
+   `.STARTUPINFO` read null (13 examples). `BindModule` hands TableT,
+   not Class; suspected re-entry via `process/job/limitKill.aardio:1`
+3. runaway recursion dies with 栈溢出 and no depth-guard contract (7 examples)
+4. `(debug)` API gaps: `getMainId` missing → `import ide` fails (both arch)
+5. `string.trimRight` primitive missing → x86 `py2`/`py3` fail at `_.aardio:141`
+6. CLR host for `System` (`dotNet.import`)
+7. language-host primitives: py2/py3 (x86), `golang` import self-guard
+
+Behaviour buckets of the 444 sweep errors (named clusters; a long tail
+beyond them): missing hosts ~55 (Java 40, CLR 15), 32-bit-only DLLs on
+x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
+~39 (headless cannot validate; re-measure inside the IDE), engine defects
+= items 1–5 and parts of the `.status/.slice/.cmp/.call/.process` and
+`无效参数` clusters.
 
 ## Phase 2 — publisher (this repo, `publish/`)
 - [x] Binary-safe payload embedder + `.aproj` embed/ignored/local rules
@@ -114,12 +159,16 @@ Current state in one line: **source parsing 100%**, **import 44/50 (x86) /
 - [x] Publish fixtures (`tests/m7/proj`, t49) + memory-DLL-from-payload
       assertions (x64 + x86 green)
 
-## Phase 3 — IDE shell (`ide/`, WTL + Scintilla)
-- [ ] VM introspection API for `(debug)` (`callcount`/`queryinfo`/`hook`/
-      `getlocalvar`/`traceback`) — blocks `import debug`
-- [ ] Tabbed MDI frame, docking panes (project tree / output console)
-- [ ] Scintilla integrated with a custom aardio lexer (UTF-8 native)
-- [ ] Real-time run/debug output plumbing over the `NODIO_*` contract
+## Phase 3 — IDE shell (`ide/`, native Win32 + Scintilla)
+- [x] VM introspection API for `(debug)` (`queryinfo`/`traceback`/
+      `callcount`/`hook`/`open`/`close`, engine-provided named module) —
+      `import debug` green; `getMainId` still missing and blocks `import ide`
+- [ ] Tabbed MDI frame, docking panes (v0 has a fixed project-tree +
+      output-pane layout)
+- [x] Scintilla integrated with a custom aardio lexer (container lexer,
+      UTF-8 native, per-line block-comment state)
+- [x] Real-time run/output plumbing over the `NODIO_*` contract
+      (pipe reader thread → output pane; smoke test drives the real window)
 
 ## Phase 4 — visual form designer (`designer/`)
 - [ ] Native HWND design canvas + 8-handle resize tracker
