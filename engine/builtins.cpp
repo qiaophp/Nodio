@@ -1,6 +1,8 @@
 #include "engine/interp.h"
 #include "engine/parser.h"
 #include <clocale>
+#include <fcntl.h>
+#include <io.h>
 
 namespace NodioVM
 {
@@ -900,60 +902,338 @@ void Interp::InitBuiltins()
                     return writer(a, L"", false); });
                 tb->map[L"println"] = NF([writer](vector<Value>& a) {
                     return writer(a, L"", true); });
-                tb->map[L"open"] = NF([](vector<Value>& a) {
-                    // io.open() with no arguments is the console library's
-                    // "open the console" call. It used to index an empty
-                    // argument vector and crash the process; the engine has
-                    // no interactive console of its own, so report whether a
-                    // console is attached.
-                    if (a.empty() || a[0].t == Value::Null)
-                        return Value::Bool_(GetConsoleWindow() != nullptr);
-                    wstring path = BStr(a[0]);
-                    wstring mode = a.size() > 1 ? BStr(a[1]) : L"r";
-                    const wchar_t* m = wcschr(mode.c_str(), L'w') ? L"wb" :
-                        wcschr(mode.c_str(), L'a') ? L"ab" : L"rb";
-                    FILE* pf = nullptr;
-                    if (_wfopen_s(&pf, path.c_str(), m) != 0 || !pf)
-                        return Value();
-                    auto fp = std::make_shared<FILE*>(pf);
+                // ---- io.file / io.open — kernel file class ----
+                // Official aardio: io.file is a kernel class; io.open is its
+                // legacy alias (builtin/io.aardio calls f.size()/f.seek on
+                // open() results). The ctor takes a path (text) or an OS
+                // handle (pointer/num), plus a CRT mode string. Byte
+                // contract (engine convention, see string.fromto): file
+                // content flows as byte strings — one wchar per raw byte,
+                // every char <= 0xFF. TEXT values written are encoded
+                // UTF-8; a byte string is written as-is.
+                struct IoFileState
+                {
+                    FILE* f = nullptr;
+                    ~IoFileState() { if (f) fclose(f); }
+                };
+                auto ioFileBytesToValue = [](const std::string& raw) -> Value {
+                    wstring s((size_t)raw.size(), 0);
+                    for (size_t k = 0; k < raw.size(); k++)
+                        s[k] = (wchar_t)(unsigned char)raw[k];
+                    return Value::Str_(s);
+                };
+                auto ioFileArgBytes = [](const Value& v,
+                                         std::string& out) -> bool {
+                    // appends to out (write() loops over several args)
+                    std::string piece;
+                    if (v.t == Value::TableT || v.t == Value::Class)
+                    {
+                        if (!v.tab) return false;
+                        int total = 0;
+                        void* p = StructSerialize(v, &total);
+                        if (!p) return false;
+                        piece.assign((const char*)p, (size_t)total);
+                        HeapFree(GetProcessHeap(), 0, p);
+                        out += piece;
+                        return true;
+                    }
+                    wstring s = v.ToString();
+                    for (wchar_t c : s)
+                    {
+                        if (c > 0xFF)
+                        {
+                            // text: encode UTF-8
+                            int n = WideCharToMultiByte(CP_UTF8, 0,
+                                s.c_str(), (int)s.size(), nullptr, 0,
+                                nullptr, nullptr);
+                            piece.resize(n > 0 ? (size_t)n : 0);
+                            if (n > 0)
+                                WideCharToMultiByte(CP_UTF8, 0, s.c_str(),
+                                    (int)s.size(), &piece[0], n, nullptr,
+                                    nullptr);
+                            out += piece;
+                            return true;
+                        }
+                    }
+                    // byte string: raw bytes as-is
+                    piece.resize(s.size());
+                    for (size_t k = 0; k < s.size(); k++)
+                        piece[k] = (char)(unsigned char)s[k];
+                    out += piece;
+                    return true;
+                };
+                auto ioFileFail = [](const wchar_t* msg, int code) -> Value {
+                    Value v;
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Str_(msg));
+                    ex->push_back(Value::Num_((double)code));
+                    v.mrets = ex;
+                    return v;
+                };
+                auto ioFileMake = [ioFileBytesToValue, ioFileArgBytes,
+                                   ioFileFail](shared_ptr<IoFileState> st) -> Value {
                     auto tb2 = std::make_shared<Table>();
-                    tb2->map[L"read"] = NF([fp](vector<Value>&) {
-                        if (!*fp) return Value();
-                        std::string raw3;
-                        char buf3[4096]; size_t rd3;
-                        while ((rd3 = fread(buf3, 1, sizeof(buf3), *fp)) > 0)
-                            raw3.append(buf3, rd3);
-                        int w3 = MultiByteToWideChar(CP_UTF8, 0, raw3.data(),
-                                                     (int)raw3.size(), nullptr, 0);
-                        wstring s3((size_t)w3, 0);
-                        if (w3 > 0)
-                            MultiByteToWideChar(CP_UTF8, 0, raw3.data(),
-                                                (int)raw3.size(), &s3[0], w3);
-                        return Value::Str_(s3); });
-                    tb2->map[L"write"] = NF([fp](vector<Value>& a2) {
-                        if (!*fp) return Value::Bool_(false);
-                        wstring s3 = BStr(a2[0]);
-                        int n3 = WideCharToMultiByte(CP_UTF8, 0, s3.c_str(),
-                                                     (int)s3.size(), nullptr, 0,
-                                                     nullptr, nullptr);
-                        std::string out3((size_t)n3, 0);
-                        if (n3 > 0)
-                            WideCharToMultiByte(CP_UTF8, 0, s3.c_str(),
-                                                (int)s3.size(), &out3[0], n3,
-                                                nullptr, nullptr);
-                        fwrite(out3.data(), 1, out3.size(), *fp);
-                        return Value::Bool_(true); });
-                    tb2->map[L"close"] = NF([fp](vector<Value>&) {
-                        if (*fp) { fclose(*fp); *fp = nullptr; }
-                        return Value(); });
-                    tb2->map[L"size"] = NF([fp](vector<Value>&) {
-                        if (!*fp) return Value::Num_(0);
-                        long long cur = ftell(*fp);
-                        fseek(*fp, 0, SEEK_END);
-                        long long end = ftell(*fp);
-                        fseek(*fp, cur, SEEK_SET);
-                        return Value::Num_((double)end); });
-                    return Value::Table_(tb2); });
+                    // read(...) — no arg: one line (bytes, newline kept);
+                    // n > 0: n bytes; n == -1: all remaining; struct arg:
+                    // sizeof(struct) bytes deserialized into a copy;
+                    // 0 bytes at EOF -> null
+                    tb2->map[L"read"] = NF([st, ioFileBytesToValue,
+                                            ioFileFail](
+                            vector<Value>& a) -> Value {
+                        if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                        std::string raw;
+                        bool bLine = a.empty() || a[0].t == Value::Null;
+                        if (!a.empty() && (a[0].t == Value::TableT ||
+                                           a[0].t == Value::Class))
+                        {
+                            int total =
+                                a[0].tab ? CalcStructTotalSize(a[0]) : 0;
+                            if (total <= 0) return Value();
+                            raw.resize((size_t)total);
+                            size_t got =
+                                fread(&raw[0], 1, (size_t)total, st->f);
+                            raw.resize(got);
+                            if (raw.empty()) return Value();
+                            auto cp = std::make_shared<Table>();
+                            // shallow copy: nested struct members stay
+                            // shared with the template
+                            cp->map = a[0].tab->map;
+                            Value vCp = Value::Table_(cp);
+                            StructDeserialize(vCp, raw.data());
+                            return vCp;
+                        }
+                        long long want = -1;
+                        if (!bLine)
+                            want = (long long)BNum(a[0]);
+                        if (bLine)
+                        {
+                            // fgetc blocks on _open_osfhandle'd pipe fds
+                            // even when data is buffered (read(3) via
+                            // fread on the same fd returns instantly), so
+                            // the line loop reads through fread as well
+                            unsigned char ch = 0;
+                            while (fread(&ch, 1, 1, st->f) == 1)
+                            {
+                                raw.push_back((char)ch);
+                                if (ch == '\n') break;
+                            }
+                        }
+                        else if (want == -1)
+                        {
+                            char buf[8192];
+                            size_t got;
+                            while ((got = fread(buf, 1, sizeof(buf),
+                                                st->f)) > 0)
+                                raw.append(buf, got);
+                        }
+                        else if (want > 0)
+                        {
+                            raw.resize((size_t)want);
+                            size_t got =
+                                fread(&raw[0], 1, (size_t)want, st->f);
+                            raw.resize(got);
+                        }
+                        if (raw.empty()) return Value();
+                        return ioFileBytesToValue(raw);
+                    });
+                    tb2->map[L"readAll"] = NF([st, ioFileBytesToValue,
+                                               ioFileFail](
+                            vector<Value>&) -> Value {
+                        if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                        std::string raw;
+                        char buf[8192];
+                        size_t got;
+                        while ((got = fread(buf, 1, sizeof(buf), st->f)) > 0)
+                            raw.append(buf, got);
+                        if (raw.empty()) return Value();
+                        return ioFileBytesToValue(raw);
+                    });
+                    tb2->map[L"readLine"] = tb2->map[L"read"];
+                    // write(...) — text encodes UTF-8; byte strings and
+                    // structs write raw. Returns true, or null,errmsg,code.
+                    tb2->map[L"write"] = NF([st, ioFileArgBytes, ioFileFail](
+                            vector<Value>& a) -> Value {
+                        if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                        std::string out;
+                        for (auto& v : a)
+                            if (!ioFileArgBytes(v, out))
+                                return ioFileFail(L"参数无法序列化", 87);
+                        if (!out.empty() &&
+                            fwrite(out.data(), 1, out.size(), st->f) !=
+                                out.size())
+                            return ioFileFail(L"写入失败", errno);
+                        return Value::Bool_(true);
+                    });
+                    tb2->map[L"writeLine"] =
+                        NF([st, ioFileArgBytes, ioFileFail](
+                               vector<Value>& a) -> Value {
+                            if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                            std::string out;
+                            for (auto& v : a)
+                                if (!ioFileArgBytes(v, out))
+                                    return ioFileFail(L"参数无法序列化", 87);
+                            out += "\r\n";
+                            if (fwrite(out.data(), 1, out.size(), st->f) !=
+                                out.size())
+                                return ioFileFail(L"写入失败", errno);
+                            return Value::Bool_(true);
+                        });
+                    tb2->map[L"flush"] = NF([st, ioFileFail](
+                            vector<Value>&) -> Value {
+                        if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                        return fflush(st->f) == 0
+                            ? Value::Bool_(true)
+                            : ioFileFail(L"刷新失败", errno);
+                    });
+                    tb2->map[L"close"] = NF([st](vector<Value>&) -> Value {
+                        if (st->f) { fclose(st->f); st->f = nullptr; }
+                        return Value::Bool_(true);
+                    });
+                    tb2->map[L"tell"] = NF([st](vector<Value>&) -> Value {
+                        if (!st->f) return Value();
+                        long long p = _ftelli64(st->f);
+                        return p >= 0 ? Value::Num_((double)p) : Value();
+                    });
+                    // seek(whence, offset) — "set"/"cur"/"end" or 0/1/2;
+                    // returns the new position
+                    tb2->map[L"seek"] = NF([st](vector<Value>& a) -> Value {
+                        if (!st->f) return Value();
+                        int origin = SEEK_SET;
+                        if (!a.empty() && a[0].t == Value::Str)
+                        {
+                            wstring w = a[0].s;
+                            for (auto& c : w) c = towlower(c);
+                            if (w == L"cur") origin = SEEK_CUR;
+                            else if (w == L"end") origin = SEEK_END;
+                        }
+                        else if (!a.empty() && a[0].t == Value::Num)
+                        {
+                            long long w = (long long)BNum(a[0]);
+                            origin = w == 1 ? SEEK_CUR
+                                            : (w == 2 ? SEEK_END : SEEK_SET);
+                        }
+                        long long off =
+                            a.size() > 1 ? (long long)BNum(a[1]) : 0;
+                        if (_fseeki64(st->f, off, origin) != 0) return Value();
+                        long long p = _ftelli64(st->f);
+                        return p >= 0 ? Value::Num_((double)p) : Value();
+                    });
+                    tb2->map[L"size"] = NF([st](vector<Value>&) -> Value {
+                        if (!st->f) return Value();
+                        long long cur = _ftelli64(st->f);
+                        _fseeki64(st->f, 0, SEEK_END);
+                        long long end = _ftelli64(st->f);
+                        _fseeki64(st->f, cur, SEEK_SET);
+                        return Value::Num_((double)end);
+                    });
+                    tb2->map[L"eof"] = NF([st](vector<Value>&) -> Value {
+                        if (!st->f) return Value::Bool_(true);
+                        return Value::Bool_(feof(st->f) != 0);
+                    });
+                    // mode(flags) — _O_TEXT(0x4000) / _O_BINARY(0x8000)
+                    tb2->map[L"mode"] = NF([st](vector<Value>& a) -> Value {
+                        if (!st->f) return Value();
+                        int flags = a.empty() ? 0 : (int)BNum(a[0]);
+                        int prev = _setmode(_fileno(st->f), flags);
+                        return prev >= 0 ? Value::Num_((double)prev)
+                                         : Value();
+                    });
+                    return Value::Table_(tb2);
+                };
+                // ctor: path or OS handle + CRT mode string. io.open() with
+                // no args stays the console library's "is a console
+                // attached" query (console/_.aardio calls it bare).
+                auto ioFileCtor = NF([ioFileMake](vector<Value>& a) -> Value {
+                    if (a.size() < 2 || a[0].t == Value::Null)
+                        return Value::Bool_(GetConsoleWindow() != nullptr);
+                    wstring mode =
+                        (a[1].t == Value::Str && !a[1].s.empty()) ? a[1].s
+                                                                  : L"r";
+                    FILE* pf = nullptr;
+                    void* hOs = nullptr;
+                    if (a[0].t == Value::Pointer)
+                        hOs = a[0].ptr;
+                    else if (a[0].t == Value::Num)
+                        hOs = (void*)(INT_PTR)(long long)BNum(a[0]);
+                    // every fd is binary — sanitize the mode string first:
+                    // drop 't', append 'b' when absent (_fdopen's mode
+                    // string overrides the _open_osfhandle text/binary
+                    // flag, so "r" would silently re-enable text mode and
+                    // block short reads on live pipes)
+                    wstring m2 = mode;
+                    if (m2.find(L'b') == wstring::npos)
+                    {
+                        wstring m3;
+                        for (wchar_t c : m2)
+                            if (c != L't') m3.push_back(c);
+                        m3.push_back(L'b');
+                        m2 = m3;
+                    }
+                    if (hOs)
+                    {
+                        // wrap an OS handle: the CRT fd takes ownership
+                        // (closing the file closes the handle) — matches
+                        // aardio io.file semantics for popen pipes.
+                        // CRT text mode is fatal on live pipes: a short
+                        // translated read loops on ReadFile until EOF, so
+                        // every fd is binary; io.file is byte-oriented and
+                        // line-ending translation is the caller's job
+                        // (popen.lines trims them, popen.peek reads exact
+                        // byte counts).
+                        int access = _O_RDONLY;
+                        if (m2.find(L'+') != wstring::npos)
+                            access = _O_RDWR;
+                        else if (m2.find(L'w') != wstring::npos ||
+                                 m2.find(L'a') != wstring::npos)
+                            access = _O_WRONLY;
+                        int fd = _open_osfhandle((intptr_t)hOs, _O_BINARY |
+                                                 _O_NOINHERIT | access);
+                        if (fd < 0) return Value();
+                        std::string mA;
+                        for (wchar_t c : m2) mA.push_back((char)c);
+                        pf = _fdopen(fd, mA.c_str());
+                        if (!pf)
+                        {
+                            _close(fd);
+                            return Value();
+                        }
+                    }
+                    else
+                    {
+                        wstring path = a[0].ToString();
+                        if (_wfopen_s(&pf, path.c_str(), m2.c_str()) != 0)
+                            pf = nullptr;
+                        if (!pf) return Value();
+                    }
+                    auto st = std::make_shared<IoFileState>();
+                    st->f = pf;
+                    return ioFileMake(st);
+                });
+                auto fileCls = std::make_shared<Table>();
+                fileCls->map[L"ctor"] = ioFileCtor;
+                Value vFileClass;
+                vFileClass.t = Value::Class;
+                vFileClass.tab = fileCls;
+                tb->map[L"file"] = vFileClass;
+                tb->map[L"open"] = vFileClass; // legacy alias, same class
+                // std streams — binary dups of fd 0/1/2; we own the dup,
+                // the process keeps the original
+                auto ioStdWrap = [ioFileMake](int nFd, const char* m) -> Value {
+                    auto st = std::make_shared<IoFileState>();
+                    int fd = _dup(nFd);
+                    if (fd >= 0)
+                    {
+                        st->f = _fdopen(fd, m);
+                        if (!st->f) _close(fd);
+                    }
+                    return ioFileMake(st);
+                };
+                tb->map[L"stdout"] = ioStdWrap(1, "wb");
+                tb->map[L"stderr"] = ioStdWrap(2, "wb");
+                tb->map[L"stdin"] = ioStdWrap(0, "rb");
+                // io.exist / io.remove keep their official contracts and
+                // are registered further down (exist returns the absolute
+                // path; remove deletes); not duplicated here.
                 // io.readFile(path) — convenience wrapper
                 // round 43: optional encoding arg — "utf8" (default, with
                 // BOM tolerance), "gbk"/"ansi"/numeric codepage, or "raw"
@@ -2449,6 +2729,22 @@ void Interp::InitBuiltins()
                     if (a[0].t == Value::Num) return Value::Pointer_((void*)(INT_PTR)(long long)a[0].n);
                     if (a[0].t == Value::Str) return Value::Pointer_((void*)a[0].s.c_str());
                     return Value::Pointer_((void*)(INT_PTR)(long long)BNum(a[0])); });
+                // raw.closeHandle(handle) — CloseHandle wrapper used by
+                // process.popen to drop the inherited pipe ends it owns
+                tb->map[L"closeHandle"] = NF([](vector<Value>& a) -> Value {
+                    void* h = nullptr;
+                    if (!a.empty() && a[0].t == Value::Pointer) h = a[0].ptr;
+                    else if (!a.empty() && a[0].t == Value::Num)
+                        h = (void*)(INT_PTR)(long long)BNum(a[0]);
+                    if (!h) return Value::Bool_(false);
+                    return Value::Bool_(CloseHandle(h) != 0); });
+                // raw._release(obj) — aardio forces a reference release.
+                // The VM's lifetimes are ARC-managed, so dropping the last
+                // reference happens naturally when callers null the field;
+                // keep this as an accepted no-op so library code
+                // (process.popen.close) runs unchanged.
+                tb->map[L"_release"] = NF([](vector<Value>&) -> Value {
+                    return Value(); });
                 tb->map[L"convert"] =
                     NF([](vector<Value>& a) -> Value {
                     if (a.size() < 2) return a.empty() ? Value() : a[0];
@@ -2674,6 +2970,37 @@ void Interp::InitBuiltins()
                 });
                 tb->map[L"push"] = fnPush;
                 globals.vars[L"push"] = fnPush;
+
+                // table.unpack(t[, from[, to]]) / table.unpackArgs(t) —
+                // expand the array part as extra return values (popen.read,
+                // io libraries return `{ file.read(...) }` through these)
+                auto fnUnpack = NF([](vector<Value>& a) -> Value {
+                    Value vRes;
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                        return vRes;
+                    auto& arr = a[0].tab->arr;
+                    long long from = 1, to = (long long)arr.size();
+                    if (a.size() > 1 && a[1].t != Value::Null)
+                        from = (long long)BNum(a[1]);
+                    if (a.size() > 2 && a[2].t != Value::Null)
+                        to = (long long)BNum(a[2]);
+                    if (from < 1) from = 1;
+                    if (to > (long long)arr.size())
+                        to = (long long)arr.size();
+                    auto ex = std::make_shared<vector<Value>>();
+                    for (long long i = from; i <= to; i++)
+                        ex->push_back(arr[(size_t)(i - 1)]);
+                    if (!ex->empty())
+                    {
+                        vRes = ex->at(0);
+                        ex->erase(ex->begin());
+                        if (!ex->empty())
+                            vRes.mrets = ex;
+                    }
+                    return vRes;
+                });
+                tb->map[L"unpack"] = fnUnpack;
+                tb->map[L"unpackArgs"] = fnUnpack;
 
                 // table.range(array) -> min, max — the smallest and the
                 // largest numeric index of the array part (sparse-array

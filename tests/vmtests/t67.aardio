@@ -1,0 +1,61 @@
+// t67: kernel io.file class — the file contract builtin/io.aardio and
+// process.popen rely on: path and OS-handle ctor forms, byte-string
+// reads (one wchar per raw byte), line reads, seek/tell/size/eof,
+// struct reads, mode flags, io.open aliasing io.file, io.exist/remove.
+// Escapes live in SINGLE-quoted strings (aardio: double quotes are raw).
+var p = "t67tmp.bin";
+var f = io.file(p, "w+b");
+io.print("open:" .. (f ? true : false));
+f.write("hello", "世界");
+f.close();
+io.print("exist:" .. (io.exist(p) ? true : false));
+var g = io.file(p, "rb");
+var all = g.read(-1);
+io.print("len:" .. (#all == 11));
+io.print("b1:" .. (all[1] == 104));
+io.print("cn:" .. (all[6] == 0xE4 && all[7] == 0xB8 && all[8] == 0x96));
+g.seek("set", 1);
+io.print("tell:" .. (g.tell() == 1));
+io.print("size:" .. (g.size() == 11));
+g.seek("set", 0);
+var l1 = g.read();
+io.print("l1len:" .. (#l1 == 11));
+g.seek("set", 3);
+var rest = g.read(-1);
+io.print("rest:" .. (#rest == 8));
+g.seek("set", 0);
+var st = g.read({ INT v });
+io.print("sv:" .. (st ? st.v == 0x6C6C6568 : false));
+g.seek("end", 0);
+g.read(1);
+io.print("eof:" .. (g.eof() == true));
+g.close();
+var f2 = io.open("t67tmp2.bin", "w+b");
+f2.write('l1\nl2\r\nl3');
+f2.close();
+var g2 = io.file("t67tmp2.bin", "rb");
+var a1 = g2.read();
+io.print("a1:" .. (#a1 == 3));
+var a2 = g2.read();
+io.print("a2:" .. (#a2 == 4));
+var a3 = g2.read();
+io.print("a3:" .. (#a3 == 2 && a3[1] == 108));
+io.print("a4:" .. (g2.read() == null));
+g2.close();
+io.remove("t67tmp2.bin");
+var k32 = raw.loadDll("Kernel32.dll");
+var CreatePipe = k32.api("CreatePipe", "bool(pointer& hRead,pointer& hWrite,struct attributes,INT size)");
+var saPipe = { INT nLength; pointer lpSecurityDescriptor; bool bInheritHandle = true; };
+var ok, r, w = CreatePipe(, , saPipe, 0);
+io.print("pipe:" .. (ok == true));
+var pw = io.file(w, "w+");
+pw.write('pipe-line\n');
+pw.flush();
+var pr = io.file(r, "r");
+var pl = pr.read();
+io.print("pl:" .. (#pl == 10));
+io.print("mode:" .. (pr.mode(0x8000) >= 0));
+pr.close();
+pw.close();
+io.remove("t67tmp.bin");
+io.print("done");

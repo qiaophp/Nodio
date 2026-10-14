@@ -744,6 +744,30 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                         inst->map[L"_meta"] = itM->second;
                 }
                 Value vInst = Value::Table_(inst);
+                // native ctor (kernel classes such as io.file): the class
+                // table carries a C++ "ctor" native. It receives the script
+                // args plus the fresh instance appended last and returns the
+                // instance on success; Null means construction failed and
+                // the instantiation itself yields null (aardio io.file()
+                // returns null for an unopenable file), any other value is
+                // handed back as-is (io.open() with no args reports console
+                // state for the console library).
+                if (!f.classBody && !f.fn && f.tab)
+                {
+                    auto itNC = f.tab->map.find(L"ctor");
+                    if (itNC != f.tab->map.end() &&
+                        itNC->second.t == Value::Func && itNC->second.native)
+                    {
+                        vector<Value> nargs = args;
+                        nargs.push_back(vInst);
+                        Value rN = itNC->second.native(nargs);
+                        if (rN.t == Value::TableT && rN.tab)
+                            return rN;
+                        if (rN.t == Value::Null)
+                            return Value();
+                        return rN;
+                    }
+                }
                 Env classNsEnv;
                 Env definingNsEnv;
                 if (f.tab)
