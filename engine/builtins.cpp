@@ -329,6 +329,20 @@ void Interp::InitBuiltins()
                         }
                     }
                     return Value::Num_(0.0); });
+                // string.concat(v [, ...]) — join the tostring of every
+                // argument, ignoring nulls (the ++ operator throws on
+                // null); no args or all-null returns null.
+                // builtin/_.aardio's lasterr() builds its error text here.
+                tb->map[L"concat"] = NF([](vector<Value>& a) -> Value {
+                    bool bAny = false;
+                    wstring out;
+                    for (auto& v : a)
+                    {
+                        if (v.t == Value::Null) continue;
+                        bAny = true;
+                        out += v.ToString();
+                    }
+                    return bAny ? Value::Str_(out) : Value(); });
                 // string.sub(s,i,j) — 1-based substring, negative = from end
                 tb->map[L"sub"] = NF([](vector<Value>& a) -> Value {
                     wstring s = BStr(a[0]);
@@ -1663,6 +1677,7 @@ void Interp::InitBuiltins()
                                 void* pBuffer = nullptr;
                                 bool bStruct = false;
                                 Value origVal;
+                                bool bNoFree = false;   // caller-owned buffer
                             };
                             std::vector<ApiArgRef> tmpRefs;
                             for (size_t i = 0; i < sig.params.size();
@@ -1690,6 +1705,91 @@ void Interp::InitBuiltins()
                                     else if (pt == 10) { double d = BNum(v); memcpy(pRef, &d, sizeof(double)); }
                                     tmpRefs.push_back({ i, pt, pRef, false, v });
                                     slots.push_back((SlotT)(INT_PTR)pRef);
+                                    continue;
+                                }
+                                if (bByRef && (pt == 6 || pt == 7))
+                                {
+                                    // aardio string-by-ref contract (docs
+                                    // raw/datatype.md): a NUMBER is the
+                                    // buffer length — bytes for string &,
+                                    // wchars for ustring & — zeroed, plus
+                                    // a 2-byte null tail; 0 passes a null
+                                    // pointer. A STRING is seeded into a
+                                    // temp buffer the API may overwrite;
+                                    // a Pointer (raw.buffer) is passed
+                                    // as-is. The final content always
+                                    // comes back as an extra string
+                                    // return value. Passing the raw
+                                    // number as the pointer (the old
+                                    // behaviour) let FormatMessage write
+                                    // through address 0x100 and crash.
+                                    if (v.t == Value::Num)
+                                    {
+                                        long long nU = (long long)BNum(v);
+                                        if (nU <= 0)
+                                        {
+                                            slots.push_back((SlotT)0);
+                                            continue;
+                                        }
+                                        size_t cb =
+                                            (size_t)nU * (pt == 7 ? 2 : 1) +
+                                            2;
+                                        void* pRef = HeapAlloc(
+                                            GetProcessHeap(),
+                                            HEAP_ZERO_MEMORY, cb);
+                                        tmpRefs.push_back(
+                                            { i, pt, pRef, false, Value() });
+                                        slots.push_back((SlotT)(INT_PTR)pRef);
+                                        continue;
+                                    }
+                                    if (v.t == Value::Str)
+                                    {
+                                        void* pRef;
+                                        if (pt == 7)
+                                        {
+                                            wstring w = BStr(v);
+                                            size_t cb = (w.size() + 1) * 2;
+                                            pRef = HeapAlloc(GetProcessHeap(),
+                                                             0, cb);
+                                            memcpy(pRef, w.c_str(), cb - 2);
+                                            ((wchar_t*)pRef)[w.size()] = 0;
+                                        }
+                                        else
+                                        {
+                                            wstring w = BStr(v);
+                                            std::string sA((size_t)
+                                                WideCharToMultiByte(CP_ACP,
+                                                    0, w.c_str(),
+                                                    (int)w.size(), nullptr, 0,
+                                                    nullptr, nullptr), 0);
+                                            if (!sA.empty())
+                                                WideCharToMultiByte(CP_ACP,
+                                                    0, w.c_str(),
+                                                    (int)w.size(), &sA[0],
+                                                    (int)sA.size(), nullptr,
+                                                    nullptr);
+                                            sA.push_back('\0');
+                                            pRef = HeapAlloc(GetProcessHeap(),
+                                                             0, sA.size());
+                                            memcpy(pRef, sA.c_str(),
+                                                   sA.size());
+                                        }
+                                        tmpRefs.push_back(
+                                            { i, pt, pRef, false, v });
+                                        slots.push_back((SlotT)(INT_PTR)pRef);
+                                        continue;
+                                    }
+                                    if (v.t == Value::Pointer && v.ptr)
+                                    {
+                                        // caller-owned raw buffer: the
+                                        // content is read back but the
+                                        // memory is never freed here
+                                        tmpRefs.push_back(
+                                            { i, pt, v.ptr, false, v, true });
+                                        slots.push_back((SlotT)(INT_PTR)v.ptr);
+                                        continue;
+                                    }
+                                    slots.push_back((SlotT)0);
                                     continue;
                                 }
                                 if (pt == 8) // struct
@@ -1972,6 +2072,16 @@ void Interp::InitBuiltins()
                                         case 5:
                                             outVal = Value::Num_((double)(__int64)*(INT_PTR*)ref.pBuffer);
                                             break;
+                                        case 6:
+                                            outVal = Value::Str_(
+                                                ReadStrA((const char*)
+                                                    ref.pBuffer));
+                                            break;
+                                        case 7:
+                                            outVal = Value::Str_(
+                                                ReadStrW((const wchar_t*)
+                                                    ref.pBuffer));
+                                            break;
                                         case 9:
                                         {
                                             float f = 0;
@@ -1991,7 +2101,9 @@ void Interp::InitBuiltins()
                                             break;
                                         }
                                         extras->push_back(outVal);
-                                        HeapFree(GetProcessHeap(), 0, ref.pBuffer);
+                                        if (!ref.bNoFree)
+                                            HeapFree(GetProcessHeap(), 0,
+                                                     ref.pBuffer);
                                     }
                                 }
                                 if (!extras->empty())
@@ -2003,26 +2115,32 @@ void Interp::InitBuiltins()
                             return retFn;
                         });
                     return Value::Table_(dll); });
-                // raw memory: pointer values are plain numbers
+                // raw memory: a raw.buffer is a distinct pointer value
+                // (aardio buffer type). Numbers still work as addresses for
+                // backwards compatibility of older scripts.
+                auto BufPtr = [](const Value& v) -> void* {
+                    if (v.t == Value::Pointer) return v.ptr;
+                    if (v.t == Value::Num)
+                        return (void*)(INT_PTR)(long long)v.n;
+                    return nullptr;
+                };
                 tb->map[L"buffer"] = NF([](vector<Value>& a) -> Value {
                     size_t n = a.empty() ? 0
                         : (size_t)(long long)BNum(a[0]);
-                    if (n == 0) return Value::Num_(0);
+                    if (n == 0) return Value::Pointer_(nullptr);
                     void* p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                         n);
-                    return Value::Num_((double)(INT_PTR)p); });
-                tb->map[L"free"] = NF([](vector<Value>& a) -> Value {
-                    if (a.empty() || a[0].t != Value::Num)
-                        return Value::Bool_(false);
-                    void* p = (void*)(INT_PTR)(long long)BNum(a[0]);
+                    return Value::Pointer_(p); });
+                tb->map[L"free"] = NF([BufPtr](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value::Bool_(false);
+                    void* p = BufPtr(a[0]);
                     if (!p) return Value::Bool_(true);
                     return Value::Bool_(
                         HeapFree(GetProcessHeap(), 0, p) != FALSE); });
                 // write(ptr, s): byte string -> raw bytes; text -> UTF-8
-                tb->map[L"write"] = NF([](vector<Value>& a) -> Value {
-                    if (a.size() < 2 || a[0].t != Value::Num)
-                        return Value::Num_(0);
-                    char* p = (char*)(INT_PTR)(long long)BNum(a[0]);
+                tb->map[L"write"] = NF([BufPtr](vector<Value>& a) -> Value {
+                    if (a.size() < 2) return Value::Num_(0);
+                    char* p = (char*)BufPtr(a[0]);
                     if (!p) return Value::Num_(0);
                     wstring s = BStr(a[1]);
                     bool bText = false;
@@ -2041,11 +2159,9 @@ void Interp::InitBuiltins()
                         (int)s.size(), p, n, nullptr, nullptr);
                     return Value::Num_((double)n); });
                 // read(ptr, n) -> byte string (one char per raw byte)
-                tb->map[L"read"] = NF([](vector<Value>& a) -> Value {
-                    if (a.size() < 2 || a[0].t != Value::Num)
-                        return Value::Str_(L"");
-                    const char* p =
-                        (const char*)(INT_PTR)(long long)BNum(a[0]);
+                tb->map[L"read"] = NF([BufPtr](vector<Value>& a) -> Value {
+                    if (a.size() < 2) return Value::Str_(L"");
+                    const char* p = (const char*)BufPtr(a[0]);
                     long long n = (long long)BNum(a[1]);
                     if (!p || n <= 0) return Value::Str_(L"");
                     wstring s((size_t)n, 0);
@@ -2054,11 +2170,9 @@ void Interp::InitBuiltins()
                             (wchar_t)(unsigned char)p[k];
                     return Value::Str_(s); });
                 // readW(ptr, nChars) -> wide text from a UTF-16 buffer
-                tb->map[L"readW"] = NF([](vector<Value>& a) -> Value {
-                    if (a.size() < 2 || a[0].t != Value::Num)
-                        return Value::Str_(L"");
-                    const wchar_t* p = (const wchar_t*)(INT_PTR)
-                        (long long)BNum(a[0]);
+                tb->map[L"readW"] = NF([BufPtr](vector<Value>& a) -> Value {
+                    if (a.size() < 2) return Value::Str_(L"");
+                    const wchar_t* p = (const wchar_t*)BufPtr(a[0]);
                     long long n = (long long)BNum(a[1]);
                     if (!p || n <= 0) return Value::Str_(L"");
                     return Value::Str_(wstring((size_t)n, L'\0')
@@ -2560,6 +2674,58 @@ void Interp::InitBuiltins()
                 });
                 tb->map[L"push"] = fnPush;
                 globals.vars[L"push"] = fnPush;
+
+                // table.range(array) -> min, max — the smallest and the
+                // largest numeric index of the array part (sparse-array
+                // helper; an ordinary array yields 1, #arr).
+                // table.range(a [, b]) with numbers builds the sequence
+                // array [a..b] (b defaults to a, so range(n) = 1..n).
+                tb->map[L"range"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
+                    if (a[0].t == Value::Num ||
+                        (a.size() > 1 && a[1].t == Value::Num))
+                    {
+                        long long lo = a[0].t == Value::Num
+                            ? (long long)BNum(a[0]) : 1;
+                        long long hi = a.size() > 1 && a[1].t == Value::Num
+                            ? (long long)BNum(a[1]) : lo;
+                        auto seq = std::make_shared<Table>();
+                        if (lo > hi) std::swap(lo, hi);
+                        for (long long v = lo; v <= hi; v++)
+                            seq->arr.push_back(Value::Num_((double)v));
+                        return Value::Table_(seq);
+                    }
+                    if (a[0].t != Value::TableT || !a[0].tab)
+                        return Value();
+                    Table* t = a[0].tab.get();
+                    long long nMin = 0, nMax = 0;
+                    bool bAny = false;
+                    if (!t->arr.empty())
+                    {
+                        nMin = 1;
+                        nMax = (long long)t->arr.size();
+                        bAny = true;
+                    }
+                    for (auto& kv : t->map)
+                    {
+                        if (kv.first.empty()) continue;
+                        bool bNum = true;
+                        for (wchar_t c : kv.first)
+                            if (c < L'0' || c > L'9') { bNum = false; break; }
+                        if (!bNum) continue;
+                        long long ix = _wtoi64(kv.first.c_str());
+                        if (ix <= 0) continue;
+                        if (!bAny || ix < nMin) nMin = ix;
+                        if (!bAny || ix > nMax) nMax = ix;
+                        bAny = true;
+                    }
+                    if (!bAny) return Value();
+                    Value vMin = Value::Num_((double)nMin);
+                    auto extras = std::make_shared<vector<Value>>();
+                    extras->push_back(Value::Num_((double)nMax));
+                    vMin.mrets = extras;
+                    return vMin;
+                });
 
                 auto fnPop = NF([](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t != Value::TableT || !a[0].tab || a[0].tab->arr.empty())

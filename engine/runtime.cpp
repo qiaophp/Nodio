@@ -158,6 +158,11 @@ Value Interp::Eval(const PNode& n, Env* env)
                     }
                     if (v.t == Value::TableT) return Value::Num_((double)v.tab->arr.size());
                 }
+                // aardio: #null is 0 — lib code sizes optional tables with
+                // it (publish's for(i=#q;1;-1) over an unregistered topic);
+                // returning null made the for-loop start value null and the
+                // body ran once against a null subscriber.
+                if (v.t == Value::Null) return Value::Num_(0);
                 return Value();
             }
             case Node::FuncLit:
@@ -591,6 +596,15 @@ Value Interp::GetMember(const Value& obj, const wstring& key,
                 auto ig = globals.vars.find(key);
                 if (ig != globals.vars.end())
                     return ig->second;
+                static bool bDbgR =
+                    GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
+                if (bDbgR)
+                {
+                    fwprintf(stderr, L"[ROOTMISS] key=%s roots=%d globals=%d\n",
+                             key.c_str(), (int)roots.count(key),
+                             (int)globals.vars.count(key));
+                    fflush(stderr);
+                }
             }
             return Value();
         }
@@ -1139,7 +1153,16 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 if (bLocal && e)
                     *env->Find(target->str) = val;   // local slot
                 else if (eNs)
+                {
                     eNs->nsTable->map[target->str] = val;
+                    // Env::Find reads scopeVars BEFORE map, so a bare
+                    // assign from a nested function (whose call env's
+                    // nsTable IS the defining namespace) must update the
+                    // var-store mirror too — otherwise a module-level
+                    // `var x;` keeps reading back as the stale null it
+                    // was declared with (console.loadingDots et al).
+                    eNs->nsTable->scopeVars[target->str] = val;
+                }
                 else
                 {
                     globals.vars[target->str] = val;   // aardio: default global
@@ -1394,39 +1417,57 @@ Value Interp::Exec(const PNode& n, Env* env)
             }
             case Node::VarDecl:
             {
+                // aardio: a var declared directly in a namespace or module
+                // body is a namespace member. Mirror the slot into the
+                // namespace table's map so member access (ns.name) and
+                // code in other modules see it; the env slot keeps the
+                // local read/write fast path. Function-call envs have
+                // bNsBody=false — their locals stay local.
+                auto BindVar = [env](const wstring& name, const Value& v)
+                {
+                    if (name.empty()) return;
+                    env->vars[name] = v;
+                    if (env->bNsBody)
+                    {
+                        if (env->nsTable)
+                            env->nsTable->map[name] = v;
+                        else if (env->modTable)
+                            env->modTable->map[name] = v;
+                    }
+                };
                 // var a = e1, b = e2 — positional init list
                 if (n->b && !n->b->list.empty())
                 {
                     Value v0 = n->a ? Eval(n->a, env) : Value();
                     if (!n->names.empty() && !n->names[0].empty())
-                        env->vars[n->names[0]] = v0;
+                        BindVar(n->names[0], v0);
                     for (size_t k = 1; k < n->names.size(); k++)
                         if (!n->names[k].empty())
-                            env->vars[n->names[k]] =
+                            BindVar(n->names[k],
                                 k - 1 < n->b->list.size()
-                                    ? Eval(n->b->list[k - 1], env) : Value();
+                                    ? Eval(n->b->list[k - 1], env) : Value());
                     return v0;
                 }
                 Value v = n->a ? Eval(n->a, env) : Value();
                 if (n->names.size() == 1)
                 {
-                    if (!n->names[0].empty()) env->vars[n->names[0]] = v;
+                    BindVar(n->names[0], v);
                     return v;
                 }
                 // var a,b = f() — aardio multi-return unpack
-                if (!n->names[0].empty()) env->vars[n->names[0]] = v;
+                if (!n->names[0].empty()) BindVar(n->names[0], v);
                 if (v.mrets)
                 {
                     for (size_t k = 1; k < n->names.size(); k++)
                         if (!n->names[k].empty())
-                            env->vars[n->names[k]] =
+                            BindVar(n->names[k],
                                 k - 1 < v.mrets->size()
-                                    ? (*v.mrets)[k - 1] : Value();
+                                    ? (*v.mrets)[k - 1] : Value());
                 }
                 else
                     for (size_t k = 1; k < n->names.size(); k++)
                         if (!n->names[k].empty())
-                            env->vars[n->names[k]] = Value();
+                            BindVar(n->names[k], Value());
                 return v;
             }
             case Node::Import:
@@ -1440,6 +1481,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 Env nsEnv;
                 nsEnv.parent = env;
                 nsEnv.nsTable = ns.tab;
+                nsEnv.bNsBody = true;
                 nsEnv.vars[L"self"] = ns;
                 for (auto& kv : ns.tab->scopeVars)
                     nsEnv.vars[kv.first] = kv.second;
@@ -1640,6 +1682,10 @@ Value Interp::Exec(const PNode& n, Env* env)
                             return nDir >= 0 ? pv->n <= BNum(lim)
                                              : pv->n >= BNum(lim);
                         }
+                        // limit form with a non-numeric loop variable
+                        // (null start etc.): the loop must not run — a
+                        // numeric comparison against null is false
+                        return false;
                     }
                     return Eval(n->b, env).Truthy();
                 };

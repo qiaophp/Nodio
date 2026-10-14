@@ -546,6 +546,11 @@ namespace NodioVM
         std::unordered_map<wstring, Value> vars;
         shared_ptr<Table> nsTable;   // namespace scope: bare names land here
         shared_ptr<Table> modTable;  // file/module scope table: scopeVars
+        // true while a namespace or module BODY executes directly in this
+        // env: a `var` declared here is a namespace member (aardio), so
+        // VarDecl mirrors it into the namespace table's map. Function-call
+        // envs leave it false — their locals must stay local.
+        bool bNsBody = false;
         Value* Find(const wstring& k)
         {
             for (Env* e = this; e; e = e->parent)

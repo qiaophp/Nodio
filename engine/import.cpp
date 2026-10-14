@@ -253,6 +253,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 Env modEnv2;
                 modEnv2.parent = &globals;
                 modEnv2.modTable = placeholder2;
+                modEnv2.bNsBody = true;   // module-level vars are members
                 wstring oldModFile2 = g_curModuleFile;
                 g_curModuleFile = file;
                 Value oldRet = ret;
@@ -439,6 +440,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             Env modEnv;
             modEnv.parent = &globals;
             modEnv.modTable = placeholder;
+            modEnv.bNsBody = true;   // module-level vars are members
             wstring oldModFile = g_curModuleFile;
             g_curModuleFile = file;
             Value oldRet = ret;

@@ -7,6 +7,6 @@ io.print(a ++ "|" ++ b);
 var kernel32 = raw.loadDll("kernel32.dll");
 var gc = kernel32.api("GetComputerNameW", "bool(ustring &lpBuffer, int &nSize)");
 var buf = raw.buffer(520);
-var name, n = gc(buf, null);
+var ret, name, n = gc(buf, null);
 io.print("n" ++ n);
 io.print("ok" ++ (n > 0));
