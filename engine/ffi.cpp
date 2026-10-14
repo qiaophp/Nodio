@@ -670,10 +670,52 @@ namespace NodioVM
                 }
                 else
                 {
+                    // struct ustring fields receive the RAW pointer — a
+                    // byte-string (string.toUtf16 product, one byte per
+                    // wchar) must be re-packed into a real UTF-16 buffer
+                    // or every high byte becomes a NUL and Windows reads
+                    // only the first character ("CLSH[..." -> "C")
+                    thread_local std::vector<std::wstring> sKeep;
+                    wstring u16;
+                    const wstring* src = nullptr;
                     if (iv != vTab.tab->map.end() && iv->second.t == Value::Str)
-                        *(const wchar_t**)(buf + off) = iv->second.s.c_str();
+                        src = &iv->second.s;
                     else if (fv.t == Value::Str)
-                        *(const wchar_t**)(buf + off) = fv.s.c_str();
+                        src = &fv.s;
+                    if (src)
+                    {
+                        bool bByteStr = true;
+                        for (wchar_t c : *src)
+                            if ((unsigned short)c > 0xFF)
+                            {
+                                bByteStr = false;
+                                break;
+                            }
+                        if (bByteStr)
+                        {
+                            // re-pack UTF-16 LE bytes into real wchars
+                            u16.reserve((*src).size() / 2 + 1);
+                            for (size_t k = 0; k + 1 < (*src).size(); k += 2)
+                                u16.push_back((wchar_t)(
+                                    (unsigned char)(*src)[k] |
+                                    ((unsigned short)(unsigned char)
+                                         (*src)[k + 1]
+                                     << 8)));
+                            if ((*src).size() & 1)
+                                u16.push_back((wchar_t)(unsigned char)
+                                                  (*src)[(*src).size() - 1]);
+                            sKeep.push_back(std::move(u16));
+                            *(const wchar_t**)(buf + off) =
+                                sKeep.back().c_str();
+                        }
+                        else
+                            *(const wchar_t**)(buf + off) = src->c_str();
+                    }
+                    else if (fv.ptr)
+                        // api function values carry their entry point in
+                        // .ptr — `wc.lpfnWndProc = ::DefWindowProc` relies
+                        // on this to land a real WNDPROC in the struct
+                        *(void**)(buf + off) = fv.ptr;
                     else if (fv.t == Value::Pointer)
                         *(void**)(buf + off) = fv.ptr;
                     else if (fv.t == Value::Num)
@@ -969,6 +1011,14 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                         void* pBuf = StructSerialize(v, &total);
                         if (pBuf)
                         {
+                            // aardio auto-maintains cbSize: when a struct's
+                            // first member is named cbSize, every API call
+                            // stamps it with the real size (the official
+                            // WNDCLASSEX default 48 would otherwise fail
+                            // RegisterClassEx's size check on x64)
+                            if (total >= 4 && v.tab &&
+                                v.tab->map.find(L"cbSize") != v.tab->map.end())
+                                *(int*)pBuf = total;
                             slots.push_back((SlotT)(INT_PTR)pBuf);
                             outStructs.push_back({ i, pBuf, v });
                         }

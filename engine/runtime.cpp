@@ -448,9 +448,16 @@ Value Interp::CallOwner(const Value& f, const Value& obj,
             {
                 if (args.size() > f.params.size() - 1)
                 {
+                    // keep the raw varargs in a shared vector so the bound
+                    // `...` value can also carry mrets — `var a,b = ...`
+                    // expands positionally while `var t = ...` still packs
+                    auto vargs = std::make_shared<vector<Value>>();
                     auto tbV = std::make_shared<Table>();
                     for (size_t k = f.params.size() - 1; k < args.size(); k++)
+                    {
+                        vargs->push_back(args[k]);
                         tbV->arr.push_back(args[k]);
+                    }
                     // aardio scripts read varargs through `arg`, while the
                     // `...` spelling expands them at a call site — bind both
                     // names to the same table. An EMPTY table must read as
@@ -458,6 +465,7 @@ Value Interp::CallOwner(const Value& f, const Value& obj,
                     // and an empty table is truthy in aardio.
                     Value vDots = tbV->arr.empty() ? Value()
                                                    : Value::Table_(tbV);
+                    if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
                     local->vars[L"..."] = vDots;
                     local->vars[L"arg"] = vDots;
                 }
@@ -861,15 +869,20 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     {
                         if (args.size() > f.fn->names.size() - 1)
                         {
+                            auto vargs = std::make_shared<vector<Value>>();
                             auto tbV = std::make_shared<Table>();
                             for (size_t k = f.fn->names.size() - 1; k < args.size(); k++)
+                            {
+                                vargs->push_back(args[k]);
                                 tbV->arr.push_back(args[k]);
+                            }
                             // `arg` is aardio's spelling for the varargs
                             // table; `...` expands it at call sites. An
                             // empty table reads as null so `if(!...)`
                             // recursion guards work.
                             Value vDots = tbV->arr.empty() ? Value()
                                                            : Value::Table_(tbV);
+                            if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
                             local->vars[L"..."] = vDots;
                             local->vars[L"arg"] = vDots;
                         }
@@ -998,14 +1011,19 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             if (f.params.size() && f.params.back() == L"..." &&
                 f.fn)
             {
+                auto vargs = std::make_shared<vector<Value>>();
                 auto tbV = std::make_shared<Table>();
                 for (size_t k = f.params.size() - 1; k < args.size(); k++)
+                {
+                    vargs->push_back(args[k]);
                     tbV->arr.push_back(args[k]);
+                }
                 // An EMPTY varargs table must read as null: library code
                 // guards recursion with `if(!...)`, and an empty table is
                 // truthy in aardio.
                 Value vDots = tbV->arr.empty() ? Value()
                                                : Value::Table_(tbV);
+                if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
                 local->vars[L"..."] = vDots;
                 local->vars[L"arg"] = vDots;
             }
@@ -1462,7 +1480,8 @@ Value Interp::Exec(const PNode& n, Env* env)
                     // expr yields multi-returns the extras fill the rest.
                     // EVERY rhs is evaluated before any target binds —
                     // `a,b = b,a+b` must read the old a (fib-style spin
-                    // loops froze otherwise)
+                    // loops froze otherwise). A packed `...` (bDots)
+                    // expands from index 0 across ALL names.
                     Value v = Eval(n->a, env);
                     size_t extras = n->b ? n->b->list.size() : 0;
                     vector<Value> pre;
@@ -1470,15 +1489,20 @@ Value Interp::Exec(const PNode& n, Env* env)
                     pre.push_back(v);
                     for (size_t e = 0; e < extras; e++)
                         pre.push_back(Eval(n->b->list[e], env));
+                    size_t dotsOff = v.bDots ? 0 : 1;
                     for (size_t k2 = 0; k2 < n->names.size(); k2++)
                     {
                         Value item;
-                        if (k2 == 0)
+                        if (k2 == 0 && v.bDots && v.mrets &&
+                            !v.mrets->empty())
+                            item = (*v.mrets)[0];
+                        else if (k2 == 0)
                             item = v;
                         else if (k2 - 1 < extras)
                             item = pre[k2];
-                        else if (v.mrets && k2 - 1 < v.mrets->size())
-                            item = (*v.mrets)[k2 - 1];
+                        else if (v.mrets &&
+                                 (k2 - dotsOff) < v.mrets->size())
+                            item = (*v.mrets)[k2 - dotsOff];
                         else
                             item = Value();
                         if (n->names[k2].empty())
@@ -1540,15 +1564,22 @@ Value Interp::Exec(const PNode& n, Env* env)
                     BindVar(n->names[0], v);
                     return v;
                 }
-                // var a,b = f() — aardio multi-return unpack
-                if (!n->names[0].empty()) BindVar(n->names[0], v);
+                // var a,b = f() — aardio multi-return unpack. A packed
+                // `...` (bDots) carries ALL varargs in mrets and expands
+                // from index 0; a normal call result holds the FIRST
+                // return in v with mrets listing the extras.
+                size_t dotsOff = v.bDots ? 0 : 1;
+                if (v.bDots && v.mrets && !v.mrets->empty())
+                    BindVar(n->names[0], (*v.mrets)[0]);
+                else if (!n->names[0].empty())
+                    BindVar(n->names[0], v);
                 if (v.mrets)
                 {
                     for (size_t k = 1; k < n->names.size(); k++)
                         if (!n->names[k].empty())
                             BindVar(n->names[k],
-                                k - 1 < v.mrets->size()
-                                    ? (*v.mrets)[k - 1] : Value());
+                                (k - dotsOff) < v.mrets->size()
+                                    ? (*v.mrets)[k - dotsOff] : Value());
                 }
                 else
                     for (size_t k = 1; k < n->names.size(); k++)
@@ -1600,8 +1631,9 @@ Value Interp::Exec(const PNode& n, Env* env)
                 while (true)
                 {
                     ExecBlock(n->b, env);
-                    if (nReturn || nBreak) break;
-                    if (nContinue) nContinue = 0;
+                    if (nReturn) break;
+                    if (nBreak) { nBreak--; break; }
+                    if (nContinue) nContinue--;
                     if (!Eval(n->a, env).Truthy())
                         break;
                 }
@@ -1910,7 +1942,22 @@ Value Interp::Exec(const PNode& n, Env* env)
             }
             case Node::Return:
                 ret = n->a ? Eval(n->a, env) : Value();
-                if (!n->list.empty())
+                if (ret.bDots && ret.mrets)
+                {
+                    // `return ...` expands the varargs as the whole
+                    // return sequence: first value in ret, extras in mrets
+                    vector<Value> all = *ret.mrets;
+                    ret = all.empty() ? Value() : all[0];
+                    if (all.size() > 1)
+                    {
+                        auto extras = std::make_shared<vector<Value>>(
+                            all.begin() + 1, all.end());
+                        ret.mrets = extras;
+                    }
+                    else
+                        ret.mrets = nullptr;
+                }
+                else if (!n->list.empty())
                 {
                     // aardio multi-return: extras ride on the Value
                     auto extras = std::make_shared<vector<Value>>();
@@ -2063,13 +2110,20 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             }
             if (f.params.size() && f.params.back() == L"..." && f.fn)
             {
+                auto vargs = std::make_shared<vector<Value>>();
                 auto tbV = std::make_shared<Table>();
                 for (size_t k = f.params.size() - 1; k < args.size(); k++)
+                {
+                    vargs->push_back(args[k]);
                     tbV->arr.push_back(args[k]);
+                }
                 // `arg` is aardio's spelling for the varargs table;
                 // `...` expands it at call sites.
-                local->vars[L"..."] = Value::Table_(tbV);
-                local->vars[L"arg"] = Value::Table_(tbV);
+                Value vDots = Value::Table_(tbV);
+                vDots.mrets = vargs;
+                vDots.bDots = true;
+                local->vars[L"..."] = vDots;
+                local->vars[L"arg"] = vDots;
             }
             Value oldRet = ret;
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;

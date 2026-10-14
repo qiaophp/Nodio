@@ -88,6 +88,7 @@ namespace NodioVM
         shared_ptr<Env> envUp;          // defining frame chain (closure upvalues)
         shared_ptr<vector<PNode>> pdefaults;  // FuncLit param defaults
         shared_ptr<vector<Value>> mrets;      // aardio extra return values
+        bool bDots = false;             // `...` packed value: mrets holds ALL varargs
         shared_ptr<Value> thisVal;            // lexical this captured at function definition
         // native builtin (round 19): C++-backed callable surfaced as a Func
         using NativeFn = std::function<Value(std::vector<Value>&)>;

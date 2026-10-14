@@ -2148,6 +2148,14 @@ void Interp::InitBuiltins()
                                         void* pBuf = StructSerialize(v, &total);
                                         if (pBuf)
                                         {
+                                            // aardio auto-maintains cbSize:
+                                            // a struct whose first member is
+                                            // cbSize gets it stamped with the
+                                            // real size on every API call
+                                            if (total >= 4 && v.tab &&
+                                                v.tab->map.find(L"cbSize") !=
+                                                    v.tab->map.end())
+                                                *(int*)pBuf = total;
                                             slots.push_back((SlotT)(INT_PTR)pBuf);
                                             tmpRefs.push_back({ i, pt, pBuf, true, v });
                                             continue;
@@ -3619,6 +3627,21 @@ void Interp::InitBuiltins()
                         return Value();
                     DWORD rc = WaitForSingleObject(h, ms);
                     return Value::Bool_(rc == WAIT_OBJECT_0); });
+                // thread.getExitCode(handle) — exit code of a finished
+                // thread or process handle (process.waitOne reads it after
+                // a successful wait; popen's peek path depends on it)
+                tb->map[L"getExitCode"] =
+                    NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value();
+                    HANDLE h = (HANDLE)(INT_PTR)(long long)BNum(a[0]);
+                    if (!h)
+                        return Value();
+                    DWORD code = 0;
+                    if (!GetExitCodeThread(h, &code) &&
+                        !GetExitCodeProcess(h, &code))
+                        return Value();
+                    return Value::Num_(code); });
                 // thread.lock(name[,fn,...]) — named inter-thread lock. With
                 // a function it runs under the lock and returns its results;
                 // without one it acquires the lock until thread.unlock(name).
@@ -3703,9 +3726,46 @@ void Interp::InitBuiltins()
                 tb->map[L"callWnd"] = NF([](vector<Value>&) -> Value {
                     return Value();
                 });
-                globals.vars[L"__waitForMultipleObjects"] = NF([](vector<Value>& a) -> Value {
-                    return Value::Num_(0);
-                });
+                // __waitForMultipleObjects(timeout, waitall, handles,
+                // flags) — official kernel global consumed by
+                // builtin\thread.aardio threadwait. With a QS_* wake
+                // mask it must be MsgWaitForMultipleObjects so that
+                // "input satisfied" returns WAIT_OBJECT_0+count (the
+                // caller then pumps and retries); without one it is a
+                // plain WaitForMultipleObjects.
+                globals.vars[L"__waitForMultipleObjects"] =
+                    NF([](vector<Value>& a) -> Value {
+                        if (a.size() < 3)
+                            return Value::Num_(0xFFFFFFFF);
+                        DWORD ms = (DWORD)(long long)BNum(a[0]);
+                        bool bAll = a[1].Truthy();
+                        std::vector<HANDLE> hs;
+                        if (a[2].t == Value::TableT && a[2].tab)
+                        {
+                            for (auto& h : a[2].tab->arr)
+                                hs.push_back((HANDLE)(INT_PTR)(long long)
+                                                 BNum(h));
+                        }
+                        else if (a[2].t != Value::Null)
+                        {
+                            hs.push_back((HANDLE)(INT_PTR)(long long)
+                                             BNum(a[2]));
+                        }
+                        if (hs.empty() ||
+                            hs.size() > MAXIMUM_WAIT_OBJECTS)
+                            return Value::Num_(0xFFFFFFFF);
+                        UINT wake = a.size() > 3
+                                        ? (UINT)(long long)BNum(a[3])
+                                        : 0;
+                        DWORD rc = wake
+                                       ? MsgWaitForMultipleObjects(
+                                             (DWORD)hs.size(), hs.data(),
+                                             bAll ? TRUE : FALSE, ms, wake)
+                                       : WaitForMultipleObjects(
+                                             (DWORD)hs.size(), hs.data(),
+                                             bAll ? TRUE : FALSE, ms);
+                        return Value::Num_((double)rc);
+                    });
                 // ---- kernel message-loop primitives (official aardio
                 // injects these as __-prefixed globals; win/_.aardio binds
                 // them at module load: `var getMessage = ..__messageGet`)
