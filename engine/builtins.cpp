@@ -4,6 +4,18 @@
 
 namespace NodioVM
 {
+    // UTF-16 (engine internal) -> UTF-8 (aardio byte semantics)
+    static std::string WToU8(const std::wstring& s)
+    {
+        int len = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
+                                      nullptr, 0, nullptr, nullptr);
+        std::string u8(len > 0 ? (size_t)len : 0, '\0');
+        if (len > 0)
+            WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
+                                &u8[0], len, nullptr, nullptr);
+        return u8;
+    }
+
     // ---- fibers (纤程) ----
     // docs/language-reference/datatype/datatype.md: a fiber has its own
     // stack and can be suspended and resumed, but it is not a thread and
@@ -279,6 +291,44 @@ void Interp::InitBuiltins()
                     for (long long i = 0; i < n; i++)
                         out += s;
                     return Value::Str_(out); });
+                // string.indexAny(str, bytes [, startPos]) — position (1-based,
+                // in bytes) of the first byte of `str` at or after startPos
+                // that also occurs in `bytes`; 0 when none matches.
+                // aardio's second argument may name a byte code numerically.
+                tb->map[L"indexAny"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value::Num_(0.0);
+                    std::string s = WToU8(BStr(a[0]));
+                    std::string set;
+                    if (a.size() > 1)
+                    {
+                        if (a[1].t == Value::Num)
+                        {
+                            // a bare byte code instead of a byte string
+                            long long code = (long long)BNum(a[1]);
+                            if (code >= 0 && code <= 0xFF)
+                                set.push_back((char)code);
+                        }
+                        else
+                            set = WToU8(BStr(a[1]));
+                    }
+                    size_t start = 0;
+                    if (a.size() > 2)
+                    {
+                        long long p = (long long)BNum(a[2]);
+                        start = p < 1 ? 0 : (size_t)(p - 1);
+                    }
+                    if (start >= s.size())
+                        return Value::Num_(0.0);
+                    for (size_t i = start; i < s.size(); i++)
+                    {
+                        for (char c : set)
+                        {
+                            if (s[i] == c)
+                                return Value::Num_((double)(i + 1));
+                        }
+                    }
+                    return Value::Num_(0.0); });
                 // string.sub(s,i,j) — 1-based substring, negative = from end
                 tb->map[L"sub"] = NF([](vector<Value>& a) -> Value {
                     wstring s = BStr(a[0]);

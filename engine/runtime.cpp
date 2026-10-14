@@ -1127,7 +1127,16 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 else if (eNs)
                     eNs->nsTable->map[target->str] = val;
                 else
+                {
                     globals.vars[target->str] = val;   // aardio: default global
+                    // engine-provided root namespaces are pre-registered in
+                    // `roots`, and NsPath/DoImport consult that map first.
+                    // Leaving the two copies apart made `namespace process{}`
+                    // after `class process{}` extend the STALE engine table,
+                    // so the class lost every member the namespace declared.
+                    if (roots.count(target->str))
+                        roots[target->str] = val;
+                }
             }
             else if (target->k == Node::Member)
             {
@@ -1792,14 +1801,28 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
             }
             else
             {
-                auto it = roots.find(names[0]);
-                if (it == roots.end())
-                    it = globals.vars.find(names[0]);
-                if (it != roots.end() && (it->second.t == Value::TableT || it->second.t == Value::Class) &&
-                    it->second.tab)
+                // both maps must name the SAME value: a script-level
+                // `class X {}` replaces globals.vars[X] while roots[X] may
+                // still hold the engine's placeholder table, and a namespace
+                // opened afterwards would then extend the stale one
+                // NB: the two maps are distinct containers, so their
+                // iterators must never be compared to each other's end()
+                Value cand;
+                auto ir = roots.find(names[0]);
+                if (ir != roots.end())
+                    cand = ir->second;
+                else
                 {
-                    ns = it->second;
+                    auto ig = globals.vars.find(names[0]);
+                    if (ig != globals.vars.end())
+                        cand = ig->second;
+                }
+                if ((cand.t == Value::TableT || cand.t == Value::Class) &&
+                    cand.tab)
+                {
+                    ns = cand;
                     roots[names[0]] = ns;
+                    globals.vars[names[0]] = ns;
                 }
                 else
                 {
