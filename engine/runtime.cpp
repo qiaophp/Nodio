@@ -731,13 +731,27 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 }
                 Value vInst = Value::Table_(inst);
                 Env classNsEnv;
+                Env definingNsEnv;
                 if (f.tab)
-                {
-                    classNsEnv.parent = &globals;
                     classNsEnv.nsTable = f.tab;
+                if (f.nsClosure)
+                {
+                    // aardio: the ctor and member code see the DEFINING
+                    // namespace as an upvalue (captured in EvalClass).
+                    // Bare names resolve instance -> class -> namespace ->
+                    // global; dropping the namespace level made the bare
+                    // `in_addr()` inside wsock.sockaddr_in resolve null
+                    // (15+ examples).
+                    definingNsEnv.parent = &globals;
+                    definingNsEnv.nsTable = f.nsClosure;
+                    classNsEnv.parent = &definingNsEnv;
                 }
+                else
+                    classNsEnv.parent = &globals;
                 Env local;
-                local.parent = f.tab ? &classNsEnv : &globals;
+                local.parent = f.tab ? &classNsEnv
+                                     : (f.nsClosure ? &definingNsEnv
+                                                    : &globals);
                 local.nsTable = inst;
                 if (bMethod)
                     local.vars[L"owner"] = vThis;   // owner = dot-left

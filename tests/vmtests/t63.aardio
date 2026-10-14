@@ -1,0 +1,32 @@
+// t63: a class ctor must see its DEFINING namespace as an upvalue.
+// Regression for the dropped f.nsClosure in the instantiation env:
+// the bare C() inside D's ctor resolved null and every official lib
+// class that constructs a namespace-sibling class failed with
+// 尝试调用非函数值 (wsock in_addr @ _.aardio:132 was the loudest).
+namespace t{
+	C = class {
+		m = 7;
+	}
+	var C = C;
+	class D {
+		ctor(){
+			this.c = C();
+		}
+	}
+}
+
+var d = t.D();
+io.print("ctor sees ns member: " .. type(d.c));
+
+namespace u{
+	K = class {
+		m = 8;
+	}
+	class E {
+		ctor(){
+			this.k = K();
+		}
+	}
+}
+var e = u.E();
+io.print("without var alias: " .. type(e.k));
