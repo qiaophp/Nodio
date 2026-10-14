@@ -1,0 +1,11 @@
+// t64: raw.swap — byte-order reversal per docs/guide/language/
+// syntax-quick-ref.md (INT 0x04030201 -> 0x01020304). Number form with
+// an API type name, default-INT form, and the struct form that swaps
+// integer fields in place per the _struct metadata. wsock/tcp, bt,
+// fastcgi, crypt/otp and bencode all call this.
+io.print(raw.swap(0x04030201, "INT") == 0x01020304);
+io.print(raw.swap(0xBBAA, "WORD") == 0xAABB);
+io.print(raw.swap(0x11223344) == 0x44332211);
+var s = { INT a = 0x04030201; WORD b = 0xBBAA };
+raw.swap(s);
+io.print(s.a == 0x01020304 && s.b == 0xAABB);

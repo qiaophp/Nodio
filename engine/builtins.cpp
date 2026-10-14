@@ -2103,6 +2103,72 @@ void Interp::InitBuiltins()
                                 (double)CalcStructTotalSize(a[0]));
                     }
                     return Value(); });
+                // raw.swap(v [, type]) — reverse byte order. Numbers swap
+                // the width named by the API type (default INT — the lib
+                // calls raw.swap on INT/WORD struct fields); a struct table
+                // swaps its integer fields in place per its _struct
+                // metadata. wsock/tcp, bt, fastcgi, crypt/otp and bencode
+                // all depend on this.
+                tb->map[L"swap"] = NF([](vector<Value>& a) -> Value {
+                    auto swapNum = [](double n, int size) -> Value {
+                        if (size != 2 && size != 4 && size != 8)
+                            return Value::Num_(n);
+                        unsigned long long v;
+                        if (size == 8)
+                            v = (unsigned long long)(long long)n;
+                        else if (size == 2)
+                            v = (unsigned short)(long long)n;
+                        else
+                            v = (unsigned int)(long long)n;
+                        unsigned long long r = 0;
+                        for (int i = 0; i < size; i++)
+                            r = (r << 8) | ((v >> (i * 8)) & 0xFFull);
+                        double d;
+                        if (size == 8) d = (double)(long long)r;
+                        else if (size == 2) d = (double)(unsigned short)r;
+                        else d = (double)(int)r;
+                        return Value::Num_(d);
+                    };
+                    auto isIntType = [](const wstring& ty) {
+                        wstring t = ty;
+                        for (auto& c : t) c = towlower(c);
+                        return t == L"byte" || t == L"uchar" || t == L"char" ||
+                               t == L"int8" || t == L"word" || t == L"ushort" ||
+                               t == L"short" || t == L"wchar" || t == L"int" ||
+                               t == L"uint" || t == L"long" || t == L"dword" ||
+                               t == L"bool" || t == L"int64" || t == L"uint64" ||
+                               t == L"long64" || t == L"i64" || t == L"qword";
+                    };
+                    if (a.empty()) return Value();
+                    if (a[0].t == Value::Num)
+                    {
+                        int size = 4;
+                        if (a.size() > 1 && a[1].t == Value::Str)
+                            size = GetStructFieldSize(a[1].s, 1);
+                        return swapNum(a[0].n, size);
+                    }
+                    if ((a[0].t == Value::TableT || a[0].t == Value::Class) &&
+                        a[0].tab)
+                    {
+                        auto is = a[0].tab->map.find(L"_struct");
+                        if (is == a[0].tab->map.end() ||
+                            is->second.t != Value::Str)
+                            return a[0];
+                        for (auto& f : ParseStructDef(a[0]))
+                        {
+                            if (f.bIsArray || !isIntType(f.type))
+                                continue;
+                            auto iv = a[0].tab->map.find(f.name);
+                            if (iv == a[0].tab->map.end() ||
+                                iv->second.t != Value::Num)
+                                continue;
+                            iv->second = swapNum(iv->second.n,
+                                                 GetStructFieldSize(f.type, 1));
+                        }
+                        return a[0];
+                    }
+                    return a[0];
+                });
                 // raw.uint / raw.int / raw.word / raw.byte — read a little-
                 // endian integer of the given width from a pointer/string.
                 // Used as raw.uint(,true) to allocate an out-parameter.
