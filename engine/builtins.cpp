@@ -2258,25 +2258,54 @@ void Interp::InitBuiltins()
                             return Value();
                         }
                         void* fn = (void*)fp;
+                        // raw.interface / COM vtable: app.api(fnPtr, proto,
+                        // cc, thisPtr) — the 4th arg binds an implicit this
+                        // prepended to every call's argument list
+                        void* pThisBound = nullptr;
+                        if (a2.size() > 3 && (a2[3].t == Value::Pointer))
+                            pThisBound = a2[3].ptr;
+                        else if (a2.size() > 3 && a2[3].t == Value::Num)
+                            pThisBound = (void*)(INT_PTR)(long long)a2[3].n;
 #if defined(_WIN64)
                         // one executable call stub per bound signature —
                         // carries float/double args into XMM0..3
-                        void* stub = EmitX64CallStub(sig);
+                        // bound this: the stub must treat the this
+                        // pointer as parameter slot 0 (RCX) — the marshal
+                        // path below already packs aBound (this + args),
+                        // so the stub needs the synthetic leading ptr arg
+                        ApiSig sigStub = sig;
+                        if (pThisBound)
+                            sigStub.params.insert(sigStub.params.begin(), 5);
+                        void* stub = EmitX64CallStub(sigStub);
 #else
                         void* stub = nullptr;
 #endif
-                        Value retFn = NF([this, fn, sig, stub, bNameW](vector<Value>& a3)
+                        Value retFn = NF([this, fn, sig, stub, bNameW,
+                                          pThisBound](vector<Value>& a3)
                             -> Value {
                             // box arguments into integer slots
                             vector<SlotT> slots;
                             std::vector<std::string> tmpA;
                             std::vector<wstring> tmpW;
+                            vector<Value> aBound;
+                            if (pThisBound)
+                            {
+                                aBound.push_back(
+                                    Value::Pointer_(pThisBound));
+                                for (auto& v : a3)
+                                    aBound.push_back(v);
+                            }
+                            vector<Value>& argsEff =
+                                pThisBound ? aBound : a3;
                             size_t nA = 0, nW = 0;
+                            // aBound[0] is the bound this — declared
+                            // parameters start at index 1
+                            size_t nOff = pThisBound ? 1 : 0;
                             for (size_t i = 0; i < sig.params.size();
                                  i++)
                             {
-                                Value v = i < a3.size()
-                                    ? a3[i] : Value();
+                                Value v = (i + nOff) < argsEff.size()
+                                    ? argsEff[i + nOff] : Value();
                                 if (sig.params[i] == 6 && v.t == Value::Str)
                                     nA++;
                                 if (sig.params[i] == 7 && v.t == Value::Str)
@@ -2294,11 +2323,16 @@ void Interp::InitBuiltins()
                                 bool bNoFree = false;   // caller-owned buffer
                             };
                             std::vector<ApiArgRef> tmpRefs;
+                            // bound this (COM vtable): RCX must be the
+                            // interface pointer — put it in slot 0 ahead
+                            // of the declared parameters
+                            if (pThisBound)
+                                slots.push_back((SlotT)(INT_PTR)pThisBound);
                             for (size_t i = 0; i < sig.params.size();
                                  i++)
                             {
-                                Value v = i < a3.size()
-                                    ? a3[i] : Value();
+                                Value v = (i + nOff) < argsEff.size()
+                                    ? argsEff[i + nOff] : Value();
                                 int pt = sig.params[i] & 0xFF;
                                 // aardio contract: a W-suffixed export takes
                                 // `str` params as UTF-16 (string.getenv with
@@ -2806,7 +2840,18 @@ void Interp::InitBuiltins()
                         return (void*)(INT_PTR)(long long)v.n;
                     return nullptr;
                 };
-                tb->map[L"buffer"] = NF([](vector<Value>& a) -> Value {
+                tb->map[L"buffer"] = NF([this](vector<Value>& a) -> Value {
+                    // raw.buffer(structTable) — serialize a struct instance
+                    // into a persistent raw buffer (official contract; the
+                    // dotNet library passes struct buffers to COM APIs)
+                    if (!a.empty() && (a[0].t == Value::TableT ||
+                                       a[0].t == Value::Class))
+                    {
+                        int total = 0;
+                        void* pS = StructSerialize(a[0], &total);
+                        if (pS)
+                            return Value::Pointer_(pS);
+                    }
                     size_t n = a.empty() ? 0
                         : (size_t)(long long)BNum(a[0]);
                     if (n == 0) return Value::Pointer_(nullptr);
@@ -4955,6 +5000,16 @@ void Interp::InitBuiltins()
             vType.tab->map[L"function"] = Value::Str_(L"function");
             vType.tab->map[L"cdata"] = Value::Str_(L"cdata");
             vType.tab->map[L"pointer"] = Value::Str_(L"pointer");
+            // official type constants (kernel): used across the lib, e.g.
+            // com.interface checkInterface `type(x) != type.class`
+            vType.tab->map[L"class"] = Value::Str_(L"class");
+            vType.tab->map[L"callable"] = Value::Str_(L"callable");
+            vType.tab->map[L"int"] = Value::Str_(L"number");
+            vType.tab->map[L"uint"] = Value::Str_(L"number");
+            vType.tab->map[L"long"] = Value::Str_(L"number");
+            vType.tab->map[L"ulong"] = Value::Str_(L"number");
+            vType.tab->map[L"float"] = Value::Str_(L"number");
+            vType.tab->map[L"double"] = Value::Str_(L"number");
             vType.tab->map[L"isString"] = NF([](vector<Value>& a) -> Value {
                 return Value::Bool_(!a.empty() && a[0].t == Value::Str);
             });

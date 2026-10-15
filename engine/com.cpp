@@ -414,6 +414,88 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         return Value::Num_(0);
     });
 
+    // com.GetIUnknown(obj, iidStr) -> raw IUnknown* QI'd to the given
+    // interface (official com.kernel API used by com.interface / dotNet.clr)
+    com->map[L"GetIUnknown"] = NF([](vector<Value>& a) -> Value {
+        if (a.size() < 2)
+            return Value();
+        IUnknown* punk = nullptr;
+        if (a[0].t == Value::TableT && a[0].tab)
+        {
+            auto io = a[0].tab->map.find(L"_object");
+            if (io != a[0].tab->map.end() && io->second.t == Value::Pointer)
+                punk = reinterpret_cast<IUnknown*>(io->second.ptr);
+            else
+            {
+                auto ip = a[0].tab->map.find(L"_pointer");
+                if (ip != a[0].tab->map.end() &&
+                    (ip->second.t == Value::Pointer))
+                    punk = reinterpret_cast<IUnknown*>(ip->second.ptr);
+                else if (a[0].t == Value::Pointer)
+                    punk = reinterpret_cast<IUnknown*>(a[0].ptr);
+            }
+        }
+        else if (a[0].t == Value::Pointer)
+            punk = reinterpret_cast<IUnknown*>(a[0].ptr);
+        if (!punk)
+            return Value();
+        IID iid;
+        // the IID may be a string ("{...}") or a win.guid struct table
+        // (com.interface's checkInterface converts it before calling)
+        if (a[1].t == Value::Str)
+        {
+            wstring sIid = BStr(a[1]);
+            if (FAILED(IIDFromString(sIid.c_str(), &iid)))
+                return Value();
+        }
+        else if (a[1].t == Value::TableT && a[1].tab)
+        {
+            int total = 0;
+            void* pG = StructSerialize(a[1], &total);
+            if (!pG || total < (int)sizeof(IID))
+            {
+                if (pG)
+                    HeapFree(GetProcessHeap(), 0, pG);
+                return Value();
+            }
+            memcpy(&iid, pG, sizeof(IID));
+            HeapFree(GetProcessHeap(), 0, pG);
+        }
+        else
+            return Value();
+        void* pv = nullptr;
+        if (FAILED(punk->QueryInterface(iid, &pv)) || !pv)
+            return Value();
+        return Value::Pointer_(pv);
+    });
+
+    // com.QueryObject(punk) -> COM wrapper: QI to IDispatch and wrap
+    // (official kernel API used by dotNet.appDomain on raw IUnknown*)
+    com->map[L"QueryObject"] = NF([](vector<Value>& a) -> Value {
+        if (a.empty())
+            return Value();
+        IUnknown* punk = nullptr;
+        if (a[0].t == Value::Pointer)
+            punk = reinterpret_cast<IUnknown*>(a[0].ptr);
+        else if (a[0].t == Value::Num)
+            punk = reinterpret_cast<IUnknown*>(
+                (INT_PTR)(long long)a[0].n);
+        else if (a[0].t == Value::TableT && a[0].tab)
+        {
+            auto io = a[0].tab->map.find(L"_object");
+            if (io != a[0].tab->map.end() && io->second.t == Value::Pointer)
+                punk = reinterpret_cast<IUnknown*>(io->second.ptr);
+        }
+        if (!punk)
+            return Value();
+        IDispatch* pd = nullptr;
+        HRESULT hrQI = punk->QueryInterface(IID_IDispatch, (void**)&pd);
+        if (SUCCEEDED(hrQI) && pd)
+            return WrapDispatch(pd);
+        // not an automation object: keep the raw pointer reachable
+        return a[0];
+    });
+
     globalsEnv.vars[L"com"] = Value::Table_(com);
     // plain `import com` must resolve to this kernel namespace (official
     // builtin\com.aardio merges into it) instead of creating an empty

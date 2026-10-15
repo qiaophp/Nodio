@@ -1089,6 +1089,50 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                         }
                         vInst = itThis->second;
                     }
+                    // a base-class ctor swap (`this = baseClass()`) keeps
+                    // the base _struct; the class body's own member
+                    // declarations (T name = proto) must extend it, or
+                    // vtable interfaces (dotNet clr) lose their slots
+                    if (vInst.tab && f.tab)
+                    {
+                        auto itCls = f.tab->map.find(L"_struct");
+                        if (itCls != f.tab->map.end() &&
+                            itCls->second.t == Value::Str)
+                        {
+                            auto itI = vInst.tab->map.find(L"_struct");
+                            wstring strCls = itCls->second.s;
+                            wstring strInst = (itI != vInst.tab->map.end() &&
+                                               itI->second.t == Value::Str)
+                                                  ? itI->second.s : L"";
+                            // append only class members missing from the
+                            // instance layout (dedupe by member name)
+                            size_t pos = 0;
+                            while (pos < strCls.size())
+                            {
+                                size_t semi = strCls.find(L';', pos);
+                                if (semi == wstring::npos)
+                                    semi = strCls.size();
+                                wstring item = strCls.substr(pos, semi - pos);
+                                pos = semi + 1;
+                                size_t sp = item.find_first_of(L" \t");
+                                if (sp == wstring::npos) continue;
+                                wstring name = item.substr(sp + 1);
+                                size_t lb = name.find(L'[');
+                                if (lb != wstring::npos)
+                                    name = name.substr(0, lb);
+                                while (!name.empty() &&
+                                       (name.back() == L' ' || name.back() == L'\t'))
+                                    name.pop_back();
+                                if (name.empty()) continue;
+                                if (strInst.find(name) != wstring::npos)
+                                    continue;
+                                if (!strInst.empty())
+                                    strInst += L";";
+                                strInst += item;
+                            }
+                            vInst.tab->map[L"_struct"] = Value::Str_(strInst);
+                        }
+                    }
                 }
                 return vInst;
             }

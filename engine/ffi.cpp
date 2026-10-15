@@ -770,6 +770,24 @@ namespace NodioVM
                 double dbl = BNum(fv);
                 memcpy(buf + off, &dbl, sizeof(double));
             }
+            else if (f.bIsArray && (fv.t == Value::TableT) && fv.tab)
+            {
+                // numeric element arrays (BYTE Data4[8], INT arr[4], ...):
+                // an aardio array table serializes element-wise; esz is
+                // the PER-ELEMENT size, not the whole-field size
+                auto& arr = fv.tab->arr;
+                int esz = f.arrCount > 0 ? sz / f.arrCount : sz;
+                for (int k = 0; k < f.arrCount; k++)
+                {
+                    long long ev = 0;
+                    if (k < (int)arr.size())
+                        ev = (long long)BNum(arr[k]);
+                    if (esz == 8) *(__int64*)(buf + off + k * 8) = (__int64)ev;
+                    else if (esz == 2) *(unsigned short*)(buf + off + k * 2) = (unsigned short)ev;
+                    else if (esz == 1) *(unsigned char*)(buf + off + k) = (unsigned char)ev;
+                    else *(int*)(buf + off + k * 4) = (int)ev;
+                }
+            }
             else
             {
                 long long v64 = (long long)BNum(fv);
@@ -867,6 +885,23 @@ namespace NodioVM
                 double dbl = 0;
                 memcpy(&dbl, buf + off, sizeof(double));
                 vTab.tab->map[f.name] = Value::Num_(dbl);
+            }
+            else if (f.bIsArray)
+            {
+                // numeric element arrays read back as an aardio array;
+                // esz is the PER-ELEMENT size (guard arrCount<=0)
+                auto at = std::make_shared<Table>();
+                int esz = f.arrCount > 0 ? sz / f.arrCount : sz;
+                for (int k = 0; k < f.arrCount; k++)
+                {
+                    long long v64 = 0;
+                    if (esz == 8) v64 = *(__int64*)(buf + off + k * 8);
+                    else if (esz == 2) v64 = *(unsigned short*)(buf + off + k * 2);
+                    else if (esz == 1) v64 = *(unsigned char*)(buf + off + k);
+                    else v64 = *(int*)(buf + off + k * 4);
+                    at->arr.push_back(Value::Num_((double)v64));
+                }
+                vTab.tab->map[f.name] = Value::Table_(at);
             }
             else
             {
