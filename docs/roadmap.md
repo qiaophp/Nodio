@@ -111,7 +111,7 @@ the `io.exist` return contract, custom API types).
 | namespace | cause | next step |
 |---|---|---|
 | `base64`, `sqlite`, `zlib`, `golang`, `nodeJs`, `py2`, `py3` (x64 only) | bundle 32-bit-only DLLs (`zlibwapi.dll`, `python27/38.dll`, MZ payloads) | OS limit on x64; all seven import on x86 |
-| `System` (both arch) | `dotNet.import(...)` — no CLR host | needs the CLR hosting layer |
+| `System` (both arch) | `dotNet.import(...)` — CLR host chain works to appDomain (CLRCreateInstance/GetRuntime/IsLoadable all hr=0, clr() version=v4.0.30319); blocked at appDomain.loadFile -> System._AppDomain Load_3 (no IDispatch; needs SAFEARRAY/CCW marshal) | _AppDomain vtable marshal (slots 47-51) + Assembly CCW wrap |
 | `ide` (both arch) | the engine-provided `(debug)` module lacks `getMainId` (`@ 行 24` of the chain) | add the API |
 | `py2`, `py3` (x86) | `string.trimRight` primitive missing (`_.aardio:141`) | add the primitive |
 | `golang` (x86) | its own import guard fires during `import golang` (self-reference) | verify the root-binding contract |
