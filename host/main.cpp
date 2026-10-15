@@ -98,6 +98,20 @@ static void EnsureConsole(bool bForce)
     if (!GetConsoleWindow() &&
         (bForce || !GetStdHandle(STD_OUTPUT_HANDLE)))
     {
+        // A valid stdout that is NOT a console (pipe/file: the regression
+        // harness, process.popen from the IDE) must be kept — allocating a
+        // console and freopen-ing CONOUT$ would detach the pipe and every
+        // io.print line would vanish into an invisible window.
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hOut)
+        {
+            DWORD mode = 0;
+            // a valid non-console stdout (pipe/file: the regression
+            // harness, process.popen from the IDE) must be kept —
+            // GetConsoleMode succeeds only on a real console device
+            if (!GetConsoleMode(hOut, &mode))
+                return;
+        }
         AllocConsole();
         freopen("CONIN$", "r", stdin);
         freopen("CONOUT$", "w", stdout);
