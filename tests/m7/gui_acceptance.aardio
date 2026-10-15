@@ -12,9 +12,9 @@ wf.add({
 	lb={cls="listbox";items={"A";"B";"C"};left=10;top=88;right=150;bottom=250};
 	cmb={cls="combobox";items={"X";"Y";"Z"};left=160;top=88;right=300;bottom=112};
 	gp={cls="groupbox";text="分组";left=160;top=120;right=500;bottom=250};
-	pg={cls="progressbar";left=10;top=260;right=500;bottom=284};
+	pg={cls="progress";left=10;top=260;right=500;bottom=284};
 	plus1={cls="plus";text="PLUS自绘";left=10;top=294;right=500;bottom=344;bgcolor=0x2b5797;color=0xFFFFFF};
-	bk={cls="bkplus";left=10;top=354;right=500;bottom=404;};
+	//	bk={cls="bkplus";left=10;top=354;right=500;bottom=404;};
 })
 
 wf.show()
@@ -36,3 +36,7 @@ win.delay(800);
 var rc = wf.getRect(true);
 io.print("shot-rect=" + rc.width() + "x" + rc.height());
 import process.popen;
+
+// 收尾:关闭窗体结束消息循环
+win.delay(200);
+wf.close();

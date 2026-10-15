@@ -418,6 +418,24 @@ void Interp::InitBuiltins()
                 // string.slice(s,i,j) — the lib aliases sub = slice; same
                 // 1-based inclusive contract with negative indices
                 tb->map[L"slice"] = tb->map[L"sub"];
+                // string.crc32(s) — kernel primitive (official engine):
+                // CRC-32 IEEE over the string's bytes, returned as an
+                // unsigned 32-bit number. fsys.update/io.tmpName and ~90
+                // examples depend on it.
+                tb->map[L"crc32"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::Str)
+                        return Value::Num_(0);
+                    std::string bytes = BUtf8(a[0]);
+                    unsigned int crc = 0xFFFFFFFFu;
+                    for (unsigned char c : bytes)
+                    {
+                        crc ^= c;
+                        for (int k = 0; k < 8; k++)
+                            crc = (crc >> 1) ^
+                                  (0xEDB88320u & (0u - (crc & 1u)));
+                    }
+                    return Value::Num_((double)(crc ^ 0xFFFFFFFFu));
+                });
                 // string.indexOf / lastIndexOf(s, sub, from?) — 1-based
                 // position or null; plain search (no pattern)
                 tb->map[L"lastIndexOf"] =

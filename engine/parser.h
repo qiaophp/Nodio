@@ -2125,6 +2125,24 @@ namespace NodioVM
                         asg->a = idx;
                         asg->b = path;
                         n->a->list.push_back(asg);
+                        // marker: this class body USES an @-annotation —
+                        // only then may instance member lookups fall back
+                        // to cls._meta (a bare `_meta = {...}` in a class
+                        // namespace, as in web.rest.client, is NOT an
+                        // instance metatable)
+                        PNode mark = New(Node::Assign);
+                        mark->str = L"=";
+                        PNode mkey = New(Node::Str);
+                        mkey->str = L"_metaAnnotated";
+                        PNode midx = New(Node::Index);
+                        PNode mth = New(Node::Ident);
+                        mth->str = L"this";
+                        midx->a = mth;
+                        midx->b = mkey;
+                        mark->a = midx;
+                        mark->b = New(Node::Bool);
+                        mark->b->num = 1;
+                        n->a->list.push_back(mark);
                         SkipNL();
                         EatPunct(L";");
                         continue;

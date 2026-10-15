@@ -105,6 +105,20 @@ namespace NodioVM
 
     // builtin-writing helpers (round 19)
     inline wstring BStr(const Value& v) { return v.ToString(); }
+    // UTF-8 byte view of a string value (for byte-level primitives such
+    // as string.crc32)
+    inline std::string BUtf8(const Value& v)
+    {
+        wstring w = v.ToString();
+        if (w.empty()) return std::string();
+        int cb = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                                     nullptr, 0, nullptr, nullptr);
+        std::string out((size_t)max(cb, 0), 0);
+        if (cb > 0)
+            WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &out[0],
+                                cb, nullptr, nullptr);
+        return out;
+    }
     inline double BNum(const Value& v)
     {
         if (v.t == Value::Num) return v.n;

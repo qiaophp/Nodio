@@ -287,21 +287,32 @@ bool Interp::MetaGet(const Value& obj, const wstring& key,
                 {
                     // class instances resolve @-annotation metas LATE: the
                     // meta may be assigned to the class after instantiation,
-                    // so fall back to _class._meta
-                    auto icc = cur.tab->map.find(L"_class");
+                    // so fall back to _class._meta — but ONLY when the class
+                    // body actually used an @-annotation (@_meta sets
+                    // _metaAnnotated on the instance); a bare `_meta = {...}`
+                    // in a class namespace, as in web.rest.client, is NOT an
+                    // instance metatable
+                    auto icc = cur.tab->map.find(L"_metaAnnotated");
                     if (icc != cur.tab->map.end() &&
-                        icc->second.tab)
+                        (icc->second.t == Value::Bool ||
+                         icc->second.t == Value::Num))
                     {
-                        auto icm = icc->second.tab->map.find(L"_meta");
-                        if (icm != icc->second.tab->map.end() &&
-                            icm->second.t == Value::TableT && icm->second.tab)
+                        auto icc2 = cur.tab->map.find(L"_class");
+                        if (icc2 != cur.tab->map.end() &&
+                            icc2->second.tab)
                         {
-                            bool hit = MetaGetLayer(obj, icm->second, key,
-                                                    out, pErr, pErrMsg,
-                                                    bOwnerCall,
-                                                    g_metaDispatchDepth > 0);
-                            if (hit || *pErr)
-                                return hit;
+                            auto icm = icc2->second.tab->map.find(L"_meta");
+                            if (icm != icc2->second.tab->map.end() &&
+                                icm->second.t == Value::TableT &&
+                                icm->second.tab)
+                            {
+                                bool hit = MetaGetLayer(obj, icm->second, key,
+                                                        out, pErr, pErrMsg,
+                                                        bOwnerCall,
+                                                        g_metaDispatchDepth > 0);
+                                if (hit || *pErr)
+                                    return hit;
+                            }
                         }
                     }
                     break;
@@ -380,6 +391,9 @@ bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
             {
                 if (bInDispatch)
                     return false;   // util._get's own this[k]: go raw below
+                if (getenv("NODIO_META_DEBUG"))
+                    fwprintf(stderr, L"[g-fn obj=%p mt=%p key=%s]\n",
+                             (void*)obj.tab.get(), (void*)mt, key.c_str());
                 // function form: g(k, ownerCall) — this is the meta table
                 // itself (util.metaProperty's _get reads this[k]); the
                 // object reaches the body via `owner`. While it runs,
@@ -410,17 +424,24 @@ bool Interp::MetaSet(const Value& obj, const wstring& key,
                 if (imc == cur.tab->map.end() || imc->second.t != Value::TableT ||
                     !imc->second.tab)
                 {
-                    auto icc = cur.tab->map.find(L"_class");
-                    if (icc != cur.tab->map.end() && icc->second.tab)
+                    auto icc = cur.tab->map.find(L"_metaAnnotated");
+                    if (icc != cur.tab->map.end() &&
+                        (icc->second.t == Value::Bool ||
+                         icc->second.t == Value::Num))
                     {
-                        auto icm = icc->second.tab->map.find(L"_meta");
-                        if (icm != icc->second.tab->map.end() &&
-                            icm->second.t == Value::TableT && icm->second.tab)
+                        auto icc2 = cur.tab->map.find(L"_class");
+                        if (icc2 != cur.tab->map.end() && icc2->second.tab)
                         {
-                            bool hit = MetaSetLayer(obj, icm->second, key,
-                                                    val, pErr, pErrMsg);
-                            if (hit || *pErr)
-                                return hit;
+                            auto icm = icc2->second.tab->map.find(L"_meta");
+                            if (icm != icc2->second.tab->map.end() &&
+                                icm->second.t == Value::TableT &&
+                                icm->second.tab)
+                            {
+                                bool hit = MetaSetLayer(obj, icm->second, key,
+                                                        val, pErr, pErrMsg);
+                                if (hit || *pErr)
+                                    return hit;
+                            }
                         }
                     }
                     break;
