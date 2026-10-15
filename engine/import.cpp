@@ -500,7 +500,14 @@ Value Interp::DoImport(const PNode& n, Env* env)
             Value modPlaceholder = Value::Table_(placeholder);
             placeholder->map[L"self"] = modPlaceholder;
             modules[file] = modPlaceholder;
-            BindModule(n->names, modPlaceholder);
+            // Single-segment imports must NOT pre-bind the root global:
+            // official aardio leaves the module's own name unbound while
+            // the body runs, so golang's `assert(!golang)` self-guard
+            // sees null. Re-entrant imports still resolve through the
+            // modules[] cache above. Dotted paths keep the placeholder
+            // chain (sub-namespace tables must exist mid-body).
+            if (n->names.size() > 1)
+                BindModule(n->names, modPlaceholder);
 
             // module runs in a child scope; its `return v` (or its collected
             // top-level globals) becomes the module value
