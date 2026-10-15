@@ -857,6 +857,11 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                     nReturn = nBreak = nContinue = 0;
                     ExecBlock(f.classBody, local.get());
+                    // member-initialization privilege ends with the ctor:
+                    // the frame stays alive as the closure parent of every
+                    // method, and a lingering bInstInit made `this.x = v`
+                    // inside ANY method bypass the metatable's _set
+                    local->bInstInit = false;
                     nReturn = oldR; nBreak = oldB; nContinue = oldC;
                     ret = oldRet;
                     auto itThis = local->vars.find(L"this");
@@ -1979,6 +1984,28 @@ Value Interp::Exec(const PNode& n, Env* env)
                 {
                     auto itv = it.tab->map.find(k);
                     Value v = itv != it.tab->map.end() ? itv->second : Value();
+                    // a numeric-string key (form._ctrlHwnd[hwndNumber]) is a
+                    // NUMBER in aardio — iterating it as a string hands
+                    // win.getStyle(string) a marshalled pointer and the
+                    // WM_SIZE/enumControl chain then tears the control down
+                    if (!k.empty() &&
+                        k.find_first_not_of(L"0123456789") == wstring::npos)
+                    {
+                        long long nK = _wtoi64(k.c_str());
+                        if (nK > 0)
+                        {
+                            Value vk = Value::Num_((double)nK);
+                            loopEnv->vars.clear();
+                            loopEnv->vars[n->names[0]] = vk;
+                            if (n->names.size() > 1)
+                                loopEnv->vars[n->names[1]] = v;
+                            Value r = ExecBlock(n->b, loopEnv.get());
+                            if (nBreak) { nBreak--; return Value(); }
+                            if (nContinue) { nContinue--; continue; }
+                            if (nReturn) { ret = r; return ret; }
+                            continue;
+                        }
+                    }
                     int rc = step(k, v);
                     if (rc == 1) return Value();
                     if (rc == 2) return ret;

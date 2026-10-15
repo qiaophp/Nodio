@@ -3405,7 +3405,20 @@ void Interp::InitBuiltins()
                     }
                     for (auto& kv : t->map)
                     {
-                        keys.push_back(Value::Str_(kv.first));
+                        // a numeric-string key was written as a number
+                        // (form._ctrlHwnd[hwndNumber] = ctrl): aardio
+                        // iterates it back as a NUMBER — handing a string
+                        // to win.getStyle(string) marshals the string's
+                        // raw buffer as the hwnd and misreads the style
+                        long long nKey = 0;
+                        if (!kv.first.empty() &&
+                            kv.first.find_first_not_of(L"0123456789") ==
+                                wstring::npos)
+                            nKey = _wtoi64(kv.first.c_str());
+                        if (nKey > 0)
+                            keys.push_back(Value::Num_((double)nKey));
+                        else
+                            keys.push_back(Value::Str_(kv.first));
                         vals.push_back(kv.second);
                     }
                     size_t start = 0;
