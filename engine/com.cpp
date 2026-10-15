@@ -288,6 +288,151 @@ namespace
         return s_meta.get();
     }
 
+    // ---------- _AppDomain vtable dispatch ----------
+    // System._AppDomain (the legacy CreateDomainEx result) exposes no
+    // IDispatch, so appDomain.loadFile/load call Load_3/Load_4 etc.
+    // directly through the interface vtable.
+    //
+    // vtable layout (mscorlib System._AppDomain, dual — confirmed from
+    // the interface's method order via reflection):
+    //   0-2  IUnknown (QI/AddRef/Release)
+    //   3-6  IDispatch (GetTypeInfoCount/GetTypeInfo/GetIDsOfNames/Invoke)
+    //   7..  interface methods in declaration order; Load overloads:
+    //        47=Load(AssemblyName) 48=Load(String) 49=Load_3(Byte[])
+    //        50=Load_4(Byte[],Byte[])
+    //   57=get_FriendlyName 58=get_BaseDirectory
+
+    static Table* AppDomainMeta()
+    {
+        static std::shared_ptr<Table> s_meta;
+        if (!s_meta)
+        {
+            s_meta = std::make_shared<Table>();
+
+            // _get(k, ownerCall, owner) — expose known members; unknown
+            // members stay null so official optional checks keep working
+            s_meta->map[L"_get"] = NF([](vector<Value>& a) -> Value {
+                if (a.size() < 3 || a[2].t != Value::TableT || !a[2].tab)
+                    return Value();
+                auto io = a[2].tab->map.find(L"_object");
+                if (io == a[2].tab->map.end() ||
+                    io->second.t != Value::Pointer)
+                    return Value();
+                auto* itf = io->second.ptr;
+                wstring key = BStr(a[0]);
+
+                if (key == L"FriendlyName" || key == L"BaseDirectory")
+                {
+                    // get_FriendlyName = slot 57, get_BaseDirectory = 58
+                    // signature: HRESULT get_X(BSTR* retval)
+                    int slot = (key == L"FriendlyName") ? 57 : 58;
+                    void** vtbl = *reinterpret_cast<void***>(itf);
+                    typedef __int64 (__stdcall *GetStrFn)(void*, BSTR*);
+                    GetStrFn fn = nullptr;
+                    memcpy(&fn, &vtbl[slot], sizeof(fn));
+                    BSTR out = nullptr;
+                    if (fn(itf, &out) < 0)
+                        return Value();
+                    wstring v = out ? wstring(out, SysStringLen(out))
+                                    : wstring();
+                    if (out)
+                        SysFreeString(out);
+                    return Value::Str_(v);
+                }
+                if (key == L"Load_3" || key == L"Load_4")
+                {
+                    // bound member: calling it runs the vtable slot
+                    auto w = std::make_shared<Table>();
+                    w->map[L"_boundSlot"] = Value::Num_(
+                        (double)((key == L"Load_3") ? 49 : 50));
+                    w->map[L"_boundAppDomain"] =
+                        Value::Pointer_(itf);
+                    w->map[L"_meta"] = Value::Table_(s_meta);
+                    return Value::Table_(w);
+                }
+                return Value();
+            });
+
+            // _call(owner, ...) on a Load_3/Load_4 bound member
+            s_meta->map[L"_call"] = NF([](vector<Value>& a) -> Value {
+                if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                    return Value();
+                auto ib = a[0].tab->map.find(L"_boundSlot");
+                auto ip = a[0].tab->map.find(L"_boundAppDomain");
+                if (ib == a[0].tab->map.end() ||
+                    ip == a[0].tab->map.end() ||
+                    ip->second.t != Value::Pointer)
+                    return Value();
+                int slot = (int)(INT_PTR)BNum(ib->second);
+                auto* itf = ip->second.ptr;
+
+                // marshal the byte[] argument(s): aardio byte string
+                // (one byte per wchar) -> flat SAFEARRAY of UI1
+                auto MakeByteArray = [](const Value& v) -> SAFEARRAY* {
+                    if (v.t != Value::Str || v.s.empty())
+                        return nullptr;
+                    ULONG n = (ULONG)v.s.size();
+                    SAFEARRAYBOUND bd{ n, 0 };
+                    SAFEARRAY* psa = SafeArrayCreate(VT_UI1, 1, &bd);
+                    if (!psa)
+                        return nullptr;
+                    void* pData = nullptr;
+                    if (SUCCEEDED(SafeArrayAccessData(psa, &pData)))
+                    {
+                        for (ULONG i = 0; i < n; i++)
+                            ((unsigned char*)pData)[i] =
+                                (unsigned char)v.s[i];
+                        SafeArrayUnaccessData(psa);
+                    }
+                    return psa;
+                };
+
+                // Load_3: HRESULT Load(SAFEARRAY*, _Assembly** retval)
+                // Load_4: HRESULT Load(SAFEARRAY*, SAFEARRAY*, _Assembly**)
+                SAFEARRAY* psa1 = a.size() > 1 ? MakeByteArray(a[1])
+                                               : nullptr;
+                SAFEARRAY* psa2 = (slot == 50 && a.size() > 2)
+                    ? MakeByteArray(a[2]) : nullptr;
+                void* pAsm = nullptr;
+                void** vtbl = *reinterpret_cast<void***>(itf);
+                typedef __int64 (__stdcall *LoadFn)(void*, void*, void*,
+                                                    void*);
+                LoadFn fn = nullptr;
+                memcpy(&fn, &vtbl[slot], sizeof(fn));
+                __int64 hr = slot == 50
+                    ? fn(itf, psa1, psa2, &pAsm)
+                    : fn(itf, psa1, &pAsm, nullptr);
+                if (psa1)
+                    SafeArrayDestroy(psa1);
+                if (psa2)
+                    SafeArrayDestroy(psa2);
+                if (hr < 0 || !pAsm)
+                {
+                    Interp* it = g_interpCurrent;
+                    if (it)
+                    {
+                        wchar_t buf[16];
+                        swprintf(buf, 16, L"%08lX", (unsigned long)hr);
+                        *it->err = wstring(L"dotNet: Load 失败 hr=0x") +
+                                   buf;
+                    }
+                    return Value();
+                }
+                // the Assembly object is a .NET CCW: IDispatch works
+                auto* pUnkAsm = reinterpret_cast<IUnknown*>(pAsm);
+                IDispatch* pd = nullptr;
+                if (SUCCEEDED(pUnkAsm->QueryInterface(
+                        IID_IDispatch, (void**)&pd)))
+                {
+                    pUnkAsm->Release();
+                    return WrapDispatch(pd);
+                }
+                return Value::Pointer_(pAsm);
+            });
+        }
+        return s_meta.get();
+    }
+
     struct ComRuntime
     {
         ComRuntime()
@@ -492,6 +637,27 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         HRESULT hrQI = punk->QueryInterface(IID_IDispatch, (void**)&pd);
         if (SUCCEEDED(hrQI) && pd)
             return WrapDispatch(pd);
+        // System._AppDomain (legacy CreateDomainEx result) exposes no
+        // IDispatch, and its CCW vtable beyond IUnknown is a CLR stub
+        // table (not flat code pointers), so direct vtable calls crash.
+        // Official aardio reaches IDispatch here via its .NET interop
+        // layer; until that is reconstructed the raw pointer is kept
+        // reachable and AppDomainMeta stays available for when the
+        // CCW/dispatch marshaling lands.
+        // IUnknown* pAD = nullptr;
+        // IID iidAD;
+        // if (SUCCEEDED(IIDFromString(
+        //         L"{05F696DC-2B29-3663-AD8B-C4389CF2A713}", &iidAD)) &&
+        //     SUCCEEDED(punk->QueryInterface(iidAD, (void**)&pAD)) && pAD)
+        // {
+        //     auto w = std::make_shared<Table>();
+        //     w->map[L"_isComObject"] = Value::Bool_(true);
+        //     w->map[L"_isNetObject"] = Value::Bool_(true);
+        //     w->map[L"_object"] = Value::Pointer_((void*)pAD);
+        //     w->map[L"_meta"] = Value::Table_(
+        //         std::shared_ptr<Table>(AppDomainMeta(), [](Table*) {}));
+        //     return Value::Table_(w);
+        // }
         // not an automation object: keep the raw pointer reachable
         return a[0];
     });
