@@ -1,0 +1,38 @@
+import win.ui;
+import win;
+import win.ui.ctrl.plus;
+
+var wf = win.form(text="gui-acceptance";right=520;bottom=420)
+wf.add({
+	btn={cls="button";text="按钮";left=10;top=10;right=150;bottom=44};
+	ed={cls="edit";text="编辑框";left=160;top=10;right=500;bottom=44};
+	st={cls="static";text="静态文本";left=10;top=54;right=150;bottom=78};
+	chk={cls="checkbox";text="复选框";left=160;top=54;right=300;bottom=78};
+	rdo={cls="radiobutton";text="单选框";left=310;top=54;right=440;bottom=78};
+	lb={cls="listbox";items={"A";"B";"C"};left=10;top=88;right=150;bottom=250};
+	cmb={cls="combobox";items={"X";"Y";"Z"};left=160;top=88;right=300;bottom=112};
+	gp={cls="groupbox";text="分组";left=160;top=120;right=500;bottom=250};
+	pg={cls="progressbar";left=10;top=260;right=500;bottom=284};
+	plus1={cls="plus";text="PLUS自绘";left=10;top=294;right=500;bottom=344;bgcolor=0x2b5797;color=0xFFFFFF};
+	bk={cls="bkplus";left=10;top=354;right=500;bottom=404;};
+})
+
+wf.show()
+
+// 验收证据:每个控件 IsWindow + IsWindowVisible + GetParent=form + rect
+import gdi;
+var winOk = 0; var winBad = "";
+for(hwnd,ctrl in wf._ctrlHwnd){
+	var ok = win.isWindow(hwnd) && win.isVisible(hwnd) && (win.getParent(hwnd) == wf.hwnd);
+	var r = ::RECT();
+	::User32.GetWindowRect(hwnd, r);
+	if(ok) winOk++; else winBad ++= (ctrl.cls || "?") + " ";
+}
+io.print("form-visible=" + win.isVisible(wf.hwnd));
+io.print("controls-ok=" + winOk + " bad=[" + winBad + "]");
+
+win.delay(800);
+// 截图
+var rc = wf.getRect(true);
+io.print("shot-rect=" + rc.width() + "x" + rc.height());
+import process.popen;

@@ -44,9 +44,21 @@ namespace NodioVM
         double ToNum(const Value& v);
         bool MetaGet(const Value& obj, const wstring& key, Value* out,
                      bool* pErr, wstring* pErrMsg, bool bOwnerCall = false);
+        bool MetaGetLayer(const Value& obj, const Value& mtv,
+                          const wstring& key, Value* out, bool* pErr,
+                          wstring* pErrMsg, bool bOwnerCall,
+                          bool bInDispatch = false);
         bool MetaSet(const Value& obj, const wstring& key, const Value& val,
                      bool* pErr, wstring* pErrMsg);
+        bool MetaSetLayer(const Value& obj, const Value& mtv,
+                          const wstring& key, const Value& val,
+                          bool* pErr, wstring* pErrMsg);
         Value CallOwner(const Value& f, const Value& obj, vector<Value>& args);
+        Value CallThisOwner(const Value& f, const Value& ths,
+                            const Value& owner, vector<Value>& args);
+        Value CallThisOwner(const Value& ths, const Value& owner,
+                            const Value& f, vector<Value>& args, bool* pErr,
+                            wstring* pErrMsg);
         Value CallVmFuncStatic(const Value& obj, const Value& f,
                                vector<Value>& args, bool* pErr,
                                wstring* pErrMsg);

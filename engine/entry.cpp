@@ -103,6 +103,26 @@ namespace NodioVM
             }
         }
         it.InitBuiltins();
+        // preload the official builtin/struct.aardio (defines ::POINT/
+        // ::RECT/::PAINTSTRUCT that every GUI library assumes) — `builtin`
+        // itself is pre-bound so a plain `import` would never load the
+        // file body. NON-FATAL: failures are swallowed; when no NODIO_LIBDIR
+        // is set (plain VM tests) there is simply nothing to preload.
+        {
+            wstring strBootErr;
+            wstring strPrevErr = it.err ? *it.err : wstring();
+            wstring* pPrevErr = it.err;
+            it.err = &strBootErr;
+            vector<Tok> toksBoot = Lex(L"import builtin.struct;", &strBootErr);
+            Parser psBoot{ toksBoot, 0, &strBootErr };
+            psBoot.strEmbedBase = pBaseDir ? *pBaseDir : wstring();
+            psBoot.strEmbedRoot = EmbedRoot();
+            PNode progBoot = psBoot.ParseBlock();
+            it.ExecBlock(progBoot, &it.globals);
+            it.err = pPrevErr;
+            if (pPrevErr)
+                *pPrevErr = strPrevErr;
+        }
         try
         {
             it.ExecBlock(prog, &it.globals);

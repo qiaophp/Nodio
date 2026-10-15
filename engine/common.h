@@ -629,6 +629,10 @@ namespace NodioVM
 
     struct Interp;
     extern Interp* g_interpCurrent;   // M2: active interp for meta hooks
+    // >0 while a metaProperty _get/_set FUNCTION is dispatching: inner
+    // this[k] lookups must see RAW definition tables (never auto-call
+    // getters, never re-enter the _get function)
+    extern thread_local int g_metaDispatchDepth;
     struct Node
     {
         enum K

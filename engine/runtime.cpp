@@ -3,6 +3,7 @@
 namespace NodioVM
 {
 Interp* g_interpCurrent = nullptr;   // M2: active interp for meta hooks
+thread_local int g_metaDispatchDepth = 0;   // metaProperty dispatch flag
 Interp* Interp::g_self = nullptr;    // M2: self for meta callbacks
 
 // ---- Eval ----
@@ -271,18 +272,54 @@ bool Interp::MetaGet(const Value& obj, const wstring& key,
             *pErr = false;
             static thread_local int s_metaDepth = 0;
             if (s_metaDepth > 40)
-            {
-                fwprintf(stderr, L"[DEBUG MetaGet recursion: key=%s]\n", key.c_str());
                 return false;
-            }
             struct ScopeDepth { int& d; ScopeDepth(int& x): d(x){ d++; } ~ScopeDepth(){ d--; } } sd(s_metaDepth);
             if (obj.t != Value::TableT || !obj.tab || key == L"_meta")
                 return false;
-            auto im = obj.tab->map.find(L"_meta");
-            if (im == obj.tab->map.end() || im->second.t != Value::TableT ||
-                !im->second.tab)
-                return false;
-            Table* mt = im->second.tab.get();
+            // the meta chain can be nested: util.metaProperty instances
+            // carry a class-annotation layer at _meta._meta (the
+            // @_metaPrototype prototype) holding the bulk of the members
+            for (Value cur = obj;;)
+            {
+                auto imc = cur.tab->map.find(L"_meta");
+                if (imc == cur.tab->map.end() || imc->second.t != Value::TableT ||
+                    !imc->second.tab)
+                {
+                    // class instances resolve @-annotation metas LATE: the
+                    // meta may be assigned to the class after instantiation,
+                    // so fall back to _class._meta
+                    auto icc = cur.tab->map.find(L"_class");
+                    if (icc != cur.tab->map.end() &&
+                        icc->second.tab)
+                    {
+                        auto icm = icc->second.tab->map.find(L"_meta");
+                        if (icm != icc->second.tab->map.end() &&
+                            icm->second.t == Value::TableT && icm->second.tab)
+                        {
+                            bool hit = MetaGetLayer(obj, icm->second, key,
+                                                    out, pErr, pErrMsg,
+                                                    bOwnerCall,
+                                                    g_metaDispatchDepth > 0);
+                            if (hit || *pErr)
+                                return hit;
+                        }
+                    }
+                    break;
+                }
+                Value mtc = imc->second;
+                bool hit = MetaGetLayer(obj, mtc, key, out, pErr, pErrMsg,
+                                        bOwnerCall, g_metaDispatchDepth > 0);
+                if (hit || *pErr)
+                    return hit;
+                cur = mtc;
+            }
+            return false;
+        }
+bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
+                            const wstring& key, Value* out, bool* pErr,
+                            wstring* pErrMsg, bool bOwnerCall, bool bInDispatch)
+        {
+            Table* mt = mtv.tab.get();
             // direct method/field entries in the meta table resolve first
             // (RECT._meta = { width = function(){...} } shape)
             auto idm = mt->map.find(key);
@@ -290,9 +327,12 @@ bool Interp::MetaGet(const Value& obj, const wstring& key,
                 key != L"_get" && key != L"_set" && key != L"_call" &&
                 key != L"_tostring")
             {
-                if (idm->second.t == Value::TableT && idm->second.tab)
+                if (idm->second.t == Value::TableT && idm->second.tab &&
+                    !bInDispatch)
                 {
-                    // nested property table: { _get = fn } / { _set = fn }
+                    // property-definition table ({ _get = fn, ... }) — a
+                    // normal object read invokes the getter; the raw
+                    // definition goes back only for the dispatcher itself
                     auto ig2 = idm->second.tab->map.find(L"_get");
                     if (ig2 != idm->second.tab->map.end() &&
                         (ig2->second.t == Value::Func ||
@@ -304,7 +344,6 @@ bool Interp::MetaGet(const Value& obj, const wstring& key,
                         *out = r;
                         return true;
                     }
-                    return false;
                 }
                 *out = idm->second;
                 return true;
@@ -312,7 +351,6 @@ bool Interp::MetaGet(const Value& obj, const wstring& key,
             auto ig = mt->map.find(L"_get");
             if (ig == mt->map.end() || ig->second.t == Value::Null)
                 return false;
-            // re-entrancy guard: _meta walk itself must not recurse
             Value g = ig->second;
             if (g.t == Value::TableT && g.tab)
             {
@@ -320,36 +358,36 @@ bool Interp::MetaGet(const Value& obj, const wstring& key,
                 if (ie == g.tab->map.end() || ie->second.t == Value::Null)
                     return false;
                 Value e = ie->second;
-                if (e.t == Value::TableT && e.tab)
+                if (e.t == Value::TableT && e.tab && !bInDispatch)
                 {
                     auto ig2 = e.tab->map.find(L"_get");
                     if (ig2 != e.tab->map.end() &&
                         (ig2->second.t == Value::Func ||
                          ig2->second.native))
                     {
-                        // property getter: call with owner=obj, no args
                         vector<Value> noArgs;
                         Value r = CallVmFuncStatic(obj, ig2->second,
                                                    noArgs, pErr, pErrMsg);
                         *out = r;
                         return true;
                     }
-                    return false;
                 }
-                if (e.t == Value::Func || e.native)
-                {
-                    // method entry: return it; owner binds at call time
-                    *out = e;
-                    return true;
-                }
-                *out = e;   // plain value in the _get table
+                // functions = methods; raw values/definitions returned as-is
+                *out = e;
                 return true;
             }
             if (g.t == Value::Func || g.native)
             {
-                // function form: g(k, ownerCall) with owner=obj
+                if (bInDispatch)
+                    return false;   // util._get's own this[k]: go raw below
+                // function form: g(k, ownerCall) — this is the meta table
+                // itself (util.metaProperty's _get reads this[k]); the
+                // object reaches the body via `owner`. While it runs,
+                // inner this[k] lookups must see RAW definition tables
+                g_metaDispatchDepth++;
                 vector<Value> args{ Value::Str_(key), Value::Bool_(bOwnerCall) };
-                Value r = CallVmFuncStatic(obj, g, args, pErr, pErrMsg);
+                Value r = CallThisOwner(mtv, obj, g, args, pErr, pErrMsg);
+                g_metaDispatchDepth--;
                 *out = r;
                 return true;
             }
@@ -363,11 +401,43 @@ bool Interp::MetaSet(const Value& obj, const wstring& key,
             *pErr = false;
             if (obj.t != Value::TableT || !obj.tab || key == L"_meta")
                 return false;
-            auto im = obj.tab->map.find(L"_meta");
-            if (im == obj.tab->map.end() || im->second.t != Value::TableT ||
-                !im->second.tab)
-                return false;
-            Table* mt = im->second.tab.get();
+            // the meta chain can be nested: util.metaProperty instances
+            // carry a class-annotation layer at _meta._meta (the
+            // @_metaPrototype prototype) holding the bulk of the members
+            for (Value cur = obj;;)
+            {
+                auto imc = cur.tab->map.find(L"_meta");
+                if (imc == cur.tab->map.end() || imc->second.t != Value::TableT ||
+                    !imc->second.tab)
+                {
+                    auto icc = cur.tab->map.find(L"_class");
+                    if (icc != cur.tab->map.end() && icc->second.tab)
+                    {
+                        auto icm = icc->second.tab->map.find(L"_meta");
+                        if (icm != icc->second.tab->map.end() &&
+                            icm->second.t == Value::TableT && icm->second.tab)
+                        {
+                            bool hit = MetaSetLayer(obj, icm->second, key,
+                                                    val, pErr, pErrMsg);
+                            if (hit || *pErr)
+                                return hit;
+                        }
+                    }
+                    break;
+                }
+                Value mtc = imc->second;
+                bool hit = MetaSetLayer(obj, mtc, key, val, pErr, pErrMsg);
+                if (hit || *pErr)
+                    return hit;
+                cur = mtc;
+            }
+            return false;
+        }
+bool Interp::MetaSetLayer(const Value& obj, const Value& mtv,
+                            const wstring& key, const Value& val,
+                            bool* pErr, wstring* pErrMsg)
+        {
+            Table* mt = mtv.tab.get();
             auto is = mt->map.find(L"_set");
             if (is == mt->map.end() || is->second.t == Value::Null)
                 return false;
@@ -402,8 +472,13 @@ bool Interp::MetaSet(const Value& obj, const wstring& key,
             }
             if (s.t == Value::Func || s.native)
             {
+                // function form: s(k,v) — this is the meta table itself
+                // (util.metaProperty's _set reads this[k]); while it runs,
+                // inner this[k] lookups must see RAW definition tables
+                g_metaDispatchDepth++;
                 vector<Value> args{ Value::Str_(key), val };
-                CallVmFuncStatic(obj, s, args, pErr, pErrMsg);
+                CallThisOwner(mtv, obj, s, args, pErr, pErrMsg);
+                g_metaDispatchDepth--;
                 return true;
             }
             return false;
@@ -414,6 +489,15 @@ bool Interp::MetaSet(const Value& obj, const wstring& key,
 // ---- CallOwner ----
 Value Interp::CallOwner(const Value& f, const Value& obj,
                         vector<Value>& args)
+        {
+            return CallThisOwner(f, obj, obj, args);
+        }
+
+// owner (dynamic `owner` keyword) and `this` (lexical, overridable) set
+// independently — metatable function forms need this=meta table while
+// owner stays the receiver object
+Value Interp::CallThisOwner(const Value& f, const Value& ths,
+                            const Value& owner, vector<Value>& args)
         {
             if (f.native)
                 return f.native(args);
@@ -428,11 +512,11 @@ Value Interp::CallOwner(const Value& f, const Value& obj,
             // the bare globals jump
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;
-            local->vars[L"owner"] = obj;
+            local->vars[L"owner"] = owner;
             if (f.thisVal)
                 local->vars[L"this"] = *f.thisVal;
             else
-                local->vars[L"this"] = obj;
+                local->vars[L"this"] = ths;
             for (size_t i = 0; i < f.params.size(); i++)
             {
                 if (i < args.size())
@@ -502,6 +586,18 @@ Value Interp::CallVmFuncStatic(const Value& obj, const Value& f,
             Interp* pSelf = g_interpCurrent;
             if (!pSelf) { *pErr = true; *pErrMsg = L"无解释器"; return Value(); }
             Value r = pSelf->CallOwner(f, obj, args);
+            *pErr = !pSelf->err->empty();
+            if (*pErr) *pErrMsg = *pSelf->err;
+            return r;
+        }
+
+Value Interp::CallThisOwner(const Value& ths, const Value& owner,
+                            const Value& f, vector<Value>& args, bool* pErr,
+                            wstring* pErrMsg)
+        {
+            Interp* pSelf = g_interpCurrent;
+            if (!pSelf) { *pErr = true; *pErrMsg = L"无解释器"; return Value(); }
+            Value r = pSelf->CallThisOwner(f, ths, owner, args);
             *pErr = !pSelf->err->empty();
             if (*pErr) *pErrMsg = *pSelf->err;
             return r;
@@ -790,9 +886,11 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     auto itS = f.tab->map.find(L"_struct");
                     if (itS != f.tab->map.end())
                         inst->map[L"_struct"] = itS->second;
-                    auto itM = f.tab->map.find(L"_meta");
-                    if (itM != f.tab->map.end())
-                        inst->map[L"_meta"] = itM->second;
+                    // @-annotation metatables may be assigned AFTER the
+                    // class definition (::RECT._meta = {...} in
+                    // builtin/struct.aardio) — keep the class reference so
+                    // member lookups can resolve the meta late
+                    inst->map[L"_class"] = f;
                 }
                 Value vInst = Value::Table_(inst);
                 // native ctor (kernel classes such as io.file): the class

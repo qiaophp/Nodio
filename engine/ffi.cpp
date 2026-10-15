@@ -2,6 +2,16 @@
 
 namespace NodioVM
 {
+    // raw-buffer wrappers store bytes one-per-wchar in a wstring; unpack
+    // back to raw bytes without any codepage translation
+    static std::string BytesOf(const wstring& ws)
+    {
+        std::string out;
+        out.reserve(ws.size());
+        for (wchar_t c : ws) out.push_back((char)(unsigned char)c);
+        return out;
+    }
+
     int ApiTypeOf(const wstring& tRaw, bool* pByRef)
     {
         // tokens arrive as "INT", "addr", "ustring&", "struct &lpRect",
@@ -998,6 +1008,22 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     }
                     else if (v.t == Value::TableT || v.t == Value::Class)
                     {
+                        // raw.long(0,true)-style out-parameter wrapper:
+                        // { _bytes = <raw buffer>, value = n } — pass the
+                        // buffer's address (StructSerialize would mangle
+                        // the embedded string member and QPF-style APIs
+                        // would write through garbage)
+                        auto iby = v.t == Value::TableT && v.tab
+                            ? v.tab->map.find(L"_bytes") : v.tab->map.end();
+                        if (iby != v.tab->map.end() && iby->second.t == Value::Str)
+                        {
+                            tmpA.push_back(BytesOf(iby->second.s));
+                            slots.push_back(
+                                (SlotT)(INT_PTR)tmpA.back().data());
+                            outStructs.push_back({ i, (void*)tmpA.back().data(), v });
+                        }
+                        else
+                        {
                         int total = 0;
                         void* pBuf = StructSerialize(v, &total);
                         if (pBuf)
@@ -1016,6 +1042,7 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                         else
                         {
                             slots.push_back((SlotT)(INT_PTR)(long long)BNum(v));
+                        }
                         }
                     }
                     else
@@ -1056,6 +1083,31 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     auto extras = std::make_shared<vector<Value>>();
                     for (auto& ref : outStructs)
                     {
+                        // raw.long-style _bytes wrapper: copy the buffer
+                        // back and refresh .value (first 8 bytes little-
+                        // endian) instead of struct-deserializing
+                        auto ivb = ref.origVal.tab
+                            ? ref.origVal.tab->map.find(L"_bytes")
+                            : ref.origVal.tab->map.end();
+                        if (ivb != ref.origVal.tab->map.end() &&
+                            ivb->second.t == Value::Str)
+                        {
+                            size_t cb = ivb->second.s.size();
+                            const char* p = (const char*)ref.pBuf;
+                            unsigned long long vv = 0;
+                            for (size_t k = 0; k < cb && k < 8; k++)
+                                vv |= ((unsigned long long)
+                                       (unsigned char)p[k]) << (8 * k);
+                            wstring ws((size_t)cb, L'\0');
+                            for (size_t k = 0; k < cb; k++)
+                                ws[k] = (wchar_t)(unsigned char)p[k];
+                            ivb->second = Value::Str_(ws);
+                            auto ivv = ref.origVal.tab->map.find(L"value");
+                            if (ivv != ref.origVal.tab->map.end())
+                                ivv->second = Value::Num_((double)vv);
+                            extras->push_back(ref.origVal);
+                            continue;
+                        }
                         StructDeserialize(ref.origVal, ref.pBuf);
                         extras->push_back(ref.origVal);
                         HeapFree(GetProcessHeap(), 0, ref.pBuf);
