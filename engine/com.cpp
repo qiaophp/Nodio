@@ -17,6 +17,8 @@ namespace
 
     static Table* ComMeta();
 
+    static Value WrapRawThunk(IUnknown* punk);
+
     static Value WrapDispatch(IDispatch* pd)
     {
         pd->AddRef();
@@ -67,9 +69,37 @@ namespace
                     IID_IDispatch, (void**)&pDisp);
                 if (SUCCEEDED(hrU) && pDisp)
                     return WrapDispatch(pDisp);
-                if (getenv("NODIO_TRACE"))
-                    fwprintf(stderr, L"[vtu] QI IDispatch hr=0x%08lX\n",
-                             (unsigned long)hrU);
+                if (hrU == E_NOINTERFACE)
+                {
+                    // CLR CCW quirk: the object carries the IDispatch
+                    // methods in its vtable but refuses the QI — try the
+                    // coclass/class-interface route first (AssemblyName:
+                    // {F12FDE6A-9394-3C32-8E4D-F3D470947284}), whose QI
+                    // may yield a dispatchable face
+                    IID iidClass;
+                    if (SUCCEEDED(IIDFromString(
+                            L"{F12FDE6A-9394-3C32-8E4D-F3D470947284}",
+                            &iidClass)))
+                    {
+                        IUnknown* pClass = nullptr;
+                        if (SUCCEEDED(in.punkVal->QueryInterface(
+                                iidClass, (void**)&pClass)) && pClass)
+                        {
+                            IDispatch* pD2 = nullptr;
+                            HRESULT hrD2 = pClass->QueryInterface(
+                                IID_IDispatch, (void**)&pD2);
+                            if (SUCCEEDED(hrD2) && pD2)
+                            {
+                                pClass->Release();
+                                return WrapDispatch(pD2);
+                            }
+                            pClass->Release();
+                        }
+                    }
+                    // last resort: raw-vtable dispatch wrapper
+                    in.punkVal->AddRef();
+                    return WrapRawThunk(in.punkVal);
+                }
                 return Value::Pointer_((void*)in.punkVal);
             }
             return Value();
@@ -149,6 +179,235 @@ namespace
         }
     }
 
+    // ---------- raw IDispatch-over-vtable ----------
+    // Some CLR CCW hand-backs (e.g. System._AssemblyName from
+    // _Assembly::GetName) implement the four IDispatch methods in their
+    // vtable but refuse QI(IID_IDispatch) with E_NOINTERFACE. For those
+    // we call GetIDsOfNames (slot 5) / Invoke (slot 6) directly through
+    // the vtable.
+    static Value RawDispatchGet(void* punk, const wstring& name,
+                                vector<Value>& args, WORD wFlags,
+                                wstring* pErr)
+    {
+        void** vtbl = *reinterpret_cast<void***>(punk);
+        // slot 5: GetIDsOfNames(riid, rgszNames*, cNames, lcid, rgsid*)
+        typedef __int64 (__stdcall *GetIdsFn)(void*, const IID*, LPOLESTR*,
+                                              UINT, ULONG, DISPID*);
+        GetIdsFn fnIds = nullptr;
+        memcpy(&fnIds, &vtbl[5], sizeof(fnIds));
+        DISPID dispid = -1;
+        LPOLESTR nm = const_cast<LPOLESTR>(name.c_str());
+        __int64 hr = fnIds(punk, &IID_NULL, &nm, 1, LOCALE_USER_DEFAULT,
+                           &dispid);
+        if (getenv("NODIO_TRACE"))
+            fwprintf(stderr, L"[raw] GetIDsOfNames(%s) hr=0x%08llX id=%d\n",
+                     name.c_str(), (unsigned long long)hr, (int)dispid);
+        if (hr < 0 || dispid < 0)
+        {
+            // half-implemented CCW dispatch (E_NOTIMPL): route through
+            // ITypeInfo (slot 4: GetTypeInfo) and ITypeInfo::Invoke,
+            // the standard late-binding fallback for CLR CCWs
+            typedef __int64 (__stdcall *GetTIFn)(void*, UINT, LCID,
+                                                 ITypeInfo**, HRESULT*);
+            GetTIFn fnTI = nullptr;
+            memcpy(&fnTI, &vtbl[4], sizeof(fnTI));
+            ITypeInfo* pTI = nullptr;
+            HRESULT hrTI = 0;
+            if (SUCCEEDED(fnTI(punk, 0, LOCALE_USER_DEFAULT, &pTI,
+                               &hrTI)) &&
+                pTI)
+            {
+                // FUNCDESC walk: find memid by name
+                TYPEATTR* pAttr = nullptr;
+                if (SUCCEEDED(pTI->GetTypeAttr(&pAttr)))
+                {
+                    for (short f = 0; f < pAttr->cFuncs; f++)
+                    {
+                        FUNCDESC* pFD = nullptr;
+                        if (FAILED(pTI->GetFuncDesc(f, &pFD)))
+                            continue;
+                        BSTR names[1] = {nullptr};
+                        UINT pcNamesU = 0;
+                        if (SUCCEEDED(pTI->GetNames(
+                                pFD->memid, names, 1, &pcNamesU)) &&
+                            pcNamesU > 0)
+                        {
+                            bool bMatch = name ==
+                                          wstring(names[0]);
+                            SysFreeString(names[0]);
+                            if (bMatch)
+                            {
+                                dispid = pFD->memid;
+                                pTI->ReleaseFuncDesc(pFD);
+                                break;
+                            }
+                        }
+                        pTI->ReleaseFuncDesc(pFD);
+                    }
+                    pTI->ReleaseTypeAttr(pAttr);
+                }
+                if (dispid < 0)
+                {
+                    pTI->Release();
+                    if (pErr && pErr->empty())
+                        *pErr = L"dotNet: 成员不存在 " + name;
+                    return Value();
+                }
+                // invoke via ITypeInfo::Invoke
+                DISPPARAMS dp2{};
+                vector<VARIANT> vars2;
+                if (!args.empty())
+                {
+                    vars2.resize(args.size());
+                    dp2.cArgs = (int)args.size();
+                    dp2.rgvarg = vars2.data();
+                    for (size_t i = 0; i < args.size(); i++)
+                        VariantFromValue(args[args.size() - 1 - i],
+                                         vars2[i], pErr);
+                    if (pErr && !pErr->empty())
+                        return Value();
+                }
+                EXCEPINFO ex2{};
+                UINT argErr2 = 0;
+                VARIANT ret2;
+                VariantInit(&ret2);
+                UINT argcArgs = (UINT)dp2.cArgs;
+                HRESULT hrInv = pTI->Invoke(punk, dispid, wFlags, &dp2,
+                                            &ret2, &ex2, &argcArgs);
+                for (auto& v : vars2)
+                    VariantClear(&v);
+                pTI->Release();
+                if (FAILED(hrInv))
+                {
+                    if (pErr)
+                    {
+                        wchar_t buf[16];
+                        swprintf(buf, 16, L"%08lX", (unsigned long)hrInv);
+                        *pErr = wstring(L"dotNet: TypeInvoke 失败 hr=0x") +
+                                buf;
+                    }
+                    VariantClear(&ret2);
+                    return Value();
+                }
+                Value r = VariantToValue(ret2, pErr);
+                VariantClear(&ret2);
+                return r;
+            }
+            if (pErr && pErr->empty())
+                *pErr = L"dotNet: 成员不存在 " + name;
+            return Value();
+        }
+        // slot 6: Invoke(dispid, riid, lcid, wFlags, dp, ret, ex, argErr)
+        DISPPARAMS dp{};
+        vector<VARIANT> vars;
+        if (!args.empty())
+        {
+            vars.resize(args.size());
+            dp.cArgs = (int)args.size();
+            dp.rgvarg = vars.data();
+            for (size_t i = 0; i < args.size(); i++)
+                VariantFromValue(args[args.size() - 1 - i], vars[i], pErr);
+            if (pErr && !pErr->empty())
+                return Value();
+        }
+        EXCEPINFO ex{};
+        UINT argErr = 0;
+        VARIANT ret;
+        VariantInit(&ret);
+        typedef __int64 (__stdcall *InvokeFn)(void*, DISPID, const IID*,
+                                              ULONG, WORD, DISPPARAMS*,
+                                              VARIANT*, EXCEPINFO*, UINT*);
+        InvokeFn fnInv = nullptr;
+        memcpy(&fnInv, &vtbl[6], sizeof(fnInv));
+        hr = fnInv(punk, dispid, &IID_NULL, LOCALE_USER_DEFAULT, wFlags,
+                   &dp, &ret, &ex, &argErr);
+        if (getenv("NODIO_TRACE"))
+            fwprintf(stderr, L"[raw] Invoke(%s) hr=0x%08llX vt=%d\n",
+                     name.c_str(), (unsigned long long)hr, (int)ret.vt);
+        for (auto& v : vars)
+            VariantClear(&v);
+        if (FAILED(hr))
+        {
+            if (pErr)
+            {
+                if (hr == DISP_E_EXCEPTION && ex.bstrDescription)
+                    *pErr = L"dotNet: " + BStrToW(ex.bstrDescription);
+                else
+                {
+                    wchar_t buf[16];
+                    swprintf(buf, 16, L"%08lX", (unsigned long)hr);
+                    *pErr = wstring(L"dotNet: Invoke 失败 hr=0x") + buf;
+                }
+            }
+            VariantClear(&ret);
+            return Value();
+        }
+        if (getenv("NODIO_TRACE"))
+            fwprintf(stderr, L"[inv] hr=0x%08lX vt=%d\n",
+                     (unsigned long)hr, (int)ret.vt);
+        Value r = VariantToValue(ret, pErr);
+        VariantClear(&ret);
+        return r;
+    }
+
+    static Table* RawThunkMeta()
+    {
+        static std::shared_ptr<Table> s_meta;
+        if (!s_meta)
+        {
+            s_meta = std::make_shared<Table>();
+            s_meta->map[L"_get"] = NF([](vector<Value>& a) -> Value {
+                if (a.size() < 3 || a[2].t != Value::TableT || !a[2].tab)
+                    return Value();
+                auto io = a[2].tab->map.find(L"_object");
+                if (io == a[2].tab->map.end() ||
+                    io->second.t != Value::Pointer)
+                    return Value();
+                wstring key = BStr(a[0]);
+                if (getenv("NODIO_TRACE"))
+                    fwprintf(stderr, L"[rawget] key=%s\n", key.c_str());
+                vector<Value> noArgs;
+                Interp* it = g_interpCurrent;
+                return RawDispatchGet(io->second.ptr, key, noArgs,
+                                      DISPATCH_METHOD |
+                                          DISPATCH_PROPERTYGET,
+                                      it ? it->err : nullptr);
+            });
+            s_meta->map[L"_call"] = NF([](vector<Value>& a) -> Value {
+                if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                    return Value();
+                auto io = a[0].tab->map.find(L"_object");
+                if (io == a[0].tab->map.end() ||
+                    io->second.t != Value::Pointer)
+                    return Value();
+                // a[1] = member name (string), a[2..] = args
+                if (a.size() < 2)
+                    return Value();
+                wstring key = BStr(a[1]);
+                vector<Value> args(a.begin() + 2, a.end());
+                Interp* it = g_interpCurrent;
+                return RawDispatchGet(io->second.ptr, key, args,
+                                      DISPATCH_METHOD |
+                                          DISPATCH_PROPERTYGET,
+                                      it ? it->err : nullptr);
+            });
+        }
+        return s_meta.get();
+    }
+
+    // wrap an IUnknown that carries IDispatch methods in its vtable but
+    // refuses QI(IID_IDispatch) — CLR CCW quirk (e.g. _AssemblyName)
+    static Value WrapRawThunk(IUnknown* punk)
+    {
+        auto w = std::make_shared<Table>();
+        w->map[L"_isComObject"] = Value::Bool_(true);
+        w->map[L"_isNetObject"] = Value::Bool_(true);
+        w->map[L"_object"] = Value::Pointer_((void*)punk);
+        w->map[L"_meta"] = Value::Table_(
+            std::shared_ptr<Table>(RawThunkMeta(), [](Table*) {}));
+        return Value::Table_(w);
+    }
+
     // Invoke a DISPID on pd
     static Value InvokeDisp(IDispatch* pd, DISPID dispid, WORD wFlags,
                             vector<Value>& args, wstring* pErr)
@@ -171,10 +430,16 @@ namespace
         VariantInit(&ret);
         HRESULT hr = pd->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT,
                                 wFlags, &dp, &ret, &ex, &argErr);
+        if (getenv("NODIO_TRACE"))
+            fwprintf(stderr, L"[idisp] hr=0x%08lX vt=%d\n",
+                     (unsigned long)hr, (int)ret.vt);
         for (auto& v : vars)
             VariantClear(&v);
         if (FAILED(hr))
         {
+            if (getenv("NODIO_TRACE"))
+                fwprintf(stderr, L"[inv] FAILED hr=0x%08lX vt=%d\n",
+                         (unsigned long)hr, (int)ret.vt);
             if (pErr)
             {
                 if (hr == DISP_E_EXCEPTION && ex.bstrDescription)
@@ -238,7 +503,14 @@ namespace
                                      noArgs, &err);
                 // a zero-arg probe that yields EMPTY is a Sub-style
                 // method (e.g. IWshShortcut.Save) — keep it callable
-                if (!err.empty() || v.t == Value::Null)
+                // a probe that yields a .NET object wrapper (vt=13, the
+                // _isNetObject thunk from VariantToValue) means the
+                // member returned a .NET object (e.g. _Assembly.GetName
+                // -> AssemblyName CCW); it must stay callable so the
+                // official `asm.GetName().Name` chain works
+                bool bNetThunk = v.t == Value::TableT && v.tab &&
+                                 v.tab->map.count(L"_isNetObject") > 0;
+                if (!err.empty() || v.t == Value::Null || bNetThunk)
                     return WrapBoundMember(pd, dispid, key);
                 return v;
             });
