@@ -218,11 +218,13 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     : baseDir + L"\\" + rel + L"\\_.nodio";
                 wstring c3 = baseDir.empty() ? wstring()
                     : baseDir + L"\\" + rel + L".nodio";
-                if (Exists(c0)) file = c0;
-                else if (Exists(c1)) file = c1;
-                else if (Exists(c2)) file = c2;
-                else if (Exists(c3)) file = c3;
-                else if (Exists(LibCand(rel, true, L"aardio")))
+                // official aardio: a plain `import x.y` resolves against
+                // the LIB root, never the script's own directory — the
+                // examples tree contains sample files that shadow lib
+                // module names (e.g. examples\Console\console.aardio);
+                // baseDir stays as a fallback only for projects with no
+                // lib root (publisher layout)
+                if (Exists(LibCand(rel, true, L"aardio")))
                     file = LibCand(rel, true, L"aardio");
                 else if (Exists(LibCand(rel, false, L"aardio")))
                     file = LibCand(rel, false, L"aardio");
@@ -230,6 +232,10 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     file = LibCand(rel, true, L"nodio");
                 else if (Exists(LibCand(rel, false, L"nodio")))
                     file = LibCand(rel, false, L"nodio");
+                else if (Exists(c0)) file = c0;
+                else if (Exists(c1)) file = c1;
+                else if (Exists(c2)) file = c2;
+                else if (Exists(c3)) file = c3;
                 else
                     file = baseDir.empty() ? rel + L".aardio"
                                            : baseDir + L"\\" + rel + L".aardio";
