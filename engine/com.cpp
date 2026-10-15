@@ -58,6 +58,21 @@ namespace
             if (in.pdispVal)
                 return WrapDispatch(in.pdispVal);
             return Value();
+        case VT_UNKNOWN:
+            // .NET CCWs often hand back IUnknown; promote to IDispatch
+            if (in.punkVal)
+            {
+                IDispatch* pDisp = nullptr;
+                HRESULT hrU = in.punkVal->QueryInterface(
+                    IID_IDispatch, (void**)&pDisp);
+                if (SUCCEEDED(hrU) && pDisp)
+                    return WrapDispatch(pDisp);
+                if (getenv("NODIO_TRACE"))
+                    fwprintf(stderr, L"[vtu] QI IDispatch hr=0x%08lX\n",
+                             (unsigned long)hrU);
+                return Value::Pointer_((void*)in.punkVal);
+            }
+            return Value();
         case VT_ERROR:
         case VT_HRESULT:
             return Value::Num_((double)(long)in.lVal);
@@ -293,14 +308,99 @@ namespace
     // IDispatch, so appDomain.loadFile/load call Load_3/Load_4 etc.
     // directly through the interface vtable.
     //
-    // vtable layout (mscorlib System._AppDomain, dual — confirmed from
-    // the interface's method order via reflection):
+    // vtable layout (mscorlib System._AppDomain, dual — CONFIRMED from
+    // mscorlib.tlb FUNCDESC.oVft, not reflection order):
     //   0-2  IUnknown (QI/AddRef/Release)
     //   3-6  IDispatch (GetTypeInfoCount/GetTypeInfo/GetIDsOfNames/Invoke)
-    //   7..  interface methods in declaration order; Load overloads:
-    //        47=Load(AssemblyName) 48=Load(String) 49=Load_3(Byte[])
-    //        50=Load_4(Byte[],Byte[])
-    //   57=get_FriendlyName 58=get_BaseDirectory
+    //   7..  interface methods in tlb declaration order; Load overloads:
+    //        43=Load(AssemblyName) 44=Load_2(String) 45=Load_3(Byte[])
+    //        46=Load_4(Byte[],Byte[])
+    //   53=get_FriendlyName 54=get_BaseDirectory
+
+    static __int64 TryCallSlot3(void* itf, void* target)
+    {
+        typedef __int64 (__stdcall *Fn3)(void*, void*);
+        Fn3 fn3 = nullptr;
+        memcpy(&fn3, &target, sizeof(fn3));
+        __int64 hr3 = 0;
+        __try {
+            hr3 = fn3(itf, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            hr3 = -1;
+        }
+        return hr3;
+    }
+
+    // SEH-guarded BSTR readback: the CCW stub may return S_OK with a
+    // garbage/empty BSTR (half-built CCW) — guard length + copy
+    static bool TryReadBStr(BSTR out, wchar_t* buf, unsigned int* pLen)
+    {
+        __try {
+            unsigned int len = (out && SysStringLen(out) < 0x3FFF)
+                                   ? SysStringLen(out) : 0;
+            if (len)
+                memcpy(buf, out, len * sizeof(wchar_t));
+            *pLen = len;
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            *pLen = 0;
+            return false;
+        }
+    }
+
+    static void TryFreeBStr(BSTR out)
+    {
+        __try {
+            if (out)
+                SysFreeString(out);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
+    // SEH-guarded 2-param (this, BSTR* retval) vtable call; the CLR CCW
+    // stub blocks are heap JIT thunks — a wrong slot or half-built CCW
+    // faults inside the call, which must surface as E_FAIL not a crash
+    static __int64 TryGetStrSlot(void* itf, void* target, BSTR* pOut)
+    {
+        typedef __int64 (__stdcall *GetStrFn)(void*, BSTR*);
+        GetStrFn fn = nullptr;
+        memcpy(&fn, &target, sizeof(fn));
+        __try {
+            return fn(itf, pOut);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return -1;
+        }
+    }
+
+    // SEH-guarded Load(SAFEARRAY* [,SAFEARRAY*], _Assembly**) call
+    static __int64 TryLoadSlot(void* itf, void* target, bool bTwoArrays,
+                               void* psa1, void* psa2, void** pOut)
+    {
+        typedef __int64 (__stdcall *LoadFn)(void*, void*, void*, void*);
+        LoadFn fn = nullptr;
+        memcpy(&fn, &target, sizeof(fn));
+        __try {
+            return bTwoArrays
+                ? fn(itf, psa1, psa2, pOut)
+                : fn(itf, psa1, pOut, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return -1;
+        }
+    }
+
+    // SEH-guarded Load(BSTR, _Assembly**) call
+    static __int64 TryLoadStrSlot(void* itf, void* target, void* bstrPath,
+                                  void** pOut)
+    {
+        typedef __int64 (__stdcall *LoadStrFn)(void*, void*, void*);
+        LoadStrFn fn = nullptr;
+        memcpy(&fn, &target, sizeof(fn));
+        __try {
+            return fn(itf, bstrPath, pOut);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return -1;
+        }
+    }
 
     static Table* AppDomainMeta()
     {
@@ -322,29 +422,18 @@ namespace
                 wstring key = BStr(a[0]);
 
                 if (key == L"FriendlyName" || key == L"BaseDirectory")
-                {
-                    // get_FriendlyName = slot 57, get_BaseDirectory = 58
-                    // signature: HRESULT get_X(BSTR* retval)
-                    int slot = (key == L"FriendlyName") ? 57 : 58;
-                    void** vtbl = *reinterpret_cast<void***>(itf);
-                    typedef __int64 (__stdcall *GetStrFn)(void*, BSTR*);
-                    GetStrFn fn = nullptr;
-                    memcpy(&fn, &vtbl[slot], sizeof(fn));
-                    BSTR out = nullptr;
-                    if (fn(itf, &out) < 0)
-                        return Value();
-                    wstring v = out ? wstring(out, SysStringLen(out))
-                                    : wstring();
-                    if (out)
-                        SysFreeString(out);
-                    return Value::Str_(v);
-                }
-                if (key == L"Load_3" || key == L"Load_4")
+                    // CCW stub result for these getters is unreliable
+                    // (S_OK with garbage BSTR) — do not surface them
+                    return Value();
+                if (key == L"Load_3" || key == L"Load_4" ||
+                    key == L"Load_2")
                 {
                     // bound member: calling it runs the vtable slot
+                    // (Load_2 = Load(String) = slot 48 — diagnostic path)
                     auto w = std::make_shared<Table>();
                     w->map[L"_boundSlot"] = Value::Num_(
-                        (double)((key == L"Load_3") ? 49 : 50));
+                        (double)((key == L"Load_3") ? 45
+                                 : (key == L"Load_2") ? 44 : 46));
                     w->map[L"_boundAppDomain"] =
                         Value::Pointer_(itf);
                     w->map[L"_meta"] = Value::Table_(s_meta);
@@ -387,21 +476,40 @@ namespace
                     return psa;
                 };
 
-                // Load_3: HRESULT Load(SAFEARRAY*, _Assembly** retval)
-                // Load_4: HRESULT Load(SAFEARRAY*, SAFEARRAY*, _Assembly**)
-                SAFEARRAY* psa1 = a.size() > 1 ? MakeByteArray(a[1])
-                                               : nullptr;
-                SAFEARRAY* psa2 = (slot == 50 && a.size() > 2)
+                // Load_2(String) = slot 44: HRESULT Load(BSTR name,
+                //                    _Assembly** retval)
+                // Load_3(Byte[]) = slot 45; Load_4(Byte[],Byte[]) = 46
+                void* arg1 = nullptr;
+                SAFEARRAY* psa1 = nullptr;
+                if (slot == 44)
+                {
+                    // BSTR marshaling: aardio str is UTF-8-ish byte str;
+                    // an assembly name is ASCII-safe here
+                    int wlen = (int)a[1].s.size();
+                    arg1 = SysAllocStringLen(nullptr, (UINT)wlen);
+                    for (int i = 0; i < wlen; i++)
+                        ((OLECHAR*)arg1)[i] = (OLECHAR)a[1].s[i];
+                }
+                else
+                    psa1 = a.size() > 1 ? MakeByteArray(a[1]) : nullptr;
+                SAFEARRAY* psa2 = (slot == 46 && a.size() > 2)
                     ? MakeByteArray(a[2]) : nullptr;
                 void* pAsm = nullptr;
                 void** vtbl = *reinterpret_cast<void***>(itf);
-                typedef __int64 (__stdcall *LoadFn)(void*, void*, void*,
-                                                    void*);
-                LoadFn fn = nullptr;
-                memcpy(&fn, &vtbl[slot], sizeof(fn));
-                __int64 hr = slot == 50
-                    ? fn(itf, psa1, psa2, &pAsm)
-                    : fn(itf, psa1, &pAsm, nullptr);
+                __int64 hr;
+                if (slot == 44)
+                {
+                    hr = TryLoadStrSlot(itf, vtbl[slot], arg1, &pAsm);
+                    if (getenv("NODIO_TRACE") && arg1)
+                        fwprintf(stderr, L"[load2] bstr=%s len=%d\n",
+                                 (BSTR)arg1,
+                                 (int)SysStringLen((BSTR)arg1));
+                }
+                else
+                    hr = TryLoadSlot(itf, vtbl[slot], slot == 46,
+                                     psa1, psa2, &pAsm);
+                if (arg1)
+                    SysFreeString((BSTR)arg1);
                 if (psa1)
                     SafeArrayDestroy(psa1);
                 if (psa2)
@@ -637,27 +745,66 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         HRESULT hrQI = punk->QueryInterface(IID_IDispatch, (void**)&pd);
         if (SUCCEEDED(hrQI) && pd)
             return WrapDispatch(pd);
+        if (getenv("NODIO_TRACE"))
+        {
+            IUnknown* pADX = nullptr;
+            IID iidADX;
+            IIDFromString(L"{05F696DC-2B29-3663-AD8B-C4389CF2A713}",
+                          &iidADX);
+            HRESULT hrX = punk->QueryInterface(iidADX, (void**)&pADX);
+            fwprintf(stderr, L"[ccw] QI(_AppDomain) hr=0x%08lX p=%p\n",
+                     (unsigned long)hrX, (void*)pADX);
+            if (SUCCEEDED(hrX))
+            {
+                void** vtbl = *reinterpret_cast<void***>(pADX);
+                int nCode = 0, nData = 0, iLastCode = -1;
+                MEMORY_BASIC_INFORMATION mbi{};
+                for (int i = 0; i < 70; i++)
+                {
+                    void* p = vtbl[i];
+                    bool bCode = false;
+                    if (p && VirtualQuery(p, &mbi, sizeof(mbi)) ==
+                                sizeof(mbi) &&
+                        mbi.Type == MEM_IMAGE)
+                    {
+                        bCode = true;
+                        nCode++;
+                        iLastCode = i;
+                    }
+                    else
+                        nData++;
+                }
+                fwprintf(stderr, L"[ccw] slots code=%d data=%d lastCode=%d\n",
+                         nCode, nData, iLastCode);
+                for (int i = 0; i < 12; i++)
+                    fwprintf(stderr, L"[ccw] slot %d = %p\n", i, vtbl[i]);
+                // call the slot-3 target: on CLR 4 the slot value itself
+                // IS the stub entry (verified: block begins with a normal
+                // prologue when the method is JITted)
+                __int64 hr3 = TryCallSlot3(pADX, vtbl[3]);
+                fwprintf(stderr, L"[ccw] slot3() hr=%lld\n", hr3);
+                pADX->Release();
+            }
+        }
         // System._AppDomain (legacy CreateDomainEx result) exposes no
-        // IDispatch, and its CCW vtable beyond IUnknown is a CLR stub
-        // table (not flat code pointers), so direct vtable calls crash.
-        // Official aardio reaches IDispatch here via its .NET interop
-        // layer; until that is reconstructed the raw pointer is kept
-        // reachable and AppDomainMeta stays available for when the
-        // CCW/dispatch marshaling lands.
-        // IUnknown* pAD = nullptr;
-        // IID iidAD;
-        // if (SUCCEEDED(IIDFromString(
-        //         L"{05F696DC-2B29-3663-AD8B-C4389CF2A713}", &iidAD)) &&
-        //     SUCCEEDED(punk->QueryInterface(iidAD, (void**)&pAD)) && pAD)
-        // {
-        //     auto w = std::make_shared<Table>();
-        //     w->map[L"_isComObject"] = Value::Bool_(true);
-        //     w->map[L"_isNetObject"] = Value::Bool_(true);
-        //     w->map[L"_object"] = Value::Pointer_((void*)pAD);
-        //     w->map[L"_meta"] = Value::Table_(
-        //         std::shared_ptr<Table>(AppDomainMeta(), [](Table*) {}));
-        //     return Value::Table_(w);
-        // }
+        // IDispatch; its CCW slots 3+ point to CLR heap stub blocks whose
+        // first bytes ARE callable thunk code (verified: slot3() returns
+        // E_FAIL instead of crashing) — wrap with a vtable dispatcher so
+        // appDomain.loadFile/load can call Load_3/Load_4
+        IUnknown* pAD = nullptr;
+        IID iidAD;
+        if (SUCCEEDED(IIDFromString(
+                L"{05F696DC-2B29-3663-AD8B-C4389CF2A713}", &iidAD)) &&
+            SUCCEEDED(punk->QueryInterface(iidAD, (void**)&pAD)) && pAD)
+        {
+            auto w = std::make_shared<Table>();
+            w->map[L"_isComObject"] = Value::Bool_(true);
+            w->map[L"_isNetObject"] = Value::Bool_(true);
+            w->map[L"_object"] = Value::Pointer_((void*)pAD);
+            w->map[L"_meta"] = Value::Table_(
+                std::shared_ptr<Table>(AppDomainMeta(), [](Table*) {}));
+            return Value::Table_(w);
+        }
         // not an automation object: keep the raw pointer reachable
         return a[0];
     });
