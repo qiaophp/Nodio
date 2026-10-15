@@ -1933,6 +1933,7 @@ void Interp::InitBuiltins()
                             (*err) = L"运行错误: API 签名无效: " + sigStr;
                             return Value();
                         }
+                        bool bNameW = false;   // final export name ends in W
                         if (!fp && !strName.empty())
                         {
                             std::string strNameA((size_t)
@@ -1963,21 +1964,27 @@ void Interp::InitBuiltins()
                             {
                                 std::string w = strNameA + "W";
                                 fp = ::GetProcAddress(hMod, w.c_str());
+                                if (fp) bNameW = true;
                             }
                             if (!fp && strNameA.size() > 1 &&
-                                strNameA.back() == L'W' &&
+                                strNameA.back() == 'W' &&
                                 strNameA.find('@') == std::string::npos)
                             {
                                 std::string bare = strNameA.substr(0,
                                     strNameA.size() - 1);
                                 fp = ::GetProcAddress(hMod, bare.c_str());
+                                if (fp) bNameW = false;
                             }
                             }
                             if (!fp)
                             {
                                 std::string an = strNameA + "A";
                                 fp = ::GetProcAddress(hMod, an.c_str());
+                                if (fp) bNameW = false;
                             }
+                            else if (!bNameW && strNameA.size() > 1 &&
+                                     strNameA.back() == 'W')
+                                bNameW = true;   // explicit W in the decl
                             if (fp)
                                 fp = ResolveLongPtrAlias(hMod, fp, strNameA);
                         }
@@ -1999,7 +2006,7 @@ void Interp::InitBuiltins()
 #else
                         void* stub = nullptr;
 #endif
-                        Value retFn = NF([this, fn, sig, stub](vector<Value>& a3)
+                        Value retFn = NF([this, fn, sig, stub, bNameW](vector<Value>& a3)
                             -> Value {
                             // box arguments into integer slots
                             vector<SlotT> slots;
@@ -2034,6 +2041,13 @@ void Interp::InitBuiltins()
                                 Value v = i < a3.size()
                                     ? a3[i] : Value();
                                 int pt = sig.params[i] & 0xFF;
+                                // aardio contract: a W-suffixed export takes
+                                // `str` params as UTF-16 (string.getenv with
+                                // GetEnvironmentVariable passes "str name" to
+                                // the auto-W'd GetEnvironmentVariableW — an
+                                // ANSI re-encode scrambled the name and the
+                                // lookup silently failed)
+                                if (bNameW && pt == 6) pt = 7;
                                 bool bByRef =
                                     (sig.params[i] & 0x100) != 0;
                                 // & out-params: allocate scratch memory, copy initial value if passed
@@ -2361,7 +2375,11 @@ void Interp::InitBuiltins()
                                     : InvokeStd<__int64>(fn, slots);
                             // decode the primary return
                             Value vRet;
-                            switch (sig.ret)
+                            // a W-suffixed export returning "str" hands back
+                            // UTF-16 even when the sig spelled it str
+                            int retW = sig.ret == ARStrA && bNameW ? ARStrW
+                                                                   : sig.ret;
+                            switch (retW)
                             {
                             case ARInt:
                                 vRet = Value::Num_((double)(int)r);
