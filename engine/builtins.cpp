@@ -1598,8 +1598,55 @@ void Interp::InitBuiltins()
                 // (zlib/nodeJs/golang/py2/py3 resolve their bundled DLL this
                 // way). mode: 2 = writable, 4 = readable, 6 = both; a
                 // directory only satisfies the default mode.
-                tb->map[L"exist"] = NF([](vector<Value>& a) -> Value {
-                    if (a.empty() || a[0].t != Value::Str)
+                // io.localpath(url) — a file:/// URL (or file:// URL)
+                // becomes the local filesystem path with '/' -> '\' and
+                // %XX escapes decoded; anything that is not a file URL or
+                // an existing plain path form passes through as-is when it
+                // is relative, http(s):// and other schemes return null
+                tb->map[L"localpath"] = NF([](vector<Value>& a) -> Value {
+                    wstring s = a.empty() ? L"" : BStr(a[0]);
+                    if (s.empty()) return Value();
+                    auto ieq = [](const wchar_t* p, const wchar_t* pre) {
+                        while (*pre)
+                            if (towlower(*p++) != towlower(*pre++))
+                                return false;
+                        return true; };
+                    wstring out;
+                    if (ieq(s.c_str(), L"file:///"))
+                        out = s.substr(8);
+                    else if (ieq(s.c_str(), L"file://"))
+                        out = s.substr(7);
+                    else
+                    {
+                        // an explicit scheme that is not file: -> null
+                        size_t sc = s.find(L"://");
+                        if (sc != wstring::npos && sc > 1)
+                            return Value();
+                        // a drive-qualified or rooted path passes through
+                        return Value::Str_(s);
+                    }
+                    // URL-decode %XX and normalise separators
+                    wstring dec;
+                    for (size_t i = 0; i < out.size(); i++)
+                    {
+                        if (out[i] == L'%' && i + 2 < out.size() &&
+                            iswxdigit(out[i + 1]) && iswxdigit(out[i + 2]))
+                        {
+                            wchar_t hb = out[i + 1] <= L'9'
+                                ? out[i + 1] - L'0'
+                                : (towlower(out[i + 1]) - L'a' + 10);
+                            wchar_t lb = out[i + 2] <= L'9'
+                                ? out[i + 2] - L'0'
+                                : (towlower(out[i + 2]) - L'a' + 10);
+                            dec += (wchar_t)(hb * 16 + lb);
+                            i += 2;
+                        }
+                        else dec += out[i];
+                    }
+                    for (auto& c : dec)
+                        if (c == L'/') c = L'\\';
+                    return Value::Str_(dec); });
+                tb->map[L"exist"] = NF([](vector<Value>& a) -> Value {                    if (a.empty() || a[0].t != Value::Str)
                         return Value();      // null
                     wstring strPath = BStr(a[0]);
                     if (strPath.empty())

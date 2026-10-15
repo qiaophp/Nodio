@@ -1,0 +1,20 @@
+import string;
+import io;
+var k,v = string.match("key=val", "(\w+)=(\w+)");
+io.print(k ++ "|" ++ v);
+var f0,f1 = string.find("foo bar", "b[a-z]r");
+io.print(f0, f1);
+var n = 0; for m in string.gmatch("a1b22c333", "\d+") { n++; }
+io.print(n);
+io.print(string.slice("hello", 2, 4));
+io.print(string.indexOf("hello", "l"));
+io.print(string.lastIndexOf("hello", "l"));
+io.print(string.startsWith("hello", "HE", true));
+io.print(string.endsWith("hello", "lo"));
+io.print(string.cmp("a", "a"));
+io.print(#string.random(8));
+io.print(#string.join({"a";"b";"c"}, "-"));
+io.print(io.localpath("file:///C:/x/y.txt"));
+io.print(io.localpath("http://a/b"));
+io.print(#string.trimRight("12.50000","0"));
+io.print("end");
