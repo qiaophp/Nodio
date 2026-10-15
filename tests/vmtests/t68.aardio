@@ -1,0 +1,10 @@
+import string.table;
+io.print(string.trimRight("  ab  "));
+io.print(string.trimRight("12.50000","0"));
+io.print(string.trimRight("c:\dir\\","\\"));
+io.print(string.trimRight("path//","/"));
+io.print(string.trimLeft("##ab##","#"));
+io.print(string.trimRight("all-trimmed","abcd-zlmtri"));
+io.print(string.trimRight("","0"));
+io.print(string.trimLeft("","0"));
+io.print("end");

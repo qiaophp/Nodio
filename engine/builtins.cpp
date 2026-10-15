@@ -393,6 +393,28 @@ void Interp::InitBuiltins()
                     if (b == wstring::npos) return Value::Str_(L"");
                     size_t e = s.find_last_not_of(L" \t\r\n");
                     return Value::Str_(s.substr(b, e - b + 1)); });
+                // string.trimLeft / trimRight(s, set?): strip leading /
+                // trailing chars from `set`; the default set is whitespace.
+                // The library depends on the default (py2 execUtf8 chain)
+                // and on set forms like "0", "\\0", ": ", "\\/", "/".
+                wstring defTrimSet = L" \t\r\n\v\f";
+                tb->map[L"trimLeft"] = NF([defTrimSet](vector<Value>& a)
+                    -> Value {
+                    wstring s = BStr(a[0]);
+                    wstring set = a.size() > 1 && a[1].t != Value::Null
+                        ? BStr(a[1]) : defTrimSet;
+                    size_t b = s.find_first_not_of(set);
+                    if (b == wstring::npos) return Value::Str_(L"");
+                    return Value::Str_(s.substr(b)); });
+                tb->map[L"trimRight"] = NF([defTrimSet](vector<Value>& a)
+                    -> Value {
+                    wstring s = BStr(a[0]);
+                    wstring set = a.size() > 1 && a[1].t != Value::Null
+                        ? BStr(a[1]) : defTrimSet;
+                    if (s.empty()) return Value::Str_(L"");
+                    size_t e = s.find_last_not_of(set);
+                    if (e == wstring::npos) return Value::Str_(L"");
+                    return Value::Str_(s.substr(0, e + 1)); });
                 tb->map[L"index"] = NF([](vector<Value>& a) {
                     wstring s = BStr(a[0]), sub = BStr(a[1]);
                     size_t from = a.size() > 2 ? (size_t)BNum(a[2]) : 1;
