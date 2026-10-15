@@ -1,0 +1,16 @@
+// t72: `v,...` multi-return spread — official dotNet/appDomain.aardio
+// wrapAssembly uses `if(!asm) return asm,...` on a null callee result
+import string;
+var f = function(){ return null; };
+var g = function(){ return 1,2,3; };
+// calling a function that returns null through spread keeps null
+var a,b = f();
+io.print(tostring(a));
+// spread of multi-return passes values through
+var c,d,e = g();
+io.print(c ++ d ++ e);
+// wrapAssembly-style guard: null result stays null, no error
+var wrap = function(asm){ if(!asm) return asm; return asm; };
+var r = wrap( f() );
+io.print(tostring(r));
+io.print("end");
