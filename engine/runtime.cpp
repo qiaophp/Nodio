@@ -846,6 +846,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                                                      : globals.self);
                 local->nsTable = inst;
                 local->bNsInst = true;   // instance scope: never capture as nsClosure
+                local->bInstInit = f.classBody != nullptr;
                 if (bMethod)
                     local->vars[L"owner"] = vThis;   // owner = dot-left
                 local->vars[L"this"] = vInst;
@@ -1296,9 +1297,26 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 }
                 else if (obj.t == Value::TableT && obj.tab)
                 {
-                    // M2: existing fields assign directly; missing fields
-                    // fall through to the metatable's _set
-                    if (obj.tab->map.count(target->str) ||
+                    // ctor-body member initialization (`this.x = v` while
+                    // the object is being constructed) writes the instance
+                    // table directly — the metatable's read-only guards
+                    // only apply after construction
+                    bool bInit = false;
+                    for (Env* e = env; e; e = e->parent.get())
+                    {
+                        if (e->bInstInit)
+                        {
+                            auto itT = e->vars.find(L"this");
+                            if (itT != e->vars.end() &&
+                                itT->second.t == Value::TableT &&
+                                itT->second.tab == obj.tab)
+                            {
+                                bInit = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (bInit || obj.tab->map.count(target->str) ||
                         !obj.tab->map.count(L"_meta"))
                     {
                         if (val.t == Value::Null)

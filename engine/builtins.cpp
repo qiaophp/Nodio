@@ -2482,14 +2482,17 @@ void Interp::InitBuiltins()
                                         // the official FFI contract
                                         Value vp;
                                         bool bE = false; wstring se;
-                                        if (MetaGet(v, L"_topointer", &vp,
-                                                    &bE, &se, true) &&
-                                            vp.t == Value::Func)
+                                        bool bGot = MetaGet(v, L"_topointer",
+                                                            &vp, &bE, &se,
+                                                            true);
+                                        if (bGot && vp.t == Value::Func)
                                         {
                                             vector<Value> noArgs;
                                             Value r = vp.native
                                                 ? vp.native(noArgs)
-                                                : CallVmFunc(vp, noArgs);
+                                                : CallVmFuncStatic(
+                                                      v, vp, noArgs, &bE,
+                                                      &se);
                                             slots.push_back(
                                                 r.t == Value::Pointer
                                                     ? (SlotT)(INT_PTR)r.ptr
@@ -2723,7 +2726,15 @@ void Interp::InitBuiltins()
                                             outVal = Value::Bool_(*(int*)ref.pBuffer != 0);
                                             break;
                                         case 5:
-                                            outVal = Value::Num_((double)(__int64)*(INT_PTR*)ref.pBuffer);
+                                            // match the return-side contract:
+                                            // pointer out-params come back as
+                                            // Pointer values (official cdata)
+                                            outVal = *(INT_PTR*)ref.pBuffer
+                                                ? Value::Pointer_(
+                                                      (void*)(INT_PTR)
+                                                          *(INT_PTR*)
+                                                              ref.pBuffer)
+                                                : Value();
                                             break;
                                         case 6:
                                             outVal = Value::Str_(

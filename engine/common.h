@@ -594,6 +594,11 @@ namespace NodioVM
         // skips these frames so method-defined callbacks (win.form's
         // wndproc) still resolve namespace members like `_defaultProc`.
         bool bNsInst = false;
+        // true in the ctor body frame: `this.x = v` there is member
+        // initialization and must bypass the metatable's _set (the official
+        // semantic — gdip.family's ctor assigns `this.name` while the
+        // metaProperty declares name as a read-only _get property)
+        bool bInstInit = false;
         Value* Find(const wstring& k)
         {
             for (Env* e = this; e; e = e->parent.get())

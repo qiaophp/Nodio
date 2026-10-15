@@ -353,53 +353,44 @@ namespace NodioVM
             { 0xF2, 0x0F, 0x10 }, { 0xF2, 0x0F, 0x10 },
             { 0xF2, 0x0F, 0x10 }, { 0xF2, 0x0F, 0x10 } };
         (void)kMsdX;
-        int nIntReg = 0, nXmmReg = 0, nStack = 0;
+        // x64 ABI: register slots are tied to PARAMETER POSITION —
+        // position 1..4 use rcx/rdx/r8/r9 for integers and xmm0..3 for
+        // floats *at that same position*. A float at position 2 takes
+        // xmm1 while position 3's integer still takes r8
+        // (GdipCreateFont's (ptr,float,int,int,ptr&) was the proof:
+        // independent numbering put emSize in xmm0 and style in rdx,
+        // and GDI+ read garbage → InvalidParameter)
+        int nIntReg = 0, nStack = 0;
         for (size_t i = 0; i < sig.params.size() && i < 14; i++)
         {
             int pt = sig.params[i] & 0xFF;
             bool bFloat = (pt == 9 || pt == 10);
             unsigned int disp = (unsigned int)(8 + 8 * i);
-            if (bFloat)
+            if (i < 4)
             {
-                if (nXmmReg < 4)
+                if (bFloat)
                 {
                     unsigned char o[3] = { pt == 10 ? 0xF2u : 0xF3u,
                                            0x0F, 0x10 };
                     c[n++] = o[0]; c[n++] = o[1]; c[n++] = o[2];
-                    c[n++] = (unsigned char)(0x83 | (nXmmReg << 3));
+                    c[n++] = (unsigned char)(0x83 | (i << 3));
                     put32(disp);
-                    nXmmReg++;
                 }
                 else
                 {
-                    put(kMovRbx[4], 3);           // mov rax,[rbx+disp]
+                    put(kMovRbx[i], 3);
                     put32(disp);
-                    unsigned char st[4] = {
-                        0x48, 0x89, 0x44, 0x24 }; // mov [rsp+d],rax
-                    put(st, 4);
-                    c[n++] = (unsigned char)(0x20 + 8 * nStack);
-                    nStack++;
                 }
+                continue;
             }
-            else
-            {
-                if (nIntReg < 4)
-                {
-                    put(kMovRbx[nIntReg], 3);
-                    put32(disp);
-                    nIntReg++;
-                }
-                else
-                {
-                    put(kMovRbx[4], 3);
-                    put32(disp);
-                    unsigned char st[4] = {
-                        0x48, 0x89, 0x44, 0x24 };
-                    put(st, 4);
-                    c[n++] = (unsigned char)(0x20 + 8 * nStack);
-                    nStack++;
-                }
-            }
+            // position 5+: stack
+            put(kMovRbx[4], 3);               // mov rax,[rbx+disp]
+            put32(disp);
+            unsigned char st[4] = {
+                0x48, 0x89, 0x44, 0x24 };     // mov [rsp+d],rax
+            put(st, 4);
+            c[n++] = (unsigned char)(0x20 + 8 * nStack);
+            nStack++;
         }
         c[n++] = 0xFF; c[n++] = 0x13;   // call qword [rbx]
         if (sig.ret == ARDbl)
