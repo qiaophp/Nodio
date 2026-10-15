@@ -969,6 +969,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 (*err) = L"运行错误: 尝试调用非函数值" +
                          (strCallee.empty() ? L""
                                             : (L" (" + strCallee + L")"));
+                if (!g_curModuleFile.empty())
+                    (*err) += L" 模块: " + g_curModuleFile;
                 return Value();
             }
             vector<Value> args = evalCallArgs(n->list);

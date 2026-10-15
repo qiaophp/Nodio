@@ -415,6 +415,161 @@ void Interp::InitBuiltins()
                     size_t e = s.find_last_not_of(set);
                     if (e == wstring::npos) return Value::Str_(L"");
                     return Value::Str_(s.substr(0, e + 1)); });
+                // string.slice(s,i,j) — the lib aliases sub = slice; same
+                // 1-based inclusive contract with negative indices
+                tb->map[L"slice"] = tb->map[L"sub"];
+                // string.indexOf / lastIndexOf(s, sub, from?) — 1-based
+                // position or null; plain search (no pattern)
+                tb->map[L"lastIndexOf"] =
+                tb->map[L"lastIndexOf"] =
+                    NF([](vector<Value>& a) -> Value {
+                    wstring s = BStr(a[0]), sub = BStr(a[1]);
+                    size_t pos = s.rfind(sub);
+                    if (pos == wstring::npos) return Value();
+                    return Value::Num_((double)(pos + 1)); });
+                // string.startsWith / endsWith(s, prefix/suffix, ci?)
+                tb->map[L"startsWith"] =
+                    NF([](vector<Value>& a) -> Value {
+                    wstring s = BStr(a[0]), p = BStr(a[1]);
+                    if (a.size() > 2 && BNum(a[2]))
+                    {
+                        wstring l = s, r = p;
+                        for (auto& c : l) c = (wchar_t)towlower(c);
+                        for (auto& c : r) c = (wchar_t)towlower(c);
+                        return Value::Bool_(
+                            l.size() >= r.size() &&
+                            l.compare(0, r.size(), r) == 0);
+                    }
+                    return Value::Bool_(s.size() >= p.size() &&
+                                        s.compare(0, p.size(), p) == 0);
+                });
+                tb->map[L"endsWith"] =
+                    NF([](vector<Value>& a) -> Value {
+                    wstring s = BStr(a[0]), p = BStr(a[1]);
+                    if (a.size() > 2 && BNum(a[2]))
+                    {
+                        wstring l = s, r = p;
+                        for (auto& c : l) c = (wchar_t)towlower(c);
+                        for (auto& c : r) c = (wchar_t)towlower(c);
+                        return Value::Bool_(
+                            l.size() >= r.size() &&
+                            l.compare(l.size() - r.size(), r.size(), r)
+                                == 0);
+                    }
+                    return Value::Bool_(s.size() >= p.size() &&
+                        s.compare(s.size() - p.size(), p.size(), p) == 0);
+                });
+                // string.cmp(a,b) — 0 when equal (the lib's cmpMatch
+                // contract); otherwise -1/1. Case-sensitive; the lib's
+                // own cmpMatch lowercases before calling.
+                tb->map[L"cmp"] = NF([](vector<Value>& a) -> Value {
+                    wstring x = BStr(a[0]), y = BStr(a[1]);
+                    if (x == y) return Value::Num_(0);
+                    return Value::Num_(x < y ? -1 : 1); });
+                // string.join(t, delim?) — concatenate array members
+                tb->map[L"join"] = NF([](vector<Value>& a) -> Value {
+                    wstring d = a.size() > 1 ? BStr(a[1]) : L"";
+                    wstring out;
+                    if (a.empty()) return Value::Str_(L"");
+                    auto addV = [&](const Value& v) {
+                        if (!out.empty()) out += d;
+                        out += BStr(v); };
+                    if (a[0].t == Value::TableT && a[0].tab)
+                    {
+                        for (auto& v : a[0].tab->arr) addV(v);
+                    }
+                    else for (auto& v : a) addV(v);
+                    return Value::Str_(out); });
+                // string.random(n, set?) — n chars from the set
+                // (default alphanumerics)
+                tb->map[L"random"] = NF([](vector<Value>& a) -> Value {
+                    static const wchar_t* defSet =
+                        L"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        L"abcdefghijklmnopqrstuvwxyz";
+                    wstring set = a.size() > 1 && a[1].t != Value::Null
+                        ? BStr(a[1]) : defSet;
+                    long long n = a.empty() ? 1 : (long long)BNum(a[0]);
+                    if (n < 0) n = 0;
+                    wstring out;
+                    for (long long i = 0; i < n; i++)
+                        out += set[rand() % set.size()];
+                    return Value::Str_(out); });
+                // string.gmatch(s, pat) — iterator over pattern matches
+                // (each iteration: the match, then capture groups)
+                tb->map[L"gmatch"] = NF([this](vector<Value>& a)
+                    -> Value {
+                    wstring s = a.empty() ? L"" : BStr(a[0]);
+                    wstring pat = a.size() > 1 ? BStr(a[1]) : L".";
+                    size_t* pPos = new size_t(0);
+                    return Value::Native_([this, s, pat, pPos](
+                        vector<Value>&) mutable -> Value {
+                        vector<vector<RE>> br; bool anchored = false;
+                        int nGroups = 0; wstring perr;
+                        if (!RECompile(pat, br, &anchored, &nGroups,
+                                       &perr))
+                        {
+                            delete pPos;
+                            return Value::Native_([](vector<Value>&) {
+                                return Value(); });
+                        }
+                        vector<wstring> caps;
+                        size_t end = 0;
+                        while (*pPos <= s.size())
+                        {
+                            size_t p0 = *pPos;
+                            if (RETry(br, s, p0, false, caps, &end))
+                            {
+                                if (end == p0) (*pPos)++;
+                                else *pPos = end;
+                                auto outs = std::make_shared
+                                    <vector<Value>>();
+                                if (caps.empty())
+                                    outs->push_back(Value::Str_(
+                                        s.substr(p0, end - p0)));
+                                else
+                                    for (auto& c : caps)
+                                        outs->push_back(Value::Str_(c));
+                                // the primary return must be non-null or
+                                // the for-in loop reads it as termination;
+                                // match string first, captures as extras
+                                Value f = outs->front();
+                                if (outs->size() > 1)
+                                {
+                                    outs->erase(outs->begin());
+                                    f.mrets = outs;
+                                }
+                                return f;
+                            }
+                            if (anchored) break;
+                            (*pPos)++;
+                        }
+                        delete pPos;
+                        return Value(); });
+                });
+                // encoding-flag layer: the engine normalizes all strings
+                // to wide text, so the official per-string flag collapses.
+                // getUtf reports 8 (UTF-8) — or 16 for even-length byte
+                // pairs containing a NUL, which is how toUtf16 output
+                // looks; setUtf is a no-op returning the string.
+                auto strLooksUtf16 = [](const wstring& s) -> bool {
+                    if (s.size() < 2 || s.size() % 2) return false;
+                    for (size_t i = 1; i < s.size(); i += 2)
+                        if (s[i] == 0) return true;
+                    return false; };
+                tb->map[L"isUtf16"] =
+                    NF([strLooksUtf16](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::Str)
+                        return Value();
+                    return Value::Bool_(strLooksUtf16(a[0].s)); });
+                tb->map[L"getUtf"] =
+                    NF([strLooksUtf16](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::Str ||
+                        a[0].s.empty())
+                        return Value();
+                    return Value::Num_(strLooksUtf16(a[0].s) ? 16 : 8);
+                });
+                tb->map[L"setUtf"] = NF([](vector<Value>& a) -> Value {
+                    return a.empty() ? Value() : a[0]; });
                 tb->map[L"index"] = NF([](vector<Value>& a) {
                     wstring s = BStr(a[0]), sub = BStr(a[1]);
                     size_t from = a.size() > 2 ? (size_t)BNum(a[2]) : 1;
@@ -422,8 +577,12 @@ void Interp::InitBuiltins()
                     size_t pos = s.find(sub, from - 1);
                     if (pos == wstring::npos) return Value();
                     return Value::Num_((double)(pos + 1)); });
+                tb->map[L"indexOf"] = tb->map[L"index"];
                 tb->map[L"find"] = NF([](vector<Value>& a) {
-                    // pattern search (aardio string.find): {start,end} table
+                    // official contract: find(s,p,init) -> start,end,
+                    // capture1..N as multiple returns (`matchStart,
+                    // matchEnd = string.find(...)` in the shipped lib);
+                    // no match -> null
                     wstring s = BStr(a[0]), pat = BStr(a[1]);
                     size_t start = a.size() > 2 ? (size_t)BNum(a[2]) : 1;
                     if (start < 1) start = 1;
@@ -436,18 +595,24 @@ void Interp::InitBuiltins()
                     {
                         if (RETry(br, s, p0, false, caps, &end))
                         {
-                            auto tb2 = std::make_shared<Table>();
-                            tb2->arr.push_back(Value::Num_((double)(p0 + 1)));
-                            tb2->arr.push_back(Value::Num_((double)end));
-                            tb2->map[L"start"] = Value::Num_((double)(p0 + 1));
-                            tb2->map[L"end"] = Value::Num_((double)end);
-                            return Value::Table_(tb2);
+                            Value first = Value::Num_((double)(p0 + 1));
+                            auto outs = std::make_shared<vector<Value>>();
+                            outs->push_back(Value::Num_((double)end));
+                            for (size_t g = 1;
+                                 g <= (size_t)nGroups && g < caps.size();
+                                 g++)
+                                outs->push_back(Value::Str_(caps[g]));
+                            first.mrets = outs;
+                            return first;
                         }
                         if (anchored) break;
                     }
                     return Value(); });
                 tb->map[L"match"] = NF([](vector<Value>& a) {
-                    // no groups -> whole match; 1 group -> it; more -> table
+                    // official contract: match(s,p) returns the match (or
+                    // capture 1) as the primary return and further
+                    // captures as extra returns — `fence,lang,title =
+                    // string.match(...)`; no match -> null
                     wstring s = BStr(a[0]), pat = BStr(a[1]);
                     size_t start = a.size() > 2 ? (size_t)BNum(a[2]) : 1;
                     if (start < 1) start = 1;
@@ -460,16 +625,23 @@ void Interp::InitBuiltins()
                     {
                         if (RETry(br, s, p0, false, caps, &end))
                         {
+                            Value first;
+                            auto outs = std::make_shared<vector<Value>>();
                             if (nGroups == 0)
-                                return Value::Str_(s.substr(p0, end - p0));
-                            if (nGroups == 1)
-                                return (size_t)1 < caps.size()
-                                    ? Value::Str_(caps[1]) : Value::Str_(L"");
-                            auto tb2 = std::make_shared<Table>();
-                            for (size_t g = 1; g <= (size_t)nGroups &&
-                                               g < caps.size(); g++)
-                                tb2->arr.push_back(Value::Str_(caps[g]));
-                            return Value::Table_(tb2);
+                                first = Value::Str_(
+                                    s.substr(p0, end - p0));
+                            else
+                            {
+                                for (size_t g = 1;
+                                     g <= (size_t)nGroups; g++)
+                                    outs->push_back(Value::Str_(
+                                        g < caps.size() ? caps[g]
+                                                        : L""));
+                                first = outs->front();
+                                outs->erase(outs->begin());
+                            }
+                            if (!outs->empty()) first.mrets = outs;
+                            return first;
                         }
                         if (anchored) break;
                     }

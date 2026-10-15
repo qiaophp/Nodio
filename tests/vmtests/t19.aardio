@@ -1,7 +1,7 @@
 io.print(string.match("hello123world", "[a-z]+"));
-io.print(string.match("key=val", "(\w+)=(\w+)"));
-var t = string.match("k=v", "(\w+)=(\w+)");
-io.print(t[1] ++ "|" ++ t[2]);
+var k,v = string.match("key=val", "(\w+)=(\w+)");
+io.print(k ++ "|" ++ v);
 io.print(string.gsub("2026-10", "(\d+)", "<$1>"));
 io.print(string.count("a1b22c333", "\d+"));
-io.print(string.find("foo bar", "b[a-z]r")[1]);
+var f0,f1 = string.find("foo bar", "b[a-z]r");
+io.print(f0);
