@@ -2474,6 +2474,31 @@ void Interp::InitBuiltins()
                                 case 5:   // pointer (hwnd / buffer)
                                     if (v.t == Value::Pointer)
                                         slots.push_back((SlotT)(INT_PTR)v.ptr);
+                                    else if (v.t == Value::TableT && v.tab)
+                                    {
+                                        // an object with a _topointer meta
+                                        // method (gdip.graphics/font/bitmap)
+                                        // marshals as its native pointer —
+                                        // the official FFI contract
+                                        Value vp;
+                                        bool bE = false; wstring se;
+                                        if (MetaGet(v, L"_topointer", &vp,
+                                                    &bE, &se, true) &&
+                                            vp.t == Value::Func)
+                                        {
+                                            vector<Value> noArgs;
+                                            Value r = vp.native
+                                                ? vp.native(noArgs)
+                                                : CallVmFunc(vp, noArgs);
+                                            slots.push_back(
+                                                r.t == Value::Pointer
+                                                    ? (SlotT)(INT_PTR)r.ptr
+                                                    : (SlotT)(INT_PTR)
+                                                          (long long)BNum(r));
+                                        }
+                                        else
+                                            slots.push_back((SlotT)0);
+                                    }
                                     else if (v.t == Value::Str)
                                         // a string passed to a pointer
                                         // parameter hands the API its raw
@@ -2637,8 +2662,12 @@ void Interp::InitBuiltins()
                                 vRet = Value::Bool_(r != 0);
                                 break;
                             case ARPtr:
-                                vRet = Value::Num_(
-                                    (double)(__int64)(INT_PTR)r);
+                                // official aardio types pointer returns as
+                                // cdata; type(arg)=="pointer" drives lib
+                                // dispatch (gdip.graphics(hdc))
+                                vRet = (INT_PTR)r
+                                    ? Value::Pointer_((void*)(INT_PTR)r)
+                                    : Value();
                                 break;
                             case ARStrA:
                                 vRet = Value::Str_(

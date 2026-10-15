@@ -468,11 +468,19 @@ Value Interp::CallOwner(const Value& f, const Value& obj,
                     if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
                     local->vars[L"..."] = vDots;
                     local->vars[L"arg"] = vDots;
+                    // an explicit `arg` parameter (gdip.bitmap's ctor) must
+                    // win over the vararg alias — restore it
+                    for (size_t i = 0; i + 1 < f.params.size(); i++)
+                        if (f.params[i] == L"arg" && i < args.size())
+                            local->vars[L"arg"] = args[i];
                 }
                 else
                 {
                     local->vars[L"..."] = Value();
                     local->vars[L"arg"] = Value();
+                    for (size_t i = 0; i < f.params.size(); i++)
+                        if (f.params[i] == L"arg" && i < args.size())
+                            local->vars[L"arg"] = args[i];
                 }
             }
             Value old = ret;
@@ -671,9 +679,14 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             if (n->a->k == Node::Ident && n->a->str == L"error")
             {
-                // aardio error(): raise a runtime error message
+                // aardio error(): raise a runtime error message; annotate
+                // with the module file so library-raised errors are
+                // traceable to their source
                 wstring msg = n->list.empty() ? L"运行错误" :
                     L"运行错误: " + Eval(n->list[0], env).ToString();
+                msg += L" @ 行 " + std::to_wstring(n->line);
+                if (!g_curModuleFile.empty())
+                    msg += L" 模块: " + g_curModuleFile;
                 (*err) = msg;
                 return Value();
             }
@@ -886,11 +899,19 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                             if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
                             local->vars[L"..."] = vDots;
                             local->vars[L"arg"] = vDots;
+                            // an explicit `arg` parameter (gdip.bitmap's
+                            // ctor) must win over the vararg alias
+                            for (size_t i = 0; i + 1 < f.fn->names.size(); i++)
+                                if (f.fn->names[i] == L"arg" && i < args.size())
+                                    local->vars[L"arg"] = args[i];
                         }
                         else
                         {
                             local->vars[L"..."] = Value();
                             local->vars[L"arg"] = Value();
+                            for (size_t i = 0; i < f.fn->names.size(); i++)
+                                if (f.fn->names[i] == L"arg" && i < args.size())
+                                    local->vars[L"arg"] = args[i];
                         }
                     }
                     Value oldRet = ret;
@@ -1029,6 +1050,9 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
                 local->vars[L"..."] = vDots;
                 local->vars[L"arg"] = vDots;
+                for (size_t i = 0; i + 1 < f.params.size(); i++)
+                    if (f.params[i] == L"arg" && i < args.size())
+                        local->vars[L"arg"] = args[i];
             }
             Value old = ret;
             int oldR = nReturn;
@@ -1545,21 +1569,39 @@ Value Interp::Exec(const PNode& n, Env* env)
                     }
                 };
                 // var a = e1, b = e2 — positional init list; all initializers
-                // evaluated before any name binds
+                // evaluated before any name binds. Multi-return values
+                // (a call result's mrets, or a packed `...`) flow across
+                // the name list: `var w,h,px = arg,...` must give w the
+                // first vararg, h the second — the shipped gdip.bitmap
+                // ctor depends on this. Only when a slot's value is a
+                // plain single value does the next name take the next
+                // initializer.
                 if (n->b && !n->b->list.empty())
                 {
-                    Value v0 = n->a ? Eval(n->a, env) : Value();
-                    vector<Value> pre;
-                    pre.reserve(n->b->list.size());
+                    vector<Value> flow;
+                    auto pushFlow = [&](Value v)
+                    {
+                        if (v.bDots && v.mrets)
+                        {
+                            for (auto& m : *v.mrets) flow.push_back(m);
+                        }
+                        else if (v.mrets)
+                        {
+                            flow.push_back(v);
+                            for (auto& m : *v.mrets) flow.push_back(m);
+                        }
+                        else
+                            flow.push_back(v);
+                    };
+                    if (n->a)
+                        pushFlow(Eval(n->a, env));
                     for (auto& eN : n->b->list)
-                        pre.push_back(Eval(eN, env));
-                    if (!n->names.empty() && !n->names[0].empty())
-                        BindVar(n->names[0], v0);
-                    for (size_t k = 1; k < n->names.size(); k++)
+                        pushFlow(Eval(eN, env));
+                    for (size_t k = 0; k < n->names.size(); k++)
                         if (!n->names[k].empty())
                             BindVar(n->names[k],
-                                k - 1 < pre.size() ? pre[k - 1] : Value());
-                    return v0;
+                                k < flow.size() ? flow[k] : Value());
+                    return flow.empty() ? Value() : flow.front();
                 }
                 Value v = n->a ? Eval(n->a, env) : Value();
                 if (n->names.size() == 1)
@@ -2127,6 +2169,9 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
                 vDots.bDots = true;
                 local->vars[L"..."] = vDots;
                 local->vars[L"arg"] = vDots;
+                for (size_t i = 0; i + 1 < f.params.size(); i++)
+                    if (f.params[i] == L"arg" && i < args.size())
+                        local->vars[L"arg"] = args[i];
             }
             Value oldRet = ret;
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;
