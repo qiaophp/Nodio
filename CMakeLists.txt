@@ -57,6 +57,10 @@ set_target_properties(nodio PROPERTIES
 if(MSVC)
     target_link_options(nodio PRIVATE "/MANIFEST:NO")
 endif()
+# 16 MB stack reserve: the tree-walking interpreter nests many C++ frames
+# per aardio call, so the default 1 MB reserve crashes a deep-but-legit
+# aardio recursion (~70 frames) before the engine's depth guard can fire.
+set_target_properties(nodio PROPERTIES LINK_FLAGS "/STACK:16777216")
 
 # ---- Nodio IDE is self-hosted: written in aardio, running on the Nodio ----
 # VM (ide/aardio/). The retired native Win32 + Scintilla C++ shell and its

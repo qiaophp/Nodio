@@ -1,0 +1,5 @@
+function walk(n){ if(n<=0) return 0; return walk(n-1)+1; }
+io.print(walk(400));
+function f(){ return f(); }
+try{ f(); io.print("no-catch"); }catch(e){ io.print("caught"); }
+io.print("end");

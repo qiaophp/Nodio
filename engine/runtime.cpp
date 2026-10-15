@@ -709,18 +709,19 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 CallDepthGuard(int& x) : d(x) { d++; }
                 ~CallDepthGuard() { d--; }
             } cdg(s_callDepth);
-            if (s_callDepth > 100)
+            if (s_callDepth > 500)
             {
+                // depth-guard contract: runaway recursion surfaces a
+                // catchable 运行错误 (official 栈溢出 shape) instead of an
+                // uncatchable OS EXCEPTION_STACK_OVERFLOW. 500 aardio
+                // frames fit the host's 16 MB reserve (~14 KB C++ stack
+                // per aardio call); the guard must stay well below the
+                // physical crash point.
                 wstring fnName = f.fname;
                 if (fnName.empty() && n->a->k == Node::Member) fnName = n->a->str;
                 else if (fnName.empty() && n->a->k == Node::Ident) fnName = n->a->str;
-                fwprintf(stderr, L"[DEBUG INFINITE CALL DEPTH %d] line=%d fname=%s\n",
-                         s_callDepth, n->line, fnName.c_str());
-                if (s_callDepth > 105)
-                {
-                    (*err) = L"运行错误: 栈溢出 (超过最大调用深度) @ 行 " + std::to_wstring(n->line) + L" 函数: " + fnName;
-                    return Value();
-                }
+                (*err) = L"运行错误: 栈溢出 (超过最大调用深度) @ 行 " + std::to_wstring(n->line) + L" 函数: " + fnName;
+                return Value();
             }
             {
                 static bool bDbg = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
