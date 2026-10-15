@@ -3628,6 +3628,18 @@ void Interp::InitBuiltins()
                 tb->map[L"getId"] = NF([](vector<Value>&) -> Value {
                     return Value::Num_((double)::GetCurrentThreadId());
                 });
+                // thread.getMainId — id of the thread that started the VM.
+                // The ide library gates on getId()!=getMainId() to detect
+                // an external launch, and dotNet/clr uses the same test;
+                // inside a fiber both official calls distinguish the
+                // worker, so a created fiber reports its own id here.
+                tb->map[L"getMainId"] =
+                    NF([](vector<Value>&) -> Value {
+                    if (g_runningFiber)
+                        return Value::Num_(
+                            (double)(INT_PTR)(void*)g_runningFiber);
+                    return Value::Num_(
+                        (double)::GetCurrentThreadId()); });
                 // thread.status(handle) — 0 = still running ("active")
                 tb->map[L"status"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty())

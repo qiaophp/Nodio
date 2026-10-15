@@ -1,0 +1,5 @@
+import thread;
+io.print(thread.getId() == thread.getMainId());
+var f = fiber.create(function(){ return thread.getId() != thread.getMainId(); });
+io.print(fiber.resume(f));
+io.print("end");
