@@ -66,6 +66,7 @@ namespace NodioVM
         wstring ToStringM(const Value& v);
         Value GetMember(const Value& obj, const wstring& key,
                         bool bDirect = false, bool bOwnerCall = false);
+        void RegisterComKernel(Env& globalsEnv);   // com.cpp (COM host)
         Value EvalCall(const PNode& n, Env* env);
         Value EvalBin(const PNode& n, Env* env);
         bool CmpLess(const Value& l, const Value& r);

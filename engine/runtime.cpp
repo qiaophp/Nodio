@@ -391,15 +391,15 @@ bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
             {
                 if (bInDispatch)
                     return false;   // util._get's own this[k]: go raw below
-                if (getenv("NODIO_META_DEBUG"))
-                    fwprintf(stderr, L"[g-fn obj=%p mt=%p key=%s]\n",
-                             (void*)obj.tab.get(), (void*)mt, key.c_str());
                 // function form: g(k, ownerCall) — this is the meta table
                 // itself (util.metaProperty's _get reads this[k]); the
                 // object reaches the body via `owner`. While it runs,
                 // inner this[k] lookups must see RAW definition tables
                 g_metaDispatchDepth++;
                 vector<Value> args{ Value::Str_(key), Value::Bool_(bOwnerCall) };
+                if (g.native)
+                    args.push_back(obj); // native kernel getters receive
+                                         // the receiver as args[3]
                 Value r = CallThisOwner(mtv, obj, g, args, pErr, pErrMsg);
                 g_metaDispatchDepth--;
                 *out = r;
@@ -522,6 +522,20 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
         {
             if (f.native)
                 return f.native(args);
+            // a callable table (COM bound member, kernel proxy objects):
+            // forward through its _meta._call with the table as owner
+            if (f.t == Value::TableT && f.tab)
+            {
+                auto ic = f.tab->map.find(L"_meta");
+                if (ic != f.tab->map.end() && ic->second.t == Value::TableT &&
+                    ic->second.tab)
+                {
+                    auto icl = ic->second.tab->map.find(L"_call");
+                    if (icl != ic->second.tab->map.end() &&
+                        (icl->second.t == Value::Func || icl->second.native))
+                        return CallOwner(icl->second, f, args);
+                }
+            }
             if (f.t != Value::Func || !f.fn)
             {
                 (*err) = L"运行错误: 元表回调不是函数";
@@ -1096,6 +1110,10 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                          icl->second.native))
                     {
                         vector<Value> args = evalCallArgs(n->list);
+                        if (icl->second.native)
+                            args.insert(args.begin(), f); // native _call
+                                                          // receives the
+                                                          // table as a[0]
                         return CallOwner(icl->second, f, args);
                     }
                 }

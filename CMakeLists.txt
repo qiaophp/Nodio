@@ -23,6 +23,7 @@ add_library(engine STATIC
     engine/builtins.cpp
     engine/debug.cpp
     engine/gdi.cpp
+    engine/com.cpp
     engine/entry.cpp
     engine/common.h
     engine/interp.h

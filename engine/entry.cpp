@@ -113,7 +113,8 @@ namespace NodioVM
             wstring strPrevErr = it.err ? *it.err : wstring();
             wstring* pPrevErr = it.err;
             it.err = &strBootErr;
-            vector<Tok> toksBoot = Lex(L"import builtin.struct;", &strBootErr);
+            vector<Tok> toksBoot = Lex(
+                L"import builtin.struct; import builtin.com;", &strBootErr);
             Parser psBoot{ toksBoot, 0, &strBootErr };
             psBoot.strEmbedBase = pBaseDir ? *pBaseDir : wstring();
             psBoot.strEmbedRoot = EmbedRoot();

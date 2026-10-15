@@ -5035,6 +5035,7 @@ void Interp::InitBuiltins()
 
                 // ---- the (debug) introspection module ----
                 auto dbg = std::make_shared<Table>();
+                RegisterComKernel(globals);   // com.cpp: kernel COM host
                 // debug.queryinfo(level,[what]) — console's test runner and
                 // debug/_.aardio read source.src / currentline from it
                 dbg->map[L"queryinfo"] = NF([](vector<Value>& a) -> Value {
