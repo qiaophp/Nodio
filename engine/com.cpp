@@ -923,6 +923,79 @@ void Interp::RegisterComKernel(Env& globalsEnv)
             a[0].tab->map.count(L"_boundDispatch"));
     });
 
+    // com.CreateEmbed(embedObject, formOrCtrl, progId, pik)
+    // official kernel API used by win.ui.ctrl metaProperty's createEmbed:
+    // create the COM control, store it in the container table as
+    // _object, and provide a minimal _host so the embed chain can run
+    com->map[L"CreateEmbed"] = NF([](vector<Value>& a) -> Value {
+        if (a.size() < 3 || a[0].t != Value::TableT || !a[0].tab)
+        {
+            Interp* it = g_interpCurrent;
+            if (it && it->err->empty())
+                *it->err = L"com.CreateEmbed: 参数不足";
+            return Value();
+        }
+        Table* embed = a[0].tab.get();
+        wstring progId =
+            (a.size() > 2 && a[2].t == Value::Str) ? BStr(a[2]) : L"";
+        // winform.createEmbed(,this) — omitted ProgID defaults to the
+        // web browser control (official metaProperty behaviour)
+        if (progId.empty())
+            progId = L"Shell.Explorer";
+        CLSID clsid;
+        if (progId.size() > 1 && progId[0] == L'{')
+            IIDFromString(progId.c_str(), &clsid);
+        else if (FAILED(CLSIDFromProgID(progId.c_str(), &clsid)))
+        {
+            Interp* it = g_interpCurrent;
+            if (it)
+                *it->err = L"com.CreateEmbed: 未找到 ProgID " + progId;
+            return Value();
+        }
+        IUnknown* punk = nullptr;
+        IDispatch* pd = nullptr;
+        if (FAILED(CoCreateInstance(clsid, nullptr,
+                                    CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
+                                    IID_IUnknown, (void**)&punk)) ||
+            !punk)
+        {
+            Interp* it = g_interpCurrent;
+            if (it)
+                *it->err = L"com.CreateEmbed: 创建失败 " + progId;
+            return Value();
+        }
+        if (SUCCEEDED(punk->QueryInterface(IID_IDispatch, (void**)&pd)) &&
+            pd)
+        {
+            embed->map[L"_object"] = WrapDispatch(pd);
+            punk->Release();
+        }
+        else
+        {
+            embed->map[L"_object"] = Value::Pointer_((void*)punk);
+        }
+        // minimal OLE host: official embedObject._host.close() /
+        // tranacc() get real implementations with full CAxHost support;
+        // these stubs keep the embed chain runnable
+        auto host = std::make_shared<Table>();
+        host->map[L"close"] = NF([](vector<Value>&) -> Value {
+            return Value();
+        });
+        host->map[L"tranacc"] = NF([](vector<Value>&) -> Value {
+            return Value();
+        });
+        embed->map[L"_host"] = Value::Table_(host);
+        return a[0];
+    });
+
+    // com.IsNetObject(v) — true for wrapped .NET CCWs (used by
+    // dotNet.appDomain's object routing)
+    com->map[L"IsNetObject"] = NF([](vector<Value>& a) -> Value {
+        if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+            return Value::Bool_(false);
+        return Value::Bool_(a[0].tab->map.count(L"_isNetObject") > 0);
+    });
+
     // com.Release(v)
     com->map[L"Release"] = NF([](vector<Value>& a) -> Value {
         if (!a.empty() && a[0].t == Value::TableT && a[0].tab)
