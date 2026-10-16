@@ -247,6 +247,7 @@ struct ThreadJob
     PNode fnBody;
     vector<wstring> params;
     vector<Value> args;
+    Value owner;
 };
 std::map<HANDLE, std::shared_ptr<ThreadState>> g_threadStates;
 std::mutex g_threadStatesMutex;
@@ -261,7 +262,9 @@ DWORD WINAPI ThreadWorkerProc(LPVOID pv)
     auto local = std::make_shared<Env>();
     local->self = local;
     local->parent = wt.globals.self;
-    for (size_t i = 0; i < job->params.size(); i++)
+        if (job->owner.t != Value::Null)
+        local->vars[L"owner"] = job->owner;
+for (size_t i = 0; i < job->params.size(); i++)
     {
         if (job->params[i] == L"...")
         {
@@ -4191,6 +4194,67 @@ void Interp::InitBuiltins()
                     if (!h)
                         return Value::Bool_(false);
                     return Value::Bool_(ResumeThread(h) != (DWORD)-1); });
+                // thread.call(funcOrName, owner, ...) - official contract: run fn in
+// a fresh thread and WAIT for it; a string first arg names a function
+// in the thread-shared map. Returns every value the thread fn produced.
+                tb->map[L"call"] = NF([this](vector<Value>& a) -> Value {
+                    if (a.empty())
+                        return Value();
+                    Value fn = a[0];
+                    if (fn.t == Value::Str)
+                    {
+                        std::lock_guard<std::mutex> lk(g_threadSharedMutex);
+                        auto it = g_threadSharedMap.find(fn.s);
+                        if (it != g_threadSharedMap.end())
+                            fn = it->second;
+                        else
+                            fn = Value();
+                    }
+                    if (fn.t != Value::Func || !fn.fn)
+                    {
+                        (*err) = L"\u8fd0\u884c\u9519\u8bef: thread.call \u9700\u8981\u51fd\u6570";
+                        return Value();
+                    }
+                    Value owner = a.size() > 1 ? a[1] : Value();
+                    vector<Value> args;
+                    for (size_t i = 2; i < a.size(); i++)
+                        args.push_back(DeepCopy(a[i]));
+                    auto st = std::make_shared<ThreadState>();
+                    PNode fnBody = fn.fn;
+                    vector<wstring> params = fn.params;
+                    // worker frame: params + trailing owner slot (official
+                    // thread functions receive owner as the first param
+                    // when the call site passed one)
+                    vector<Value> callArgs = args;
+                    HANDLE hTh = CreateThread(
+                        nullptr, 0, ThreadWorkerProc,
+                        new ThreadJob{ st, fnBody, params, callArgs, owner }, 0,
+                        nullptr);
+                    if (hTh)
+                    {
+                        {
+                            std::lock_guard<std::mutex> lk(g_threadStatesMutex);
+                            g_threadStates[hTh] = st;
+                        }
+                        while (!st->done)
+                            Sleep(5);
+                        CloseHandle(hTh);
+                        std::lock_guard<std::mutex> lk2(g_threadStatesMutex);
+                        g_threadStates.erase(hTh);
+                    }
+                    if (!st->error.empty())
+                    {
+                        (*err) = L"\u8fd0\u884c\u9519\u8bef: \u7ebf\u7a0b\u5185\u9519\u8bef: " + st->error;
+                        return Value();
+                    }
+                    Value r = st->result;
+                    if (r.mrets && !r.mrets->empty())
+                    {
+                        Value first = (*r.mrets)[0];
+                        first.mrets = r.mrets;
+                        return first;
+                    }
+                    return r; });
                 tb->map[L"waitOne"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty())
                         return Value();
@@ -4458,7 +4522,7 @@ void Interp::InitBuiltins()
                     // feeds it into waitOne/waitAll/raw.closeHandle
                     HANDLE hTh = CreateThread(
                         nullptr, 0, ThreadWorkerProc,
-                        new ThreadJob{ st, fnBody, params, args }, 0,
+                        new ThreadJob{ st, fnBody, params, args, Value() }, 0,
                         nullptr);
                     if (!hTh)
                     {
