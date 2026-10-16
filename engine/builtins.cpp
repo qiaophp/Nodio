@@ -3363,6 +3363,92 @@ void Interp::InitBuiltins()
             // ---- table ----
             {
                 auto tb = GetRoot(L"table").tab;
+                // table.tostring(t) — official kernel primitive:
+                // serialize a table to aardio source format (array part
+                // separated by ';', named members as k=v;), strings
+                // quoted with escapes; scalars pass through
+                tb->map[L"tostring"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value::Str_(L"");
+                    if (a[0].t != Value::TableT)
+                        return Value::Str_(BStr(a[0]));
+                    // self-recursive serializer: plain function pointers
+                    // via explicit stack would be heavy; a Y-combinator
+                    // style pair of std::function kept alive by the NF
+                    std::function<void(const Value&, wstring&, int)>
+                        serTbl;
+                    std::function<void(const Value&, wstring&, int)>
+                        serVal;
+                    serVal = [&serTbl](const Value& v, wstring& out,
+                                       int depth)
+                    {
+                        if (depth > 8) return;
+                        switch (v.t)
+                        {
+                        case Value::Str:
+                        {
+                            wstring e = L"'";
+                            for (wchar_t ch : v.s)
+                            {
+                                if (ch == 39) e += L"\'";
+                                else if (ch == 92) e += L"\\\\";
+                                else if (ch == 13) e += L"\r";
+                                else if (ch == 10) e += L"\n";
+                                else if (ch == 9) e += L"\t";
+                                else if (ch == 0) e += L"\0";
+                                else e += ch;
+                            }
+                            out += e + L"'";
+                            break;
+                        }
+                        case Value::Num:
+                            out += BStr(v);
+                            break;
+                        case Value::Bool:
+                            out += v.b ? L"true" : L"false";
+                            break;
+                        case Value::TableT:
+                            if (v.tab)
+                                serTbl(v, out, depth + 1);
+                            else
+                                out += L"{}";
+                            break;
+                        default:
+                            break;
+                        }
+                    };
+                    serTbl = [&serVal](const Value& tv, wstring& out,
+                                       int depth)
+                    {
+                        if (!tv.tab || depth > 8)
+                        {
+                            out += L"{}";
+                            return;
+                        }
+                        bool bFirst = true;
+                        wstring s = L"{";
+                        for (auto& item : tv.tab->arr)
+                        {
+                            if (!bFirst) s += L";";
+                            bFirst = false;
+                            serVal(item, s, depth);
+                        }
+                        for (auto& kv : tv.tab->map)
+                        {
+                            if (kv.first.empty()) continue;
+                            if (kv.first.rfind(L"_", 0) == 0) continue;
+                            wstring vs;
+                            serVal(kv.second, vs, depth);
+                            if (vs.empty()) continue;
+                            if (!bFirst) s += L";";
+                            bFirst = false;
+                            s += kv.first + L"=" + vs;
+                        }
+                        s += L"}";
+                        out += s;
+                    };
+                    wstring out;
+                    serTbl(a[0], out, 0);
+                    return Value::Str_(out); });
                 // table.slice(array,start,end) — aardio 1-based slice
                 tb->map[L"slice"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
