@@ -399,6 +399,11 @@ namespace NodioVM
         wstring error;
         bool done = false;
     };
+    // heap job packet handed to a raw Win32 thread (thread.create):
+    // keeps the VM nodes/args alive for the worker lifetime
+    struct ThreadJob;
+    extern std::map<HANDLE, std::shared_ptr<ThreadState>> g_threadStates;
+    extern std::mutex g_threadStatesMutex;
     extern std::map<wstring, Value> g_threadSharedMap;
     extern std::mutex g_threadSharedMutex;
     struct RE

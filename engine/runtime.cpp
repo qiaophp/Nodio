@@ -228,9 +228,26 @@ Value Interp::Eval(const PNode& n, Env* env)
                     }
                     Value k = Eval(n->list[i], env);
                     Value v = Eval(n->list[i + 1], env);
+                    // an array-slot call expression expands ALL its return
+                    // values into consecutive elements (official:
+                    // var ret = [ call(func) ] keeps (ok, v) both)
                     if (k.t == Value::Num && k.n == (long long)k.n &&
                         k.n >= 1 && (size_t)(k.n - 1) == tb->arr.size())
-                        tb->arr.push_back(v);
+                    {
+                        if (v.mrets && !v.bDots)
+                        {
+                            tb->arr.push_back(v);
+                            for (auto& m : *v.mrets)
+                                tb->arr.push_back(m);
+                        }
+                        else if (v.bDots && v.mrets)
+                        {
+                            for (auto& m : *v.mrets)
+                                tb->arr.push_back(m);
+                        }
+                        else
+                            tb->arr.push_back(v);
+                    }
                     else
                         tb->map[k.ToString()] = v;
                 }

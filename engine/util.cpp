@@ -35,6 +35,17 @@ namespace NodioVM
                 nt->map[L"self"] = r;
             return r;
         }
+        // functions cross threads as a re-bindable literal: the AST
+        // (PNode) is immutable and shared, the worker VM re-resolves
+        // bare names against its own globals (official aardio: thread
+        // functions get an independent global environment)
+        if (v.t == Value::Func && v.fn)
+        {
+            Value x = v;
+            x.tab.reset();
+            x.native = nullptr;
+            return x;
+        }
         Value x = v;
         x.tab.reset();
         x.nsClosure.reset();

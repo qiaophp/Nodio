@@ -1,4 +1,6 @@
 var h = thread.create(function(x) {
+    thread.set("t28r", x * 2);
     return x * 2;
 }, 21);
-io.print(h.join());
+io.print(tostring(thread.waitOne(h, 3000)));
+io.print(tostring(thread.get("t28r")));

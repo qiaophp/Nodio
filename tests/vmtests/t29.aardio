@@ -1,3 +1,4 @@
+import thread;
 var t0 = time.tick();
 var h1 = thread.create(function() {
     sleep(400);
@@ -7,5 +8,7 @@ var h2 = thread.create(function() {
     sleep(400);
     return 2;
 });
-io.print(h1.join() + h2.join());
+var ok1 = thread.waitOne(h1, 3000);
+var ok2 = thread.waitOne(h2, 3000);
+io.print(tostring(ok1) ++ tostring(ok2));
 io.print(time.tick() - t0 < 700);

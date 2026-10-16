@@ -239,6 +239,62 @@ namespace NodioVM
     }
 
 // ---- InitBuiltins ----
+// thread.create state registry: HANDLE -> result slot. Worker threads
+// write through the mutex; waitOne/getExitCode read the HANDLE directly.
+struct ThreadJob
+{
+    std::shared_ptr<ThreadState> st;
+    PNode fnBody;
+    vector<wstring> params;
+    vector<Value> args;
+};
+std::map<HANDLE, std::shared_ptr<ThreadState>> g_threadStates;
+std::mutex g_threadStatesMutex;
+
+DWORD WINAPI ThreadWorkerProc(LPVOID pv)
+{
+    auto* job = (ThreadJob*)pv;
+    wstring threadErr;
+    Interp wt{ &threadErr };
+    g_interpCurrent = &wt;
+    wt.InitBuiltins();
+    auto local = std::make_shared<Env>();
+    local->self = local;
+    local->parent = wt.globals.self;
+    for (size_t i = 0; i < job->params.size(); i++)
+    {
+        if (job->params[i] == L"...")
+        {
+            // trailing `...` parameter packs ALL remaining args (bDots
+            // shape) - binding it like a plain param truncated the
+            // varargs to one inside worker threads
+            auto vargs = std::make_shared<vector<Value>>();
+            auto tbV = std::make_shared<Table>();
+            for (size_t k = i; k < job->args.size(); k++)
+            {
+                vargs->push_back(job->args[k]);
+                tbV->arr.push_back(job->args[k]);
+            }
+            Value vD = tbV->arr.empty() ? Value() : Value::Table_(tbV);
+            if (vD.tab) { vD.mrets = vargs; vD.bDots = true; }
+            local->vars[L"..."] = vD;
+            break;
+        }
+        local->vars[job->params[i]] =
+            i < job->args.size() ? job->args[i] : Value();
+    }
+    wt.nReturn = 0;
+    Value r = wt.ExecBlock(job->fnBody, local.get());
+    std::lock_guard<std::mutex> lk(g_threadStatesMutex);
+    if (threadErr.empty())
+        job->st->result = DeepCopy(r);
+    else
+        job->st->error = threadErr;
+    job->st->done = true;
+    delete job;
+    return 0;
+}
+
 void Interp::InitBuiltins()
         {
             // ---- global call() builtin: call(fn, owner, ...)
@@ -4079,7 +4135,9 @@ void Interp::InitBuiltins()
                     return Value::Str_(out); });
             }
 
-            // ---- round 36: thread (worker threads, own VM per thread) ----
+            
+
+// ---- round 36: thread (worker threads, own VM per thread) ----
             {
                 auto tb = GetRoot(L"thread").tab;
                 // thread.applyCallWnd(form, wParam, lParam) - forward
@@ -4395,40 +4453,23 @@ void Interp::InitBuiltins()
                     for (size_t i = 1; i < a.size(); i++)
                         args.push_back(DeepCopy(a[i]));
                     auto st = std::make_shared<ThreadState>();
-                    st->th = std::thread(
-                        [fnBody, params, args, st]() {
-                            wstring threadErr;
-                            Interp wt{ &threadErr };
-                            g_interpCurrent = &wt;
-                            wt.InitBuiltins();
-                            auto local = std::make_shared<Env>();
-                            local->self = local;
-                            local->parent = wt.globals.self;
-                            for (size_t i = 0; i < params.size(); i++)
-                                local->vars[params[i]] =
-                                    i < args.size() ? args[i] : Value();
-                            wt.nReturn = 0;
-                            Value r = wt.ExecBlock(fnBody, local.get());
-                            if (threadErr.empty())
-                                st->result = DeepCopy(r);
-                            else
-                                st->error = threadErr;
-                            st->done = true;
-                        });
-                    st->th.detach();
-                    auto h = std::make_shared<Table>();
-                    h->map[L"join"] = NF([st, this](vector<Value>&) -> Value {
-                        while (!st->done)
-                            Sleep(5);
-                        if (!st->error.empty())
-                        {
-                            (*err) = L"运行错误: 线程内错误: " + st->error;
-                            return Value();
-                        }
-                        return st->result; });
-                    h->map[L"done"] = NF([st](vector<Value>&) -> Value {
-                        return Value::Bool_(st->done); });
-                    return Value::Table_(h); });
+                    // official contract: thread.create returns a real
+                    // Win32 thread HANDLE (number) — builtin/thread.aardio
+                    // feeds it into waitOne/waitAll/raw.closeHandle
+                    HANDLE hTh = CreateThread(
+                        nullptr, 0, ThreadWorkerProc,
+                        new ThreadJob{ st, fnBody, params, args }, 0,
+                        nullptr);
+                    if (!hTh)
+                    {
+                        (*err) = L"运行错误: thread.create CreateThread 失败";
+                        return Value();
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(g_threadStatesMutex);
+                        g_threadStates[hTh] = st;
+                    }
+                    return Value::Pointer_((void*)hTh); });
             }
 
             // ---- round 37: fsys (file system) ----
