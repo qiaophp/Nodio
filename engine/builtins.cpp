@@ -5183,6 +5183,103 @@ void Interp::InitBuiltins()
                                 MAKEWPARAM(nId, BN_CLICKED),
                                 (LPARAM)hC);
                             return Value(); });
+                        // script-side property dispatch: .items = {...}
+                        // (listbox/combobox) and .checked = v (checkbox/radio)
+                        // must reach the Win32 control, not sit as plain
+                        // data in the ctrl table
+                        if (strCls == L"listbox" || strCls == L"combobox")
+                        {
+                            UINT mAddP = strCls == L"combobox"
+                                ? CB_ADDSTRING : LB_ADDSTRING;
+                            UINT mRstP = strCls == L"combobox"
+                                ? CB_RESETCONTENT : LB_RESETCONTENT;
+                            UINT mCntP = strCls == L"combobox"
+                                ? CB_GETCOUNT : LB_GETCOUNT;
+                            // table-form meta._set: only named attrs
+                            // (items / checked) are intercepted; any other
+                            // write (onselchange, oncommand, ...) falls
+                            // through to a plain data member
+                            auto tbMeta = std::make_shared<Table>();
+                            auto tbSet = std::make_shared<Table>();
+                            tbSet->map[L"items"] = NF([hC, mAddP, mRstP](
+                                vector<Value>& a3) -> Value {
+                                if (a3.size() > 0 && a3[0].t == Value::TableT &&
+                                    a3[0].tab)
+                                {
+                                    SendMessageW(hC, mRstP, 0, 0);
+                                    for (auto& x : a3[0].tab->arr)
+                                        SendMessageW(hC, mAddP, 0,
+                                                     (LPARAM)BStr(x).c_str());
+                                }
+                                return Value(); });
+                            tbMeta->map[L"_set"] = Value::Table_(tbSet);
+                            ctrl->map[L"_meta"] = Value::Table_(tbMeta);
+                        }
+                        else if (strCls == L"checkbox" || strCls == L"radio")
+                        {
+                            auto tbMeta = std::make_shared<Table>();
+                            auto tbSet = std::make_shared<Table>();
+                            tbSet->map[L"checked"] = NF([hC](
+                                vector<Value>& a3) -> Value {
+                                SendMessageW(hC, BM_SETCHECK,
+                                    (!a3.empty() && a3[0].t != Value::Null &&
+                                     (a3[0].t != Value::Num ||
+                                      (int)BNum(a3[0]) != 0))
+                                        ? BST_CHECKED
+                                        : BST_UNCHECKED, 0);
+                                return Value(); });
+                            tbMeta->map[L"_set"] = Value::Table_(tbSet);
+                            ctrl->map[L"_meta"] = Value::Table_(tbMeta);
+                        }
+                        // apply remaining DSG init attributes the way
+                        // official win.ui.ctrl classes do in their ctor:
+                        // items array for listbox/combobox, checked for
+                        // checkbox/radio, password char for edit,
+                        // disabled/hide visibility
+                        if (ci.vInit.tab)
+                        {
+                            auto itI = ci.vInit.tab->map.find(L"items");
+                            if (itI != ci.vInit.tab->map.end() &&
+                                itI->second.t == Value::TableT &&
+                                itI->second.tab &&
+                                (strCls == L"listbox" ||
+                                 strCls == L"combobox"))
+                            {
+                                UINT mAddD = strCls == L"combobox"
+                                    ? CB_ADDSTRING : LB_ADDSTRING;
+                                for (auto& x : itI->second.tab->arr)
+                                    SendMessageW(hC, mAddD, 0,
+                                                 (LPARAM)BStr(x).c_str());
+                            }
+                            auto itC = ci.vInit.tab->map.find(L"checked");
+                            if (itC != ci.vInit.tab->map.end() &&
+                                (strCls == L"checkbox" || strCls == L"radio"))
+                                SendMessageW(hC, BM_SETCHECK,
+                                    (itC->second.t != Value::Null &&
+                                     (itC->second.t != Value::Num ||
+                                      (int)BNum(itC->second) != 0))
+                                        ? BST_CHECKED : BST_UNCHECKED, 0);
+                            auto itP = ci.vInit.tab->map.find(L"password");
+                            if (itP != ci.vInit.tab->map.end() &&
+                                strCls == L"edit" &&
+                                (itP->second.t != Value::Null &&
+                                 (itP->second.t != Value::Num ||
+                                  (int)BNum(itP->second) != 0)))
+                                SendMessageW(hC, EM_SETPASSWORDCHAR,
+                                             (WPARAM)'*', 0);
+                            auto itD = ci.vInit.tab->map.find(L"disabled");
+                            if (itD != ci.vInit.tab->map.end() &&
+                                itD->second.t != Value::Null &&
+                                (itD->second.t != Value::Num ||
+                                 (int)BNum(itD->second) != 0))
+                                EnableWindow(hC, FALSE);
+                            auto itH = ci.vInit.tab->map.find(L"hide");
+                            if (itH != ci.vInit.tab->map.end() &&
+                                itH->second.t != Value::Null &&
+                                (itH->second.t != Value::Num ||
+                                 (int)BNum(itH->second) != 0))
+                                ShowWindow(hC, SW_HIDE);
+                        }
                         // callback slot: assign a function to .oncommand
                         ctrl->map[L"oncommand"] = Value();   // set by script
                         // the dispatch reads ctrl->map["oncommand"] live

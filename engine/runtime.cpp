@@ -700,6 +700,42 @@ Value Interp::GetMember(const Value& obj, const wstring& key,
             {
                 if (obj.tab)
                 {
+                    // official semantics: a metaProperty attribute wins over
+                    // an existing data member of the same name - DSG init
+                    // table.assigns ALL attrs (items={}, checked=...) onto
+                    // the ctrl, and later reads of e.g. combobox .items must
+                    // still hit the live control, not the stale copied table
+                    if (!bDirect)
+                    {
+                        auto im0 = obj.tab->map.find(L"_meta");
+                        if (im0 != obj.tab->map.end() &&
+                            im0->second.t == Value::TableT && im0->second.tab)
+                        {
+                            auto ia = im0->second.tab->map.find(key);
+                            if (ia != im0->second.tab->map.end() &&
+                                ia->second.t == Value::TableT && ia->second.tab)
+                            {
+                                auto ig = ia->second.tab->map.find(L"_get");
+                                if (ig != ia->second.tab->map.end() &&
+                                    (ig->second.t == Value::Func ||
+                                     ig->second.native))
+                                {
+                                    bool bErr = false;
+                                    wstring strErrM;
+                                    Value r;
+                                    if (MetaGet(obj, key, &r, &bErr,
+                                                &strErrM, bOwnerCall))
+                                        return r;
+                                    if (bErr)
+                                    {
+                                        if (err->empty())
+                                            (*err) = L"\u8fd0\u884c\u9519\u8bef: " + strErrM;
+                                        return Value();
+                                    }
+                                }
+                            }
+                        }
+                    }
                     auto it = obj.tab->map.find(key);
                     if (it != obj.tab->map.end())
                         return it->second;
@@ -1520,8 +1556,11 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                             }
                         }
                     }
-                    if (bInit || obj.tab->map.count(target->str) ||
-                        !obj.tab->map.count(L"_meta"))
+                    // official semantics: an existing data member does
+                    // NOT bypass the metatable - DSG init copies DSG attrs
+                    // (table.assign) onto the ctrl, and a later script
+                    // write must still route through the metaProperty
+                    if (bInit || !obj.tab->map.count(L"_meta"))
                     {
                         if (val.t == Value::Null)
                             obj.tab->map.erase(target->str);
