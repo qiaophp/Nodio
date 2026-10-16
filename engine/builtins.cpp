@@ -1147,6 +1147,12 @@ void Interp::InitBuiltins()
                     for (size_t i = 1; i < a.size(); i++)
                         m = min(m, BNum(a[i]));
                     return Value::Num_(m); });
+                tb->map[L"clamp"] = NF([](vector<Value>& a) {
+                    double v = a.empty() ? 0 : BNum(a[0]);
+                    double lo = a.size() > 1 ? BNum(a[1]) : 0;
+                    double hi = a.size() > 2 ? BNum(a[2]) : 255;
+                    if (lo > hi) { double t = lo; lo = hi; hi = t; }
+                    return Value::Num_(v < lo ? lo : (v > hi ? hi : v)); });
                 tb->map[L"random"] = NF([](vector<Value>& a) {
                     static bool seeded = false;
                     if (!seeded) { srand((unsigned)time(nullptr)); seeded = true; }
