@@ -813,6 +813,24 @@ void Interp::InitBuiltins()
                         return Value::Str_(wstring(p));
                     }
                     return Value(); });
+                tb->map[L"fromUtf16If"] = NF([](vector<Value>& a) -> Value {
+                    // official contract: decode only when the input looks
+                    // like UTF-16 LE (heuristic — a plain ASCII/UTF-8
+                    // string with a NUL every other byte is UTF-16)
+                    if (a.empty()) return Value();
+                    if (a[0].t != Value::Str) return a[0];
+                    const wstring& s = a[0].s;
+                    if (s.size() < 2) return a[0];
+                    bool bLooksUtf16 = true;
+                    for (size_t i = 1; i + 1 < s.size(); i += 2)
+                        if (s[i] != (wchar_t)0) { bLooksUtf16 = false; break; }
+                    if (!bLooksUtf16) return a[0];
+                    wstring w;
+                    w.reserve(s.size() / 2);
+                    for (size_t i = 0; i + 1 < s.size(); i += 2)
+                        w += (wchar_t)(unsigned char)s[i] |
+                             ((wchar_t)(unsigned char)s[i + 1] << 8);
+                    return Value::Str_(w); });
                 tb->map[L"pack"] = NF([](vector<Value>& a) -> Value {
                     wstring out;
                     std::function<void(const Value&)> addVal = [&](const Value& v) {
