@@ -349,9 +349,10 @@ bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
                         (ig2->second.t == Value::Func ||
                          ig2->second.native))
                     {
-                        vector<Value> noArgs;
+                        vector<Value> gArgs{ Value::Bool_(bOwnerCall),
+                                             idm->second };
                         Value r = CallVmFuncStatic(obj, ig2->second,
-                                                   noArgs, pErr, pErrMsg);
+                                                   gArgs, pErr, pErrMsg);
                         *out = r;
                         return true;
                     }
@@ -376,9 +377,9 @@ bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
                         (ig2->second.t == Value::Func ||
                          ig2->second.native))
                     {
-                        vector<Value> noArgs;
+                        vector<Value> gArgs{ Value::Bool_(bOwnerCall), e };
                         Value r = CallVmFuncStatic(obj, ig2->second,
-                                                   noArgs, pErr, pErrMsg);
+                                                   gArgs, pErr, pErrMsg);
                         *out = r;
                         return true;
                     }
