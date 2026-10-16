@@ -285,6 +285,13 @@ void Interp::InitBuiltins()
             // ---- string (1-based, aardio/Lua style) ----
             {
                 auto tb = GetRoot(L"string").tab;
+                // string.str(v) — official kernel primitive: coerce a
+                // pointer / byte buffer / number to a text value
+                // (win.version csdVersion, D3D info fields etc.)
+                tb->map[L"str"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
+                    if (a[0].t == Value::Str) return a[0];
+                    return Value::Str_(BStr(a[0])); });
                 // string.repeat(s,n) — repeat the string n times
                 tb->map[L"repeat"] = NF([](vector<Value>& a) -> Value {
                     wstring s = BStr(a[0]);
