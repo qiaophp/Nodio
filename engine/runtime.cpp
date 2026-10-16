@@ -1862,17 +1862,17 @@ Value Interp::Exec(const PNode& n, Env* env)
                 return EvalClass(n, env);
             case Node::With:
             {
-                // with(expr) body: child scope binds expr's table members
-                // as locals; `owner` = the expr value
+                // with(expr) body: bare names inside the body READ AND
+                // WRITE the with-target table live (bk.aardio's
+                // `with bk._metaProperty{ saveScale = d.saveScale }`
+                // must land back in the meta table) — bind the target
+                // as this env's namespace instead of snapshotting
                 Value v = Eval(n->a, env);
                 auto local = std::make_shared<Env>();
                 local->self = local;
                 local->parent = env ? env->self : globals.self;
                 if (v.t == Value::TableT && v.tab)
-                {
-                    for (auto& pr : v.tab->map)
-                        local->vars[pr.first] = pr.second;
-                }
+                    local->nsTable = v.tab;
                 local->vars[L"owner"] = v;
                 return ExecBlock(n->b, local.get());
             }

@@ -3509,8 +3509,25 @@ void Interp::InitBuiltins()
                 globals.vars[L"isArray"] = fnIsArray;
                 globals.vars[L"isArrayLike"] = fnIsArray;
                 tb->map[L"append"] = NF([](vector<Value>& a) {
-                    if (a[0].t == Value::TableT && a[0].tab)
-                        a[0].tab->arr.push_back(a.size() > 1 ? a[1] : Value());
+                    // official contract (pinned by the official testCase):
+                    // table.append(arr, v1, v2, ...) appends EVERY arg;
+                    // an array-typed arg is spliced element-by-element
+                    // (table.append([1,2],[3]) == [1,2,3])
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                        return a.empty() ? Value() : a[0];
+                    Table* t = a[0].tab.get();
+                    for (size_t i = 1; i < a.size(); i++)
+                    {
+                        if (a[i].t == Value::TableT && a[i].tab &&
+                            a[i].tab->map.empty() &&
+                            !a[i].tab->arr.empty())
+                        {
+                            for (auto& item : a[i].tab->arr)
+                                t->arr.push_back(item);
+                        }
+                        else
+                            t->arr.push_back(a[i]);
+                    }
                     return a[0]; });
                 tb->map[L"gc"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
