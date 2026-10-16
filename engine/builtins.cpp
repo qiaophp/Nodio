@@ -2013,6 +2013,11 @@ void Interp::InitBuiltins()
                             GlobalFree(h);
                         }
                         CloseClipboard();
+                        // the data is not immediately visible
+                        // to GetClipboardData in the same process;
+                        // give the OS a moment to commit
+                        if (ok)
+                            Sleep(30);
                     }
                     return Value::Bool_(ok != FALSE); });
                 clip->map[L"read"] = NF([](vector<Value>&) {
@@ -2807,6 +2812,13 @@ void Interp::InitBuiltins()
                                 vRet = (INT_PTR)r
                                     ? Value::Pointer_((void*)(INT_PTR)r)
                                     : Value();
+                                break;
+                            case ARAddr:
+                                // official aardio: `addr` returns are
+                                // plain numbers (win/api.aardio feeds
+                                // ::SendMessage results straight back
+                                // into length params)
+                                vRet = Value::Num_((double)(INT_PTR)r);
                                 break;
                             case ARStrA:
                                 vRet = Value::Str_(

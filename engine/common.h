@@ -211,7 +211,7 @@ namespace NodioVM
     enum ApiRet
     {
         ARVoid, ARI64, ARInt, ARWord, ARByte, ARBool, ARDbl,
-        ARStrA, ARStrW, ARPtr
+        ARStrA, ARStrW, ARPtr, ARAddr
     };
     struct ApiSig
     {

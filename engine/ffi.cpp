@@ -294,8 +294,11 @@ namespace NodioVM
                 out->ret = ARStrA;
             else if (rt == L"wstr" || rt == L"ustring")
                 out->ret = ARStrW;
-            else if (rt == L"addr" || rt == L"ptr" ||
-                     rt == L"pointer" || rt == L"handle" ||
+            // official aardio: `addr` returns are plain NUMBERS;
+            // `pointer` returns are the pointer datatype (type()=="pointer")
+            else if (rt == L"addr" || rt == L"handle")
+                out->ret = ARAddr;
+            else if (rt == L"ptr" || rt == L"pointer" ||
                      rt == L"struct") out->ret = ARPtr;
             else if (rt == L"int" || rt == L"long" || rt == L"dword" ||
                      rt == L"uint") out->ret = ARInt;
