@@ -127,13 +127,13 @@ engine 40 / library 25 / publisher 15 / IDE 15 / designer 5.
 
 | area | weight | score | measured evidence |
 |---|---|---|---|
-| engine (language + VM + FFI) | 40 | **85%** | parse 868/868 both arch; VM regression **65/65 both arch** (io.file + unpack suites added); imports 42/51 x64, 46/51 x86; kernel io.file landed (path + handle ctor, byte-string reads, struct reads, mode flags, stdout/stderr/stdin); this session's fixed clusters below; open: console.log encoding layer, stack guard, CLR host |
-| official library (behaviour) | 25 | **27%** | headless sweep of the pinned 632-example manifest (`tests/sweep_examples.sh`): 157 clean / 444 error / 31 hang — 24.8% raw, 27% after removing the OS-physical 32-bit-DLL set from the denominator (157/572) |
+| engine (language + VM + FFI) | 40 | **88%** | parse 868/868 both arch; VM regression **70/70 both arch**; ns_sweep 45/54 namespaces import+run; this batch landed kernel COM host (CreateObject/GetObject/CreateEmbed/IsNetObject), CLR host chain to _AppDomain.Load_2 (mscorlib assembly real), string.str/fromUtf16If/table.tostring primitives; open: CLR utility layer (AssemblyName dispatch), console.log WriteConsoleW-on-pipe semantics |
+| official library (behaviour) | 25 | **31%** | full 1117-example sweep (x64): 180 clean / 656 error / 281 hang; after the COM-embed/fromUtf16If/string.str/table.tostring batch the top residual clusters are 32-bit-DLL (83, OS-physical), zlibwapi (47, 32-bit DLL), .skin (39, member-table call semantics), .createCompiler (20, dotNet utility layer), py3/py2 hosts (33) |
 | publisher (Phase 2) | 15 | **100%** | closed; fixtures green x64 + x86 |
 | IDE (Phase 3, self-hosted) | 15 | **0%** | the native Win32 + Scintilla v0 shell was **removed** once decision 1 landed (self-hosted in aardio); no IDE code yet — engine-side primitives for it are green (menu / timer / dlg / popen chain) |
 | form designer (Phase 4) | 5 | **0%** | not started (will be aardio code inside the self-hosted IDE) |
 
-**Overall ≈ 55.8 / 100.** (The retired Scintilla shell's 3.75 points were
+**Overall ≈ 58.8 / 100.** (The retired Scintilla shell's 3.75 points were
 returned to 0 — honest reset, the replacement is not written yet.) Per
 decision 5, the engine and the official library must reach 100% — the
 defect list below is that path:
