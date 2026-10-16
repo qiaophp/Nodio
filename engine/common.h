@@ -620,11 +620,19 @@ namespace NodioVM
         bool bInstInit = false;
         Value* Find(const wstring& k)
         {
+            // official aardio bare-name lookup: ALL local frames first,
+            // then global roots (Ident checks roots after Find), THEN
+            // namespace members. A namespace table must not shadow base
+            // globals (builtin/thread.aardio calls base `call` inside
+            // namespace thread even though thread.call exists)
             for (Env* e = this; e; e = e->parent.get())
             {
                 auto it = e->vars.find(k);
                 if (it != e->vars.end())
                     return &it->second;
+            }
+            for (Env* e = this; e; e = e->parent.get())
+            {
                 // aardio: `type` is a built-in primitive keyword/operator, never shadowed by namespace members
                 if (e->nsTable && k != L"type")
                 {

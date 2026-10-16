@@ -4210,6 +4210,23 @@ void Interp::InitBuiltins()
                         else
                             fn = Value();
                     }
+                    if (fn.t == Value::Func && !fn.fn && fn.native)
+                    {
+                        // native (like thread.create called from
+                        // builtin invoke) cannot cross threads - call in place
+                        vector<Value> nArgs;
+                        for (size_t i = 2; i < a.size(); i++)
+                            nArgs.push_back(a[i]);
+                        Value r = this->CallOwner(fn,
+                            a.size() > 1 ? a[1] : Value(), nArgs);
+                        if (r.mrets && !r.mrets->empty())
+                        {
+                            Value first = (*r.mrets)[0];
+                            first.mrets = r.mrets;
+                            return first;
+                        }
+                        return r;
+                    }
                     if (fn.t != Value::Func || !fn.fn)
                     {
                         (*err) = L"\u8fd0\u884c\u9519\u8bef: thread.call \u9700\u8981\u51fd\u6570";
