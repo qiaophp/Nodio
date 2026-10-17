@@ -3062,6 +3062,37 @@ void Interp::InitBuiltins()
                     return Value::Num_(BNum(v) / 86400.0);
                 });
                 timeMeta->map[L"format"] = formatFunc;
+                timeMeta->map[L"_get"] = NF([formatFunc](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::Str) return Value();
+                    const wstring& k = a[0].s;
+                    bool bOwnerCall = (a.size() > 1 && a[1].t == Value::Bool && a[1].b);
+                    Value self = Interp::GetCurrentOwner();
+                    if (!self.tab && a.size() > 2 && a[2].t == Value::TableT && a[2].tab)
+                        self = a[2];
+                    if (k == L"format")
+                    {
+                        if (bOwnerCall) return formatFunc;
+                        if (self.tab)
+                        {
+                            auto itF = self.tab->map.find(L"format");
+                            if (itF != self.tab->map.end()) return itF->second;
+                        }
+                        return Value::Str_(L"%Y/%m/%d %H:%M:%S");
+                    }
+                    return Value();
+                });
+                timeMeta->map[L"_set"] = NF([](vector<Value>& a) -> Value {
+                    if (a.size() < 2 || a[0].t != Value::Str) return Value();
+                    const wstring& k = a[0].s;
+                    Value self = Interp::GetCurrentOwner();
+                    if (!self.tab && a.size() > 3 && a[3].t == Value::TableT && a[3].tab)
+                        self = a[3];
+                    if (k == L"format" && self.tab)
+                    {
+                        self.tab->map[L"format"] = a[1];
+                    }
+                    return Value();
+                });
                 timeMeta->map[L"local"] = NF([getSelf](vector<Value>& a) -> Value {
                     Value self = getSelf(a);
                     if (!self.tab) return self;

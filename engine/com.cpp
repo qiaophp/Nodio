@@ -4,6 +4,8 @@
 // {_object = IDispatch*, _meta = comMeta} where comMeta._get/_set
 // dispatch through IDispatch::Invoke.
 #include "pch.h"
+#include <ole2.h>
+#include <ocidl.h>
 #include "interp.h"
 
 namespace NodioVM
@@ -48,6 +50,27 @@ namespace
 
     // ---------- Forward Declarations ----------
     static void VariantFromValue(const Value& v, VARIANT& out, wstring* pErr);
+
+    typedef HRESULT (WINAPI *PFN_AtlAxWinInit)();
+    typedef HRESULT (WINAPI *PFN_AtlAxAttachControl)(IUnknown* pControl, HWND hWnd, IUnknown** ppUnkContainer);
+
+    static PFN_AtlAxWinInit s_pfnAtlAxWinInit = nullptr;
+    static PFN_AtlAxAttachControl s_pfnAtlAxAttachControl = nullptr;
+    static bool s_bAtlLoaded = false;
+
+    static void EnsureAtl()
+    {
+        if (s_bAtlLoaded) return;
+        s_bAtlLoaded = true;
+        HMODULE hAtl = LoadLibraryW(L"atl.dll");
+        if (hAtl)
+        {
+            s_pfnAtlAxWinInit = (PFN_AtlAxWinInit)GetProcAddress(hAtl, "AtlAxWinInit");
+            s_pfnAtlAxAttachControl = (PFN_AtlAxAttachControl)GetProcAddress(hAtl, "AtlAxAttachControl");
+            if (s_pfnAtlAxWinInit)
+                s_pfnAtlAxWinInit();
+        }
+    }
 
     static SAFEARRAY* CreateSafeArrayFromVector(const vector<Value>& arr, VARTYPE forcedVt)
     {
@@ -1550,9 +1573,9 @@ void Interp::RegisterComKernel(Env& globalsEnv)
     // com.CreateEmbed(embedObject, formOrCtrl, progId, pik)
     // official kernel API used by win.ui.ctrl metaProperty's createEmbed:
     // create the COM control, store it in the container table as
-    // _object, and provide a minimal _host so the embed chain can run
+    // _object, and provide a full OLE _host via AtlAxAttachControl
     com->map[L"CreateEmbed"] = NF([](vector<Value>& a) -> Value {
-        if (a.size() < 3 || a[0].t != Value::TableT || !a[0].tab)
+        if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
         {
             Interp* it = g_interpCurrent;
             if (it && it->err->empty())
@@ -1560,52 +1583,146 @@ void Interp::RegisterComKernel(Env& globalsEnv)
             return Value();
         }
         Table* embed = a[0].tab.get();
-        wstring progId =
-            (a.size() > 2 && a[2].t == Value::Str) ? BStr(a[2]) : L"";
-        // winform.createEmbed(,this) — omitted ProgID defaults to the
-        // web browser control (official metaProperty behaviour)
-        if (progId.empty())
-            progId = L"Shell.Explorer";
-        CLSID clsid;
-        if (progId.size() > 1 && progId[0] == L'{')
-            IIDFromString(progId.c_str(), &clsid);
-        else if (FAILED(CLSIDFromProgID(progId.c_str(), &clsid)))
-        {
-            Interp* it = g_interpCurrent;
-            if (it)
-                *it->err = L"com.CreateEmbed: 未找到 ProgID " + progId;
-            return Value();
-        }
+
         IUnknown* punk = nullptr;
-        IDispatch* pd = nullptr;
-        if (FAILED(CoCreateInstance(clsid, nullptr,
-                                    CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
-                                    IID_IUnknown, (void**)&punk)) ||
-            !punk)
+        if (a.size() > 2 && a[2].t == Value::TableT && a[2].tab)
         {
-            Interp* it = g_interpCurrent;
-            if (it)
-                *it->err = L"com.CreateEmbed: 创建失败 " + progId;
-            return Value();
+            auto itObj = a[2].tab->map.find(L"_object");
+            if (itObj != a[2].tab->map.end())
+            {
+                if (itObj->second.t == Value::Pointer && itObj->second.ptr)
+                {
+                    punk = (IUnknown*)itObj->second.ptr;
+                    punk->AddRef();
+                }
+                else if (itObj->second.t == Value::TableT && itObj->second.tab)
+                {
+                    auto itSub = itObj->second.tab->map.find(L"_object");
+                    if (itSub != itObj->second.tab->map.end() && itSub->second.t == Value::Pointer && itSub->second.ptr)
+                    {
+                        punk = (IUnknown*)itSub->second.ptr;
+                        punk->AddRef();
+                    }
+                }
+            }
         }
-        if (SUCCEEDED(punk->QueryInterface(IID_IDispatch, (void**)&pd)) &&
-            pd)
+
+        if (!punk)
+        {
+            wstring progId = (a.size() > 2 && a[2].t == Value::Str) ? BStr(a[2]) : L"";
+            if (progId.empty())
+                progId = L"Shell.Explorer";
+            CLSID clsid{};
+            if (progId.size() > 1 && progId[0] == L'{')
+                IIDFromString(progId.c_str(), &clsid);
+            else if (FAILED(CLSIDFromProgID(progId.c_str(), &clsid)))
+            {
+                Interp* it = g_interpCurrent;
+                if (it)
+                    *it->err = L"com.CreateEmbed: 未找到 ProgID " + progId;
+                return Value();
+            }
+            if (FAILED(CoCreateInstance(clsid, nullptr,
+                                        CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
+                                        IID_IUnknown, (void**)&punk)) ||
+                !punk)
+            {
+                Interp* it = g_interpCurrent;
+                if (it)
+                    *it->err = L"com.CreateEmbed: 创建失败 " + progId;
+                return Value();
+            }
+        }
+
+        HWND hwndHost = nullptr;
+        if (a.size() > 1 && a[1].t == Value::TableT && a[1].tab)
+        {
+            auto itH = a[1].tab->map.find(L"hwnd");
+            if (itH != a[1].tab->map.end())
+            {
+                if (itH->second.t == Value::Pointer)
+                    hwndHost = (HWND)itH->second.ptr;
+                else if (itH->second.t == Value::Num)
+                    hwndHost = (HWND)(INT_PTR)itH->second.n;
+            }
+        }
+
+        IUnknown* pContainer = nullptr;
+        if (hwndHost && IsWindow(hwndHost))
+        {
+            EnsureAtl();
+            if (s_pfnAtlAxAttachControl)
+            {
+                s_pfnAtlAxAttachControl(punk, hwndHost, &pContainer);
+            }
+        }
+
+        IDispatch* pd = nullptr;
+        if (SUCCEEDED(punk->QueryInterface(IID_IDispatch, (void**)&pd)) && pd)
         {
             embed->map[L"_object"] = WrapDispatch(pd);
-            punk->Release();
+            pd->Release();
         }
         else
         {
             embed->map[L"_object"] = Value::Pointer_((void*)punk);
         }
-        // minimal OLE host: official embedObject._host.close() /
-        // tranacc() get real implementations with full CAxHost support;
-        // these stubs keep the embed chain runnable
+
+        if (a.size() > 1)
+        {
+            embed->map[L"_form"] = a[1];
+        }
+
         auto host = std::make_shared<Table>();
-        host->map[L"close"] = NF([](vector<Value>&) -> Value {
+        host->map[L"close"] = NF([pContainer, punk](vector<Value>&) -> Value {
+            if (pContainer) pContainer->Release();
+            if (punk) punk->Release();
             return Value();
         });
-        host->map[L"tranacc"] = NF([](vector<Value>&) -> Value {
+        host->map[L"tranacc"] = NF([punk](vector<Value>& aMsg) -> Value {
+            if (!punk || aMsg.empty()) return Value::Bool_(false);
+            IOleInPlaceActiveObject* pActive = nullptr;
+            if (SUCCEEDED(punk->QueryInterface(IID_IOleInPlaceActiveObject, (void**)&pActive)) && pActive)
+            {
+                MSG msg{};
+                if (aMsg[0].t == Value::TableT && aMsg[0].tab)
+                {
+                    msg.hwnd = (HWND)(INT_PTR)BNum(aMsg[0].tab->map[L"hwnd"]);
+                    msg.message = (UINT)BNum(aMsg[0].tab->map[L"message"]);
+                    msg.wParam = (WPARAM)(INT_PTR)BNum(aMsg[0].tab->map[L"wParam"]);
+                    msg.lParam = (LPARAM)(INT_PTR)BNum(aMsg[0].tab->map[L"lParam"]);
+                }
+                HRESULT hr = pActive->TranslateAcceleratorW(&msg);
+                pActive->Release();
+                return Value::Bool_(hr == S_OK);
+            }
+            return Value::Bool_(false);
+        });
+        host->map[L"adjust"] = NF([hwndHost](vector<Value>&) -> Value {
+            if (hwndHost && IsWindow(hwndHost))
+            {
+                RECT rc;
+                GetClientRect(hwndHost, &rc);
+                HWND hChild = GetWindow(hwndHost, GW_CHILD);
+                if (hChild)
+                {
+                    SetWindowPos(hChild, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+                                 SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
+            return Value();
+        });
+        host->map[L"_adjust"] = host->map[L"adjust"];
+        host->map[L"doObjectVerb"] = NF([punk, hwndHost](vector<Value>& aV) -> Value {
+            LONG verb = aV.empty() ? OLEIVERB_SHOW : (LONG)BNum(aV[0]);
+            IOleObject* pOle = nullptr;
+            if (punk && SUCCEEDED(punk->QueryInterface(IID_IOleObject, (void**)&pOle)) && pOle)
+            {
+                RECT rc{};
+                if (hwndHost && IsWindow(hwndHost)) GetClientRect(hwndHost, &rc);
+                pOle->DoVerb(verb, nullptr, nullptr, 0, hwndHost, &rc);
+                pOle->Release();
+            }
             return Value();
         });
         embed->map[L"_host"] = Value::Table_(host);

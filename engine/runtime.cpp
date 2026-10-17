@@ -208,6 +208,12 @@ Value Interp::Eval(const PNode& n, Env* env)
                         if (itThis != e->vars.end() && itThis->second.t != Value::Null)
                             f.thisVal = std::make_shared<Value>(itThis->second);
                     }
+                    if (!f.ownerVal)
+                    {
+                        auto itOwner = e->vars.find(L"owner");
+                        if (itOwner != e->vars.end() && itOwner->second.t != Value::Null)
+                            f.ownerVal = std::make_shared<Value>(itOwner->second);
+                    }
                     if (!f.nsClosure && e->nsTable && !e->bNsInst)
                     {
                         f.nsClosure = e->nsTable;
@@ -842,34 +848,43 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                         if (im0 != obj.tab->map.end() &&
                             im0->second.t == Value::TableT && im0->second.tab)
                         {
+                            bool hasMetaGet = false;
                             auto ia = im0->second.tab->map.find(key);
                             if (ia != im0->second.tab->map.end() &&
                                 ia->second.t == Value::TableT && ia->second.tab)
                             {
                                 auto ig = ia->second.tab->map.find(L"_get");
                                 if (ig != ia->second.tab->map.end() &&
-                                    (ig->second.t == Value::Func ||
-                                     ig->second.native))
+                                    (ig->second.t == Value::Func || ig->second.native))
+                                    hasMetaGet = true;
+                            }
+                            if (!hasMetaGet)
+                            {
+                                auto ig0 = im0->second.tab->map.find(L"_get");
+                                if (ig0 != im0->second.tab->map.end() &&
+                                    (ig0->second.t == Value::Func || ig0->second.native))
+                                    hasMetaGet = true;
+                            }
+                            if (hasMetaGet)
+                            {
+                                bool bErr = false;
+                                wstring strErrM;
+                                Value r;
+                                if (MetaGet(obj, keyVal, &r, &bErr,
+                                            &strErrM, ownerCallMode))
                                 {
-                                    bool bErr = false;
-                                    wstring strErrM;
-                                    Value r;
-                                    if (MetaGet(obj, keyVal, &r, &bErr,
-                                                &strErrM, ownerCallMode))
-                                    {
-                                        if (r.t != Value::Null)
-                                            return r;
-                                        auto itRaw = obj.tab->map.find(key);
-                                        if (itRaw != obj.tab->map.end() && itRaw->second.t != Value::Null)
-                                            return itRaw->second;
+                                    if (r.t != Value::Null)
                                         return r;
-                                    }
-                                    if (bErr)
-                                    {
-                                        if (err->empty())
-                                            (*err) = L"\u8fd0\u884c\u9519\u8bef: " + strErrM;
-                                        return Value();
-                                    }
+                                    auto itRaw = obj.tab->map.find(key);
+                                    if (itRaw != obj.tab->map.end() && itRaw->second.t != Value::Null)
+                                        return itRaw->second;
+                                    return r;
+                                }
+                                if (bErr)
+                                {
+                                    if (err->empty())
+                                        (*err) = L"运行错误: " + strErrM;
+                                    return Value();
                                 }
                             }
                         }
@@ -1446,7 +1461,10 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             {
                 if (f.thisVal)
                     local->vars[L"this"] = *f.thisVal;
-                local->vars[L"owner"] = Value();
+                if (f.ownerVal)
+                    local->vars[L"owner"] = *f.ownerVal;
+                else
+                    local->vars[L"owner"] = Value();
             }
             for (size_t i = 0; i < f.params.size(); i++)
             {

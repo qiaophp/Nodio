@@ -92,6 +92,7 @@ namespace NodioVM
         shared_ptr<vector<Value>> mrets;      // aardio extra return values
         bool bDots = false;             // `...` packed value: mrets holds ALL varargs
         shared_ptr<Value> thisVal;            // lexical this captured at function definition
+        shared_ptr<Value> ownerVal;           // lexical owner captured at function definition
         // native builtin (round 19): C++-backed callable surfaced as a Func
         using NativeFn = std::function<Value(std::vector<Value>&)>;
         NativeFn native;
