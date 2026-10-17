@@ -161,6 +161,11 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     if (i) relT += L"\\";
                     relT += n->names[i];
                 }
+                bool bLibFile =
+                    Exists(LibCand(relT, false, L"aardio")) ||
+                    Exists(LibCand(relT, false, L"nodio")) ||
+                    Exists(LibCand(relT, true, L"aardio")) ||
+                    Exists(LibCand(relT, true, L"nodio"));
                 bool bAnyFile =
                     Exists(baseDir.empty() ? relT + L".aardio"
                                            : baseDir + L"\\" + relT + L".aardio") ||
@@ -170,10 +175,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                                            : baseDir + L"\\" + relT + L"\\_.aardio") ||
                     Exists(baseDir.empty() ? relT + L"\\_.nodio"
                                            : baseDir + L"\\" + relT + L"\\_.nodio") ||
-                    Exists(LibCand(relT, false, L"aardio")) ||
-                    Exists(LibCand(relT, false, L"nodio")) ||
-                    Exists(LibCand(relT, true, L"aardio")) ||
-                    Exists(LibCand(relT, true, L"nodio"));
+                    bLibFile;
                 // 0) engine-provided modules with no backing file
                 if (n->names.size() == 1)
                 {
@@ -186,16 +188,30 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 {
                     wstring full2;
                     for (size_t i = 0; i < n->names.size(); ++i) { if (i) full2 += L"."; full2 += n->names[i]; }
-                    fwprintf(stderr, L"[IMPORT] %s inRoots=%d anyFile=%d\n", full2.c_str(),
-                             (int)roots.count(n->names[0]), (int)bAnyFile);
+                    fwprintf(stderr, L"[IMPORT] %s inRoots=%d anyFile=%d libFile=%d\n", full2.c_str(),
+                             (int)roots.count(n->names[0]), (int)bAnyFile, (int)bLibFile);
                     fflush(stderr);
                 }
+                bool bSkipShadow = false;
+                static const std::unordered_set<wstring> s_coreBuiltins = {
+                    L"time", L"string", L"math", L"table", L"raw", L"thread", L"io", L"fiber"
+                };
+                if (n->names.size() == 1 && s_coreBuiltins.count(n->names[0]) && !strLibDir.empty())
+                {
+                    // Core language builtin should only be shadowed by official lib, not local baseDir file
+                    bSkipShadow = !bLibFile;
+                }
+                else
+                {
+                    bSkipShadow = !bAnyFile;
+                }
+
                 if (roots.count(n->names[0]) &&
                     !embedded.count(relT + L".aardio") &&
                     !embedded.count(relT + L"\\_.aardio") &&
                     !embedded.count(relT + L".nodio") &&
                     !embedded.count(relT + L"\\_.nodio") &&
-                    !bAnyFile)
+                    bSkipShadow)
                     return roots[n->names[0]];
             }
             // 2) file module: baseDir\a\b\c.aardio for `import a.b.c`

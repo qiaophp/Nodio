@@ -147,17 +147,6 @@ namespace NodioVM
     // Transform aardio template syntax (<? ... ?> and ?> raw text <? / <?= expr ?>) into pure aardio code calling print(...)
     static wstring PreprocessTemplate(const wstring& src)
     {
-        // Check if template syntax is present
-        size_t pQ = src.find(L"?>");
-        size_t pO = src.find(L"<?");
-        if (pQ == wstring::npos && pO == wstring::npos)
-            return src;
-
-        wstring out;
-        size_t pos = 0;
-        size_t n = src.size();
-        bool inCode = true;
-
         auto escapeRawString = [](const wstring& s) -> wstring {
             wstring esc;
             esc.reserve(s.size() + 10);
@@ -172,6 +161,56 @@ namespace NodioVM
             esc += L"`";
             return esc;
         };
+
+        // Check if template syntax is present
+        size_t pQ = src.find(L"?>");
+        size_t pO = src.find(L"<?");
+        if (pQ == wstring::npos && pO == wstring::npos)
+        {
+            // If it starts with an HTML-like tag (e.g. <!DOCTYPE, <html>), treat as raw HTML template
+            size_t firstNonWs = 0;
+            while (firstNonWs < src.size() && iswspace(src[firstNonWs])) firstNonWs++;
+            if (firstNonWs < src.size() && src[firstNonWs] == L'<')
+            {
+                wstring head = src.substr(firstNonWs, 15);
+                for (auto& c : head) c = towlower(c);
+                if (head.find(L"<!doctype") == 0 || head.find(L"<html") == 0 ||
+                    head.find(L"<head") == 0 || head.find(L"<body") == 0 ||
+                    head.find(L"<!--") == 0 || head.find(L"<div") == 0 ||
+                    head.find(L"<table") == 0 || head.find(L"<span") == 0)
+                {
+                    return L"..print(" + escapeRawString(src) + L");\n";
+                }
+            }
+            return src;
+        }
+
+        wstring out;
+        size_t pos = 0;
+        size_t n = src.size();
+
+        // Skip leading whitespace to inspect template opening
+        size_t firstNonWs = 0;
+        while (firstNonWs < n && iswspace(src[firstNonWs])) firstNonWs++;
+
+        bool inCode = false;
+        if (firstNonWs + 1 < n && src[firstNonWs] == L'<' && src[firstNonWs + 1] == L'?')
+        {
+            inCode = true;
+            pos = firstNonWs + 2;
+            if (pos + 6 <= n && src.compare(pos, 6, L"aardio") == 0)
+                pos += 6;
+        }
+        else if (firstNonWs + 1 < n && src[firstNonWs] == L'?' && src[firstNonWs + 1] == L'>')
+        {
+            inCode = false;
+            pos = firstNonWs + 2;
+        }
+        else
+        {
+            inCode = false;
+            pos = 0;
+        }
 
         while (pos < n)
         {
@@ -2942,6 +2981,57 @@ void Interp::InitBuiltins()
                     if (!na.empty() && na[0].t == Value::Num) na[0] = Value::Num_(BNum(na[0]) * 86400);
                     else if (na.size() > 1 && na[1].t == Value::Num) na[1] = Value::Num_(BNum(na[1]) * 86400);
                     return addSecondsFunc.native(na);
+                });
+                auto addMonthsFunc = NF([getSelf](vector<Value>& a) -> Value {
+                    Value self = getSelf(a);
+                    if (!self.tab) return self;
+                    long long n = 0;
+                    if (!a.empty()) {
+                        if (a[0].t == Value::Num) n = (long long)BNum(a[0]);
+                        else if (a.size() > 1 && a[1].t == Value::Num) n = (long long)BNum(a[1]);
+                    }
+                    long long curY = (long long)BNum(self.tab->map[L"year"]);
+                    long long curM = (long long)BNum(self.tab->map[L"month"]);
+                    long long curD = (long long)BNum(self.tab->map[L"day"]);
+                    long long totalM = curY * 12 + (curM - 1) + n;
+                    long long newY = totalM / 12;
+                    long long newM = totalM % 12 + 1;
+                    if (newM <= 0) {
+                        newM += 12;
+                        newY--;
+                    }
+                    int daysInMonth[] = { 0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+                    if ((newY % 4 == 0 && newY % 100 != 0) || (newY % 400 == 0))
+                        daysInMonth[2] = 29;
+                    if (curD > daysInMonth[newM]) curD = daysInMonth[newM];
+                    self.tab->map[L"year"] = Value::Num_((double)newY);
+                    self.tab->map[L"month"] = Value::Num_((double)newM);
+                    self.tab->map[L"day"] = Value::Num_((double)curD);
+                    tm tmb{};
+                    tmb.tm_year = (int)newY - 1900;
+                    tmb.tm_mon = (int)newM - 1;
+                    tmb.tm_mday = (int)curD;
+                    tmb.tm_hour = (int)(long long)BNum(self.tab->map[L"hour"]);
+                    tmb.tm_min = (int)(long long)BNum(self.tab->map[L"minute"]);
+                    tmb.tm_sec = (int)(long long)BNum(self.tab->map[L"second"]);
+                    mktime(&tmb);
+                    self.tab->map[L"dayofweek"] = Value::Num_(tmb.tm_wday);
+                    return self;
+                });
+                timeMeta->map[L"addMonths"] = addMonthsFunc;
+                timeMeta->map[L"diffMonths"] = NF([getSelf](vector<Value>& a) -> Value {
+                    Value self = getSelf(a);
+                    Value other;
+                    if (!a.empty()) {
+                        if (a[0].t == Value::TableT && a[0].tab != self.tab) other = a[0];
+                        else if (a.size() > 1 && a[1].t == Value::TableT) other = a[1];
+                    }
+                    if (!self.tab || !other.tab) return Value::Num_(0);
+                    long long y1 = (long long)BNum(self.tab->map[L"year"]);
+                    long long m1 = (long long)BNum(self.tab->map[L"month"]);
+                    long long y2 = (long long)BNum(other.tab->map[L"year"]);
+                    long long m2 = (long long)BNum(other.tab->map[L"month"]);
+                    return Value::Num_((double)((y1 - y2) * 12 + (m1 - m2)));
                 });
                 timeMeta->map[L"diffSeconds"] = NF([getSelf](vector<Value>& a) -> Value {
                     Value self = getSelf(a);
