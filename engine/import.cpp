@@ -151,31 +151,67 @@ Value Interp::DoImport(const PNode& n, Env* env)
             {
                 return !p.empty() && _waccess(p.c_str(), 0) == 0;
             };
+
+            vector<wstring> relCands;
+            for (size_t p = 0; p < n->names.size(); ++p)
+            {
+                wstring cand;
+                for (size_t i = 0; i < p; ++i)
+                {
+                    if (i > 0) cand += L"\\";
+                    cand += n->names[i];
+                }
+                wstring filePart;
+                for (size_t i = p; i < n->names.size(); ++i)
+                {
+                    if (i > p) filePart += L".";
+                    filePart += n->names[i];
+                }
+                if (!cand.empty()) cand += L"\\";
+                cand += filePart;
+                relCands.push_back(cand);
+            }
+            {
+                wstring folderCand;
+                for (size_t i = 0; i < n->names.size(); ++i)
+                {
+                    if (i > 0) folderCand += L"\\";
+                    folderCand += n->names[i];
+                }
+                folderCand += L"\\_";
+                relCands.push_back(folderCand);
+            }
+
             // 1) pre-bound builtin namespaces resolve immediately —
             // but a matching lib FILE merges into the namespace first
             // (aardio: import X loads lib source into namespace X)
             {
-                wstring relT;
-                for (size_t i = 0; i < n->names.size(); i++)
+                bool bLibFile = false;
+                if (!strLibDir.empty())
                 {
-                    if (i) relT += L"\\";
-                    relT += n->names[i];
+                    for (const auto& rc : relCands)
+                    {
+                        if (Exists(strLibDir + L"\\" + rc + L".aardio") ||
+                            Exists(strLibDir + L"\\" + rc + L".nodio"))
+                        {
+                            bLibFile = true;
+                            break;
+                        }
+                    }
                 }
-                bool bLibFile =
-                    Exists(LibCand(relT, false, L"aardio")) ||
-                    Exists(LibCand(relT, false, L"nodio")) ||
-                    Exists(LibCand(relT, true, L"aardio")) ||
-                    Exists(LibCand(relT, true, L"nodio"));
-                bool bAnyFile =
-                    Exists(baseDir.empty() ? relT + L".aardio"
-                                           : baseDir + L"\\" + relT + L".aardio") ||
-                    Exists(baseDir.empty() ? relT + L".nodio"
-                                           : baseDir + L"\\" + relT + L".nodio") ||
-                    Exists(baseDir.empty() ? relT + L"\\_.aardio"
-                                           : baseDir + L"\\" + relT + L"\\_.aardio") ||
-                    Exists(baseDir.empty() ? relT + L"\\_.nodio"
-                                           : baseDir + L"\\" + relT + L"\\_.nodio") ||
-                    bLibFile;
+                bool bAnyFile = bLibFile;
+                if (!bAnyFile && !baseDir.empty())
+                {
+                    for (const auto& rc : relCands)
+                    {
+                        if (Exists(baseDir + L"\\" + rc + L".aardio") ||
+                            Exists(baseDir + L"\\" + rc + L".nodio"))
+                        {
+                            bAnyFile = true;
+                            break;
+                        }
+                    }
+                }
                 // 0) engine-provided modules with no backing file
                 if (n->names.size() == 1)
                 {
@@ -206,11 +242,19 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     bSkipShadow = !bAnyFile;
                 }
 
+                bool bEmbedded = false;
+                for (const auto& rc : relCands)
+                {
+                    if (embedded.count(rc + L".aardio") ||
+                        embedded.count(rc + L".nodio"))
+                    {
+                        bEmbedded = true;
+                        break;
+                    }
+                }
+
                 if (roots.count(n->names[0]) &&
-                    !embedded.count(relT + L".aardio") &&
-                    !embedded.count(relT + L"\\_.aardio") &&
-                    !embedded.count(relT + L".nodio") &&
-                    !embedded.count(relT + L"\\_.nodio") &&
+                    !bEmbedded &&
                     bSkipShadow)
                     return roots[n->names[0]];
             }
@@ -239,47 +283,34 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 }
             }
 
-            // 3) file module: baseDir\a\b\c.aardio for `import a.b.c`
-            wstring rel;
-            for (size_t i = 0; i < n->names.size(); i++)
-            {
-                if (i) rel += L"\\";
-                rel += n->names[i];
-            }
-            // candidate priority: baseDir first, then the lib root;
-            // within a root: rel\_.aardio > rel.aardio >
-            //                rel\_.nodio > rel.nodio
+            // 3) file module: check lib root first, then baseDir
+            // candidates follow official hierarchical partition order (e.g. chrome\edge.history.aardio)
             wstring file;
+            if (!strLibDir.empty())
             {
-                wstring c0 = baseDir.empty() ? wstring()
-                    : baseDir + L"\\" + rel + L"\\_.aardio";
-                wstring c1 = baseDir.empty() ? wstring()
-                    : baseDir + L"\\" + rel + L".aardio";
-                wstring c2 = baseDir.empty() ? wstring()
-                    : baseDir + L"\\" + rel + L"\\_.nodio";
-                wstring c3 = baseDir.empty() ? wstring()
-                    : baseDir + L"\\" + rel + L".nodio";
-                // official aardio: a plain `import x.y` resolves against
-                // the LIB root, never the script's own directory — the
-                // examples tree contains sample files that shadow lib
-                // module names (e.g. examples\Console\console.aardio);
-                // baseDir stays as a fallback only for projects with no
-                // lib root (publisher layout)
-                if (Exists(LibCand(rel, true, L"aardio")))
-                    file = LibCand(rel, true, L"aardio");
-                else if (Exists(LibCand(rel, false, L"aardio")))
-                    file = LibCand(rel, false, L"aardio");
-                else if (Exists(LibCand(rel, true, L"nodio")))
-                    file = LibCand(rel, true, L"nodio");
-                else if (Exists(LibCand(rel, false, L"nodio")))
-                    file = LibCand(rel, false, L"nodio");
-                else if (Exists(c0)) file = c0;
-                else if (Exists(c1)) file = c1;
-                else if (Exists(c2)) file = c2;
-                else if (Exists(c3)) file = c3;
-                else
-                    file = baseDir.empty() ? rel + L".aardio"
-                                           : baseDir + L"\\" + rel + L".aardio";
+                for (const auto& rc : relCands)
+                {
+                    wstring candA = strLibDir + L"\\" + rc + L".aardio";
+                    if (Exists(candA)) { file = candA; break; }
+                    wstring candN = strLibDir + L"\\" + rc + L".nodio";
+                    if (Exists(candN)) { file = candN; break; }
+                }
+            }
+            if (file.empty() && !baseDir.empty())
+            {
+                for (const auto& rc : relCands)
+                {
+                    wstring candA = baseDir + L"\\" + rc + L".aardio";
+                    if (Exists(candA)) { file = candA; break; }
+                    wstring candN = baseDir + L"\\" + rc + L".nodio";
+                    if (Exists(candN)) { file = candN; break; }
+                }
+            }
+            if (file.empty())
+            {
+                wstring defRel = relCands.empty() ? L"" : relCands.back();
+                file = baseDir.empty() ? (defRel + L".aardio")
+                                       : (baseDir + L"\\" + defRel + L".aardio");
             }
             static bool bDbg = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
             if (bDbg)
@@ -297,13 +328,14 @@ Value Interp::DoImport(const PNode& n, Env* env)
             // (published exe: libEmbed closure ships under lib-relative
             // keys — "win\_.aardio" — so try both lib layouts, both
             // extensions)
-            auto itE = embedded.find(rel + L".aardio");
-            if (itE == embedded.end())
-                itE = embedded.find(rel + L"\\_.aardio");
-            if (itE == embedded.end())
-                itE = embedded.find(rel + L".nodio");
-            if (itE == embedded.end())
-                itE = embedded.find(rel + L"\\_.nodio");
+            auto itE = embedded.end();
+            for (const auto& rc : relCands)
+            {
+                auto itCand = embedded.find(rc + L".aardio");
+                if (itCand != embedded.end()) { itE = itCand; break; }
+                itCand = embedded.find(rc + L".nodio");
+                if (itCand != embedded.end()) { itE = itCand; break; }
+            }
             if (itE != embedded.end())
             {
                 wstring src = itE->second;
@@ -456,13 +488,19 @@ Value Interp::DoImport(const PNode& n, Env* env)
             {
                 // pure-namespace import: no <name>.aardio / _\_.aardio
                 // but a submodule folder exists (com/, util/...) in baseDir or strLibDir
-                wstring dirCand = file.substr(0, file.size() - 7);
+                wstring relDir;
+                for (size_t i = 0; i < n->names.size(); i++)
+                {
+                    if (i) relDir += L"\\";
+                    relDir += n->names[i];
+                }
+                wstring dirCand = baseDir.empty() ? relDir : baseDir + L"\\" + relDir;
                 DWORD attr = GetFileAttributesW(dirCand.c_str());
                 if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
                 {
                     if (!strLibDir.empty())
                     {
-                        wstring dirLib = strLibDir + L"\\" + rel;
+                        wstring dirLib = strLibDir + L"\\" + relDir;
                         attr = GetFileAttributesW(dirLib.c_str());
                     }
                 }
