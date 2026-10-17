@@ -1544,6 +1544,90 @@ void Interp::InitBuiltins()
                 };
                 tb->map[L"gsub"] = NF(doReplace);
                 tb->map[L"replace"] = NF(doReplace);
+                tb->map[L"replaceLiteral"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value::Str_(L"");
+                    wstring s = BStr(a[0]);
+                    if (a.size() < 2) return Value::Str_(s);
+
+                    auto replaceOnce = [](const wstring& src, const wstring& f, const wstring& r, int limit, int& totalCount) -> wstring {
+                        if (limit == 0) return src;
+                        if (f.empty()) {
+                            wstring out;
+                            out += r;
+                            for (size_t i = 0; i < src.size(); i++) {
+                                out += src[i];
+                                out += r;
+                                totalCount++;
+                                if (limit > 0 && totalCount >= limit) {
+                                    out += src.substr(i + 1);
+                                    break;
+                                }
+                            }
+                            return out;
+                        }
+                        wstring out;
+                        size_t pos = 0;
+                        int c = 0;
+                        while (pos < src.size()) {
+                            if (limit > 0 && c >= limit) {
+                                out += src.substr(pos);
+                                break;
+                            }
+                            size_t found = src.find(f, pos);
+                            if (found == wstring::npos) {
+                                out += src.substr(pos);
+                                break;
+                            }
+                            out += src.substr(pos, found - pos);
+                            out += r;
+                            pos = found + f.size();
+                            c++;
+                        }
+                        totalCount += c;
+                        return out;
+                    };
+
+                    int count = 0;
+                    if (a[1].t == Value::TableT && a[1].tab) {
+                        int tableLimit = (a.size() > 2 && a[2].t == Value::Num) ? (int)a[2].n : -1;
+                        if (a.size() > 2 && tableLimit <= 0) {
+                            Value vOut = Value::Str_(s);
+                            auto ex = std::make_shared<vector<Value>>();
+                            ex->push_back(Value::Num_(0));
+                            vOut.mrets = ex;
+                            return vOut;
+                        }
+                        wstring cur = s;
+                        for (auto& kv : a[1].tab->map) {
+                            int subCount = 0;
+                            cur = replaceOnce(cur, kv.first, BStr(kv.second), tableLimit, subCount);
+                            count += subCount;
+                        }
+                        Value vOut = Value::Str_(cur);
+                        auto ex = std::make_shared<vector<Value>>();
+                        ex->push_back(Value::Num_((double)count));
+                        vOut.mrets = ex;
+                        return vOut;
+                    }
+
+                    int limit = (a.size() > 3 && a[3].t == Value::Num) ? (int)a[3].n : -1;
+                    if (a.size() > 3 && limit <= 0) {
+                        Value vOut = Value::Str_(s);
+                        auto ex = std::make_shared<vector<Value>>();
+                        ex->push_back(Value::Num_(0));
+                        vOut.mrets = ex;
+                        return vOut;
+                    }
+
+                    wstring f = BStr(a[1]);
+                    wstring r = a.size() > 2 ? BStr(a[2]) : L"";
+                    wstring out = replaceOnce(s, f, r, limit, count);
+                    Value vOut = Value::Str_(out);
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Num_((double)count));
+                    vOut.mrets = ex;
+                    return vOut;
+                });
                 tb->map[L"split"] = NF([](vector<Value>& a) {
                     wstring s = BStr(a[0]), d = a.size() > 1 ? BStr(a[1]) : L",";
                     auto tb2 = std::make_shared<Table>();
