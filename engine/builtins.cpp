@@ -2947,6 +2947,33 @@ void Interp::InitBuiltins()
                     fwrite(out3.data(), 1, out3.size(), pf);
                     fclose(pf);
                     return Value::Bool_(true); });
+                tb->map[L"getText"] = NF([](vector<Value>& a) -> Value {
+                    int maxLen = (a.size() > 0 && a[0].t == Value::Num) ? (int)a[0].n : 1024;
+                    if (maxLen <= 0) maxLen = 1024;
+                    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+                    DWORD mode = 0;
+                    if (hIn && GetConsoleMode(hIn, &mode))
+                    {
+                        std::vector<wchar_t> buf(maxLen + 1, 0);
+                        DWORD charsRead = 0;
+                        if (ReadConsoleW(hIn, buf.data(), (DWORD)maxLen, &charsRead, nullptr) && charsRead > 0)
+                        {
+                            wstring s(buf.data(), charsRead);
+                            while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n'))
+                                s.pop_back();
+                            return Value::Str_(s);
+                        }
+                    }
+                    std::vector<wchar_t> buf(maxLen + 1, 0);
+                    if (fgetws(buf.data(), maxLen, stdin))
+                    {
+                        wstring s(buf.data());
+                        while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n'))
+                            s.pop_back();
+                        return Value::Str_(s);
+                    }
+                    return Value::Str_(L"");
+                });
             }
             // ---- console ----
             {
