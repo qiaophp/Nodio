@@ -57,7 +57,7 @@ namespace NodioVM
     inline const wchar_t* const KEYWORDS[] = {
         L"var", L"function", L"if", L"else", L"elseif", L"while", L"for",
         L"in", L"break", L"continue", L"return", L"null", L"true", L"false",
-        L"and", L"or", L"not", L"do", L"end", L"import", L"namespace",
+        L"and", L"or", L"not", L"do", L"import", L"namespace",
         L"try", L"catch", L"class", L"lambda", L"λ", L"select", L"case", L"with",
         nullptr
     };
@@ -238,11 +238,12 @@ namespace NodioVM
         static const wchar_t* const kTypes[] = {
             L"int", L"INT", L"uint", L"UINT", L"byte", L"BYTE", L"word", L"WORD",
             L"dword", L"DWORD", L"long", L"LONG", L"int64", L"INT64", L"uint64", L"UINT64", L"long64",
-            L"pointer", L"PTR", L"ptr", L"PTR", L"addr", L"ADDR", L"ustring",
+            L"int16", L"INT16", L"uint16", L"UINT16", L"int32", L"INT32", L"uint32", L"UINT32",
+            L"pointer", L"PTR", L"ptr", L"addr", L"ADDR", L"ustring",
             L"string", L"bool", L"BOOL", L"float", L"FLOAT", L"double", L"DOUBLE",
             L"struct", L"ustr", L"bstr", L"wstr", L"lpcstr", L"lpwstr",
             L"short", L"SHORT", L"ushort", L"USHORT", L"wchar", L"char", L"CHAR",
-            L"uchar", L"UCHAR", L"int8", L"i64", L"qword", L"handle",
+            L"uchar", L"UCHAR", L"int8", L"INT8", L"uint8", L"UINT8", L"i64", L"qword", L"handle",
             L"hwnd", L"hkey", L"lpvoid", L"strb",
             nullptr };
         for (int k = 0; kTypes[k]; k++)

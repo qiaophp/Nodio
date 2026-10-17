@@ -187,6 +187,25 @@ int wmain(int argc, wchar_t** argv)
         return nFail ? 1 : 0;
     }
 
+    // support `-e "code"` one-liner execution
+    if (argc > 2 && wcscmp(argv[1], L"-e") == 0)
+    {
+        wchar_t szCon[8];
+        bool bForceConsole =
+            GetEnvironmentVariableW(L"NODIO_CONSOLE", szCon, 8) > 0 &&
+            szCon[0] == L'1';
+        EnsureConsole(bForceConsole);
+
+        std::wstring src = argv[2];
+        std::wstring strDir = L"";
+        std::wstring strErr;
+        NodioVM::RunSource(src, &strErr, &strDir, nullptr, false, nullptr);
+        if (!strErr.empty())
+            WriteStderrUtf8(strErr);
+        fflush(stdout);
+        return strErr.empty() ? 0 : 1;
+    }
+
     // a script path as the first command-line argument runs it directly
     // (aardio.exe behaviour): forward it into the NODIO_RUN harness below.
     // The self-hosted IDE's F5 spawns `nodio.exe <script>` and streams the

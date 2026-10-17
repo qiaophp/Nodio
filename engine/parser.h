@@ -312,11 +312,24 @@ namespace NodioVM
                         n->bRoot = true;
                     }
                     n->names.push_back(ExpectIdent());
-                    while (IsPunct(L".") &&
-                           (Peek(1).t == TIdent || Peek(1).t == TKw))
+                    while (true)
                     {
-                        p++;
-                        n->names.push_back(Next().text);
+                        if (IsPunct(L".") && (Peek(1).t == TIdent || Peek(1).t == TKw))
+                        {
+                            p++;
+                            n->names.push_back(Next().text);
+                        }
+                        else if (IsPunct(L"[") && (Peek(1).t == TStr || Peek(1).t == TNum))
+                        {
+                            p++;
+                            Tok tk = Next();
+                            n->names.push_back(tk.text);
+                            Expect(L"]");
+                        }
+                        else
+                        {
+                            break;
+                        }
                     }
                     // aardio: 'namespace a.b;' or 'namespace a.b\n' (newline/EOF/non-brace)
                     // scopes the rest of the file
@@ -2430,16 +2443,7 @@ namespace NodioVM
                         key->str = Peek().text;
                         p += 2;
                         n->list.push_back(key);
-                        if (bColonPair)
-                        {
-                            // colon value must not eat the next pair
-                            bool bOld = bNoCoalesce;
-                            bNoCoalesce = true;
-                            n->list.push_back(ParseExpr());
-                            bNoCoalesce = bOld;
-                        }
-                        else
-                            n->list.push_back(ParseExpr());
+                        n->list.push_back(ParseExpr());
                     }
                     else if (IsPunct(L"["))
                     {
@@ -2455,15 +2459,7 @@ namespace NodioVM
                         else
                             Expect(L"=");
                         n->list.push_back(key);
-                        if (bColonPair)
-                        {
-                            bool bOld = bNoCoalesce;
-                            bNoCoalesce = true;
-                            n->list.push_back(ParseExpr());
-                            bNoCoalesce = bOld;
-                        }
-                        else
-                            n->list.push_back(ParseExpr());
+                        n->list.push_back(ParseExpr());
                     }
                     else
                     {
