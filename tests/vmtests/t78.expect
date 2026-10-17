@@ -1,0 +1,6 @@
+has QueryInterface:true
+has AddRef:true
+has Release:true
+has MethodA:true
+has MethodB:true
+_struct valid:true

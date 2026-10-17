@@ -1,0 +1,22 @@
+// t78: struct layout inheritance and vtable interface slot preservation
+class BaseUnknown {
+    ptr QueryInterface = "int(struct iid,ptr &ptr)";
+    ptr AddRef = "int()";
+    ptr Release = "int()";
+}
+
+class DerivedInterface {
+    ctor() {
+        this = BaseUnknown();
+    };
+    ptr MethodA = "int()";
+    ptr MethodB = "int(int x)";
+}
+
+var obj = DerivedInterface();
+io.print("has QueryInterface:", type(obj.QueryInterface) == "string");
+io.print("has AddRef:", type(obj.AddRef) == "string");
+io.print("has Release:", type(obj.Release) == "string");
+io.print("has MethodA:", type(obj.MethodA) == "string");
+io.print("has MethodB:", type(obj.MethodB) == "string");
+io.print("_struct valid:", (string.indexOf(obj._struct, "QueryInterface") !== null) && (string.indexOf(obj._struct, "MethodB") !== null));

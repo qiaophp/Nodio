@@ -1325,6 +1325,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                             wstring strInst = (itI != vInst.tab->map.end() &&
                                                itI->second.t == Value::Str)
                                                   ? itI->second.s : L"";
+                            while (!strInst.empty() && strInst.back() == L';')
+                                strInst.pop_back();
                             // append only class members missing from the
                             // instance layout (dedupe by member name)
                             size_t pos = 0;
@@ -1351,6 +1353,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                                     strInst += L";";
                                 strInst += item;
                             }
+                            if (!strInst.empty()) strInst += L";";
                             vInst.tab->map[L"_struct"] = Value::Str_(strInst);
                         }
                     }
@@ -2101,7 +2104,24 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                         if (val.t == Value::Null)
                             obj.tab->map.erase(idx.ToString());
                         else
+                        {
+                            if (idx.ToString() == L"_struct" && val.t == Value::Str)
+                            {
+                                auto itCur = obj.tab->map.find(L"_struct");
+                                if (itCur != obj.tab->map.end() && itCur->second.t == Value::Str)
+                                {
+                                    wstring sCur = itCur->second.s;
+                                    wstring sVal = val.s;
+                                    if (!sCur.empty() && sCur.back() != L';') sCur += L';';
+                                    if (!sVal.empty() && sVal.back() != L';') sVal += L';';
+                                    if (sCur != sVal && sCur.find(sVal) != wstring::npos)
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
                             obj.tab->map[idx.ToString()] = val;
+                        }
                     }
                 }
             }
