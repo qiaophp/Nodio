@@ -34,7 +34,7 @@ target_compile_options(engine PRIVATE /utf-8)
 target_compile_definitions(engine PRIVATE
     _UNICODE UNICODE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(engine PUBLIC
-    user32 gdi32 kernel32 wininet ole32 oleaut32 uuid advapi32)
+    user32 gdi32 kernel32 wininet ole32 oleaut32 uuid advapi32 shlwapi)
 set_target_properties(engine PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 

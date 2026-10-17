@@ -22,5 +22,6 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <wininet.h>
 #include <olectl.h>

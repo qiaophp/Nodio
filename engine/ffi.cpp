@@ -447,8 +447,8 @@ namespace NodioVM
         if (!bIsArray) arrCount = 1;
         if (t == L"byte" || t == L"uchar" || t == L"char" || t == L"int8") return 1 * arrCount;
         if (t == L"word" || t == L"ushort" || t == L"short" || t == L"wchar") return 2 * arrCount;
-        if (t == L"int" || t == L"uint" || t == L"long" || t == L"dword" || t == L"bool") return 4 * arrCount;
-        if (t == L"int64" || t == L"uint64" || t == L"long64" || t == L"i64" || t == L"qword") return 8 * arrCount;
+        if (t == L"int" || t == L"uint" || t == L"dword" || t == L"bool") return 4 * arrCount;
+        if (t == L"int64" || t == L"uint64" || t == L"long" || t == L"ulong" || t == L"long64" || t == L"ulong64" || t == L"i64" || t == L"qword") return 8 * arrCount;
         if (t == L"float") return 4 * arrCount;
         if (t == L"double") return 8 * arrCount;
         if (t == L"ustring" || t == L"ustr" || t == L"wstr" || t == L"bstr")
@@ -592,8 +592,8 @@ namespace NodioVM
             t == L"wstr" || t == L"bstr" || t == L"string" || t == L"str" ||
             t == L"strb" || t == L"lpcstr")
             return (int)sizeof(void*);
-        if (t == L"int64" || t == L"uint64" || t == L"long64" ||
-            t == L"i64" || t == L"qword" || t == L"double")
+        if (t == L"int64" || t == L"uint64" || t == L"long" || t == L"ulong" ||
+            t == L"long64" || t == L"ulong64" || t == L"i64" || t == L"qword" || t == L"double")
             return 8;
         if (t == L"word" || t == L"ushort" || t == L"short" || t == L"wchar")
             return 2;
@@ -949,7 +949,11 @@ namespace NodioVM
             }
             else
             {
-                long long v64 = (long long)BNum(fv);
+                long long v64 = 0;
+                if (sz == 8 && IsSize64(fv))
+                    v64 = (__int64)GetSize64Val(fv);
+                else
+                    v64 = (long long)BNum(fv);
                 if (sz == 8) *(__int64*)(buf + off) = (__int64)v64;
                 else if (sz == 2) *(unsigned short*)(buf + off) = (unsigned short)v64;
                 else if (sz == 1) *(unsigned char*)(buf + off) = (unsigned char)v64;
@@ -1129,7 +1133,14 @@ namespace NodioVM
                 else if (sz == 2) v64 = *(unsigned short*)(buf + off);
                 else if (sz == 1) v64 = *(unsigned char*)(buf + off);
                 else v64 = *(int*)(buf + off);
-                vTab.tab->map[f.name] = Value::Num_((double)v64);
+                if (sz == 8 && iv != vTab.tab->map.end() && IsSize64(iv->second))
+                {
+                    vTab.tab->map[f.name] = CreateSize64((uint64_t)v64);
+                }
+                else
+                {
+                    vTab.tab->map[f.name] = Value::Num_((double)v64);
+                }
             }
             off += sz;
         }

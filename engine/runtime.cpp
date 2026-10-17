@@ -978,7 +978,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             {
                 wstring out;
                 for (auto& arg : n->list)
-                    out += Eval(arg, env).ToString();
+                    out += ToStringM(Eval(arg, env));
                 out += L"\n";
                 WriteU8(stdout, out);
                 fflush(stdout);
@@ -988,7 +988,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             {
                 wstring out;
                 for (auto& arg : n->list)
-                    out += Eval(arg, env).ToString();
+                    out += ToStringM(Eval(arg, env));
                 out += L"\n";
                 WriteU8(stdout, out);
                 fflush(stdout);
@@ -997,7 +997,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             if (n->a->k == Node::Ident && n->a->str == L"tostring")
             {
                 return n->list.empty() ? Value() :
-                    Value::Str_(Eval(n->list[0], env).ToString());
+                    Value::Str_(ToStringM(Eval(n->list[0], env)));
             }
             if (n->a->k == Node::Ident && n->a->str == L"tonumber")
             {
@@ -1560,6 +1560,101 @@ Value Interp::EvalBin(const PNode& n, Env* env)
                         return Value::Str_(ToStringM(l) + ToStringM(r));
                 }
             }
+            if (op == L"+" || op == L"-" || op == L"*" || op == L"/" || op == L"%" || op == L"%=" ||
+                op == L"<<" || op == L">>" || op == L"<" || op == L"<=" || op == L">" || op == L">=")
+            {
+                wstring metaOp;
+                if (op == L"+") metaOp = L"_add";
+                else if (op == L"-") metaOp = L"_sub";
+                else if (op == L"*") metaOp = L"_mul";
+                else if (op == L"/") metaOp = L"_div";
+                else if (op == L"%" || op == L"%=") metaOp = L"_mod";
+                else if (op == L"<<") metaOp = L"_lshift";
+                else if (op == L">>") metaOp = L"_rshift";
+                else if (op == L"<") metaOp = L"_lt";
+                else if (op == L"<=") metaOp = L"_le";
+
+                if (!metaOp.empty())
+                {
+                    if (l.t == Value::TableT && l.tab)
+                    {
+                        auto im = l.tab->map.find(L"_meta");
+                        if (im != l.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                        {
+                            auto ifn = im->second.tab->map.find(metaOp);
+                            if (ifn != im->second.tab->map.end() && (ifn->second.t == Value::Func || ifn->second.native))
+                            {
+                                vector<Value> args{ r };
+                                return CallOwner(ifn->second, l, args);
+                            }
+                        }
+                    }
+                    if (r.t == Value::TableT && r.tab)
+                    {
+                        auto im = r.tab->map.find(L"_meta");
+                        if (im != r.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                        {
+                            auto ifn = im->second.tab->map.find(metaOp);
+                            if (ifn != im->second.tab->map.end() && (ifn->second.t == Value::Func || ifn->second.native))
+                            {
+                                vector<Value> args{ l };
+                                return CallOwner(ifn->second, r, args);
+                            }
+                        }
+                    }
+                }
+                if (op == L">")
+                {
+                    if (r.t == Value::TableT && r.tab)
+                    {
+                        auto im = r.tab->map.find(L"_meta");
+                        if (im != r.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                        {
+                            auto ifn = im->second.tab->map.find(L"_lt");
+                            if (ifn != im->second.tab->map.end() && (ifn->second.t == Value::Func || ifn->second.native))
+                            {
+                                vector<Value> args{ l };
+                                return CallOwner(ifn->second, r, args);
+                            }
+                        }
+                    }
+                    if (l.t == Value::TableT && l.tab)
+                    {
+                        auto im = l.tab->map.find(L"_meta");
+                        if (im != l.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                        {
+                            auto ifn = im->second.tab->map.find(L"_le");
+                            if (ifn != im->second.tab->map.end() && (ifn->second.t == Value::Func || ifn->second.native))
+                            {
+                                vector<Value> args{ r };
+                                return Value::Bool_(!CallOwner(ifn->second, l, args).Truthy());
+                            }
+                        }
+                    }
+                }
+                if (op == L">=")
+                {
+                    if (l.t == Value::TableT && l.tab)
+                    {
+                        auto im = l.tab->map.find(L"_meta");
+                        if (im != l.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                        {
+                            auto ifn = im->second.tab->map.find(L"_le");
+                            if (ifn != im->second.tab->map.end() && (ifn->second.t == Value::Func || ifn->second.native))
+                            {
+                                vector<Value> args{ r };
+                                return CallOwner(ifn->second, l, args);
+                            }
+                            auto ifnlt = im->second.tab->map.find(L"_lt");
+                            if (ifnlt != im->second.tab->map.end() && (ifnlt->second.t == Value::Func || ifnlt->second.native))
+                            {
+                                vector<Value> args{ r };
+                                return Value::Bool_(!CallOwner(ifnlt->second, l, args).Truthy());
+                            }
+                        }
+                    }
+                }
+            }
             double a = ToNum(l), b = ToNum(r);
             if (op == L"+") return Value::Num_(a + b);
             if (op == L"-") return Value::Num_(a - b);
@@ -1610,6 +1705,32 @@ bool Interp::ValuesEqual(const Value& l, const Value& r, bool strict)
                     double v = wcstod(s.c_str(), &endp);
                     if (endp && *endp == 0)
                         return n == v;
+                }
+                if (l.t == Value::TableT && l.tab)
+                {
+                    auto im = l.tab->map.find(L"_meta");
+                    if (im != l.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                    {
+                        auto ieq = im->second.tab->map.find(L"_eq");
+                        if (ieq != im->second.tab->map.end() && (ieq->second.t == Value::Func || ieq->second.native))
+                        {
+                            vector<Value> args{ r };
+                            return CallOwner(ieq->second, l, args).Truthy();
+                        }
+                    }
+                }
+                if (r.t == Value::TableT && r.tab)
+                {
+                    auto im = r.tab->map.find(L"_meta");
+                    if (im != r.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                    {
+                        auto ieq = im->second.tab->map.find(L"_eq");
+                        if (ieq != im->second.tab->map.end() && (ieq->second.t == Value::Func || ieq->second.native))
+                        {
+                            vector<Value> args{ l };
+                            return CallOwner(ieq->second, r, args).Truthy();
+                        }
+                    }
                 }
                 return false;
             }
@@ -1663,7 +1784,51 @@ Value Interp::ApplyOp(const wstring& op, const Value& l, const Value& r)
             if (op == L"..")
                 return Value::Str_(l.ToString() + r.ToString());
             if (op == L"++")
-                return Value::Str_(l.ToString() + r.ToString());   // aardio concat
+                return Value::Str_(ToStringM(l) + ToStringM(r));   // aardio concat
+            if (op == L"+" || op == L"-" || op == L"*" || op == L"/" || op == L"%" || op == L"%=" ||
+                op == L"<<" || op == L">>" || op == L"<" || op == L"<=" || op == L">" || op == L">=")
+            {
+                wstring metaOp;
+                if (op == L"+") metaOp = L"_add";
+                else if (op == L"-") metaOp = L"_sub";
+                else if (op == L"*") metaOp = L"_mul";
+                else if (op == L"/") metaOp = L"_div";
+                else if (op == L"%" || op == L"%=") metaOp = L"_mod";
+                else if (op == L"<<") metaOp = L"_lshift";
+                else if (op == L">>") metaOp = L"_rshift";
+                else if (op == L"<") metaOp = L"_lt";
+                else if (op == L"<=") metaOp = L"_le";
+
+                if (!metaOp.empty())
+                {
+                    if (l.t == Value::TableT && l.tab)
+                    {
+                        auto im = l.tab->map.find(L"_meta");
+                        if (im != l.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                        {
+                            auto ifn = im->second.tab->map.find(metaOp);
+                            if (ifn != im->second.tab->map.end() && (ifn->second.t == Value::Func || ifn->second.native))
+                            {
+                                vector<Value> args{ r };
+                                return CallOwner(ifn->second, l, args);
+                            }
+                        }
+                    }
+                    if (r.t == Value::TableT && r.tab)
+                    {
+                        auto im = r.tab->map.find(L"_meta");
+                        if (im != r.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                        {
+                            auto ifn = im->second.tab->map.find(metaOp);
+                            if (ifn != im->second.tab->map.end() && (ifn->second.t == Value::Func || ifn->second.native))
+                            {
+                                vector<Value> args{ l };
+                                return CallOwner(ifn->second, r, args);
+                            }
+                        }
+                    }
+                }
+            }
             double a = ToNum(l), b = ToNum(r);
             if (op == L"+") return Value::Num_(a + b);
             if (op == L"-") return Value::Num_(a - b);

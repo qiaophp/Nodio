@@ -418,6 +418,285 @@ for (size_t i = 0; i < job->params.size(); i++)
     return 0;
 }
 
+// ---- math.size64 implementation ----
+static shared_ptr<Table> g_size64_meta;
+
+bool IsSize64(const Value& v)
+{
+    if (v.t != Value::TableT || !v.tab) return false;
+    auto it = v.tab->map.find(L"_isSize64");
+    if (it != v.tab->map.end() && it->second.Truthy()) return true;
+    auto im = v.tab->map.find(L"_meta");
+    if (im != v.tab->map.end() && g_size64_meta && im->second.tab == g_size64_meta)
+        return true;
+    return false;
+}
+
+uint64_t GetSize64Val(const Value& v)
+{
+    if (!IsSize64(v)) return 0;
+    auto ilo = v.tab->map.find(L"_size64_lo");
+    auto ihi = v.tab->map.find(L"_size64_hi");
+    if (ilo != v.tab->map.end() && ihi != v.tab->map.end())
+    {
+        uint32_t lo = (uint32_t)(unsigned long long)ilo->second.n;
+        uint32_t hi = (uint32_t)(unsigned long long)ihi->second.n;
+        return ((uint64_t)hi << 32) | lo;
+    }
+    auto iv = v.tab->map.find(L"_size64_val");
+    if (iv != v.tab->map.end())
+        return (uint64_t)iv->second.n;
+    return 0;
+}
+
+void SetSize64Val(Value& v, uint64_t val)
+{
+    if (!v.tab) return;
+    uint32_t lo = (uint32_t)(val & 0xFFFFFFFF);
+    uint32_t hi = (uint32_t)(val >> 32);
+    v.tab->map[L"_size64_lo"] = Value::Num_((double)lo);
+    v.tab->map[L"_size64_hi"] = Value::Num_((double)hi);
+    v.tab->map[L"_size64_val"] = Value::Num_((double)val);
+}
+
+uint64_t ToSize64Uint(const Value& v)
+{
+    if (IsSize64(v)) return GetSize64Val(v);
+    if (v.t == Value::Num) return (uint64_t)(long long)v.n;
+    if (v.t == Value::Str)
+    {
+        wchar_t* end = nullptr;
+        return _wcstoui64(v.s.c_str(), &end, 0);
+    }
+    if (v.t == Value::Pointer) return (uint64_t)(INT_PTR)v.ptr;
+    return (uint64_t)BNum(v);
+}
+
+Value CreateSize64(uint64_t val)
+{
+    auto t = std::make_shared<Table>();
+    Value v = Value::Table_(t);
+    t->map[L"_isSize64"] = Value::Bool_(true);
+    t->map[L"_struct"] = Value::Str_(L"LONG value;");
+    SetSize64Val(v, val);
+
+    t->map[L"split32"] = NF([](vector<Value>& a) -> Value {
+        Value self = Interp::GetCurrentOwner();
+        if (!IsSize64(self) && !a.empty() && IsSize64(a[0])) self = a[0];
+        uint64_t u = GetSize64Val(self);
+        uint32_t lo = (uint32_t)(u & 0xFFFFFFFF);
+        uint32_t hi = (uint32_t)(u >> 32);
+        Value vLo = Value::Num_((double)lo);
+        auto ex = std::make_shared<vector<Value>>();
+        ex->push_back(Value::Num_((double)hi));
+        vLo.mrets = ex;
+        return vLo;
+    });
+
+    t->map[L"swap"] = NF([](vector<Value>& a) -> Value {
+        Value self = (!a.empty() && IsSize64(a[0])) ? a[0] : Interp::GetCurrentOwner();
+        if (!IsSize64(self)) return self;
+        uint64_t u = _byteswap_uint64(GetSize64Val(self));
+        SetSize64Val(self, u);
+        return self;
+    });
+
+    t->map[L"format"] = NF([](vector<Value>& a) -> Value {
+        Value self = (!a.empty() && IsSize64(a[0])) ? a[0] : Interp::GetCurrentOwner();
+        uint64_t u = GetSize64Val(self);
+        wchar_t buf[128] = L"";
+        if (StrFormatByteSizeW((LONGLONG)u, buf, 128))
+            return Value::Str_(buf);
+        if (u < 1024)
+            swprintf_s(buf, 128, L"%llu 字节", u);
+        else if (u < 1024 * 1024)
+            swprintf_s(buf, 128, L"%.2f KB", (double)u / 1024.0);
+        else if (u < 1024ULL * 1024 * 1024)
+            swprintf_s(buf, 128, L"%.2f MB", (double)u / (1024.0 * 1024.0));
+        else
+            swprintf_s(buf, 128, L"%.2f GB", (double)u / (1024.0 * 1024.0 * 1024.0));
+        return Value::Str_(buf);
+    });
+
+    t->map[L"add"] = NF([](vector<Value>& a) -> Value {
+        Value self = Interp::GetCurrentOwner();
+        int idx = 0;
+        if ((!IsSize64(self) || a.size() >= 2) && !a.empty() && IsSize64(a[0])) { self = a[0]; idx = 1; }
+        if (!IsSize64(self)) return self;
+        uint64_t d = (idx < (int)a.size()) ? ToSize64Uint(a[idx]) : 0;
+        SetSize64Val(self, GetSize64Val(self) + d);
+        return self;
+    });
+
+    t->map[L"sub"] = NF([](vector<Value>& a) -> Value {
+        Value self = Interp::GetCurrentOwner();
+        int idx = 0;
+        if ((!IsSize64(self) || a.size() >= 2) && !a.empty() && IsSize64(a[0])) { self = a[0]; idx = 1; }
+        if (!IsSize64(self)) return self;
+        uint64_t d = (idx < (int)a.size()) ? ToSize64Uint(a[idx]) : 0;
+        SetSize64Val(self, GetSize64Val(self) - d);
+        return self;
+    });
+
+    t->map[L"mul"] = NF([](vector<Value>& a) -> Value {
+        Value self = Interp::GetCurrentOwner();
+        int idx = 0;
+        if ((!IsSize64(self) || a.size() >= 2) && !a.empty() && IsSize64(a[0])) { self = a[0]; idx = 1; }
+        if (!IsSize64(self)) return self;
+        uint64_t factor = (idx < (int)a.size()) ? ToSize64Uint(a[idx]) : 1;
+        SetSize64Val(self, GetSize64Val(self) * factor);
+        return self;
+    });
+
+    t->map[L"div"] = NF([](vector<Value>& a) -> Value {
+        Value self = Interp::GetCurrentOwner();
+        int idx = 0;
+        if ((!IsSize64(self) || a.size() >= 2) && !a.empty() && IsSize64(a[0])) { self = a[0]; idx = 1; }
+        if (!IsSize64(self)) return self;
+        uint64_t divisor = (idx < (int)a.size()) ? ToSize64Uint(a[idx]) : 1;
+        if (divisor != 0)
+            SetSize64Val(self, GetSize64Val(self) / divisor);
+        return self;
+    });
+
+    t->map[L"mod"] = NF([](vector<Value>& a) -> Value {
+        Value self = Interp::GetCurrentOwner();
+        int idx = 0;
+        if ((!IsSize64(self) || a.size() >= 2) && !a.empty() && IsSize64(a[0])) { self = a[0]; idx = 1; }
+        if (!IsSize64(self)) return self;
+        uint64_t divisor = (idx < (int)a.size()) ? ToSize64Uint(a[idx]) : 1;
+        if (divisor != 0)
+            SetSize64Val(self, GetSize64Val(self) % divisor);
+        return self;
+    });
+
+    t->map[L"reset"] = NF([](vector<Value>& a) -> Value {
+        Value self = (!a.empty() && IsSize64(a[0]) && a.size() > 1) ? a[0] : Interp::GetCurrentOwner();
+        if (!IsSize64(self)) return self;
+        int idx = (!a.empty() && IsSize64(a[0]) && a.size() > 1) ? 1 : 0;
+        uint64_t u = (idx < (int)a.size()) ? ToSize64Uint(a[idx]) : 0;
+        SetSize64Val(self, u);
+        return self;
+    });
+
+    t->map[L"greaterThan"] = NF([](vector<Value>& a) -> Value {
+        Value self = Interp::GetCurrentOwner();
+        int idx = 0;
+        if ((!IsSize64(self) || a.size() >= 2) && !a.empty() && IsSize64(a[0])) { self = a[0]; idx = 1; }
+        if (!IsSize64(self)) return Value::Bool_(false);
+        uint64_t target = (idx < (int)a.size()) ? ToSize64Uint(a[idx]) : 0;
+        return Value::Bool_(GetSize64Val(self) > target);
+    });
+
+    t->map[L"rshift"] = NF([](vector<Value>& a) -> Value {
+        Value self = Interp::GetCurrentOwner();
+        int idx = 0;
+        if ((!IsSize64(self) || a.size() >= 2) && !a.empty() && IsSize64(a[0])) { self = a[0]; idx = 1; }
+        if (!IsSize64(self)) return self;
+        int shift = (idx < (int)a.size()) ? (int)BNum(a[idx]) : 0;
+        SetSize64Val(self, GetSize64Val(self) >> shift);
+        return self;
+    });
+
+    t->map[L"lshift"] = NF([](vector<Value>& a) -> Value {
+        Value self = Interp::GetCurrentOwner();
+        int idx = 0;
+        if ((!IsSize64(self) || a.size() >= 2) && !a.empty() && IsSize64(a[0])) { self = a[0]; idx = 1; }
+        if (!IsSize64(self)) return self;
+        int shift = (idx < (int)a.size()) ? (int)BNum(a[idx]) : 0;
+        SetSize64Val(self, GetSize64Val(self) << shift);
+        return self;
+    });
+
+    if (!g_size64_meta)
+    {
+        g_size64_meta = std::make_shared<Table>();
+        g_size64_meta->map[L"_tostring"] = NF([](vector<Value>& a) -> Value {
+            Value self = (!a.empty() && IsSize64(a[0])) ? a[0] : Interp::GetCurrentOwner();
+            uint64_t u = GetSize64Val(self);
+            wchar_t buf[32];
+            swprintf_s(buf, 32, L"%llu", u);
+            return Value::Str_(buf);
+        });
+        g_size64_meta->map[L"_tonumber"] = NF([](vector<Value>& a) -> Value {
+            Value self = (!a.empty() && IsSize64(a[0])) ? a[0] : Interp::GetCurrentOwner();
+            return Value::Num_((double)GetSize64Val(self));
+        });
+        g_size64_meta->map[L"_topointer"] = NF([](vector<Value>& a) -> Value {
+            Value self = (!a.empty() && IsSize64(a[0])) ? a[0] : Interp::GetCurrentOwner();
+            return Value::Pointer_((void*)(INT_PTR)GetSize64Val(self));
+        });
+        g_size64_meta->map[L"_eq"] = NF([](vector<Value>& a) -> Value {
+            Value self = Interp::GetCurrentOwner();
+            Value other = a.empty() ? Value() : a[0];
+            if (!IsSize64(self) && a.size() >= 2) {
+                self = a[0];
+                other = a[1];
+            }
+            return Value::Bool_(ToSize64Uint(self) == ToSize64Uint(other));
+        });
+        g_size64_meta->map[L"_add"] = NF([](vector<Value>& a) -> Value {
+            if (a.empty()) return Value();
+            Value self = Interp::GetCurrentOwner();
+            Value other = a[0];
+            if (!IsSize64(self) && a.size() >= 2) { self = a[0]; other = a[1]; }
+            return CreateSize64(ToSize64Uint(self) + ToSize64Uint(other));
+        });
+        g_size64_meta->map[L"_sub"] = NF([](vector<Value>& a) -> Value {
+            if (a.empty()) return Value();
+            Value self = Interp::GetCurrentOwner();
+            Value other = a[0];
+            if (!IsSize64(self) && a.size() >= 2) { self = a[0]; other = a[1]; }
+            return CreateSize64(ToSize64Uint(self) - ToSize64Uint(other));
+        });
+        g_size64_meta->map[L"_mul"] = NF([](vector<Value>& a) -> Value {
+            if (a.empty()) return Value();
+            Value self = Interp::GetCurrentOwner();
+            Value other = a[0];
+            if (!IsSize64(self) && a.size() >= 2) { self = a[0]; other = a[1]; }
+            return CreateSize64(ToSize64Uint(self) * ToSize64Uint(other));
+        });
+        g_size64_meta->map[L"_div"] = NF([](vector<Value>& a) -> Value {
+            if (a.empty()) return Value();
+            Value self = Interp::GetCurrentOwner();
+            Value other = a[0];
+            if (!IsSize64(self) && a.size() >= 2) { self = a[0]; other = a[1]; }
+            uint64_t d = ToSize64Uint(other);
+            return CreateSize64(d ? ToSize64Uint(self) / d : 0);
+        });
+        g_size64_meta->map[L"_mod"] = NF([](vector<Value>& a) -> Value {
+            if (a.empty()) return Value();
+            Value self = Interp::GetCurrentOwner();
+            Value other = a[0];
+            if (!IsSize64(self) && a.size() >= 2) { self = a[0]; other = a[1]; }
+            uint64_t d = ToSize64Uint(other);
+            return CreateSize64(d ? ToSize64Uint(self) % d : 0);
+        });
+        g_size64_meta->map[L"_concat"] = NF([](vector<Value>& a) -> Value {
+            Value self = Interp::GetCurrentOwner();
+            Value other = a.empty() ? Value() : a[0];
+            if (!IsSize64(self) && a.size() >= 2) { self = a[0]; other = a[1]; }
+            wstring s1 = self.ToString();
+            if (IsSize64(self))
+            {
+                wchar_t buf[32];
+                swprintf_s(buf, 32, L"%llu", GetSize64Val(self));
+                s1 = buf;
+            }
+            wstring s2 = other.ToString();
+            if (IsSize64(other))
+            {
+                wchar_t buf[32];
+                swprintf_s(buf, 32, L"%llu", GetSize64Val(other));
+                s2 = buf;
+            }
+            return Value::Str_(s1 + s2);
+        });
+    }
+    t->map[L"_meta"] = Value::Table_(g_size64_meta);
+    return v;
+}
+
 void Interp::InitBuiltins()
         {
             // ---- global call() builtin: call(fn, owner, ...)
@@ -1723,6 +2002,31 @@ void Interp::InitBuiltins()
                     long long hi = (long long)BNum(a[1]);
                     if (hi < lo) return Value::Num_((double)lo);
                     return Value::Num_((double)(lo + rand() % (hi - lo + 1))); });
+                tb->map[L"size64"] = NF([](vector<Value>& a) -> Value {
+                    uint64_t val = 0;
+                    if (a.empty() || a[0].t == Value::Null)
+                    {
+                        val = 0;
+                    }
+                    else if (a.size() >= 2 && a[1].t != Value::Null)
+                    {
+                        uint32_t lo = (uint32_t)(unsigned long long)BNum(a[0]);
+                        uint32_t hi = (uint32_t)(unsigned long long)BNum(a[1]);
+                        val = ((uint64_t)hi << 32) | lo;
+                    }
+                    else
+                    {
+                        val = ToSize64Uint(a[0]);
+                    }
+                    return CreateSize64(val);
+                });
+                tb->map[L"isSize64"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                        return Value::Bool_(false);
+                    return Value::Bool_(IsSize64(a[0]));
+                });
+                if (g_size64_meta)
+                    tb->map[L"_size64_meta"] = Value::Table_(g_size64_meta);
             }
             // ---- io ----
             {

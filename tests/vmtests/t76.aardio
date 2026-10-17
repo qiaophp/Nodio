@@ -1,0 +1,28 @@
+// t76: math.size64, math.isSize64, 64-bit struct LONG conversion, and metatable operators
+var s = math.size64(1024);
+io.print("isSize64:", math.isSize64(s));
+io.print("format:", s.format());
+io.print("gt500:", s.greaterThan(500), "gt2000:", s.greaterThan(2000));
+
+var s2 = math.size64("1073741824");
+io.print("s2format:", s2.format());
+var lo, hi = s2.split32();
+io.print("split32:", lo, hi);
+
+s.add(24);
+io.print("s-add24:", tostring(s));
+var s3 = s + 10;
+io.print("s3:", tostring(s3), "isSize64:", math.isSize64(s3));
+io.print("s-eq-1048:", s == 1048);
+
+class Pair {
+    INT lo = 100;
+    INT hi = 1;
+}
+class Holder {
+    LONG ftm = ..math.size64();
+}
+var p = Pair();
+var h = Holder();
+raw.convert(p, h);
+io.print("holder:", tostring(h.ftm), "isSize64:", math.isSize64(h.ftm));

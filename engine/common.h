@@ -121,12 +121,29 @@ namespace NodioVM
                                 cb, nullptr, nullptr);
         return out;
     }
+    bool IsSize64(const Value& v);
+    uint64_t GetSize64Val(const Value& v);
+    void SetSize64Val(Value& v, uint64_t val);
+    uint64_t ToSize64Uint(const Value& v);
+    Value CreateSize64(uint64_t val);
+
     inline double BNum(const Value& v)
     {
         if (v.t == Value::Num) return v.n;
         if (v.t == Value::Pointer) return (double)(__int64)(INT_PTR)v.ptr;
         if (v.t == Value::Str) { wchar_t* e = nullptr; return wcstod(v.s.c_str(), &e); }
         if (v.t == Value::Bool) return v.b ? 1 : 0;
+        if (v.t == Value::TableT && v.tab)
+        {
+            auto ilo = v.tab->map.find(L"_size64_lo");
+            auto ihi = v.tab->map.find(L"_size64_hi");
+            if (ilo != v.tab->map.end() && ihi != v.tab->map.end())
+            {
+                uint32_t lo = (uint32_t)(unsigned long long)ilo->second.n;
+                uint32_t hi = (uint32_t)(unsigned long long)ihi->second.n;
+                return (double)(((uint64_t)hi << 32) | lo);
+            }
+        }
         return 0;
     }
     // round 43: codepage argument — accepts a number (0=ACP, 65001=UTF-8,

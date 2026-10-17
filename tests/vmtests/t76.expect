@@ -1,0 +1,9 @@
+isSize64:true
+format:1.00 KB
+gt500:truegt2000:false
+s2format:1.00 GB
+split32:10737418240
+s-add24:1048
+s3:1058isSize64:true
+s-eq-1048:true
+holder:4294967396isSize64:true
