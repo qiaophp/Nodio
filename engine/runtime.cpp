@@ -2004,6 +2004,8 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                     {
                         eFound->modTable->map[target->str] = val;
                         eFound->modTable->scopeVars[target->str] = val;
+                        if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
+                            globals.vars[target->str] = val;
                     }
                     else if (eFound->bNsInst && eFound->nsTable && eFound->bClassBody)
                     {
@@ -2015,12 +2017,16 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                     eNs->vars[target->str] = val;
                     eNs->nsTable->map[target->str] = val;
                     eNs->nsTable->scopeVars[target->str] = val;
+                    if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
+                        globals.vars[target->str] = val;
                 }
                 else if (eMod && eMod->modTable)
                 {
                     eMod->vars[target->str] = val;
                     eMod->modTable->map[target->str] = val;
                     eMod->modTable->scopeVars[target->str] = val;
+                    if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
+                        globals.vars[target->str] = val;
                 }
                 else
                 {
