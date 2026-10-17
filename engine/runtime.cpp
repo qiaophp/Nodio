@@ -43,6 +43,28 @@ Value Interp::Eval(const PNode& n, Env* env)
                 if (n->str == L"..") return Value();  // root marker
                 if (Value* v = env->Find(n->str))
                     return *v;
+                static auto isBuiltinPrimitive = [](const wstring& name) {
+                    return name == L"type" || name == L"call" || name == L"loadcode" ||
+                           name == L"loadcodex" || name == L"eval" || name == L"error" ||
+                           name == L"assert" || name == L"invoke" || name == L"callex" ||
+                           name == L"rget";
+                };
+                if (!isBuiltinPrimitive(n->str))
+                {
+                    for (Env* e = env; e; e = e->parent.get())
+                    {
+                        if (e->nsTable)
+                        {
+                            auto im = e->nsTable->map.find(L"_meta");
+                            if (im != e->nsTable->map.end() && im->second.t == Value::TableT)
+                            {
+                                Value m = GetMember(Value::Table_(e->nsTable), n->str);
+                                if (m.t != Value::Null)
+                                    return m;
+                            }
+                        }
+                    }
+                }
                 auto itR = roots.find(n->str);
                 if (itR != roots.end())
                     return itR->second;

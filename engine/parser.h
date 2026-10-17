@@ -289,12 +289,26 @@ namespace NodioVM
                         p++;   // root prefixes resolve absolutely anyway
                     n->names.push_back(ExpectIdent());
                     // path segments may be keywords: 'import java.class;'
-                    // (java/_.aardio) and 'import java.object;'
-                    while (IsPunct(L".") &&
-                           (Peek(1).t == TIdent || Peek(1).t == TKw))
+                    // or numeric segments: 'import System.Windows.Automation.3;'
+                    while (true)
                     {
-                        p++;
-                        n->names.push_back(Next().text);
+                        if (IsPunct(L".") &&
+                            (Peek(1).t == TIdent || Peek(1).t == TKw || Peek(1).t == TNum))
+                        {
+                            p++;
+                            n->names.push_back(Next().text);
+                        }
+                        else if (IsPunct(L"[") && (Peek(1).t == TStr || Peek(1).t == TNum))
+                        {
+                            p++;
+                            Tok tk = Next();
+                            n->names.push_back(tk.text);
+                            Expect(L"]");
+                        }
+                        else
+                        {
+                            break;
+                        }
                     }
                     return n;
                 }
@@ -314,7 +328,7 @@ namespace NodioVM
                     n->names.push_back(ExpectIdent());
                     while (true)
                     {
-                        if (IsPunct(L".") && (Peek(1).t == TIdent || Peek(1).t == TKw))
+                        if (IsPunct(L".") && (Peek(1).t == TIdent || Peek(1).t == TKw || Peek(1).t == TNum))
                         {
                             p++;
                             n->names.push_back(Next().text);
@@ -375,7 +389,7 @@ namespace NodioVM
                     }
                     n->names.push_back(ExpectIdent());
                     while (IsPunct(L".") &&
-                           (Peek(1).t == TIdent || Peek(1).t == TKw))
+                           (Peek(1).t == TIdent || Peek(1).t == TKw || Peek(1).t == TNum))
                     {
                         p++;
                         n->names.push_back(Next().text);
@@ -1732,7 +1746,7 @@ namespace NodioVM
             PNode e = ParsePrimary();
             while (true)
             {
-                if (IsPunct(L".") && (Peek(1).t == TIdent || Peek(1).t == TKw || (Peek(1).t == TPunct && Peek(1).text == L"$")))
+                if (IsPunct(L".") && (Peek(1).t == TIdent || Peek(1).t == TKw || Peek(1).t == TNum || (Peek(1).t == TPunct && Peek(1).text == L"$")))
                 {
                     p++;
                     PNode m = New(Node::Member);
@@ -2541,7 +2555,7 @@ namespace NodioVM
         {
             while (true)
             {
-                if (IsPunct(L".") && (Peek(1).t == TIdent || Peek(1).t == TKw || (Peek(1).t == TPunct && Peek(1).text == L"$")))
+                if (IsPunct(L".") && (Peek(1).t == TIdent || Peek(1).t == TKw || Peek(1).t == TNum || (Peek(1).t == TPunct && Peek(1).text == L"$")))
                 {
                     p++;
                     PNode m = New(Node::Member);

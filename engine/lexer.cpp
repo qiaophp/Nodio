@@ -305,8 +305,17 @@ namespace NodioVM
                 continue;
             }
             // numbers
-            if ((c >= L'0' && c <= L'9') ||
-                (c == L'.' && i + 1 < n && src[i + 1] >= L'0' && src[i + 1] <= L'9'))
+            bool bDotNumber = (c == L'.' && i + 1 < n && src[i + 1] >= L'0' && src[i + 1] <= L'9');
+            if (bDotNumber && !hadSpace && !out.empty())
+            {
+                const Tok& prev = out.back();
+                if (prev.t == TIdent || prev.t == TKw || prev.t == TNum ||
+                    (prev.t == TPunct && (prev.text == L")" || prev.text == L"]" || prev.text == L"}")))
+                {
+                    bDotNumber = false;
+                }
+            }
+            if ((c >= L'0' && c <= L'9') || bDotNumber)
             {
                 size_t b = i;
                 if (c == L'0' && i + 1 < n && (src[i + 1] == L'x' || src[i + 1] == L'X'))
@@ -350,7 +359,7 @@ namespace NodioVM
                     if (i < n && (src[i] == L'+' || src[i] == L'-')) i++;
                     while (i < n && src[i] >= L'0' && src[i] <= L'9') i++;
                 }
-                Tok t{ TNum, L"", 0, line };
+                Tok t{ TNum, src.substr(b, i - b), 0, line };
                 t.num = wcstod(src.substr(b, i - b).c_str(), nullptr);
                 pushTok(t);
                 continue;

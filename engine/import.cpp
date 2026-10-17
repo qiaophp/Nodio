@@ -259,9 +259,12 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     return roots[n->names[0]];
             }
             // 2) For multi-segment imports (e.g. `import win.ui.ctrl.thread`),
-            // ensure each enclosing package folder module (e.g. win, win.ui, win.ui.ctrl)
-            // is loaded in sequence if its official package module (_\.aardio) exists
-            // and has not yet been loaded.
+            // Note: Official aardio does NOT automatically import parent package _.aardio
+            // files for dotted library paths; each sub-library explicitly imports its own
+            // dependencies. Unconditionally pre-loading parent _.aardio breaks versioned
+            // or alternative package variants such as System.Windows.Automation.3 which
+            // replaces System.Windows.Automation.
+#if 0
             if (n->names.size() > 1)
             {
                 wstring prefixRel;
@@ -282,6 +285,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     }
                 }
             }
+#endif
 
             // 3) file module: check lib root first, then baseDir
             // candidates follow official hierarchical partition order (e.g. chrome\edge.history.aardio)

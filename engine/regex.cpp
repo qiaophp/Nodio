@@ -296,12 +296,42 @@ namespace NodioVM
                 ParseQuantifier(el);
                 return true;
             }
-            else if (c == L'%' && i + 2 < pat.size())
+            else if (c == L'%' && i + 1 < pat.size())
             {
-                el.k = 7;
-                el.ch = pat[i + 1];
-                el.chClose = pat[i + 2];
-                i += 3;
+                // aardio balanced delimiter pattern %<begin><end>
+                // e.g. %(), %{}, %"", %'', %\[\], %\<\>
+                size_t pCur = i + 1;
+                wchar_t openC = 0, closeC = 0;
+                if (pCur < pat.size() && pat[pCur] == L'\\')
+                    pCur++;
+                if (pCur < pat.size())
+                {
+                    openC = pat[pCur++];
+                    if (pCur < pat.size() && pat[pCur] == L'\\')
+                        pCur++;
+                    if (pCur < pat.size())
+                    {
+                        closeC = pat[pCur++];
+                        el.k = 7;
+                        el.ch = openC;
+                        el.chClose = closeC;
+                        i = pCur;
+                        if (i < pat.size() && pat[i] == L'?')
+                        {
+                            el.lazy = true;
+                            i++;
+                        }
+                        else
+                        {
+                            ParseQuantifier(el);
+                        }
+                        return true;
+                    }
+                }
+                // Fallback to literal '%'
+                i++;
+                el.k = 0;
+                el.ch = c;
                 ParseQuantifier(el);
                 return true;
             }
