@@ -60,7 +60,7 @@ Value Interp::Eval(const PNode& n, Env* env)
                 if (n->bMeta)
                 {
                     // 'tab@' — the metatable itself
-                    if ((obj.t == Value::TableT || obj.t == Value::Class || obj.t == Value::Func) && obj.tab)
+                    if ((obj.t == Value::TableT || obj.t == Value::Class || obj.t == Value::Func || obj.t == Value::Pointer) && obj.tab)
                     {
                         auto im = obj.tab->map.find(L"_meta");
                         if (im != obj.tab->map.end())
@@ -348,7 +348,7 @@ bool Interp::MetaGet(const Value& obj, const Value& keyVal,
             if (s_metaDepth > 40)
                 return false;
             struct ScopeDepth { int& d; ScopeDepth(int& x): d(x){ d++; } ~ScopeDepth(){ d--; } } sd(s_metaDepth);
-            if ((obj.t != Value::TableT && obj.t != Value::Class && obj.t != Value::Func) || !obj.tab || key == L"_meta")
+            if ((obj.t != Value::TableT && obj.t != Value::Class && obj.t != Value::Func && obj.t != Value::Pointer) || !obj.tab || key == L"_meta")
                 return false;
             // the meta chain can be nested: util.metaProperty instances
             // carry a class-annotation layer at _meta._meta (the
@@ -520,7 +520,7 @@ bool Interp::MetaSet(const Value& obj, const Value& keyVal,
         {
             wstring key = keyVal.ToString();
             *pErr = false;
-            if ((obj.t != Value::TableT && obj.t != Value::Class && obj.t != Value::Func) || !obj.tab || key == L"_meta")
+            if ((obj.t != Value::TableT && obj.t != Value::Class && obj.t != Value::Func && obj.t != Value::Pointer) || !obj.tab || key == L"_meta")
                 return false;
             // the meta chain can be nested: util.metaProperty instances
             // carry a class-annotation layer at _meta._meta (the
@@ -827,7 +827,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                         bool bDirect, int ownerCallMode)
         {
             wstring key = keyVal.ToString();
-            if (obj.t == Value::TableT || ((obj.t == Value::Func || obj.t == Value::Class) && obj.tab))
+            if (obj.t == Value::TableT || ((obj.t == Value::Func || obj.t == Value::Class || obj.t == Value::Pointer) && obj.tab))
             {
                 if (obj.tab)
                 {
@@ -1908,9 +1908,17 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                         eFound = e;
                         break;
                     }
+                    if (e->bNsBody && (e->nsTable || e->modTable))
+                    {
+                        // Stop at the enclosing namespace/module boundary.
+                        // Outer namespaces should NOT capture bare assignments!
+                        break;
+                    }
                 }
                 Env* eNs = env;
                 while (eNs && !eNs->nsTable) eNs = eNs->parent.get();
+                Env* eMod = env;
+                while (eMod && !eMod->modTable) eMod = eMod->parent.get();
                 if (eFound)
                 {
                     eFound->vars[target->str] = val;
@@ -1927,8 +1935,15 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 }
                 else if (eNs && eNs->nsTable)
                 {
+                    eNs->vars[target->str] = val;
                     eNs->nsTable->map[target->str] = val;
                     eNs->nsTable->scopeVars[target->str] = val;
+                }
+                else if (eMod && eMod->modTable)
+                {
+                    eMod->vars[target->str] = val;
+                    eMod->modTable->map[target->str] = val;
+                    eMod->modTable->scopeVars[target->str] = val;
                 }
                 else
                 {
@@ -1948,6 +1963,23 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 if (target->bMeta)
                 {
                     // tab@ = meta — set the metatable
+                    if (target->a->k == Node::Ident)
+                    {
+                        if (Value* vVar = env->Find(target->a->str))
+                        {
+                            if (vVar->t == Value::Pointer)
+                            {
+                                if (!vVar->tab) vVar->tab = std::make_shared<Table>();
+                                vVar->tab->map[L"_meta"] = val;
+                                return;
+                            }
+                        }
+                    }
+                    if (obj.t == Value::Pointer && obj.tab)
+                    {
+                        obj.tab->map[L"_meta"] = val;
+                        return;
+                    }
                     if ((obj.t == Value::TableT || obj.t == Value::Class || obj.t == Value::Func) && obj.tab)
                         obj.tab->map[L"_meta"] = val;
                     return;

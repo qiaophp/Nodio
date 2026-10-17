@@ -1,0 +1,7 @@
+dist2D: 5
+dist3D: 3
+type_cdata: cdata
+cdata_member: my_cdata
+topointer_cdata: valid
+outer_foo: outer_val
+inner_foo: inner_val

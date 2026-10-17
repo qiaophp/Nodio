@@ -315,8 +315,12 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 auto modEnv2 = std::make_shared<Env>();
                 modEnv2->self = modEnv2;
                 modEnv2->parent = globals.self;
-                modEnv2->modTable = placeholder2;
-                modEnv2->bNsBody = true;   // module-level vars are members
+                bool bIsBuiltin2 = (n->names.size() == 1 && n->names[0] == L"builtin");
+                if (!bIsBuiltin2)
+                {
+                    modEnv2->modTable = placeholder2;
+                    modEnv2->bNsBody = true;   // module-level vars are members
+                }
                 wstring oldModFile2 = g_curModuleFile;
                 g_curModuleFile = file;
                 Value oldRet = ret;
@@ -520,8 +524,12 @@ Value Interp::DoImport(const PNode& n, Env* env)
             auto modEnv = std::make_shared<Env>();
             modEnv->self = modEnv;
             modEnv->parent = globals.self;
-            modEnv->modTable = placeholder;
-            modEnv->bNsBody = true;   // module-level vars are members
+            bool bIsBuiltin = (n->names.size() == 1 && n->names[0] == L"builtin");
+            if (!bIsBuiltin)
+            {
+                modEnv->modTable = placeholder;
+                modEnv->bNsBody = true;   // module-level vars are members
+            }
             wstring oldModFile = g_curModuleFile;
             g_curModuleFile = file;
             Value oldRet = ret;

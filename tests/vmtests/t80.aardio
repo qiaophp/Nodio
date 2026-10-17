@@ -1,0 +1,25 @@
+import io;
+import math;
+
+io.print("dist2D:", " ", math.dist(0, 0, 3, 4));
+io.print("dist3D:", " ", math.dist(0, 0, 0, 1, 2, 2));
+
+var gcObj = ..gcdata(
+    _topointer = topointer(0x1234);
+    _get = {
+        name = "my_cdata";
+    }
+);
+
+io.print("type_cdata:", " ", type(gcObj));
+io.print("cdata_member:", " ", gcObj.name);
+io.print("topointer_cdata:", " ", topointer(gcObj) != null ? "valid" : "null");
+
+namespace outerNs {
+    foo = "outer_val";
+    namespace innerNs {
+        foo = "inner_val";
+    }
+}
+io.print("outer_foo:", " ", outerNs.foo);
+io.print("inner_foo:", " ", outerNs.innerNs.foo);

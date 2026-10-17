@@ -2038,6 +2038,32 @@ void Interp::InitBuiltins()
                     double hi = a.size() > 2 ? BNum(a[2]) : 255;
                     if (lo > hi) { double t = lo; lo = hi; hi = t; }
                     return Value::Num_(v < lo ? lo : (v > hi ? hi : v)); });
+                tb->map[L"dist"] = NF([](vector<Value>& a) {
+                    if (a.empty()) return Value::Num_(0);
+                    if (a.size() >= 6)
+                    {
+                        double dx = BNum(a[0]) - BNum(a[3]);
+                        double dy = BNum(a[1]) - BNum(a[4]);
+                        double dz = BNum(a[2]) - BNum(a[5]);
+                        return Value::Num_(sqrt(dx * dx + dy * dy + dz * dz));
+                    }
+                    if (a.size() >= 4)
+                    {
+                        double dx = BNum(a[0]) - BNum(a[2]);
+                        double dy = BNum(a[1]) - BNum(a[3]);
+                        return Value::Num_(_hypot(dx, dy));
+                    }
+                    if (a.size() == 3)
+                    {
+                        double x = BNum(a[0]), y = BNum(a[1]), z = BNum(a[2]);
+                        return Value::Num_(sqrt(x * x + y * y + z * z));
+                    }
+                    if (a.size() == 2)
+                    {
+                        return Value::Num_(_hypot(BNum(a[0]), BNum(a[1])));
+                    }
+                    return Value::Num_(fabs(BNum(a[0])));
+                });
                 tb->map[L"validateRange"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
                     long long len = a[0].t != Value::Null ? (long long)BNum(a[0]) : 0;
@@ -3939,7 +3965,34 @@ void Interp::InitBuiltins()
                                     break;
                                 case 5:   // pointer (hwnd / buffer)
                                     if (v.t == Value::Pointer)
+                                    {
+                                        if (v.tab)
+                                        {
+                                            auto im = v.tab->map.find(L"_meta");
+                                            if (im != v.tab->map.end() && (im->second.t == Value::TableT || im->second.t == Value::Class) && im->second.tab)
+                                            {
+                                                auto itp = im->second.tab->map.find(L"_topointer");
+                                                if (itp != im->second.tab->map.end())
+                                                {
+                                                    if (itp->second.t == Value::Pointer)
+                                                    {
+                                                        slots.push_back((SlotT)(INT_PTR)itp->second.ptr);
+                                                        break;
+                                                    }
+                                                    else if (itp->second.t == Value::Func || itp->second.native)
+                                                    {
+                                                        vector<Value> noArgs;
+                                                        Value r = CallOwner(itp->second, v, noArgs);
+                                                        slots.push_back(r.t == Value::Pointer
+                                                            ? (SlotT)(INT_PTR)r.ptr
+                                                            : (SlotT)(INT_PTR)(long long)BNum(r));
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         slots.push_back((SlotT)(INT_PTR)v.ptr);
+                                    }
                                     else if (v.t == Value::TableT && v.tab)
                                     {
                                         // an object with a _topointer meta
@@ -6253,6 +6306,7 @@ void Interp::InitBuiltins()
                                                          nullptr) ||
                         GetFileAttributesW(strPath.c_str()) !=
                             INVALID_FILE_ATTRIBUTES); });
+                GetRoot(L"io").tab->map[L"createDir"] = tb->map[L"createDir"];
                 tb->map[L"delete"] = NF([](vector<Value>& a) -> Value {
                     // recursive delete (files then deepest-first directories)
                     std::function<bool(const wstring&)> del =
@@ -6997,6 +7051,8 @@ void Interp::InitBuiltins()
                 case Value::Bool: return Value::Str_(L"boolean");
                 case Value::Num: return Value::Str_(L"number");
                 case Value::Pointer:
+                    if (a[0].tab && a[0].tab->map.count(L"_meta"))
+                        return Value::Str_(L"cdata");
                     if (a[0].ptr && IsBuffer(a[0].ptr))
                         return Value::Str_(L"buffer");
                     return Value::Str_(L"pointer");
@@ -7074,6 +7130,19 @@ void Interp::InitBuiltins()
             globals.vars[L"_HINSTANCE"] = Value::Pointer_(GetModuleHandleW(nullptr));
             globals.vars[L"_HAPPICON"] = Value::Pointer_(LoadIconW(nullptr, IDI_APPLICATION));
             globals.vars[L"_INVALID_HANDLE_VALUE"] = Value::Pointer_(INVALID_HANDLE_VALUE);
+            {
+                auto fnGcData = NF([this](vector<Value>& a) -> Value {
+                    void* p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 1);
+                    RegisterBuffer(p, 1);
+                    Value buf = Value::Pointer_(p);
+                    buf.tab = std::make_shared<Table>();
+                    if (!a.empty())
+                        buf.tab->map[L"_meta"] = a[0];
+                    return buf;
+                });
+                globals.vars[L"gcdata"] = fnGcData;
+                roots[L"gcdata"] = fnGcData;
+            }
 
             // ---- global namespace + VM introspection (Phase 3) ----
             // debug/_.aardio opens with global.import("(debug)"), so `global`
