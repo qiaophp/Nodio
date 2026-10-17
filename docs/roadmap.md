@@ -125,16 +125,18 @@ engine 40 / library 25 / publisher 15 / IDE 15 / designer 5.
 
 | area | weight | score | measured evidence |
 |---|---|---|---|
-| engine (language + VM + FFI) | 40 | **92%** | parse 868/868 both arch; VM regression **78/78 both arch**; ns_sweep 45/54 (x64) / 52/54 (x86); Python3 全链路双向互操作通过; COM host + CLR host 加载通过; cdata/gcdata 元表解包与 _topointer 机制打通; math.dist/io.createDir 原语补齐 |
-| library (behaviour) | 25 | **36%** | GUI 控件链 (LOGFONT、createIndirect、getFont/setFont、DSG 属性优先级、plus.skin) 实测通过; DeepSeek OCR 等实机 GUI 窗体正常拉起进入消息循环; 嵌套命名空间 (win.clip.png/bitmap) 作用域隔离修复 |
+| engine (language + VM + FFI) | 40 | **93%** | parse 868/868 both arch; VM regression **78/78 both arch**; ns_sweep 45/54 (x64) / 50/54 (x86); Python3 全链路双向互操作通过; COM host + CLR host 加载通过; COM ActiveX 内嵌宿主 (com.CreateEmbed / _host / _form 反向绑定) 落地; 闭包词法 owner 捕获 (f.ownerVal) 打通 .NET 构造回调链 (System.DateTime / time.lunar); timeMeta 属性/方法重载分发修复; cdata/gcdata 元表解包与 _topointer 机制打通; math.dist/io.createDir 原语补齐 |
+| library (behaviour) | 25 | **38%** | GUI 控件链 (LOGFONT、createIndirect、getFont/setFont、DSG 属性优先级、plus.skin) 实测通过; web.form / web.form.chat / web.form.simpleMarkdown 控件初始化与内嵌成功; time.lunar / time.ganzhi 完整格式化实测通过; DeepSeek OCR 等实机 GUI 窗体正常拉起进入消息循环; 嵌套命名空间作用域隔离修复 |
 | publisher (Phase 2) | 15 | **100%** | closed; fixtures green x64 + x86 |
 | IDE (Phase 3, self-hosted) | 15 | **0%** | the native Win32 + Scintilla v0 shell was **removed** once decision 1 landed (self-hosted in aardio); no IDE code yet — engine-side primitives for it are green (menu / timer / dlg / popen chain) |
 | form designer (Phase 4) | 5 | **0%** | not started (will be aardio code inside the self-hosted IDE) |
 
-**Overall ≈ 61.4 / 100.** Per decision 5, the engine and the official library must reach 100% — the defect list below is that path:
-defect list below is that path:
+**Overall ≈ 62.1 / 100.** Per decision 5, the engine and the official library must reach 100% — the defect list below is that path:
 
-Fixed this session (pinned by t63–t67 and the ideprobe):
+Fixed this session (pinned by t63–t80, sys_dt, lunar, and ideprobe):
+- **COM ActiveX In-Place Embedding** (`com.CreateEmbed`): ATL ActiveX hosting via `AtlAxAttachControl`, `_host` methods (`close`, `adjust`, `tranacc`), reverse `wb._form` binding;
+- **Closure Lexical Owner Capture** (`f.ownerVal`): bare callback closures now preserve defining lexical `owner`, resolving .NET constructor callbacks losing `owner` (`System.DateTime(tm)` NullReferenceException resolved);
+- **time MetaProperty Resolution**: `timeMeta` `_get`/`_set` dispatch and string `format` property overload, allowing `lunarDate.format("%Lyyyy-%Lmm-%Ldd %H:%M")` and standard date formatting to co-exist without collision;
 - `class` instantiation dropped the defining namespace upvalue
   (`in_addr` bare calls, 15+ examples) — t63
 - dotted delegator imports (`win/form.aardio` = one `import win.ui;`
