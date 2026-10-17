@@ -556,10 +556,30 @@ Value Interp::DoImport(const PNode& n, Env* env)
             // official aardio leaves the module's own name unbound while
             // the body runs, so golang's `assert(!golang)` self-guard
             // sees null. Re-entrant imports still resolve through the
-            // modules[] cache above. Dotted paths keep the placeholder
-            // chain (sub-namespace tables must exist mid-body).
-            if (n->names.size() > 1)
-                BindModule(n->names, modPlaceholder);
+            // modules[] cache above.
+            // For dotted paths (e.g. `import a.b.c`), ensure parent namespace
+            // tables (`a`, `a.b`) exist mid-body, but do NOT pre-bind the leaf
+            // name (`c`), so self-guards like `if(layout)` in `web.layout` see null.
+            if (n->names.size() > 2)
+            {
+                Value ns = GetRoot(n->names[0]);
+                for (size_t i = 1; i + 1 < n->names.size(); i++)
+                {
+                    if (ns.t != Value::TableT || !ns.tab) break;
+                    auto it = ns.tab->map.find(n->names[i]);
+                    if (it != ns.tab->map.end() && (it->second.t == Value::TableT || it->second.t == Value::Class))
+                    {
+                        ns = it->second;
+                    }
+                    else
+                    {
+                        auto nt = std::make_shared<Table>();
+                        Value v = Value::Table_(nt);
+                        ns.tab->map[n->names[i]] = v;
+                        ns = v;
+                    }
+                }
+            }
 
             // module runs in a child scope; its `return v` (or its collected
             // top-level globals) becomes the module value
