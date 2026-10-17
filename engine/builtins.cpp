@@ -697,6 +697,71 @@ Value CreateSize64(uint64_t val)
     return v;
 }
 
+    void* DynAlloc(size_t n, void* pOld)
+    {
+        if (n == 0)
+        {
+            if (pOld)
+            {
+                if (IsDynBuffer(pOld))
+                {
+                    DynBufHeader* h = GetDynBufHeader(pOld);
+                    h->magic = 0;
+                    HeapFree(GetProcessHeap(), 0, h);
+                }
+                else
+                {
+                    HeapFree(GetProcessHeap(), 0, pOld);
+                }
+            }
+            return nullptr;
+        }
+
+        if (pOld && IsDynBuffer(pOld))
+        {
+            DynBufHeader* hOld = GetDynBufHeader(pOld);
+            size_t oldLen = hOld->length;
+            size_t allocSz = sizeof(DynBufHeader) + n + 16;
+            DynBufHeader* hNew = (DynBufHeader*)HeapReAlloc(
+                GetProcessHeap(), HEAP_ZERO_MEMORY, hOld, allocSz);
+            if (!hNew) return nullptr;
+            hNew->magic = DYN_BUF_MAGIC;
+            hNew->capacity = (uint32_t)n;
+            hNew->length = (uint32_t)min((size_t)hNew->capacity, oldLen);
+            char* pData = (char*)hNew + sizeof(DynBufHeader);
+            pData[n] = 0;
+            return pData;
+        }
+        else if (pOld)
+        {
+            size_t allocSz = sizeof(DynBufHeader) + n + 16;
+            DynBufHeader* hNew = (DynBufHeader*)HeapAlloc(
+                GetProcessHeap(), HEAP_ZERO_MEMORY, allocSz);
+            if (!hNew) return nullptr;
+            hNew->magic = DYN_BUF_MAGIC;
+            hNew->capacity = (uint32_t)n;
+            hNew->length = 0;
+            char* pData = (char*)hNew + sizeof(DynBufHeader);
+            memcpy(pData, pOld, n);
+            HeapFree(GetProcessHeap(), 0, pOld);
+            pData[n] = 0;
+            return pData;
+        }
+        else
+        {
+            size_t allocSz = sizeof(DynBufHeader) + n + 16;
+            DynBufHeader* hNew = (DynBufHeader*)HeapAlloc(
+                GetProcessHeap(), HEAP_ZERO_MEMORY, allocSz);
+            if (!hNew) return nullptr;
+            hNew->magic = DYN_BUF_MAGIC;
+            hNew->capacity = (uint32_t)n;
+            hNew->length = 0;
+            char* pData = (char*)hNew + sizeof(DynBufHeader);
+            pData[n] = 0;
+            return pData;
+        }
+    }
+
 void Interp::InitBuiltins()
         {
             // ---- global call() builtin: call(fn, owner, ...)
@@ -1973,6 +2038,22 @@ void Interp::InitBuiltins()
                     double hi = a.size() > 2 ? BNum(a[2]) : 255;
                     if (lo > hi) { double t = lo; lo = hi; hi = t; }
                     return Value::Num_(v < lo ? lo : (v > hi ? hi : v)); });
+                tb->map[L"validateRange"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
+                    long long len = a[0].t != Value::Null ? (long long)BNum(a[0]) : 0;
+                    long long st = a.size() > 1 && a[1].t != Value::Null ? (long long)BNum(a[1]) : 1;
+                    long long en = a.size() > 2 && a[2].t != Value::Null ? (long long)BNum(a[2]) : len;
+                    if (st < 0 && len > 0) st = len + st + 1;
+                    if (en < 0 && len > 0) en = len + en + 1;
+                    if (st < 1) st = 1;
+                    if (len > 0 && en > len) en = len;
+                    if (st > en) return Value();
+                    Value r = Value::Num_((double)st);
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Num_((double)en));
+                    r.mrets = ex;
+                    return r;
+                });
                 tb->map[L"round"] = NF([](vector<Value>& a) {
                     if (a.empty()) return Value::Num_(0);
                     return Value::Num_(round(BNum(a[0]))); });
@@ -4308,9 +4389,21 @@ void Interp::InitBuiltins()
                     StructDeserialize(vTab, p);
                     return vTab;
                 });
-                // byte size of a struct table
+                // byte size of a struct table or dynamic pointer
                 tb->map[L"sizeOf"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value::Num_(0);
+                    if (a[0].t == Value::Pointer && a[0].ptr)
+                    {
+                        if (IsDynBuffer(a[0].ptr))
+                        {
+                            const DynBufHeader* h = GetDynBufHeader(a[0].ptr);
+                            Value v = Value::Num_((double)h->length);
+                            auto extras = std::make_shared<vector<Value>>();
+                            extras->push_back(Value::Num_((double)h->capacity));
+                            v.mrets = extras;
+                            return v;
+                        }
+                    }
                     if (a[0].t == Value::Str)
                         return Value::Num_((double)GetStructFieldSize(a[0].s, 1));
                     return Value::Num_((double)CalcStructTotalSize(a[0]));
@@ -4484,6 +4577,8 @@ void Interp::InitBuiltins()
                         p = (const char*)a[0].ptr;
                         if (a[0].ptr && IsBuffer(a[0].ptr))
                             knownSize = GetBufferSize(a[0].ptr);
+                        else if (a[0].ptr && IsDynBuffer(a[0].ptr))
+                            knownSize = GetDynBufHeader(a[0].ptr)->length;
                     }
                     else if (a[0].t == Value::Num)
                     {
@@ -4567,31 +4662,89 @@ void Interp::InitBuiltins()
                     size_t n = (size_t)BNum(a[2]);
                     if (d && s && n) memcpy(d, s, n);
                     return a[0]; });
-                // raw.concat(dst,src,len) — append src bytes to a buffer
-                tb->map[L"concat"] = NF([](vector<Value>& a) -> Value {
+                // raw.concat(dst,src,len) — append src bytes to a buffer / dynamic pointer
+                auto fnConcat = NF([](vector<Value>& a) -> Value {
                     if (a.size() < 2) return a.empty() ? Value() : a[0];
                     std::string held;
+                    void* pAllocStruct = nullptr;
                     const char* s = nullptr; size_t n = 0;
                     if (a[1].t == Value::Str)
                     {
                         held = RawBytesOf(BStr(a[1]));
                         s = held.data();
-                        n = a.size() > 2 ? (size_t)BNum(a[2]) : held.size();
+                        n = a.size() > 2 && a[2].t != Value::Null ? (size_t)BNum(a[2]) : held.size();
                     }
                     else if (a[1].t == Value::Pointer)
                     {
                         s = (const char*)a[1].ptr;
-                        n = a.size() > 2 ? (size_t)BNum(a[2]) : 0;
+                        n = a.size() > 2 && a[2].t != Value::Null ? (size_t)BNum(a[2]) : 0;
                     }
-                    if (a[0].t == Value::Str && s)
+                    else if (a[1].t == Value::TableT || a[1].t == Value::Class)
                     {
-                        // string form: append the bytes
+                        int total = 0;
+                        pAllocStruct = StructSerialize(a[1], &total);
+                        s = (const char*)pAllocStruct;
+                        n = a.size() > 2 && a[2].t != Value::Null ? (size_t)BNum(a[2]) : (size_t)total;
+                    }
+                    else if (a[1].t == Value::Num)
+                    {
+                        held = std::to_string((long long)a[1].n);
+                        s = held.data();
+                        n = a.size() > 2 && a[2].t != Value::Null ? (size_t)BNum(a[2]) : held.size();
+                    }
+
+                    if (!s || n == 0)
+                    {
+                        if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
+                        return a[0];
+                    }
+
+                    if (a[0].t == Value::Pointer && a[0].ptr && IsDynBuffer(a[0].ptr))
+                    {
+                        DynBufHeader* h = GetDynBufHeader(a[0].ptr);
+                        if (h->length + n >= h->capacity)
+                        {
+                            size_t newCap = max((size_t)h->capacity * 2, (size_t)h->length + n + 1024);
+                            void* pNew = DynAlloc(newCap, a[0].ptr);
+                            if (pNew)
+                            {
+                                a[0].ptr = pNew;
+                                h = GetDynBufHeader(pNew);
+                            }
+                        }
+                        memcpy((char*)a[0].ptr + h->length, s, n);
+                        h->length += (uint32_t)n;
+                        ((char*)a[0].ptr)[h->length] = 0;
+                        if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
+                        return a[0];
+                    }
+
+                    if (a[0].t == Value::Pointer || a[0].t == Value::Num)
+                    {
+                        void* dst = a[0].t == Value::Pointer ? a[0].ptr : (void*)(INT_PTR)(long long)a[0].n;
+                        if (dst)
+                        {
+                            size_t off = a.size() > 2 ? (size_t)BNum(a[2]) : 0;
+                            memcpy((char*)dst + off, s, n);
+                            if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
+                            return Value::Num_((double)(off + n));
+                        }
+                    }
+
+                    if (a[0].t == Value::Str)
+                    {
                         wstring w = BStr(a[0]);
-                        for (size_t k = 0; k < n && s[k]; k++)
+                        for (size_t k = 0; k < n; k++)
                             w.push_back((wchar_t)(unsigned char)s[k]);
+                        if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
                         return Value::Str_(w);
                     }
-                    return a[0]; });
+
+                    if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
+                    return a[0];
+                });
+                tb->map[L"concat"] = fnConcat;
+                tb->map[L"append"] = fnConcat;
                 // raw.closehandle(h) — CloseHandle
                 auto rawArrayFunc = NF([](vector<Value>& a) -> Value {
                     // raw.array / raw.toarray(arrayOrLength, rawTypename, fieldName)
@@ -4629,7 +4782,7 @@ void Interp::InitBuiltins()
                         h = (HANDLE)(INT_PTR)(long long)a[0].n;
                     if (!h) return Value::Bool_(false);
                     return Value::Bool_(CloseHandle(h) != FALSE); });
-                // raw.realloc(size, ptr) — official contract: raw.realloc(size, [ptr])
+                // raw.realloc(size, ptr [, initialData]) — official contract: raw.realloc(size, [ptr])
                 // also tolerant to raw.realloc(ptr, size) if someone passes ptr first
                 tb->map[L"realloc"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
@@ -4650,12 +4803,33 @@ void Interp::InitBuiltins()
                                 p = (void*)(INT_PTR)(long long)a[1].n;
                         }
                     }
-                    if (!n) {
-                        if (p) HeapFree(GetProcessHeap(), 0, p);
-                        return Value::Pointer_(nullptr);
+                    void* q = DynAlloc(n, p);
+                    if (q && a.size() > 2 && a[2].t != Value::Null)
+                    {
+                        DynBufHeader* h = GetDynBufHeader(q);
+                        if (a[2].t == Value::Str)
+                        {
+                            std::string bytes = RawBytesOf(BStr(a[2]));
+                            size_t cpy = min((size_t)h->capacity, bytes.size());
+                            memcpy(q, bytes.data(), cpy);
+                            h->length = (uint32_t)cpy;
+                            ((char*)q)[cpy] = 0;
+                        }
+                        else if (a[2].t == Value::TableT || a[2].t == Value::Class)
+                        {
+                            int total = 0;
+                            void* pS = StructSerialize(a[2], &total);
+                            if (pS)
+                            {
+                                size_t cpy = min((size_t)h->capacity, (size_t)total);
+                                memcpy(q, pS, cpy);
+                                h->length = (uint32_t)cpy;
+                                ((char*)q)[cpy] = 0;
+                                HeapFree(GetProcessHeap(), 0, pS);
+                            }
+                        }
                     }
-                    void* q = p ? HeapReAlloc(GetProcessHeap(), 0, p, n)
-                                : HeapAlloc(GetProcessHeap(), 0, n);
+                    if (!q) return Value();
                     return Value::Pointer_(q); });
                 tb->map[L"malloc"] = tb->map[L"realloc"];
                 // raw.equal(a,b,size) — byte comparison
@@ -4697,6 +4871,36 @@ void Interp::InitBuiltins()
                     const Value& from = a[0];
                     Value to = a[1];
                     long long off = a.size() > 2 ? (long long)BNum(a[2]) : 0;
+
+                    if (to.t == Value::Pointer || to.t == Value::Num)
+                    {
+                        void* dst = to.t == Value::Pointer ? to.ptr : (void*)(INT_PTR)(long long)to.n;
+                        if (dst)
+                        {
+                            if (from.t == Value::TableT || from.t == Value::Class)
+                            {
+                                int total = 0;
+                                void* pSrc = StructSerialize(from, &total);
+                                if (pSrc)
+                                {
+                                    memcpy((char*)dst + off, pSrc, total);
+                                    HeapFree(GetProcessHeap(), 0, pSrc);
+                                }
+                            }
+                            else if (from.t == Value::Str)
+                            {
+                                std::string bytes = RawBytesOf(BStr(from));
+                                memcpy((char*)dst + off, bytes.data(), bytes.size());
+                            }
+                            else if (from.t == Value::Pointer && from.ptr)
+                            {
+                                size_t sz = a.size() > 3 ? (size_t)BNum(a[3]) : 0;
+                                if (sz > 0) memcpy((char*)dst + off, from.ptr, sz);
+                            }
+                        }
+                        return to;
+                    }
+
                     if (to.t != Value::TableT || !to.tab) return to;
 
                     if (from.t == Value::TableT || from.t == Value::Class)
@@ -4719,9 +4923,43 @@ void Interp::InitBuiltins()
                     }
                     else if (from.t == Value::Str)
                     {
-                        StructDeserialize(to, (const char*)from.s.data() + off);
+                        std::string bytes = RawBytesOf(BStr(from));
+                        if ((size_t)off < bytes.size())
+                            StructDeserialize(to, bytes.data() + off);
                     }
                     return to;
+                });
+                tb->map[L"find"] = NF([this](vector<Value>& a) -> Value {
+                    if (a.size() < 3) return Value();
+                    void* p = a[0].t == Value::Pointer ? a[0].ptr : (void*)(INT_PTR)(long long)BNum(a[0]);
+                    size_t len = (size_t)BNum(a[1]);
+                    if (!p || len == 0) return Value();
+                    wstring s; s.resize(len);
+                    const unsigned char* up = (const unsigned char*)p;
+                    for (size_t k = 0; k < len; k++) s[k] = (wchar_t)up[k];
+                    vector<Value> args;
+                    args.push_back(Value::Str_(s));
+                    args.push_back(a[2]);
+                    if (a.size() > 3) args.push_back(a[3]);
+                    auto sFind = GetRoot(L"string").tab ? GetRoot(L"string").tab->map[L"find"] : Value();
+                    if (sFind.native) return sFind.native(args);
+                    return Value();
+                });
+                tb->map[L"match"] = NF([this](vector<Value>& a) -> Value {
+                    if (a.size() < 3) return Value();
+                    void* p = a[0].t == Value::Pointer ? a[0].ptr : (void*)(INT_PTR)(long long)BNum(a[0]);
+                    size_t len = (size_t)BNum(a[1]);
+                    if (!p || len == 0) return Value();
+                    wstring s; s.resize(len);
+                    const unsigned char* up = (const unsigned char*)p;
+                    for (size_t k = 0; k < len; k++) s[k] = (wchar_t)up[k];
+                    vector<Value> args;
+                    args.push_back(Value::Str_(s));
+                    args.push_back(a[2]);
+                    if (a.size() > 3) args.push_back(a[3]);
+                    auto sMatch = GetRoot(L"string").tab ? GetRoot(L"string").tab->map[L"match"] : Value();
+                    if (sMatch.native) return sMatch.native(args);
+                    return Value();
                 });
                 // M5: preloaded system DLLs, mirroring builtin/_.aardio's
                 // ::User32/::Kernel32 — api.aardio assumes they exist
@@ -4748,25 +4986,21 @@ void Interp::InitBuiltins()
                     // pointer and crash the process. Provide the CRT helpers
                     // ourselves so the reopen is a safe no-op.
                     {
-                        auto vm = std::make_shared<Table>();
-                        vm->map[L"__iob_func"] = NF([](vector<Value>&) -> Value {
-                            return Value::Pointer_(stdin); });
-                        vm->map[L"freopen"] = NF([](vector<Value>& a) -> Value {
-                            wstring path = a.empty() ? L"" : BStr(a[0]);
-                            wstring mode = a.size() > 1 ? BStr(a[1]) : L"r";
-                            // only the console streams are meaningful here
-                            FILE* pf = nullptr;
-                            if (path == L"CONIN$")
-                                pf = stdin;
-                            else
-                                pf = stdout;
-                            (void)mode;
-                            return Value::Pointer_(pf); });
-                        vm->map[L"_open_osfhandle"] =
-                            NF([](vector<Value>&) -> Value {
+                        vector<Value> da{ Value::Str_(L"msvcrt.dll"), Value::Str_(L"cdecl") };
+                        Value dv = uDll.native(da);
+                        if (dv.t == Value::TableT && dv.tab)
+                        {
+                            dv.tab->map[L"__iob_func"] = NF([](vector<Value>&) -> Value {
+                                return Value::Pointer_(stdin); });
+                            dv.tab->map[L"freopen"] = NF([](vector<Value>& a) -> Value {
+                                wstring path = a.empty() ? L"" : BStr(a[0]);
+                                FILE* pf = (path == L"CONIN$") ? stdin : stdout;
+                                return Value::Pointer_(pf); });
+                            dv.tab->map[L"_open_osfhandle"] = NF([](vector<Value>&) -> Value {
                                 return Value::Num_(-1.0); });
-                        globals.vars[L"Msvcrt"] = Value::Table_(vm);
-                        roots[L"Msvcrt"] = globals.vars[L"Msvcrt"];
+                            globals.vars[L"Msvcrt"] = dv;
+                            roots[L"Msvcrt"] = dv;
+                        }
                     }
                     const wchar_t* DLLS[] = { L"Shell32.dll", L"Gdi32.dll",
                         L"Ole32.dll", L"OleAut32.dll", L"Advapi32.dll",

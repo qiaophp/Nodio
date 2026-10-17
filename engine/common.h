@@ -127,6 +127,42 @@ namespace NodioVM
     uint64_t ToSize64Uint(const Value& v);
     Value CreateSize64(uint64_t val);
 
+    const uint32_t DYN_BUF_MAGIC = 0xAA55AA55;
+    struct DynBufHeader
+    {
+        uint32_t magic;
+        uint32_t reserved;
+        uint32_t capacity;
+        uint32_t length;
+    };
+    static_assert(sizeof(DynBufHeader) == 16, "DynBufHeader must be 16 bytes");
+
+    inline bool IsDynBuffer(const void* p)
+    {
+        if (!p) return false;
+        __try
+        {
+            const DynBufHeader* h = (const DynBufHeader*)((const char*)p - 16);
+            return h->magic == DYN_BUF_MAGIC;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    inline DynBufHeader* GetDynBufHeader(void* p)
+    {
+        return (DynBufHeader*)((char*)p - 16);
+    }
+
+    inline const DynBufHeader* GetDynBufHeader(const void* p)
+    {
+        return (const DynBufHeader*)((const char*)p - 16);
+    }
+
+    void* DynAlloc(size_t n, void* pOld = nullptr);
+
     inline double BNum(const Value& v)
     {
         if (v.t == Value::Num) return v.n;

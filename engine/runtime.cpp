@@ -300,6 +300,7 @@ Value Interp::Eval(const PNode& n, Env* env)
 double Interp::ToNum(const Value& v)
         {
             if (v.t == Value::Num) return v.n;
+            if (v.t == Value::Pointer) return (double)(__int64)(INT_PTR)v.ptr;
             if (v.t == Value::Str)
             {
                 wchar_t* e = nullptr;
@@ -309,6 +310,7 @@ double Interp::ToNum(const Value& v)
             if (v.t == Value::Bool) return v.b ? 1 : 0;
             if (v.t == Value::TableT && v.tab)
             {
+                if (IsSize64(v)) return (double)GetSize64Val(v);
                 auto im = v.tab->map.find(L"_meta");
                 if (im != v.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
                 {

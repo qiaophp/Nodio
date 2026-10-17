@@ -1,0 +1,24 @@
+// t77: dynamic pointers, raw.realloc/sizeof, raw.append, raw.convert, math.validateRange, tonumber(ptr)
+var p = raw.realloc(64);
+var l, c = raw.sizeof(p);
+io.print("dyn alloc:", l, c);
+
+raw.append(p, "hello");
+l, c = raw.sizeof(p);
+io.print("after append:", l, c, raw.tostring(p, 1, l));
+
+var numPtr = tonumber(p);
+io.print("tonumber ptr > 0:", numPtr > 0);
+
+raw.convert({INT size = 10}, topointer(p, -4));
+l, c = raw.sizeof(p);
+io.print("after convert size:", l);
+
+var st, en = math.validateRange(10, -3, -1);
+io.print("validateRange:", st, en);
+
+var st2, en2 = math.validateRange(10, 5, 2);
+io.print("validateRange invalid:", st2, en2);
+
+p = raw.realloc(0, p);
+io.print("freed:", p === null);

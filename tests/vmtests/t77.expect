@@ -1,0 +1,7 @@
+dyn alloc:064
+after append:564hello
+tonumber ptr > 0:true
+after convert size:10
+validateRange:810
+validateRange invalid:nullnull
+freed:true
