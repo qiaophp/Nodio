@@ -502,7 +502,7 @@ namespace NodioVM
     extern std::mutex g_threadSharedMutex;
     struct RE
     {
-        int k;                 // 0 char, 1 class, 2 dot, 3 group, 4 $ end, 7 balanced
+        int k;                 // 0 char, 1 class, 2 dot, 3 group, 4 $ end, 7 balanced, 8 alt
         wchar_t ch = 0;
         wchar_t chClose = 0;
         unsigned cls = 0;      // 1=\d 2=\D 4=\w 8=\W 16=\s 32=\S
@@ -510,6 +510,8 @@ namespace NodioVM
         bool neg = false;
         int gi = -1;           // capture index (group)
         vector<RE> sub;
+        vector<vector<RE>> alt;
+        bool nocase = false;
         int min = 1, max = 1;  // max -1 = unbounded
         bool lazy = false;
     };

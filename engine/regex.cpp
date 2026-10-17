@@ -38,219 +38,6 @@ namespace NodioVM
         wstring* err;
         explicit REParser(const wstring& p, wstring* e) : pat(p), err(e) {}
 
-        bool ParseSeq(vector<RE>& out, bool inGroup)
-        {
-            while (i < pat.size())
-            {
-                wchar_t c = pat[i];
-                if (c == L'|' || c == L')')
-                    return inGroup ? true : true;   // caller handles both
-                RE el;
-                if (c == L'(')
-                {
-                    i++;
-                    int gi = -1;
-                    if (i + 1 < pat.size() && pat[i] == L'?' && pat[i + 1] == L':')
-                        i += 2;
-                    else
-                        gi = ++nGroups;
-                    vector<RE> sub;
-                    if (!ParseSeq(sub, true))
-                        return false;
-                    if (i >= pat.size() || pat[i] != L')')
-                    {
-                        (*err) = L"模式错误: 缺少 )";
-                        return false;
-                    }
-                    i++;
-
-                    int qMin = 1, qMax = 1;
-                    bool qLazy = false;
-                    bool hasQuant = false;
-                    if (i < pat.size())
-                    {
-                        wchar_t q = pat[i];
-                        if (q == L'*') { qMin = 0; qMax = -1; i++; hasQuant = true; }
-                        else if (q == L'+') { qMin = 1; qMax = -1; i++; hasQuant = true; }
-                        else if (q == L'?') { qMin = 0; qMax = 1; i++; hasQuant = true; }
-                        else if (q == L'{')
-                        {
-                            size_t j = pat.find(L'}', i);
-                            if (j != wstring::npos)
-                            {
-                                wstring spec = pat.substr(i + 1, j - i - 1);
-                                size_t comma = spec.find(L',');
-                                qMin = _wtoi(spec.substr(0, comma).c_str());
-                                if (comma == wstring::npos)
-                                    qMax = qMin;
-                                else
-                                {
-                                    wstring hi = spec.substr(comma + 1);
-                                    qMax = hi.empty() ? -1 : _wtoi(hi.c_str());
-                                }
-                                if (qMin < 0) qMin = 0;
-                                i = j + 1;
-                                hasQuant = true;
-                            }
-                        }
-                        if (hasQuant && i < pat.size() && pat[i] == L'?')
-                        {
-                            qLazy = true;
-                            i++;
-                        }
-                    }
-
-                    if (!hasQuant)
-                    {
-                        RE startEl; startEl.k = 5; startEl.gi = gi;
-                        out.push_back(std::move(startEl));
-                        for (auto& s : sub)
-                            out.push_back(std::move(s));
-                        RE endEl; endEl.k = 6; endEl.gi = gi;
-                        out.push_back(std::move(endEl));
-                        continue;
-                    }
-                    else
-                    {
-                        el.k = 3;
-                        el.gi = gi;
-                        el.sub = std::move(sub);
-                        el.min = qMin;
-                        el.max = qMax;
-                        el.lazy = qLazy;
-                        out.push_back(std::move(el));
-                        continue;
-                    }
-                }
-                else if (c == L'[')
-                {
-                    i++;
-                    el.k = 1;
-                    if (i < pat.size() && pat[i] == L'^') { el.neg = true; i++; }
-                    bool first = true;
-                    while (i < pat.size() && (pat[i] != L']' || first))
-                    {
-                        first = false;
-                        wchar_t lo = pat[i];
-                        if (lo == L'\\' && i + 1 < pat.size())
-                        {
-                            i++;
-                            wchar_t e = pat[i];
-                            unsigned bit = ClassBit(e);
-                            if (bit) el.cls |= bit;
-                            else if (e == L'n') lo = L'\n';
-                            else if (e == L't') lo = L'\t';
-                            else if (e == L'r') lo = L'\r';
-                            else lo = e;
-                        }
-                        if (i + 2 < pat.size() && pat[i + 1] == L'-' &&
-                            pat[i + 2] != L']')
-                        {
-                            wchar_t hi = pat[i + 2];
-                            if (hi == L'\\' && i + 3 < pat.size())
-                                hi = pat[i + 3];
-                            el.ranges.push_back({ lo, hi });
-                            i += 3;
-                        }
-                        else
-                        {
-                            el.ranges.push_back({ lo, lo });
-                            i++;
-                        }
-                    }
-                    if (i >= pat.size())
-                    {
-                        (*err) = L"模式错误: 缺少 ]";
-                        return false;
-                    }
-                    i++;   // ']'
-                }
-                else if (c == L'.')
-                {
-                    i++;
-                    el.k = 2;
-                }
-                else if (c == L'$')
-                {
-                    i++;
-                    el.k = 4;
-                }
-                else if (c == L'^' && out.empty())
-                {
-                    i++;   // ^ anchor: only meaningful at pattern start; the
-                           // search loop honors it by not scanning
-                    continue;
-                }
-                else if (c == L'\\')
-                {
-                    i++;
-                    if (i >= pat.size())
-                    {
-                        (*err) = L"模式错误: 悬挂的 \\";
-                        return false;
-                    }
-                    wchar_t e = pat[i++];
-                    unsigned bit = ClassBit(e);
-                    if (bit) { el.k = 1; el.cls |= bit; }
-                    else
-                    {
-                        el.k = 0;
-                        if (e == L'n') el.ch = L'\n';
-                        else if (e == L't') el.ch = L'\t';
-                        else if (e == L'r') el.ch = L'\r';
-                        else el.ch = e;
-                    }
-                }
-                else if (c == L'%' && i + 2 < pat.size())
-                {
-                    el.k = 7;
-                    el.ch = pat[i + 1];
-                    el.chClose = pat[i + 2];
-                    i += 3;
-                }
-                else
-                {
-                    i++;
-                    el.k = 0;
-                    el.ch = c;
-                }
-                // quantifier
-                if (i < pat.size())
-                {
-                    wchar_t q = pat[i];
-                    if (q == L'*') { el.min = 0; el.max = -1; i++; }
-                    else if (q == L'+') { el.min = 1; el.max = -1; i++; }
-                    else if (q == L'?') { el.min = 0; el.max = 1; i++; }
-                    else if (q == L'{')
-                    {
-                        size_t j = pat.find(L'}', i);
-                        if (j != wstring::npos)
-                        {
-                            wstring spec = pat.substr(i + 1, j - i - 1);
-                            size_t comma = spec.find(L',');
-                            el.min = _wtoi(spec.substr(0, comma).c_str());
-                            if (comma == wstring::npos)
-                                el.max = el.min;
-                            else
-                            {
-                                wstring hi = spec.substr(comma + 1);
-                                el.max = hi.empty() ? -1 : _wtoi(hi.c_str());
-                            }
-                            if (el.min < 0) el.min = 0;
-                            i = j + 1;
-                        }
-                    }
-                    if (i < pat.size() && pat[i] == L'?')
-                    {
-                        el.lazy = true;
-                        i++;
-                    }
-                }
-                out.push_back(std::move(el));
-            }
-            return true;
-        }
-
         unsigned ClassBit(wchar_t e)
         {
             switch (e)
@@ -269,6 +56,356 @@ namespace NodioVM
             case L'p': return 2048;
             default: return 0;
             }
+        }
+
+        void ParseQuantifier(RE& el)
+        {
+            if (i >= pat.size()) return;
+            wchar_t q = pat[i];
+            bool hasQuant = false;
+            int qMin = 1, qMax = 1;
+            bool qLazy = false;
+            if (q == L'*') { qMin = 0; qMax = -1; i++; hasQuant = true; }
+            else if (q == L'+') { qMin = 1; qMax = -1; i++; hasQuant = true; }
+            else if (q == L'?') { qMin = 0; qMax = 1; i++; hasQuant = true; }
+            else if (q == L'{')
+            {
+                size_t j = pat.find(L'}', i);
+                if (j != wstring::npos)
+                {
+                    wstring spec = pat.substr(i + 1, j - i - 1);
+                    size_t comma = spec.find(L',');
+                    qMin = _wtoi(spec.substr(0, comma).c_str());
+                    if (comma == wstring::npos)
+                        qMax = qMin;
+                    else
+                    {
+                        wstring hi = spec.substr(comma + 1);
+                        qMax = hi.empty() ? -1 : _wtoi(hi.c_str());
+                    }
+                    if (qMin < 0) qMin = 0;
+                    i = j + 1;
+                    hasQuant = true;
+                }
+            }
+            if (hasQuant)
+            {
+                if (i < pat.size() && pat[i] == L'?')
+                {
+                    qLazy = true;
+                    i++;
+                }
+                el.min = qMin;
+                el.max = qMax;
+                el.lazy = qLazy;
+            }
+        }
+
+        bool ParseOne(RE& el)
+        {
+            if (i >= pat.size()) return false;
+            wchar_t c = pat[i];
+            if (c == L'(')
+            {
+                i++;
+                int gi = -1;
+                if (i + 1 < pat.size() && pat[i] == L'?' && pat[i + 1] == L':')
+                    i += 2;
+                else
+                    gi = ++nGroups;
+                vector<vector<RE>> subBranches;
+                while (true)
+                {
+                    vector<RE> sub;
+                    if (!ParseSeq(sub, L')'))
+                        return false;
+                    subBranches.push_back(std::move(sub));
+                    if (i < pat.size() && pat[i] == L'|')
+                    {
+                        i++;
+                        continue;
+                    }
+                    break;
+                }
+                if (i < pat.size() && pat[i] == L')')
+                    i++;
+                if (subBranches.size() == 1)
+                {
+                    el.k = 3;
+                    el.gi = gi;
+                    el.sub = std::move(subBranches[0]);
+                }
+                else
+                {
+                    el.k = 8;
+                    el.gi = gi;
+                    el.alt = std::move(subBranches);
+                }
+                ParseQuantifier(el);
+                return true;
+            }
+            else if (c == L'<')
+            {
+                // Aardio non-capturing group
+                if (pat.size() >= i + 3 && pat.substr(i, 3) == L"<@@")
+                {
+                    size_t endAt = pat.find(L"@>", i + 3);
+                    if (endAt != wstring::npos)
+                    {
+                        wstring lit = pat.substr(i + 3, endAt - (i + 3));
+                        i = endAt + 2;
+                        el.k = 3;
+                        el.gi = -1;
+                        for (wchar_t chLit : lit)
+                        {
+                            RE chEl;
+                            chEl.k = 0;
+                            chEl.ch = chLit;
+                            chEl.nocase = true;
+                            el.sub.push_back(chEl);
+                        }
+                        ParseQuantifier(el);
+                        return true;
+                    }
+                }
+                else if (pat.size() >= i + 2 && pat.substr(i, 2) == L"<@")
+                {
+                    size_t endAt = pat.find(L"@>", i + 2);
+                    if (endAt != wstring::npos)
+                    {
+                        wstring lit = pat.substr(i + 2, endAt - (i + 2));
+                        i = endAt + 2;
+                        el.k = 3;
+                        el.gi = -1;
+                        for (wchar_t chLit : lit)
+                        {
+                            RE chEl;
+                            chEl.k = 0;
+                            chEl.ch = chLit;
+                            chEl.nocase = false;
+                            el.sub.push_back(chEl);
+                        }
+                        ParseQuantifier(el);
+                        return true;
+                    }
+                }
+                i++; // skip '<'
+                vector<vector<RE>> subBranches;
+                while (true)
+                {
+                    vector<RE> sub;
+                    if (!ParseSeq(sub, L'>'))
+                        return false;
+                    subBranches.push_back(std::move(sub));
+                    if (i < pat.size() && pat[i] == L'|')
+                    {
+                        i++;
+                        continue;
+                    }
+                    break;
+                }
+                if (i < pat.size() && pat[i] == L'>')
+                    i++;
+                if (subBranches.size() == 1)
+                {
+                    el.k = 3;
+                    el.gi = -1;
+                    el.sub = std::move(subBranches[0]);
+                }
+                else
+                {
+                    el.k = 8;
+                    el.gi = -1;
+                    el.alt = std::move(subBranches);
+                }
+                ParseQuantifier(el);
+                return true;
+            }
+            else if (c == L'[')
+            {
+                i++;
+                el.k = 1;
+                if (i < pat.size() && pat[i] == L'^') { el.neg = true; i++; }
+                bool first = true;
+                while (i < pat.size() && (pat[i] != L']' || first))
+                {
+                    first = false;
+                    wchar_t lo = pat[i];
+                    if (lo == L'\\' && i + 1 < pat.size())
+                    {
+                        i++;
+                        wchar_t e = pat[i];
+                        unsigned bit = ClassBit(e);
+                        if (bit) el.cls |= bit;
+                        else if (e == L'n') lo = L'\n';
+                        else if (e == L't') lo = L'\t';
+                        else if (e == L'r') lo = L'\r';
+                        else lo = e;
+                    }
+                    if (i + 2 < pat.size() && pat[i + 1] == L'-' && pat[i + 2] != L']')
+                    {
+                        wchar_t hi = pat[i + 2];
+                        if (hi == L'\\' && i + 3 < pat.size())
+                            hi = pat[i + 3];
+                        el.ranges.push_back({ lo, hi });
+                        i += 3;
+                    }
+                    else
+                    {
+                        el.ranges.push_back({ lo, lo });
+                        i++;
+                    }
+                }
+                if (i < pat.size() && pat[i] == L']')
+                    i++;
+                ParseQuantifier(el);
+                return true;
+            }
+            else if (c == L'.')
+            {
+                i++;
+                el.k = 2;
+                ParseQuantifier(el);
+                return true;
+            }
+            else if (c == L'$')
+            {
+                i++;
+                el.k = 4;
+                return true;
+            }
+            else if (c == L'\\')
+            {
+                i++;
+                if (i >= pat.size())
+                {
+                    (*err) = L"模式错误: 悬挂的 \\";
+                    return false;
+                }
+                wchar_t e = pat[i++];
+                unsigned bit = ClassBit(e);
+                if (bit) { el.k = 1; el.cls |= bit; }
+                else
+                {
+                    el.k = 0;
+                    if (e == L'n') el.ch = L'\n';
+                    else if (e == L't') el.ch = L'\t';
+                    else if (e == L'r') el.ch = L'\r';
+                    else el.ch = e;
+                }
+                ParseQuantifier(el);
+                return true;
+            }
+            else if (c == L'%' && i + 2 < pat.size())
+            {
+                el.k = 7;
+                el.ch = pat[i + 1];
+                el.chClose = pat[i + 2];
+                i += 3;
+                ParseQuantifier(el);
+                return true;
+            }
+            else
+            {
+                i++;
+                el.k = 0;
+                el.ch = c;
+                ParseQuantifier(el);
+                return true;
+            }
+        }
+
+        bool ParseBranch(vector<RE>& branch)
+        {
+            if (i >= pat.size()) return false;
+            wchar_t c = pat[i];
+            if (iswalnum(c) || c == L'_')
+            {
+                while (i < pat.size() && (iswalnum(pat[i]) || pat[i] == L'_'))
+                {
+                    RE el;
+                    if (!ParseOne(el)) return false;
+                    branch.push_back(std::move(el));
+                }
+                return true;
+            }
+            RE el;
+            if (!ParseOne(el)) return false;
+            branch.push_back(std::move(el));
+            return true;
+        }
+
+        bool ParseSeq(vector<RE>& out, wchar_t stopChar)
+        {
+            while (i < pat.size())
+            {
+                wchar_t c = pat[i];
+                if (stopChar != 0 && c == stopChar)
+                    break;
+                if (c == L')' && stopChar == L')')
+                    break;
+                if (c == L'>' && stopChar == L'>')
+                    break;
+                if (c == L'|')
+                {
+                    i++; // consume '|'
+                    vector<RE> nextBranch;
+                    if (!ParseBranch(nextBranch))
+                        return false;
+                    if (!out.empty() && out.back().k == 8)
+                    {
+                        out.back().alt.push_back(std::move(nextBranch));
+                    }
+                    else if (!out.empty())
+                    {
+                        vector<RE> leftBranch;
+                        if (out.back().k == 0 && (iswalnum(out.back().ch) || out.back().ch == L'_'))
+                        {
+                            vector<RE> words;
+                            while (!out.empty() && out.back().k == 0 && (iswalnum(out.back().ch) || out.back().ch == L'_'))
+                            {
+                                words.push_back(std::move(out.back()));
+                                out.pop_back();
+                            }
+                            for (auto it = words.rbegin(); it != words.rend(); ++it)
+                                leftBranch.push_back(std::move(*it));
+                        }
+                        else
+                        {
+                            leftBranch.push_back(std::move(out.back()));
+                            out.pop_back();
+                        }
+                        RE altEl;
+                        altEl.k = 8;
+                        altEl.alt.push_back(std::move(leftBranch));
+                        altEl.alt.push_back(std::move(nextBranch));
+                        out.push_back(std::move(altEl));
+                    }
+                    else
+                    {
+                        for (auto& nb : nextBranch)
+                            out.push_back(std::move(nb));
+                    }
+                    continue;
+                }
+                RE el;
+                if (!ParseOne(el))
+                    return false;
+                if (el.k == 3 && el.min == 1 && el.max == 1 && el.gi >= 0)
+                {
+                    RE startEl; startEl.k = 5; startEl.gi = el.gi;
+                    out.push_back(std::move(startEl));
+                    for (auto& s : el.sub)
+                        out.push_back(std::move(s));
+                    RE endEl; endEl.k = 6; endEl.gi = el.gi;
+                    out.push_back(std::move(endEl));
+                }
+                else
+                {
+                    out.push_back(std::move(el));
+                }
+            }
+            return true;
         }
     };
 
@@ -289,10 +426,46 @@ namespace NodioVM
                              vector<wstring>& caps)
     {
         if (pos >= s.size())
+        {
+            if (el.k == 8)
+            {
+                for (const auto& branch : el.alt)
+                {
+                    vector<wstring> tmp = caps;
+                    vector<size_t> starts;
+                    long long e = REMatchSeq(branch, 0, s, pos, tmp, starts, false);
+                    if (e >= 0)
+                    {
+                        caps = tmp;
+                        return (size_t)e;
+                    }
+                }
+            }
+            if (el.k == 3)
+            {
+                vector<wstring> tmp = caps;
+                vector<size_t> starts;
+                long long e = REMatchSeq(el.sub, 0, s, pos, tmp, starts, false);
+                if (e >= 0)
+                {
+                    if (el.gi >= 0)
+                    {
+                        if ((size_t)el.gi >= caps.size())
+                            caps.resize((size_t)el.gi + 1);
+                        caps[(size_t)el.gi] = L"";
+                    }
+                    caps = tmp;
+                    return (size_t)e;
+                }
+            }
             return RENPOS;
+        }
         switch (el.k)
         {
-        case 0: return s[pos] == el.ch ? pos + 1 : RENPOS;
+        case 0:
+            if (el.nocase)
+                return (towlower(s[pos]) == towlower(el.ch)) ? pos + 1 : RENPOS;
+            return s[pos] == el.ch ? pos + 1 : RENPOS;
         case 2: return s[pos] != L'\n' ? pos + 1 : RENPOS;
         case 1: return REClassHit(el, s[pos]) ? pos + 1 : RENPOS;
         case 3:
@@ -308,7 +481,23 @@ namespace NodioVM
                     caps.resize((size_t)el.gi + 1);
                 caps[(size_t)el.gi] = s.substr(pos, (size_t)e - pos);
             }
+            caps = tmp;
             return (size_t)e;
+        }
+        case 8: // Alternation
+        {
+            for (const auto& branch : el.alt)
+            {
+                vector<wstring> tmp = caps;
+                vector<size_t> starts;
+                long long e = REMatchSeq(branch, 0, s, pos, tmp, starts, false);
+                if (e >= 0)
+                {
+                    caps = tmp;
+                    return (size_t)e;
+                }
+            }
+            return RENPOS;
         }
         case 7:
         {
@@ -466,19 +655,10 @@ namespace NodioVM
         size_t j = 0;
         if (!pat.empty() && pat[0] == L'^') { anchored = true; j = 1; }
         ps.i = j;
-        while (true)
-        {
-            vector<RE> els;
-            if (!ps.ParseSeq(els, false))
-                return false;
-            branches.push_back(std::move(els));
-            if (ps.i < ps.pat.size() && ps.pat[ps.i] == L'|')
-            {
-                ps.i++;
-                continue;
-            }
-            break;
-        }
+        vector<RE> els;
+        if (!ps.ParseSeq(els, 0))
+            return false;
+        branches.push_back(std::move(els));
         if (!err->empty())
             return false;
         *pAnchored = anchored;
