@@ -2413,6 +2413,97 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         return Value();
     });
 
+    auto fnGetEnumerator = NF([](vector<Value>& a) -> Value {
+        if (a.empty()) return Value();
+        Value target = a[0];
+        IDispatch* pDisp = nullptr;
+        if (target.t == Value::Pointer)
+        {
+            pDisp = reinterpret_cast<IDispatch*>(target.ptr);
+        }
+        else if (target.t == Value::TableT && target.tab)
+        {
+            auto io = target.tab->map.find(L"_object");
+            if (io != target.tab->map.end() && io->second.t == Value::Pointer)
+                pDisp = reinterpret_cast<IDispatch*>(io->second.ptr);
+            else
+            {
+                auto ib = target.tab->map.find(L"_boundDispatch");
+                if (ib != target.tab->map.end() && ib->second.t == Value::Pointer)
+                    pDisp = reinterpret_cast<IDispatch*>(ib->second.ptr);
+            }
+        }
+        IEnumVARIANT* pEnum = nullptr;
+        if (pDisp)
+        {
+            DISPPARAMS dpNoArgs = { nullptr, nullptr, 0, 0 };
+            VARIANT varEnum;
+            VariantInit(&varEnum);
+            HRESULT hr = pDisp->Invoke(DISPID_NEWENUM, IID_NULL, LOCALE_USER_DEFAULT,
+                                       DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+                                       &dpNoArgs, &varEnum, nullptr, nullptr);
+            if (SUCCEEDED(hr))
+            {
+                if (varEnum.vt == VT_UNKNOWN && varEnum.punkVal)
+                    varEnum.punkVal->QueryInterface(IID_IEnumVARIANT, (void**)&pEnum);
+                else if (varEnum.vt == VT_DISPATCH && varEnum.pdispVal)
+                    varEnum.pdispVal->QueryInterface(IID_IEnumVARIANT, (void**)&pEnum);
+                VariantClear(&varEnum);
+            }
+            if (!pEnum)
+            {
+                pDisp->QueryInterface(IID_IEnumVARIANT, (void**)&pEnum);
+            }
+        }
+        if (!pEnum) return Value();
+
+        auto spEnum = std::shared_ptr<IEnumVARIANT>(pEnum, [](IEnumVARIANT* pe) { if (pe) pe->Release(); });
+        auto tbEnum = std::make_shared<Table>();
+        tbEnum->map[L"_isEnumerator"] = Value::Bool_(true);
+        tbEnum->map[L"_object"] = Value::Pointer_(pEnum);
+
+        tbEnum->map[L"Next"] = NF([spEnum](vector<Value>&) -> Value {
+            VARIANT varItem;
+            VariantInit(&varItem);
+            ULONG fetched = 0;
+            HRESULT hrNext = spEnum->Next(1, &varItem, &fetched);
+            if (hrNext == S_OK && fetched == 1)
+            {
+                Value val = VariantToValue(varItem, nullptr);
+                VariantClear(&varItem);
+                return val;
+            }
+            VariantClear(&varItem);
+            return Value();
+        });
+
+        tbEnum->map[L"Reset"] = NF([spEnum](vector<Value>&) -> Value {
+            spEnum->Reset();
+            return Value::Bool_(true);
+        });
+
+        tbEnum->map[L"Skip"] = NF([spEnum](vector<Value>& aArgs) -> Value {
+            ULONG c = (aArgs.empty() || aArgs[0].t != Value::Num) ? 1 : (ULONG)aArgs[0].n;
+            spEnum->Skip(c);
+            return Value::Bool_(true);
+        });
+
+        return Value::Table_(tbEnum);
+    });
+
+    auto fnIsEnumerator = NF([](vector<Value>& a) -> Value {
+        if (a.empty()) return Value::Bool_(false);
+        Value v = a[0];
+        if (v.t == Value::TableT && v.tab && v.tab->map.count(L"_isEnumerator"))
+            return Value::Bool_(true);
+        return Value::Bool_(false);
+    });
+
+    com->map[L"GetEnumerator"] = fnGetEnumerator;
+    com->map[L"isEnumerator"] = fnIsEnumerator;
+    globalsEnv.vars[L"GetEnumerator"] = fnGetEnumerator;
+    globalsEnv.vars[L"isEnumerator"] = fnIsEnumerator;
+
     globalsEnv.vars[L"com"] = Value::Table_(com);
     // plain `import com` must resolve to this kernel namespace (official
     // builtin\com.aardio merges into it) instead of creating an empty
