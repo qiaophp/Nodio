@@ -30,6 +30,8 @@
 //                                 opt-out in this build.
 
 #include <windows.h>
+#include <commctrl.h>
+#pragma comment(lib, "comctl32.lib")
 #include "engine/NodioVM.h"
 #include "publish/payload.h"
 #include "publish/publish.h"
@@ -123,6 +125,9 @@ static void EnsureConsole(bool bForce)
 
 int wmain(int argc, wchar_t** argv)
 {
+    INITCOMMONCONTROLSEX icc = { sizeof(INITCOMMONCONTROLSEX), ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES | ICC_COOL_CLASSES };
+    InitCommonControlsEx(&icc);
+
     // NODIO_CHECK=<listfile>: parse-only sweep for coverage measurement.
     // The list file holds one .aardio path per line; each is lexed and
     // parsed (no execution) and reported as "OK <path>" / "FAIL <path> <err>".

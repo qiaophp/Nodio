@@ -1745,13 +1745,22 @@ bool Interp::ValuesEqual(const Value& l, const Value& r, bool strict)
             if (l.t != r.t)
             {
                 if (strict) return false;
+                if (l.t == Value::Bool || r.t == Value::Bool)
+                {
+                    return l.Truthy() == r.Truthy();
+                }
                 if (l.t == Value::Null || r.t == Value::Null)
                     return false;
                 if ((l.t == Value::Num && r.t == Value::Str) || (l.t == Value::Str && r.t == Value::Num))
                 {
-                    wchar_t* endp = nullptr;
                     const wstring& s = (l.t == Value::Str) ? l.s : r.s;
                     double n = (l.t == Value::Num) ? l.n : r.n;
+                    size_t first = s.find_first_not_of(L" \t\r\n");
+                    if (first == wstring::npos)
+                    {
+                        if (n == 0) return true;
+                    }
+                    wchar_t* endp = nullptr;
                     double v = wcstod(s.c_str(), &endp);
                     if (endp && *endp == 0)
                         return n == v;
