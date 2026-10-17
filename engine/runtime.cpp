@@ -60,7 +60,7 @@ Value Interp::Eval(const PNode& n, Env* env)
                 if (n->bMeta)
                 {
                     // 'tab@' — the metatable itself
-                    if (obj.t == Value::TableT && obj.tab)
+                    if ((obj.t == Value::TableT || obj.t == Value::Class || obj.t == Value::Func) && obj.tab)
                     {
                         auto im = obj.tab->map.find(L"_meta");
                         if (im != obj.tab->map.end())
@@ -348,7 +348,7 @@ bool Interp::MetaGet(const Value& obj, const Value& keyVal,
             if (s_metaDepth > 40)
                 return false;
             struct ScopeDepth { int& d; ScopeDepth(int& x): d(x){ d++; } ~ScopeDepth(){ d--; } } sd(s_metaDepth);
-            if (obj.t != Value::TableT || !obj.tab || key == L"_meta")
+            if ((obj.t != Value::TableT && obj.t != Value::Class && obj.t != Value::Func) || !obj.tab || key == L"_meta")
                 return false;
             // the meta chain can be nested: util.metaProperty instances
             // carry a class-annotation layer at _meta._meta (the
@@ -520,7 +520,7 @@ bool Interp::MetaSet(const Value& obj, const Value& keyVal,
         {
             wstring key = keyVal.ToString();
             *pErr = false;
-            if (obj.t != Value::TableT || !obj.tab || key == L"_meta")
+            if ((obj.t != Value::TableT && obj.t != Value::Class && obj.t != Value::Func) || !obj.tab || key == L"_meta")
                 return false;
             // the meta chain can be nested: util.metaProperty instances
             // carry a class-annotation layer at _meta._meta (the
@@ -1011,8 +1011,9 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 // aardio error(): raise a runtime error message; annotate
                 // with the module file so library-raised errors are
                 // traceable to their source
+                Value vErr = n->list.empty() ? Value() : Eval(n->list[0], env);
                 wstring msg = n->list.empty() ? L"运行错误" :
-                    L"运行错误: " + Eval(n->list[0], env).ToString();
+                    L"运行错误: " + vErr.ToString();
                 msg += L" @ 行 " + std::to_wstring(n->line);
                 if (!g_curModuleFile.empty())
                     msg += L" 模块: " + g_curModuleFile;
@@ -1947,7 +1948,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 if (target->bMeta)
                 {
                     // tab@ = meta — set the metatable
-                    if (obj.t == Value::TableT && obj.tab)
+                    if ((obj.t == Value::TableT || obj.t == Value::Class || obj.t == Value::Func) && obj.tab)
                         obj.tab->map[L"_meta"] = val;
                     return;
                 }
@@ -1955,10 +1956,27 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 // ::RECT._meta = ... must land on the class table; type.callable = ... on function table
                 if ((obj.t == Value::Class || obj.t == Value::Func) && obj.tab)
                 {
-                    if (val.t == Value::Null)
-                        obj.tab->map.erase(target->str);
+                    if (target->str == L"_meta" || !obj.tab->map.count(L"_meta"))
+                    {
+                        if (val.t == Value::Null)
+                            obj.tab->map.erase(target->str);
+                        else
+                            obj.tab->map[target->str] = val;
+                    }
                     else
-                        obj.tab->map[target->str] = val;
+                    {
+                        bool bErr = false;
+                        wstring strErrM;
+                        if (!MetaSet(obj, target->str, val, &bErr, &strErrM))
+                        {
+                            if (val.t == Value::Null)
+                                obj.tab->map.erase(target->str);
+                            else
+                                obj.tab->map[target->str] = val;
+                        }
+                        else if (bErr && err->empty())
+                            (*err) = L"运行错误: " + strErrM;
+                    }
                 }
                 else if (obj.t == Value::TableT && obj.tab)
                 {

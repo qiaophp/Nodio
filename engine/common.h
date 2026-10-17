@@ -681,6 +681,7 @@ namespace NodioVM
         wstring type;
         int arrCount = 1;
         bool bIsArray = false;
+        bool bPtrArray = false;
     };
 
     struct Env
@@ -844,7 +845,7 @@ namespace NodioVM
     void* EmitX64CallStub(const ApiSig& sig);
     void CallbackTrampoline(CbCtx* ctx);
     int GetStructFieldSize(const wstring& type, int arrCount,
-                           bool bIsArray = false);
+                           bool bIsArray = false, bool bPtrArray = false);
     std::vector<StructFieldDef> ParseStructDef(const Value& vTab);
     int CalcStructTotalSize(const Value& vTab);
     void* StructSerialize(const Value& vTab, int* pOutTotal = nullptr);

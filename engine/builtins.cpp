@@ -4136,7 +4136,7 @@ void Interp::InitBuiltins()
                                     (double)(unsigned char)r);
                                 break;
                             case ARBool:
-                                vRet = Value::Bool_(r != 0);
+                                vRet = Value::Bool_((int)r != 0);
                                 break;
                             case ARPtr:
                                 // official aardio types pointer returns as
@@ -5038,46 +5038,48 @@ void Interp::InitBuiltins()
                         switch (ctx->sig.ret)
                         {
                         case ARDbl: return (__int64)BNum(r);
-                        case ARBool: return BNum(r) != 0 ? 1 : 0;
+                        case ARBool: return (int)BNum(r) != 0 ? 1 : 0;
+                        case ARPtr: return r.t == Value::Pointer ? (__int64)(INT_PTR)r.ptr : (__int64)BNum(r);
                         case ARStrA:
                         case ARStrW:
-                        default: return (__int64)BNum(r);
+                        default: return r.t == Value::Pointer ? (__int64)(INT_PTR)r.ptr : (__int64)BNum(r);
                         }
                     };
                 // M3-c: callback(fn, "ret(p1,p2)", owner) -> function pointer
-                // (number) that APIs can call; the VM function receives
-                // the caller's arguments as numbers
-                auto fnCallback =
-                    NF([this](vector<Value>& a) -> Value {
-                    if (a.size() < 2 ||
-                        !(a[0].t == Value::Func))
-                    {
-                        (*err) =
-                            L"运行错误: raw.callback(fn, sig, owner)";
-                        return Value();
-                    }
-                    ApiSig sig;
-                    if (!ParseApiSig(BStr(a[1]), &sig))
-                    {
-                        (*err) = L"运行错误: 回调签名无效: " +
-                                 BStr(a[1]);
-                        return Value();
-                    }
-                    CbCtx* ctx = new CbCtx();
-                    ctx->fn = a[0];
-                    if (a.size() >= 3)
-                        ctx->owner = a[2];
-                    ctx->sig = sig;
-                    ctx->interp = this;
-                    CallbackTrampoline(ctx);
-                    g_cbs.push_back(ctx);
-                    return Value::Num_(
-                        (double)(__int64)(INT_PTR)ctx->code); });
+                // (number) that APIs can call
+                auto makeCallback = [this](bool bForceCdecl) {
+                    return NF([this, bForceCdecl](vector<Value>& a) -> Value {
+                        if (a.size() < 2 || !(a[0].t == Value::Func))
+                        {
+                            (*err) = L"运行错误: raw.callback(fn, sig, owner)";
+                            return Value();
+                        }
+                        ApiSig sig;
+                        if (!ParseApiSig(BStr(a[1]), &sig))
+                        {
+                            (*err) = L"运行错误: 回调签名无效: " + BStr(a[1]);
+                            return Value();
+                        }
+                        if (bForceCdecl)
+                            sig.bCdecl = true;
+                        CbCtx* ctx = new CbCtx();
+                        ctx->fn = a[0];
+                        if (a.size() >= 3)
+                            ctx->owner = a[2];
+                        ctx->sig = sig;
+                        ctx->interp = this;
+                        CallbackTrampoline(ctx);
+                        g_cbs.push_back(ctx);
+                        return Value::Num_((double)(__int64)(INT_PTR)ctx->code);
+                    });
+                };
+                auto fnCallback = makeCallback(false);
+                auto fnTocdecl = makeCallback(true);
                 tb->map[L"callback"] = fnCallback;
                 tb->map[L"tostdcall"] = fnCallback;
-                tb->map[L"tocdecl"] = fnCallback;
+                tb->map[L"tocdecl"] = fnTocdecl;
                 globals.vars[L"tostdcall"] = fnCallback;
-                globals.vars[L"tocdecl"] = fnCallback;
+                globals.vars[L"tocdecl"] = fnTocdecl;
             }
             // ---- table ----
             {

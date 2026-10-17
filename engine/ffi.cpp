@@ -80,6 +80,18 @@ namespace NodioVM
                 args.push_back(Value::Num_((double)v));
                 pArg += 8;
             }
+            else if (pt == 5)
+            {
+                void* p = *(void**)pArg;
+                args.push_back(p ? Value::Pointer_(p) : Value());
+                pArg += 4;
+            }
+            else if (pt == 4)
+            {
+                int v = *(int*)pArg;
+                args.push_back(Value::Bool_(v != 0));
+                pArg += 4;
+            }
             else
             {
                 int v = *(int*)pArg;
@@ -130,6 +142,18 @@ namespace NodioVM
                 args.push_back(Value::Num_(d));
                 if (i >= 4) pArg += 8;
             }
+            else if (pt == 5)     // pointer
+            {
+                unsigned __int64 v = (i < 4) ? regs[i] : *(unsigned __int64*)pArg;
+                if (i >= 4) pArg += 8;
+                args.push_back(v ? Value::Pointer_((void*)(INT_PTR)v) : Value());
+            }
+            else if (pt == 4)     // bool
+            {
+                unsigned __int64 v = (i < 4) ? regs[i] : *(unsigned __int64*)pArg;
+                if (i >= 4) pArg += 8;
+                args.push_back(Value::Bool_(v != 0));
+            }
             else                  // integer class (int/ptr/str...)
             {
                 unsigned __int64 v;
@@ -179,7 +203,7 @@ namespace NodioVM
             int pt = p & 0xFF;
             slots += (pt == 1) ? 2 : 1;
         }
-        int popBytes = slots * 4;             // stdcall callee cleanup
+        int popBytes = (ctx->sig.bCdecl) ? 0 : (slots * 4); // stdcall callee cleanup, cdecl caller cleans
         if (popBytes == 0)
             code[n++] = 0xC3;                 // ret
         else
@@ -439,12 +463,13 @@ namespace NodioVM
         return c;
     }
 
-    int GetStructFieldSize(const wstring& type, int arrCount, bool bIsArray)
+    int GetStructFieldSize(const wstring& type, int arrCount, bool bIsArray, bool bPtrArray)
     {
         wstring t = type;
         for (auto& c : t) c = towlower(c);
         if (arrCount < 0) arrCount = 0;
         if (!bIsArray) arrCount = 1;
+        if (bPtrArray) return (int)sizeof(void*) * arrCount;
         if (t == L"byte" || t == L"uchar" || t == L"char" || t == L"int8") return 1 * arrCount;
         if (t == L"word" || t == L"ushort" || t == L"short" || t == L"wchar") return 2 * arrCount;
         if (t == L"int" || t == L"uint" || t == L"dword" || t == L"bool") return 4 * arrCount;
@@ -519,6 +544,7 @@ namespace NodioVM
                 bool bArr = false;
                 size_t lb = srest.find(L'[');
                 wstring sname = srest;
+                bool bPtrArr = false;
                 if (lb != wstring::npos)
                 {
                     bArr = true;
@@ -539,10 +565,26 @@ namespace NodioVM
                             }
                         }
                     }
+                    wstring lowerType = stype;
+                    for (auto& c : lowerType) c = towlower(c);
+                    if (lowerType == L"string" || lowerType == L"str" || lowerType == L"strb" ||
+                        lowerType == L"lpcstr" || lowerType == L"ustring" || lowerType == L"ustr" ||
+                        lowerType == L"wstr" || lowerType == L"bstr" || lowerType == L"pointer" ||
+                        lowerType == L"ptr")
+                    {
+                        if (snum.empty())
+                            bPtrArr = true;
+                        else if (vTab.t == Value::TableT && vTab.tab)
+                        {
+                            auto iv = vTab.tab->map.find(sname);
+                            if (iv != vTab.tab->map.end() && iv->second.t == Value::TableT)
+                                bPtrArr = true;
+                        }
+                    }
                 }
                 while (!sname.empty() && (sname.back() == L' ' || sname.back() == L'\t'))
                     sname.pop_back();
-                fields.push_back({ sname, stype, nArr, bArr });
+                fields.push_back({ sname, stype, nArr, bArr, bPtrArr });
             }
         }
         else if (is->second.t == Value::TableT && is->second.tab)
@@ -552,6 +594,7 @@ namespace NodioVM
                 wstring t = kv.second.ToString();
                 int nArr = 1;
                 bool bArr = false;
+                bool bPtrArr = false;
                 size_t lb = t.find(L'[');
                 wstring stype = t;
                 if (lb != wstring::npos)
@@ -572,8 +615,24 @@ namespace NodioVM
                             }
                         }
                     }
+                    wstring lowerType = stype;
+                    for (auto& c : lowerType) c = towlower(c);
+                    if (lowerType == L"string" || lowerType == L"str" || lowerType == L"strb" ||
+                        lowerType == L"lpcstr" || lowerType == L"ustring" || lowerType == L"ustr" ||
+                        lowerType == L"wstr" || lowerType == L"bstr" || lowerType == L"pointer" ||
+                        lowerType == L"ptr")
+                    {
+                        if (snum.empty())
+                            bPtrArr = true;
+                        else if (vTab.t == Value::TableT && vTab.tab)
+                        {
+                            auto iv = vTab.tab->map.find(kv.first);
+                            if (iv != vTab.tab->map.end() && iv->second.t == Value::TableT)
+                                bPtrArr = true;
+                        }
+                    }
                 }
-                fields.push_back({ kv.first, stype, nArr, bArr });
+                fields.push_back({ kv.first, stype, nArr, bArr, bPtrArr });
             }
         }
         return fields;
@@ -611,7 +670,11 @@ namespace NodioVM
             wstring t = f.type;
             for (auto& c : t) c = towlower(c);
             int a = 1;
-            if (t == L"struct" && vTab.tab)
+            if (f.bPtrArray)
+            {
+                a = (int)sizeof(void*);
+            }
+            else if (t == L"struct" && vTab.tab)
             {
                 auto itM = vTab.tab->map.find(f.name);
                 if (itM != vTab.tab->map.end() &&
@@ -678,9 +741,9 @@ namespace NodioVM
                     continue;
                 }
             }
-            int al = GetStructFieldAlign(f.type);
+            int al = f.bPtrArray ? (int)sizeof(void*) : GetStructFieldAlign(f.type);
             total = AlignOffset(total, al);
-            total += GetStructFieldSize(f.type, f.arrCount, f.bIsArray);
+            total += GetStructFieldSize(f.type, f.arrCount, f.bIsArray, f.bPtrArray);
             if (al > maxA) maxA = al;
         }
         return AlignOffset(total, maxA);
@@ -705,12 +768,14 @@ namespace NodioVM
             const Value& fv = (iv != vTab.tab->map.end()) ? iv->second : s_nullVal;
             wstring t = f.type;
             for (auto& c : t) c = towlower(c);
-            int sz = GetStructFieldSize(f.type, f.arrCount, f.bIsArray);
+            int sz = GetStructFieldSize(f.type, f.arrCount, f.bIsArray, f.bPtrArray);
             wstring lowerName = f.name;
             for (auto& c : lowerName) c = towlower(c);
             {
                 int al;
-                if (t == L"struct")
+                if (f.bPtrArray)
+                    al = (int)sizeof(void*);
+                else if (t == L"struct")
                 {
                     auto itM2 = vTab.tab->map.find(f.name);
                     if (itM2 != vTab.tab->map.end() &&
@@ -725,7 +790,59 @@ namespace NodioVM
                     al = GetStructFieldAlign(f.type);
                 off = AlignOffset(off, al);
             }
-            if ((lowerName == L"cbsize" || lowerName == L"dwsize") && (t == L"int" || t == L"uint" || t == L"dword"))
+            if (f.bPtrArray)
+            {
+                int count = f.arrCount > 0 ? f.arrCount : (int)GetTableLength(fv);
+                thread_local std::vector<std::string> s_bytesKeep;
+                thread_local std::vector<std::wstring> s_wstrKeep;
+                for (int k = 0; k < count; k++)
+                {
+                    Value elem = GetTableElement(fv, k);
+                    void* ptr = nullptr;
+                    if (elem.t == Value::Str)
+                    {
+                        bool bIsBytes = true;
+                        for (wchar_t c : elem.s)
+                        {
+                            if ((unsigned short)c > 0xFF)
+                            {
+                                bIsBytes = false;
+                                break;
+                            }
+                        }
+                        if (bIsBytes)
+                        {
+                            s_bytesKeep.push_back(BytesOf(elem.s));
+                            ptr = (void*)s_bytesKeep.back().data();
+                        }
+                        else if (t == L"ustring" || t == L"ustr" || t == L"wstr" || t == L"bstr")
+                        {
+                            s_wstrKeep.push_back(elem.s);
+                            ptr = (void*)s_wstrKeep.back().c_str();
+                        }
+                        else
+                        {
+                            std::string sA((size_t)WideCharToMultiByte(CP_ACP, 0, elem.s.c_str(),
+                                (int)elem.s.size(), nullptr, 0, nullptr, nullptr), 0);
+                            if (!sA.empty())
+                                WideCharToMultiByte(CP_ACP, 0, elem.s.c_str(), (int)elem.s.size(),
+                                                   &sA[0], (int)sA.size(), nullptr, nullptr);
+                            s_bytesKeep.push_back(std::move(sA));
+                            ptr = (void*)s_bytesKeep.back().c_str();
+                        }
+                    }
+                    else if (elem.t == Value::Pointer)
+                    {
+                        ptr = elem.ptr;
+                    }
+                    else if (elem.t == Value::Num)
+                    {
+                        ptr = (void*)(INT_PTR)(long long)elem.n;
+                    }
+                    *(void**)(buf + off + k * sizeof(void*)) = ptr;
+                }
+            }
+            else if ((lowerName == L"cbsize" || lowerName == L"dwsize") && (t == L"int" || t == L"uint" || t == L"dword"))
             {
                 if (fv.n != total)
                 {
@@ -854,7 +971,31 @@ namespace NodioVM
                 else
                 {
                     if (fv.t == Value::Str)
-                        *(const wchar_t**)(buf + off) = fv.s.c_str();
+                    {
+                        thread_local std::vector<std::string> s_ansiKeep;
+                        std::string sA;
+                        bool bIsBytes = true;
+                        for (wchar_t c : fv.s)
+                        {
+                            if ((unsigned short)c > 0xFF)
+                            {
+                                bIsBytes = false;
+                                break;
+                            }
+                        }
+                        if (bIsBytes)
+                        {
+                            sA = BytesOf(fv.s);
+                        }
+                        else
+                        {
+                            sA.resize((size_t)WideCharToMultiByte(CP_ACP, 0, fv.s.c_str(), (int)fv.s.size(), nullptr, 0, nullptr, nullptr));
+                            if (!sA.empty())
+                                WideCharToMultiByte(CP_ACP, 0, fv.s.c_str(), (int)fv.s.size(), &sA[0], (int)sA.size(), nullptr, nullptr);
+                        }
+                        s_ansiKeep.push_back(std::move(sA));
+                        *(const char**)(buf + off) = s_ansiKeep.back().c_str();
+                    }
                     else if (fv.t == Value::Pointer)
                         *(void**)(buf + off) = fv.ptr;
                     else if (fv.t == Value::Num)
@@ -974,12 +1115,14 @@ namespace NodioVM
         for (auto& f : fields)
         {
             auto iv = vTab.tab->map.find(f.name);
-            int sz = GetStructFieldSize(f.type, f.arrCount, f.bIsArray);
+            int sz = GetStructFieldSize(f.type, f.arrCount, f.bIsArray, f.bPtrArray);
             wstring t = f.type;
             for (auto& c : t) c = towlower(c);
             {
                 int al;
-                if (t == L"struct")
+                if (f.bPtrArray)
+                    al = (int)sizeof(void*);
+                else if (t == L"struct")
                 {
                     if (iv != vTab.tab->map.end() &&
                         (iv->second.t == Value::TableT ||
@@ -993,7 +1136,35 @@ namespace NodioVM
                     al = GetStructFieldAlign(f.type);
                 off = AlignOffset(off, al);
             }
-            if (t == L"struct")
+            if (f.bPtrArray)
+            {
+                int count = f.arrCount > 0 ? f.arrCount : 0;
+                auto outArr = std::make_shared<Table>();
+                for (int k = 0; k < count; k++)
+                {
+                    void* ptr = *(void**)(buf + off + k * sizeof(void*));
+                    if (!ptr)
+                    {
+                        outArr->arr.push_back(Value());
+                    }
+                    else if (t == L"ustring" || t == L"ustr" || t == L"wstr" || t == L"bstr")
+                    {
+                        const wchar_t* pw = (const wchar_t*)ptr;
+                        outArr->arr.push_back(Value::Str_(wstring(pw)));
+                    }
+                    else if (t == L"pointer" || t == L"ptr")
+                    {
+                        outArr->arr.push_back(Value::Pointer_(ptr));
+                    }
+                    else
+                    {
+                        const char* pc = (const char*)ptr;
+                        outArr->arr.push_back(Value::Str_(ReadStrA(pc)));
+                    }
+                }
+                vTab.tab->map[f.name] = Value::Table_(outArr);
+            }
+            else if (t == L"struct")
             {
                 if (iv != vTab.tab->map.end() && (iv->second.t == Value::TableT || iv->second.t == Value::Class) && iv->second.tab)
                 {
@@ -1183,20 +1354,27 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
             bool bUnicode = bDllUnicode;
             ApiRet retType = ARInt;
 
-            if (suffix == 'W') { bUnicode = true; }
-            else if (suffix == 'A') { bUnicode = false; }
-            else if (suffix == 'L') { retType = ARI64; }
-            else if (suffix == 'P') { retType = ARPtr; }
-            else if (suffix == 'D' || suffix == 'F') { retType = ARDbl; }
-            else if (suffix == 'B') { retType = ARBool; }
-
             // Step 1: try exact name
             fp = ::GetProcAddress(hMod, strNameA.c_str());
+            bool bFoundExact = (fp != nullptr);
 
             // Step 2: if not found and suffix exists, try bareName
             if (!fp && suffix)
             {
                 fp = ::GetProcAddress(hMod, bareName.c_str());
+            }
+
+            if (fp)
+            {
+                if (suffix == 'W') { bUnicode = true; }
+                else if (suffix == 'A') { bUnicode = false; }
+                else if (!bFoundExact)
+                {
+                    if (suffix == 'L') { retType = ARI64; }
+                    else if (suffix == 'P') { retType = ARPtr; }
+                    else if (suffix == 'D' || suffix == 'F') { retType = ARDbl; }
+                    else if (suffix == 'B') { retType = ARBool; }
+                }
             }
 
             // Step 3: if not found, try appending 'W'
@@ -1369,7 +1547,7 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     __int64 r = bCdecl ? InvokeCdl<__int64>(fn, slots)
                                        : InvokeStd<__int64>(fn, slots);
                     if (retType == ARBool)
-                        vRet = Value::Bool_(r != 0);
+                        vRet = Value::Bool_((int)r != 0);
                     else if (retType == ARPtr)
                         vRet = (INT_PTR)r ? Value::Pointer_((void*)(INT_PTR)r)
                                           : Value();

@@ -1890,16 +1890,14 @@ namespace NodioVM
                             c->list.push_back(ParseExpr());
                         SkipNL();
                         while (EatPunct(L","))
-                            {
-                                SkipNL();
-                                if (IsPunct(L",") || IsPunct(L")"))
-                                    c->list.push_back(New(Node::NullK));
-                                else if (IsPunct(L")"))
-                                    c->list.push_back(New(Node::NullK));  // empty slot before )
-                                else
-                                    c->list.push_back(ParseExpr());
-                                SkipNL();
-                            }
+                        {
+                            SkipNL();
+                            if (IsPunct(L",") || IsPunct(L")"))
+                                c->list.push_back(New(Node::NullK));
+                            else
+                                c->list.push_back(ParseExpr());
+                            SkipNL();
+                        }
                     }
                     bInAssignLhs = bOldLhs;
                     Expect(L")");
@@ -2697,16 +2695,14 @@ namespace NodioVM
                             c->list.push_back(ParseExpr());
                         SkipNL();
                         while (EatPunct(L","))
-                            {
-                                SkipNL();
-                                if (IsPunct(L",") || IsPunct(L")"))
-                                    c->list.push_back(New(Node::NullK));
-                                else if (IsPunct(L")"))
-                                    c->list.push_back(New(Node::NullK));  // empty slot before )
-                                else
-                                    c->list.push_back(ParseExpr());
-                                SkipNL();
-                            }
+                        {
+                            SkipNL();
+                            if (IsPunct(L",") || IsPunct(L")"))
+                                c->list.push_back(New(Node::NullK));
+                            else
+                                c->list.push_back(ParseExpr());
+                            SkipNL();
+                        }
                     }
                     bInAssignLhs = bOldLhs;
                     Expect(L")");
