@@ -1371,7 +1371,8 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     if (retType == ARBool)
                         vRet = Value::Bool_(r != 0);
                     else if (retType == ARPtr)
-                        vRet = Value::Num_((double)(INT_PTR)r);
+                        vRet = (INT_PTR)r ? Value::Pointer_((void*)(INT_PTR)r)
+                                          : Value();
                     else if (retType == ARI64)
                         vRet = Value::Num_((double)r);
                     else

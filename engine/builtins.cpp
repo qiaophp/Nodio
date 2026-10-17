@@ -2152,6 +2152,17 @@ void Interp::InitBuiltins()
                         slash == wstring::npos ? L"" : p.substr(0, slash + 1));
                     out->map[L"path"] = Value::Str_(p);
                     return Value::Table_(out); });
+
+                // Official aardio built-in io properties: _exepath, _exedir, _exefile
+                wchar_t szModExe[MAX_PATH] = L"";
+                GetModuleFileNameW(nullptr, szModExe, MAX_PATH);
+                wstring exePathStr = szModExe;
+                size_t exeSlash = exePathStr.find_last_of(L"\\/");
+                wstring exeDirStr = (exeSlash == wstring::npos) ? L"" : exePathStr.substr(0, exeSlash + 1);
+                wstring exeFileStr = (exeSlash == wstring::npos) ? exePathStr : exePathStr.substr(exeSlash + 1);
+                tb->map[L"_exepath"] = Value::Str_(exePathStr);
+                tb->map[L"_exedir"] = Value::Str_(exeDirStr);
+                tb->map[L"_exefile"] = Value::Str_(exeFileStr);
                 auto writer = [](vector<Value>& a, const wchar_t* sep,
                                  bool nl) -> Value {
                     wstring out;

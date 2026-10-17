@@ -1,0 +1,5 @@
+import io;
+
+io.print("exepath:", " ", io.exist(io._exepath) ? "exists" : "none");
+io.print("exedir:", " ", io.exist(io._exedir) ? "exists" : "none");
+io.print("exefile:", " ", (io._exefile != null && #io._exefile > 0) ? "valid" : "none");
