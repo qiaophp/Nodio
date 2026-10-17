@@ -72,6 +72,7 @@ namespace NodioVM
         std::unordered_map<wstring, Value> map;
         vector<Value> arr;
         std::unordered_map<wstring, Value> scopeVars; // private namespace/module scope variables (var x)
+        bool bExplicitMeta = false;
     };
 
     struct Value

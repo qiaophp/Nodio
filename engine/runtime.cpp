@@ -356,6 +356,8 @@ bool Interp::MetaGet(const Value& obj, const Value& keyVal,
             struct ScopeDepth { int& d; ScopeDepth(int& x): d(x){ d++; } ~ScopeDepth(){ d--; } } sd(s_metaDepth);
             if ((obj.t != Value::TableT && obj.t != Value::Class && obj.t != Value::Func && obj.t != Value::Pointer) || !obj.tab || key == L"_meta")
                 return false;
+            if ((obj.t == Value::Class || obj.t == Value::Func) && !obj.tab->bExplicitMeta)
+                return false;
             // the meta chain can be nested: util.metaProperty instances
             // carry a class-annotation layer at _meta._meta (the
             // @_metaPrototype prototype) holding the bulk of the members
@@ -527,6 +529,8 @@ bool Interp::MetaSet(const Value& obj, const Value& keyVal,
             wstring key = keyVal.ToString();
             *pErr = false;
             if ((obj.t != Value::TableT && obj.t != Value::Class && obj.t != Value::Func && obj.t != Value::Pointer) || !obj.tab || key == L"_meta")
+                return false;
+            if ((obj.t == Value::Class || obj.t == Value::Func) && !obj.tab->bExplicitMeta)
                 return false;
             // the meta chain can be nested: util.metaProperty instances
             // carry a class-annotation layer at _meta._meta (the
@@ -2044,6 +2048,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                             {
                                 if (!vVar->tab) vVar->tab = std::make_shared<Table>();
                                 vVar->tab->map[L"_meta"] = val;
+                                vVar->tab->bExplicitMeta = true;
                                 return;
                             }
                         }
@@ -2051,17 +2056,21 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                     if (obj.t == Value::Pointer && obj.tab)
                     {
                         obj.tab->map[L"_meta"] = val;
+                        obj.tab->bExplicitMeta = true;
                         return;
                     }
                     if ((obj.t == Value::TableT || obj.t == Value::Class || obj.t == Value::Func) && obj.tab)
+                    {
                         obj.tab->map[L"_meta"] = val;
+                        obj.tab->bExplicitMeta = true;
+                    }
                     return;
                 }
                 // class templates and functions hold members in the same Table shape —
                 // ::RECT._meta = ... must land on the class table; type.callable = ... on function table
                 if ((obj.t == Value::Class || obj.t == Value::Func) && obj.tab)
                 {
-                    if (target->str == L"_meta" || !obj.tab->map.count(L"_meta"))
+                    if (target->str == L"_meta" || !obj.tab->bExplicitMeta || !obj.tab->map.count(L"_meta"))
                     {
                         if (val.t == Value::Null)
                             obj.tab->map.erase(target->str);
@@ -2323,14 +2332,17 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                          st->a->a->k == Node::Ident && st->a->a->str == L"this" &&
                          st->a->b && st->a->b->k == Node::Str)
                 {
-                    Value v = Eval(st->b, classEnv.get());
-                    if (err && !err->empty() && prevErr.empty())
+                    if (st->a->b->str != L"_meta")
                     {
-                        *err = L"";
-                    }
-                    else
-                    {
-                        tb->map[st->a->b->str] = v;
+                        Value v = Eval(st->b, classEnv.get());
+                        if (err && !err->empty() && prevErr.empty())
+                        {
+                            *err = L"";
+                        }
+                        else
+                        {
+                            tb->map[st->a->b->str] = v;
+                        }
                     }
                 }
             }
