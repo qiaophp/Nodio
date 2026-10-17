@@ -2296,15 +2296,36 @@ Value Interp::EvalClass(const PNode& n, Env* env)
             classEnv->bNsBody = true;
             for (auto& st : n->a->list)
             {
+                wstring prevErr = err ? *err : L"";
                 if (st->k == Node::Assign && st->a &&
                     st->a->k == Node::Ident)
-                    tb->map[st->a->str] = Eval(st->b, classEnv.get());
+                {
+                    Value v = Eval(st->b, classEnv.get());
+                    if (err && !err->empty() && prevErr.empty())
+                    {
+                        // Expression failed during class definition (e.g. references `this` or late-bound namespace methods).
+                        // This is an instance field initializer that will be evaluated at instantiation time.
+                        *err = L"";
+                    }
+                    else
+                    {
+                        tb->map[st->a->str] = v;
+                    }
+                }
                 else if (st->k == Node::Assign && st->a &&
                          st->a->k == Node::Index && st->a->a &&
                          st->a->a->k == Node::Ident && st->a->a->str == L"this" &&
                          st->a->b && st->a->b->k == Node::Str)
                 {
-                    tb->map[st->a->b->str] = Eval(st->b, classEnv.get());
+                    Value v = Eval(st->b, classEnv.get());
+                    if (err && !err->empty() && prevErr.empty())
+                    {
+                        *err = L"";
+                    }
+                    else
+                    {
+                        tb->map[st->a->b->str] = v;
+                    }
                 }
             }
             // anonymous class (class { ... }) has no name to bind

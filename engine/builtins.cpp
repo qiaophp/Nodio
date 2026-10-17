@@ -7523,6 +7523,64 @@ void Interp::InitBuiltins()
                 if (a.empty() || a[0].t != Value::Str)
                     return Value();
                 wstring src = BStr(a[0]);
+                // If src is a binary-serialized table ({ \0... <len>:<key>=<val>; ... })
+                if (src.size() >= 2 && src.find(L'{') != wstring::npos && src.find(L'\0') != wstring::npos)
+                {
+                    size_t p = src.find(L'{');
+                    if (p != wstring::npos)
+                    {
+                        p++;
+                        auto tb = std::make_shared<Table>();
+                        bool bBinaryTable = false;
+                        while (p < src.size())
+                        {
+                            while (p < src.size() && ((unsigned short)src[p] <= 32 || src[p] == L';' || src[p] == L','))
+                                p++;
+                            if (p >= src.size() || src[p] == L'}')
+                            {
+                                if (p < src.size() && src[p] == L'}') bBinaryTable = true;
+                                break;
+                            }
+                            size_t dStart = p;
+                            while (p < src.size() && iswdigit(src[p])) p++;
+                            if (dStart == p || p >= src.size() || src[p] != L':')
+                                break;
+                            int klen = _wtoi(src.substr(dStart, p - dStart).c_str());
+                            p++; // skip ':'
+                            if (p + (size_t)klen > src.size())
+                                break;
+                            // key bytes (in Nodio byte-string convention: (unsigned char)src[i])
+                            std::string u8key;
+                            u8key.resize(klen);
+                            for (int i = 0; i < klen; i++)
+                                u8key[i] = (char)(unsigned char)src[p + i];
+                            p += klen;
+                            wstring wkey;
+                            int reqW = MultiByteToWideChar(CP_UTF8, 0, u8key.data(), (int)u8key.size(), nullptr, 0);
+                            if (reqW > 0)
+                            {
+                                wkey.resize(reqW);
+                                MultiByteToWideChar(CP_UTF8, 0, u8key.data(), (int)u8key.size(), &wkey[0], reqW);
+                            }
+                            else
+                            {
+                                for (char ch : u8key) wkey += (wchar_t)(unsigned char)ch;
+                            }
+                            if (p < src.size() && src[p] == L'=')
+                                p++;
+                            size_t vStart = p;
+                            while (p < src.size() && (iswdigit(src[p]) || src[p] == L'.' || src[p] == L'-'))
+                                p++;
+                            double numVal = 0;
+                            if (vStart < p)
+                                numVal = _wtof(src.substr(vStart, p - vStart).c_str());
+                            tb->map[wkey] = Value::Num_(numVal);
+                            bBinaryTable = true;
+                        }
+                        if (bBinaryTable)
+                            return Value::Table_(tb);
+                    }
+                }
                 wstring e;
                 PNode fn = CompileToFunc(L"return " + src, &e);
                 if (!fn)
