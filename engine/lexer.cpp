@@ -14,13 +14,19 @@ namespace NodioVM
         vector<Tok> out;
         size_t i = 0, n = src.size();
         int line = 1;
+        bool hadSpace = false;
+        auto pushTok = [&](Tok t) {
+            t.bLeadingSpace = hadSpace;
+            hadSpace = false;
+            out.push_back(t);
+        };
         while (i < n)
         {
             wchar_t c = src[i];
             if (c == 0xFEFF) { i++; continue; }
             if (c == L'\r') { i++; continue; }
-            if (c == L'\n') { out.push_back({ TNL, L"", 0, line++ }); i++; continue; }
-            if (c == L' ' || c == L'\t') { i++; continue; }
+            if (c == L'\n') { pushTok({ TNL, L"", 0, line++ }); hadSpace = true; i++; continue; }
+            if (c == L' ' || c == L'\t') { hadSpace = true; i++; continue; }
             // comments
             bool bRightOfAssign = false;
             {
@@ -39,11 +45,12 @@ namespace NodioVM
                 {
                     size_t e = i + 2;
                     while (e < n && src[e] != L'\n' && src[e] != L'\r') e++;
-                    out.push_back({ TStr, src.substr(i + 2, e - i - 2), 0, line });
+                    pushTok({ TStr, src.substr(i + 2, e - i - 2), 0, line });
                     i = e;
                     continue;
                 }
                 while (i < n && src[i] != L'\n') i++;
+                hadSpace = true;
                 continue;
             }
             if (c == L'/' && i + 1 < n && src[i + 1] == L'*')
@@ -63,6 +70,7 @@ namespace NodioVM
                     // '/*' + stars + '/' with nothing between: an empty
                     // comment ('/**/' / '/*/'); the trailing star closes it.
                     i += k + 1;
+                    hadSpace = true;
                     continue;
                 }
                 size_t s = i + k;                 // content start
@@ -111,12 +119,13 @@ namespace NodioVM
                     for (size_t q = i; q < e && q < n; q++)
                         if (src[q] == L'\n') line++;
                     i = e;
-                    out.push_back({ TStr, norm, 0, line });
+                    pushTok({ TStr, norm, 0, line });
                     continue;
                 }
                 for (size_t q = i; q < e && q < n; q++)
                     if (src[q] == L'\n') line++;
                 i = e;
+                hadSpace = true;
                 continue;
             }
             // strings
@@ -158,10 +167,10 @@ namespace NodioVM
                     double val = 0;
                     for (size_t k = 0; k < u8.size() && k < 4; k++)
                         val += (double)(((unsigned int)(unsigned char)u8[k]) << (k * 8));
-                    out.push_back({ TNum, std::to_wstring((long long)val), val, line });
+                    pushTok({ TNum, std::to_wstring((long long)val), val, line });
                     continue;
                 }
-                out.push_back({ TStr, s, 0, line });
+                pushTok({ TStr, s, 0, line });
                 continue;
             }
             if (c == L'\'')
@@ -221,7 +230,7 @@ namespace NodioVM
                     double val = 0;
                     for (size_t k = 0; k < u8.size() && k < 4; k++)
                         val += (double)(((unsigned int)(unsigned char)u8[k]) << (k * 8));
-                    out.push_back({ TNum, std::to_wstring((long long)val), val, line });
+                    pushTok({ TNum, std::to_wstring((long long)val), val, line });
                     continue;
                 }
                 // a trailing lowercase 'u' marks a UTF-16 (ustring) string
@@ -230,7 +239,7 @@ namespace NodioVM
                 if (i < n && src[i] == L'u' &&
                     !(i + 1 < n && IsIdentChar(src[i + 1])))
                     i++;
-                out.push_back({ TStr, s, 0, line });
+                pushTok({ TStr, s, 0, line });
                 continue;
             }
             // numbers
@@ -244,7 +253,7 @@ namespace NodioVM
                     while (i < n && iswxdigit(src[i])) i++;
                     Tok t{ TNum, src.substr(b, i - b), 0, line };
                     t.num = (double)wcstoul(src.substr(b + 2, i - b - 2).c_str(), nullptr, 16);
-                    out.push_back(t);
+                    pushTok(t);
                     continue;
                 }
                 // aardio radix literal: <radix>#<digits> (e.g. 2#100, 8#77, 16#FF, 36#Z)
@@ -268,7 +277,7 @@ namespace NodioVM
                         wchar_t* endp = nullptr;
                         double val = (double)_wcstoui64(numStr.c_str(), &endp, radix);
                         Tok t{ TNum, src.substr(b, i - b), val, line };
-                        out.push_back(t);
+                        pushTok(t);
                         continue;
                     }
                 }
@@ -281,7 +290,7 @@ namespace NodioVM
                 }
                 Tok t{ TNum, L"", 0, line };
                 t.num = wcstod(src.substr(b, i - b).c_str(), nullptr);
-                out.push_back(t);
+                pushTok(t);
                 continue;
             }
             // identifiers / keywords
@@ -291,8 +300,8 @@ namespace NodioVM
                 while (i < n && IsIdentChar(src[i])) i++;
                 wstring w = src.substr(b, i - b);
                 for (int k = 0; KEYWORDS[k]; k++)
-                    if (w == KEYWORDS[k]) { out.push_back({ TKw, w, 0, line }); goto next; }
-                out.push_back({ TIdent, w, 0, line });
+                    if (w == KEYWORDS[k]) { pushTok({ TKw, w, 0, line }); goto next; }
+                pushTok({ TIdent, w, 0, line });
             next:
                 continue;
             }
@@ -314,17 +323,17 @@ namespace NodioVM
                 size_t l = wcslen(OPS[k].op);
                 if (src.compare(i, l, OPS[k].op) == 0)
                 {
-                    out.push_back({ TPunct, OPS[k].op, 0, line });
+                    pushTok({ TPunct, OPS[k].op, 0, line });
                     i += l;
                     bMatched = true;
                     break;
                 }
             }
             if (bMatched) continue;
-            out.push_back({ TPunct, wstring(1, c), 0, line });
+            pushTok({ TPunct, wstring(1, c), 0, line });
             i++;
         }
-        out.push_back({ TEnd, L"", 0, line });
+        pushTok({ TEnd, L"", 0, line });
         return out;
     }
 

@@ -16,6 +16,7 @@
 #include <thread>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <memory>
 #include <wininet.h>
@@ -40,6 +41,7 @@ namespace NodioVM
         wstring text;        // ident/keyword/string value/number text
         double num = 0;
         int line = 1;
+        bool bLeadingSpace = false;
     };
 
     // aardio compiled (bytecode) modules begin with the literal '=aardio'
@@ -291,6 +293,24 @@ namespace NodioVM
                    return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12]); }
         case 14: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT);
                    return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13]); }
+        case 15: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14]); }
+        case 16: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15]); }
+        case 17: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16]); }
+        case 18: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17]); }
+        case 19: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18]); }
+        case 20: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19]); }
+        case 21: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20]); }
+        case 22: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21]); }
+        case 23: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22]); }
+        case 24: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23]); }
+        case 25: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24]); }
+        case 26: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25]); }
+        case 27: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26]); }
+        case 28: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27]); }
+        case 29: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27], s[28]); }
+        case 30: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27], s[28], s[29]); }
+        case 31: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27], s[28], s[29], s[30]); }
+        case 32: { typedef R(__stdcall *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27], s[28], s[29], s[30], s[31]); }
         }
         return R();
     }
@@ -340,6 +360,24 @@ namespace NodioVM
                    return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12]); }
         case 14: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT);
                    return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13]); }
+        case 15: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14]); }
+        case 16: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15]); }
+        case 17: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16]); }
+        case 18: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17]); }
+        case 19: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18]); }
+        case 20: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19]); }
+        case 21: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20]); }
+        case 22: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21]); }
+        case 23: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22]); }
+        case 24: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23]); }
+        case 25: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24]); }
+        case 26: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25]); }
+        case 27: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26]); }
+        case 28: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27]); }
+        case 29: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27], s[28]); }
+        case 30: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27], s[28], s[29]); }
+        case 31: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27], s[28], s[29], s[30]); }
+        case 32: { typedef R(__cdecl *FP)(SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT, SlotT); return ((FP)fn)(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24], s[25], s[26], s[27], s[28], s[29], s[30], s[31]); }
         }
         return R();
     }
@@ -408,8 +446,9 @@ namespace NodioVM
     extern std::mutex g_threadSharedMutex;
     struct RE
     {
-        int k;                 // 0 char, 1 class, 2 dot, 3 group, 4 $ end
+        int k;                 // 0 char, 1 class, 2 dot, 3 group, 4 $ end, 7 balanced
         wchar_t ch = 0;
+        wchar_t chClose = 0;
         unsigned cls = 0;      // 1=\d 2=\D 4=\w 8=\W 16=\s 32=\S
         vector<std::pair<wchar_t, wchar_t>> ranges;
         bool neg = false;
@@ -423,7 +462,8 @@ namespace NodioVM
 
     long long REMatchRep(const vector<RE>& els, size_t idx,
                          const wstring& s, size_t pos, int count,
-                         vector<wstring>& caps, bool anchored);
+                         vector<wstring>& caps, vector<size_t>& groupStarts,
+                         bool anchored);
 
     // regex.cpp — pattern engine surface used by string.match/replace etc.
     bool RECompile(const wstring& pat, vector<vector<RE>>& branches,
@@ -620,21 +660,32 @@ namespace NodioVM
         bool bInstInit = false;
         Value* Find(const wstring& k)
         {
-            // official aardio bare-name lookup: ALL local frames first,
-            // then global roots (Ident checks roots after Find), THEN
-            // namespace members. A namespace table must not shadow base
-            // globals (builtin/thread.aardio calls base `call` inside
-            // namespace thread even though thread.call exists)
-            for (Env* e = this; e; e = e->parent.get())
+            // 1. Local frames (frames that have a parent)
+            for (Env* e = this; e && e->parent; e = e->parent.get())
             {
                 auto it = e->vars.find(k);
                 if (it != e->vars.end())
                     return &it->second;
             }
+            // 2. Built-in primitives like `type`, `call`, `loadcode` etc. are never shadowed by namespace members
+            static auto isBuiltinPrimitive = [](const wstring& name) {
+                return name == L"type" || name == L"call" || name == L"loadcode" ||
+                       name == L"loadcodex" || name == L"eval" || name == L"error" ||
+                       name == L"assert" || name == L"invoke" || name == L"callex" ||
+                       name == L"rget";
+            };
+            if (isBuiltinPrimitive(k))
+            {
+                Env* root = this;
+                while (root->parent) root = root->parent.get();
+                auto it = root->vars.find(k);
+                if (it != root->vars.end())
+                    return &it->second;
+            }
+            // 3. Namespace members in ambient namespace scopes
             for (Env* e = this; e; e = e->parent.get())
             {
-                // aardio: `type` is a built-in primitive keyword/operator, never shadowed by namespace members
-                if (e->nsTable && k != L"type")
+                if (e->nsTable && !isBuiltinPrimitive(k))
                 {
                     auto itS = e->nsTable->scopeVars.find(k);
                     if (itS != e->nsTable->scopeVars.end())
@@ -643,23 +694,31 @@ namespace NodioVM
                     if (it2 != e->nsTable->map.end())
                         return &it2->second;
                 }
-                if (e->modTable && k != L"type")
+                if (e->modTable && !isBuiltinPrimitive(k))
                 {
                     auto itS = e->modTable->scopeVars.find(k);
                     if (itS != e->modTable->scopeVars.end())
                         return &itS->second;
                 }
             }
+            // 4. Global variables (root env where parent == nullptr)
+            Env* root = this;
+            while (root->parent) root = root->parent.get();
+            auto it = root->vars.find(k);
+            if (it != root->vars.end())
+                return &it->second;
+
             return nullptr;
         }
     };
 
     struct Interp;
-    extern Interp* g_interpCurrent;   // M2: active interp for meta hooks
+    extern thread_local Interp* g_interpCurrent;   // M2: active interp for meta hooks
     // >0 while a metaProperty _get/_set FUNCTION is dispatching: inner
     // this[k] lookups must see RAW definition tables (never auto-call
     // getters, never re-enter the _get function)
     extern thread_local int g_metaDispatchDepth;
+    extern thread_local std::unordered_set<Table*> g_metaDispatchActive;
     struct Node
     {
         enum K
@@ -769,6 +828,15 @@ namespace NodioVM
     struct GdiCtx;
     Value MakeGdiTable(const std::shared_ptr<GdiCtx>& g);
     bool RegisterFormClass();
+
+    // buffer tracking
+    void RegisterBuffer(void* ptr, size_t size);
+    void UnregisterBuffer(void* ptr);
+    bool IsBuffer(const void* ptr);
+    size_t GetBufferSize(const void* ptr);
+
+    // time.cpp / builtins.cpp
+    Value MakeTimeObject(const SYSTEMTIME& st, const wstring& fmt = L"%Y/%m/%d %H:%M:%S");
 
     // entry.cpp
     wstring EmbedRoot();

@@ -23,3 +23,4 @@
 #include <commctrl.h>
 #include <shlobj.h>
 #include <wininet.h>
+#include <olectl.h>

@@ -11,7 +11,7 @@ namespace NodioVM
         case Bool: return b;
         case Num: return n != 0;
         case Pointer: return ptr != nullptr;
-        case Str: return !s.empty();
+        case Str: return true;
         default: return true;
         }
     }

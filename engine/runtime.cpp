@@ -2,9 +2,13 @@
 
 namespace NodioVM
 {
-Interp* g_interpCurrent = nullptr;   // M2: active interp for meta hooks
+thread_local Interp* g_interpCurrent = nullptr;   // M2: active interp for meta hooks
 thread_local int g_metaDispatchDepth = 0;   // metaProperty dispatch flag
+thread_local std::unordered_set<Table*> g_metaDispatchActive;
+thread_local Value s_currentOwner;
 Interp* Interp::g_self = nullptr;    // M2: self for meta callbacks
+Value Interp::GetCurrentOwner() { return s_currentOwner; }
+void Interp::SetCurrentOwner(const Value& v) { s_currentOwner = v; }
 
 // ---- Eval ----
 Value Interp::Eval(const PNode& n, Env* env)
@@ -111,7 +115,7 @@ Value Interp::Eval(const PNode& n, Env* env)
                             (double)(unsigned char)buf[(size_t)(i - 1)]);
                     return Value();
                 }
-                return GetMember(obj, idx.ToString(), n->bDirect);
+                return GetMember(obj, idx, n->bDirect, /*ownerCallMode=*/-1);
             }
             case Node::Call: return EvalCall(n, env);
             case Node::Return:
@@ -157,7 +161,23 @@ Value Interp::Eval(const PNode& n, Env* env)
                                                      nullptr);
                         return Value::Num_((double)cb);
                     }
-                    if (v.t == Value::TableT) return Value::Num_((double)v.tab->arr.size());
+                    if (v.t == Value::Pointer)
+                    {
+                        if (v.ptr && IsBuffer(v.ptr))
+                            return Value::Num_((double)GetBufferSize(v.ptr));
+                        return Value::Num_(0);
+                    }
+                    if (v.t == Value::TableT)
+                    {
+                        if (v.tab)
+                        {
+                            size_t sz = v.tab->arr.size();
+                            while (sz > 0 && v.tab->arr[sz - 1].t == Value::Null)
+                                sz--;
+                            return Value::Num_((double)sz);
+                        }
+                        return Value::Num_(0);
+                    }
                 }
                 // aardio: #null is 0 — lib code sizes optional tables with
                 // it (publish's for(i=#q;1;-1) over an unregistered topic);
@@ -188,14 +208,9 @@ Value Interp::Eval(const PNode& n, Env* env)
                         if (itThis != e->vars.end() && itThis->second.t != Value::Null)
                             f.thisVal = std::make_shared<Value>(itThis->second);
                     }
-                    // skip instance-scoped frames (bNsInst): a method's
-                    // `this` table is not a namespace. Capturing it made
-                    // callbacks defined inside methods (win.form's wndproc)
-                    // resolve namespace members like `_defaultProc` to null.
-                    if (e->nsTable && !e->bNsInst)
+                    if (!f.nsClosure && e->nsTable && !e->bNsInst)
                     {
                         f.nsClosure = e->nsTable;
-                        break;
                     }
                 }
                 if (!f.nsClosure)
@@ -236,25 +251,47 @@ Value Interp::Eval(const PNode& n, Env* env)
                     {
                         if (v.mrets && !v.bDots)
                         {
+                            auto mrets = v.mrets;
+                            v.mrets = nullptr;
                             tb->arr.push_back(v);
-                            for (auto& m : *v.mrets)
-                                tb->arr.push_back(m);
+                            for (auto& m : *mrets)
+                            {
+                                Value em = m;
+                                em.mrets = nullptr;
+                                tb->arr.push_back(em);
+                            }
                         }
                         else if (v.bDots && v.mrets)
                         {
                             for (auto& m : *v.mrets)
-                                tb->arr.push_back(m);
+                            {
+                                Value em = m;
+                                em.mrets = nullptr;
+                                tb->arr.push_back(em);
+                            }
                         }
                         else
+                        {
+                            v.mrets = nullptr;
                             tb->arr.push_back(v);
+                        }
                     }
                     else
-                        tb->map[k.ToString()] = v;
+                    {
+                        v.mrets = nullptr;
+                        if (v.t == Value::Null)
+                            tb->map.erase(k.ToString());
+                        else
+                            tb->map[k.ToString()] = v;
+                    }
                 }
+                while (!tb->arr.empty() && tb->arr.back().t == Value::Null)
+                    tb->arr.pop_back();
                 return Value::Table_(tb);
             }
             case Node::Class: return EvalClass(n, env);
             case Node::ExprStmt: return Eval(n->a, env);
+            case Node::VarDecl: return Exec(n, env);
             default: return Value();
             }
         }
@@ -270,6 +307,23 @@ double Interp::ToNum(const Value& v)
                 return d;
             }
             if (v.t == Value::Bool) return v.b ? 1 : 0;
+            if (v.t == Value::TableT && v.tab)
+            {
+                auto im = v.tab->map.find(L"_meta");
+                if (im != v.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                {
+                    auto it = im->second.tab->map.find(L"_tonumber");
+                    if (it != im->second.tab->map.end() &&
+                        (it->second.t == Value::Func || it->second.native))
+                    {
+                        vector<Value> noArgs;
+                        return ToNum(CallOwner(it->second, v, noArgs));
+                    }
+                }
+                auto iv = v.tab->map.find(L"value");
+                if (iv != v.tab->map.end() && iv->second.t == Value::Num)
+                    return iv->second.n;
+            }
             return 0;
         }
 
@@ -282,10 +336,11 @@ double Interp::ToNum(const Value& v)
         // table call -> _meta._call(...) owner=obj
 
 // ---- MetaGet ----
-bool Interp::MetaGet(const Value& obj, const wstring& key,
-                            Value* out, bool* pErr, wstring* pErrMsg,
-                            bool bOwnerCall)
+bool Interp::MetaGet(const Value& obj, const Value& keyVal,
+                     Value* out, bool* pErr, wstring* pErrMsg,
+                     int ownerCallMode)
         {
+            wstring key = keyVal.ToString();
             *pErr = false;
             static thread_local int s_metaDepth = 0;
             if (s_metaDepth > 40)
@@ -323,10 +378,10 @@ bool Interp::MetaGet(const Value& obj, const wstring& key,
                                 icm->second.t == Value::TableT &&
                                 icm->second.tab)
                             {
-                                bool hit = MetaGetLayer(obj, icm->second, key,
+                                bool hit = MetaGetLayer(obj, icm->second, keyVal,
                                                         out, pErr, pErrMsg,
-                                                        bOwnerCall,
-                                                        g_metaDispatchDepth > 0);
+                                                        ownerCallMode,
+                                                        obj.tab && (g_metaDispatchActive.count(obj.tab.get()) > 0));
                                 if (hit || *pErr)
                                     return hit;
                             }
@@ -335,19 +390,29 @@ bool Interp::MetaGet(const Value& obj, const wstring& key,
                     break;
                 }
                 Value mtc = imc->second;
-                bool hit = MetaGetLayer(obj, mtc, key, out, pErr, pErrMsg,
-                                        bOwnerCall, g_metaDispatchDepth > 0);
+                bool hit = MetaGetLayer(obj, mtc, keyVal, out, pErr, pErrMsg,
+                                        ownerCallMode,
+                                        obj.tab && (g_metaDispatchActive.count(obj.tab.get()) > 0));
                 if (hit || *pErr)
                     return hit;
                 cur = mtc;
             }
             return false;
         }
+
+bool Interp::MetaGet(const Value& obj, const wstring& key,
+                     Value* out, bool* pErr, wstring* pErrMsg,
+                     bool bOwnerCall)
+        {
+            return MetaGet(obj, Value::Str_(key), out, pErr, pErrMsg, bOwnerCall ? 1 : 0);
+        }
+
 bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
-                            const wstring& key, Value* out, bool* pErr,
-                            wstring* pErrMsg, bool bOwnerCall, bool bInDispatch)
+                          const Value& keyVal, Value* out, bool* pErr,
+                          wstring* pErrMsg, int ownerCallMode, bool bInDispatch)
         {
             Table* mt = mtv.tab.get();
+            wstring key = keyVal.ToString();
             // direct method/field entries in the meta table resolve first
             // (RECT._meta = { width = function(){...} } shape)
             auto idm = mt->map.find(key);
@@ -366,8 +431,9 @@ bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
                         (ig2->second.t == Value::Func ||
                          ig2->second.native))
                     {
-                        vector<Value> gArgs{ Value::Bool_(bOwnerCall),
-                                             idm->second };
+                        Value vOwnerCall = (ownerCallMode == 1) ? Value::Bool_(true) :
+                                           (ownerCallMode == 0) ? Value::Bool_(false) : Value();
+                        vector<Value> gArgs{ vOwnerCall, idm->second };
                         Value r = CallVmFuncStatic(obj, ig2->second,
                                                    gArgs, pErr, pErrMsg);
                         *out = r;
@@ -394,7 +460,9 @@ bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
                         (ig2->second.t == Value::Func ||
                          ig2->second.native))
                     {
-                        vector<Value> gArgs{ Value::Bool_(bOwnerCall), e };
+                        Value vOwnerCall = (ownerCallMode == 1) ? Value::Bool_(true) :
+                                           (ownerCallMode == 0) ? Value::Bool_(false) : Value();
+                        vector<Value> gArgs{ vOwnerCall, e };
                         Value r = CallVmFuncStatic(obj, ig2->second,
                                                    gArgs, pErr, pErrMsg);
                         *out = r;
@@ -407,18 +475,27 @@ bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
             }
             if (g.t == Value::Func || g.native)
             {
-                if (bInDispatch)
+                static thread_local std::set<std::pair<Table*, wstring>> s_activeProps;
+                bool bActiveThis = mtv.tab && (obj.tab == mtv.tab) && (g_metaDispatchActive.count(mtv.tab.get()) > 0);
+                bool bActiveProp = obj.tab && (s_activeProps.count({obj.tab.get(), key}) > 0);
+                if (bActiveThis || bActiveProp)
                     return false;   // util._get's own this[k]: go raw below
                 // function form: g(k, ownerCall) — this is the meta table
                 // itself (util.metaProperty's _get reads this[k]); the
                 // object reaches the body via `owner`. While it runs,
-                // inner this[k] lookups must see RAW definition tables
+                // inner this[k] lookups on this same meta table must see RAW definition tables
                 g_metaDispatchDepth++;
-                vector<Value> args{ Value::Str_(key), Value::Bool_(bOwnerCall) };
+                if (mtv.tab) g_metaDispatchActive.insert(mtv.tab.get());
+                if (obj.tab) s_activeProps.insert({obj.tab.get(), key});
+                Value vOwnerCall = (ownerCallMode == 1) ? Value::Bool_(true) :
+                                   (ownerCallMode == 0) ? Value::Bool_(false) : Value();
+                vector<Value> args{ keyVal, vOwnerCall };
                 if (g.native)
                     args.push_back(obj); // native kernel getters receive
                                          // the receiver as args[3]
                 Value r = CallThisOwner(mtv, obj, g, args, pErr, pErrMsg);
+                if (obj.tab) s_activeProps.erase({obj.tab.get(), key});
+                if (mtv.tab) g_metaDispatchActive.erase(mtv.tab.get());
                 g_metaDispatchDepth--;
                 *out = r;
                 return true;
@@ -426,10 +503,20 @@ bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
             return false;
         }
 
-// ---- MetaSet ----
-bool Interp::MetaSet(const Value& obj, const wstring& key,
-                            const Value& val, bool* pErr, wstring* pErrMsg)
+bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
+                          const wstring& key, Value* out, bool* pErr,
+                          wstring* pErrMsg, bool bOwnerCall, bool bInDispatch)
         {
+            return MetaGetLayer(obj, mtv, Value::Str_(key), out, pErr, pErrMsg,
+                                bOwnerCall ? 1 : 0, bInDispatch);
+        }
+
+// ---- MetaSet ----
+bool Interp::MetaSet(const Value& obj, const Value& keyVal,
+                     const Value& val, bool* pErr, wstring* pErrMsg,
+                     bool bOwnerAttr)
+        {
+            wstring key = keyVal.ToString();
             *pErr = false;
             if (obj.t != Value::TableT || !obj.tab || key == L"_meta")
                 return false;
@@ -455,8 +542,8 @@ bool Interp::MetaSet(const Value& obj, const wstring& key,
                                 icm->second.t == Value::TableT &&
                                 icm->second.tab)
                             {
-                                bool hit = MetaSetLayer(obj, icm->second, key,
-                                                        val, pErr, pErrMsg);
+                                bool hit = MetaSetLayer(obj, icm->second, keyVal,
+                                                        val, pErr, pErrMsg, bOwnerAttr);
                                 if (hit || *pErr)
                                     return hit;
                             }
@@ -465,18 +552,26 @@ bool Interp::MetaSet(const Value& obj, const wstring& key,
                     break;
                 }
                 Value mtc = imc->second;
-                bool hit = MetaSetLayer(obj, mtc, key, val, pErr, pErrMsg);
+                bool hit = MetaSetLayer(obj, mtc, keyVal, val, pErr, pErrMsg, bOwnerAttr);
                 if (hit || *pErr)
                     return hit;
                 cur = mtc;
             }
             return false;
         }
+
+bool Interp::MetaSet(const Value& obj, const wstring& key,
+                     const Value& val, bool* pErr, wstring* pErrMsg)
+        {
+            return MetaSet(obj, Value::Str_(key), val, pErr, pErrMsg, true);
+        }
+
 bool Interp::MetaSetLayer(const Value& obj, const Value& mtv,
-                            const wstring& key, const Value& val,
-                            bool* pErr, wstring* pErrMsg)
+                          const Value& keyVal, const Value& val,
+                          bool* pErr, wstring* pErrMsg, bool bOwnerAttr)
         {
             Table* mt = mtv.tab.get();
+            wstring key = keyVal.ToString();
             auto is = mt->map.find(L"_set");
             if (is == mt->map.end() || is->second.t == Value::Null)
                 return false;
@@ -511,16 +606,38 @@ bool Interp::MetaSetLayer(const Value& obj, const Value& mtv,
             }
             if (s.t == Value::Func || s.native)
             {
-                // function form: s(k,v) — this is the meta table itself
+                // function form: s(k,v,ownerAttr) — this is the meta table itself
                 // (util.metaProperty's _set reads this[k]); while it runs,
-                // inner this[k] lookups must see RAW definition tables
+                // inner this[k] lookups on this same meta table must see RAW definition tables
+                static thread_local std::set<std::pair<Table*, wstring>> s_activeSetProps;
+                bool bActiveThis = mtv.tab && (obj.tab == mtv.tab) && (g_metaDispatchActive.count(mtv.tab.get()) > 0);
+                bool bActiveProp = obj.tab && (s_activeSetProps.count({obj.tab.get(), key}) > 0);
+                if (bActiveThis || bActiveProp)
+                    return false;
                 g_metaDispatchDepth++;
-                vector<Value> args{ Value::Str_(key), val };
+                if (mtv.tab) g_metaDispatchActive.insert(mtv.tab.get());
+                if (obj.tab) s_activeSetProps.insert({obj.tab.get(), key});
+                vector<Value> args{ keyVal, val, Value::Bool_(bOwnerAttr) };
+                if (s.native)
+                {
+                    // For native kernel setters (e.g. ComMeta), pass obj as args[3]
+                    // signature: a[0]=key, a[1]=val, a[2]=ownerAttr, a[3]=obj
+                    args.push_back(obj);
+                }
                 CallThisOwner(mtv, obj, s, args, pErr, pErrMsg);
+                if (obj.tab) s_activeSetProps.erase({obj.tab.get(), key});
+                if (mtv.tab) g_metaDispatchActive.erase(mtv.tab.get());
                 g_metaDispatchDepth--;
                 return true;
             }
             return false;
+        }
+
+bool Interp::MetaSetLayer(const Value& obj, const Value& mtv,
+                          const wstring& key, const Value& val,
+                          bool* pErr, wstring* pErrMsg)
+        {
+            return MetaSetLayer(obj, mtv, Value::Str_(key), val, pErr, pErrMsg, true);
         }
 
         // instance method shim: CallVmFunc with owner forced to obj
@@ -538,8 +655,14 @@ Value Interp::CallOwner(const Value& f, const Value& obj,
 Value Interp::CallThisOwner(const Value& f, const Value& ths,
                             const Value& owner, vector<Value>& args)
         {
+            Value oldOwner = s_currentOwner;
+            s_currentOwner = owner;
             if (f.native)
-                return f.native(args);
+            {
+                Value r = f.native(args);
+                s_currentOwner = oldOwner;
+                return r;
+            }
             // a callable table (COM bound member, kernel proxy objects):
             // forward through its _meta._call with the table as owner
             if (f.t == Value::TableT && f.tab)
@@ -551,7 +674,11 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                     auto icl = ic->second.tab->map.find(L"_call");
                     if (icl != ic->second.tab->map.end() &&
                         (icl->second.t == Value::Func || icl->second.native))
+                    {
+                        if (icl->second.native)
+                            args.insert(args.begin(), f);
                         return CallOwner(icl->second, f, args);
+                    }
                 }
             }
             if (f.t != Value::Func || !f.fn)
@@ -626,6 +753,7 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             Value r = ExecBlock(f.fn, local.get());
             nReturn = oldR; nBreak = oldB; nContinue = oldC;
             ret = old;
+            s_currentOwner = oldOwner;
             return r;
         }
 
@@ -693,9 +821,10 @@ wstring Interp::ToStringM(const Value& v)
         }
 
 // ---- GetMember ----
-Value Interp::GetMember(const Value& obj, const wstring& key,
-                        bool bDirect, bool bOwnerCall)
+Value Interp::GetMember(const Value& obj, const Value& keyVal,
+                        bool bDirect, int ownerCallMode)
         {
+            wstring key = keyVal.ToString();
             if (obj.t == Value::TableT || ((obj.t == Value::Func || obj.t == Value::Class) && obj.tab))
             {
                 if (obj.tab)
@@ -705,7 +834,7 @@ Value Interp::GetMember(const Value& obj, const wstring& key,
                     // table.assigns ALL attrs (items={}, checked=...) onto
                     // the ctrl, and later reads of e.g. combobox .items must
                     // still hit the live control, not the stale copied table
-                    if (!bDirect)
+                    if (!bDirect && (!obj.tab || g_metaDispatchActive.count(obj.tab.get()) == 0))
                     {
                         auto im0 = obj.tab->map.find(L"_meta");
                         if (im0 != obj.tab->map.end() &&
@@ -723,9 +852,16 @@ Value Interp::GetMember(const Value& obj, const wstring& key,
                                     bool bErr = false;
                                     wstring strErrM;
                                     Value r;
-                                    if (MetaGet(obj, key, &r, &bErr,
-                                                &strErrM, bOwnerCall))
+                                    if (MetaGet(obj, keyVal, &r, &bErr,
+                                                &strErrM, ownerCallMode))
+                                    {
+                                        if (r.t != Value::Null)
+                                            return r;
+                                        auto itRaw = obj.tab->map.find(key);
+                                        if (itRaw != obj.tab->map.end() && itRaw->second.t != Value::Null)
+                                            return itRaw->second;
                                         return r;
+                                    }
                                     if (bErr)
                                     {
                                         if (err->empty())
@@ -774,7 +910,7 @@ Value Interp::GetMember(const Value& obj, const wstring& key,
                     bool bErr = false;
                     wstring strErrM;
                     Value r;
-                    if (MetaGet(obj, key, &r, &bErr, &strErrM, bOwnerCall))
+                    if (MetaGet(obj, keyVal, &r, &bErr, &strErrM, ownerCallMode))
                         return r;
                     if (bErr)
                     {
@@ -825,6 +961,12 @@ Value Interp::GetMember(const Value& obj, const wstring& key,
                 }
             }
             return Value();
+        }
+
+Value Interp::GetMember(const Value& obj, const wstring& key,
+                        bool bDirect, bool bOwnerCall)
+        {
+            return GetMember(obj, Value::Str_(key), bDirect, bOwnerCall ? 1 : 0);
         }
 
 // ---- EvalCall ----
@@ -940,17 +1082,22 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                         if (vDots.t == Value::TableT && vDots.tab)
                         {
                             for (auto& item : vDots.tab->arr)
-                                res.push_back(item);
+                            {
+                                Value elem = item;
+                                elem.mrets = nullptr;
+                                res.push_back(elem);
+                            }
                         }
                         else if (vDots.t != Value::Null)
                         {
-                            res.push_back(vDots);
+                            Value elem = vDots;
+                            elem.mrets = nullptr;
+                            res.push_back(elem);
                         }
                     }
                     else
                     {
                         Value v = Eval(a, env);
-                        res.push_back(v);
                         // aardio: a multi-return call in the LAST argument
                         // position expands into the parameter list —
                         // `assert2(2, resume(fib))` must receive (2, true,
@@ -958,8 +1105,20 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                         // yielded value
                         if (ai + 1 == exprs.size() && v.mrets)
                         {
-                            for (auto& extra : *v.mrets)
-                                res.push_back(extra);
+                            auto mrets = v.mrets;
+                            v.mrets = nullptr;
+                            res.push_back(v);
+                            for (auto& extra : *mrets)
+                            {
+                                Value ex = extra;
+                                ex.mrets = nullptr;
+                                res.push_back(ex);
+                            }
+                        }
+                        else
+                        {
+                            v.mrets = nullptr;
+                            res.push_back(v);
                         }
                     }
                 }
@@ -1033,7 +1192,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                                                      : globals.self);
                 local->nsTable = inst;
                 local->bNsInst = true;   // instance scope: never capture as nsClosure
-                local->bInstInit = f.classBody != nullptr;
+                local->bInstInit = true;
                 if (bMethod)
                     local->vars[L"owner"] = vThis;   // owner = dot-left
                 local->vars[L"this"] = vInst;
@@ -1044,11 +1203,6 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                     nReturn = nBreak = nContinue = 0;
                     ExecBlock(f.classBody, local.get());
-                    // member-initialization privilege ends with the ctor:
-                    // the frame stays alive as the closure parent of every
-                    // method, and a lingering bInstInit made `this.x = v`
-                    // inside ANY method bypass the metatable's _set
-                    local->bInstInit = false;
                     nReturn = oldR; nBreak = oldB; nContinue = oldC;
                     ret = oldRet;
                     auto itThis = local->vars.find(L"this");
@@ -1110,13 +1264,21 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     Value oldRet = ret;
                     int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                     nReturn = nBreak = nContinue = 0;
+                    ret = Value();
                     ExecBlock(f.fn->a, local.get());
                     bool bCtorRet = (nReturn > 0);
                     Value ctorRet = ret;
                     nReturn = oldR; nBreak = oldB; nContinue = oldC;
                     ret = oldRet;
-                    if (bCtorRet && ctorRet.t != Value::Null)
+                    // member-initialization privilege ends with the ctor:
+                    // the frame stays alive as the closure parent of every
+                    // method, and a lingering bInstInit made `this.x = v`
+                    // inside ANY method bypass the metatable's _set
+                    local->bInstInit = false;
+                    if (bCtorRet)
                     {
+                        if (ctorRet.t == Value::Null)
+                            return ctorRet;
                         if (ctorRet.t == Value::TableT && ctorRet.tab && vInst.tab)
                         {
                             for (auto& kv : vInst.tab->map)
@@ -1135,11 +1297,28 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     {
                         if (itThis->second.tab != vInst.tab && vInst.tab)
                         {
+                            auto rebindVal = [&](Value& val) {
+                                if (val.t == Value::Func && val.thisVal &&
+                                    val.thisVal->tab == vInst.tab)
+                                {
+                                    *val.thisVal = itThis->second;
+                                }
+                            };
                             for (auto& kv : vInst.tab->map)
                             {
+                                rebindVal(kv.second);
                                 if (itThis->second.tab->map.find(kv.first) == itThis->second.tab->map.end())
                                     itThis->second.tab->map[kv.first] = kv.second;
                             }
+                            for (auto& kv : itThis->second.tab->map)
+                            {
+                                rebindVal(kv.second);
+                            }
+                            for (auto& kv : local->vars)
+                            {
+                                rebindVal(kv.second);
+                            }
+                            local->nsTable = itThis->second.tab;
                         }
                         vInst = itThis->second;
                     }
@@ -1193,7 +1372,11 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             if (f.native)
             {
                 vector<Value> args = evalCallArgs(n->list);
-                return f.native(args);
+                Value oldOwner = s_currentOwner;
+                s_currentOwner = bMethod ? vThis : Value();
+                Value r = f.native(args);
+                s_currentOwner = oldOwner;
+                return r;
             }
             // M2: calling a table -> metatable _call (owner = the table)
             if (f.t == Value::TableT && f.tab)
@@ -1335,16 +1518,13 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             }
             Value l = Eval(n->a, env), r = Eval(n->b, env);
             if (op == L"===")
-                return ApplyOp(op, l, r);
-            if (op == L"==") return Value::Bool_(l.ToString() == r.ToString() &&
-                                                l.t == r.t);
-            if (op == L"!=") return Value::Bool_(!(l.ToString() == r.ToString() &&
-                                                   l.t == r.t));
+                return Value::Bool_(ValuesEqual(l, r, true));
             if (op == L"!==")
-                return Value::Bool_(!(l.ToString() == r.ToString() &&
-                                      l.t == r.t) &&
-                                    !(l.t == Value::Null &&
-                                      r.t == Value::Null));
+                return Value::Bool_(!ValuesEqual(l, r, true));
+            if (op == L"==")
+                return Value::Bool_(ValuesEqual(l, r, false));
+            if (op == L"!=")
+                return Value::Bool_(!ValuesEqual(l, r, false));
             if (op == L"..")
             {
                 if (l.t == Value::TableT || r.t == Value::TableT)
@@ -1413,12 +1593,72 @@ bool Interp::CmpLess(const Value& l, const Value& r)
             return false;
         }
 
+// ---- ValuesEqual ----
+bool Interp::ValuesEqual(const Value& l, const Value& r, bool strict)
+        {
+            if (l.t != r.t)
+            {
+                if (strict) return false;
+                if (l.t == Value::Null || r.t == Value::Null)
+                    return false;
+                if ((l.t == Value::Num && r.t == Value::Str) || (l.t == Value::Str && r.t == Value::Num))
+                {
+                    wchar_t* endp = nullptr;
+                    const wstring& s = (l.t == Value::Str) ? l.s : r.s;
+                    double n = (l.t == Value::Num) ? l.n : r.n;
+                    double v = wcstod(s.c_str(), &endp);
+                    if (endp && *endp == 0)
+                        return n == v;
+                }
+                return false;
+            }
+            switch (l.t)
+            {
+            case Value::Null:
+                return true;
+            case Value::Bool:
+                return l.b == r.b;
+            case Value::Num:
+                return l.n == r.n;
+            case Value::Pointer:
+                return l.ptr == r.ptr;
+            case Value::Str:
+                return l.s == r.s;
+            case Value::TableT:
+            case Value::Class:
+                if (l.tab == r.tab) return true;
+                if (!strict && l.tab)
+                {
+                    auto im = l.tab->map.find(L"_meta");
+                    if (im != l.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                    {
+                        auto ieq = im->second.tab->map.find(L"_eq");
+                        if (ieq != im->second.tab->map.end() && (ieq->second.t == Value::Func || ieq->second.native))
+                        {
+                            vector<Value> args{ r };
+                            return CallOwner(ieq->second, l, args).Truthy();
+                        }
+                    }
+                }
+                return false;
+            case Value::Func:
+                if (l.native && r.native) return l.native.target_type() == r.native.target_type();
+                return l.fn == r.fn;
+            }
+            return false;
+        }
+
 // ---- ApplyOp ----
 Value Interp::ApplyOp(const wstring& op, const Value& l, const Value& r)
         {
             if (op == L"===")
-                return Value::Bool_(l.t == r.t &&
-                                    l.ToString() == r.ToString());
+                return Value::Bool_(ValuesEqual(l, r, true));
+            if (op == L"!==")
+                return Value::Bool_(!ValuesEqual(l, r, true));
+            if (op == L"==")
+                return Value::Bool_(ValuesEqual(l, r, false));
+            if (op == L"!=")
+                return Value::Bool_(!ValuesEqual(l, r, false));
             if (op == L"..")
                 return Value::Str_(l.ToString() + r.ToString());
             if (op == L"++")
@@ -1441,15 +1681,6 @@ Value Interp::ApplyOp(const wstring& op, const Value& l, const Value& r)
             if (op == L">>") return Value::Num_((double)(int)(ua >> (ub & 31)));
             if (op == L">>>")
                 return Value::Num_((double)((long long)(ua >> (ub & 31))));
-            if (op == L"==") return Value::Bool_(l.ToString() == r.ToString() &&
-                                                l.t == r.t);
-            if (op == L"!=") return Value::Bool_(!(l.ToString() == r.ToString() &&
-                                                   l.t == r.t));
-            if (op == L"!==")
-                return Value::Bool_(!(l.ToString() == r.ToString() &&
-                                      l.t == r.t) &&
-                                    !(l.t == Value::Null &&
-                                      r.t == Value::Null));
             if (op == L"<") return Value::Bool_(CmpLess(l, r));
             if (op == L">") return Value::Bool_(CmpLess(r, l));
             if (op == L"<=") return Value::Bool_(!CmpLess(r, l));
@@ -1464,7 +1695,21 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                       const wstring& op)
         {
             Value val = v;
-            if (op != L"=" && op != L":=" && op != L"::=")
+            val.mrets = nullptr;
+            if (op == L":=" || op == L"::=")
+            {
+                Value cur;
+                if (target->k == Node::Ident)
+                {
+                    if (Value* pv = env->Find(target->str))
+                        cur = *pv;
+                }
+                else if (target->k == Node::Member || target->k == Node::Index)
+                    cur = Eval(target, env);
+                if (cur.Truthy())
+                    return;
+            }
+            else if (op != L"=")
             {
                 Value cur;
                 if (target->k == Node::Ident)
@@ -1480,28 +1725,37 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
             {
                 // aardio: inside a namespace scope, bare names are
                 // namespace members — only locals (var/params) resolve
-                // before the namespace table
+                // before the namespace table. Check if target was declared
+                // as a lexical variable in any enclosing env frame (stopping
+                // before globals, which is not a local var frame).
+                Env* eFound = nullptr;
+                for (Env* e = env; e && e->parent; e = e->parent.get())
+                {
+                    if (e->vars.find(target->str) != e->vars.end())
+                    {
+                        eFound = e;
+                        break;
+                    }
+                }
                 Env* eNs = env;
                 while (eNs && !eNs->nsTable) eNs = eNs->parent.get();
-                Env* e = env;
-                bool bLocal = false;
-                while (e)
+                if (eFound)
                 {
-                    if (e->vars.count(target->str)) { bLocal = true; break; }
-                    if (e->nsTable) break;   // namespace boundary
-                    e = e->parent.get();
+                    eFound->vars[target->str] = val;
+                    if (eFound->bNsBody && eFound->nsTable)
+                    {
+                        eFound->nsTable->map[target->str] = val;
+                        eFound->nsTable->scopeVars[target->str] = val;
+                    }
+                    else if (eFound->bNsBody && eFound->modTable)
+                    {
+                        eFound->modTable->map[target->str] = val;
+                        eFound->modTable->scopeVars[target->str] = val;
+                    }
                 }
-                if (bLocal && e)
-                    *env->Find(target->str) = val;   // local slot
-                else if (eNs)
+                else if (eNs && eNs->nsTable)
                 {
                     eNs->nsTable->map[target->str] = val;
-                    // Env::Find reads scopeVars BEFORE map, so a bare
-                    // assign from a nested function (whose call env's
-                    // nsTable IS the defining namespace) must update the
-                    // var-store mirror too — otherwise a module-level
-                    // `var x;` keeps reading back as the stale null it
-                    // was declared with (console.loadingDots et al).
                     eNs->nsTable->scopeVars[target->str] = val;
                 }
                 else
@@ -1556,11 +1810,29 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                             }
                         }
                     }
-                    // official semantics: an existing data member does
-                    // NOT bypass the metatable - DSG init copies DSG attrs
-                    // (table.assign) onto the ctrl, and a later script
-                    // write must still route through the metaProperty
-                    if (bInit || !obj.tab->map.count(L"_meta"))
+                    bool bHasPropSetter = false;
+                    auto im = obj.tab->map.find(L"_meta");
+                    if (im != obj.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                    {
+                        auto ik = im->second.tab->map.find(target->str);
+                        if (ik != im->second.tab->map.end() && ik->second.t == Value::TableT && ik->second.tab)
+                        {
+                            if (ik->second.tab->map.count(L"_set"))
+                                bHasPropSetter = true;
+                        }
+                        if (!bHasPropSetter)
+                        {
+                            auto is = im->second.tab->map.find(L"_set");
+                            if (is != im->second.tab->map.end() && is->second.t == Value::TableT && is->second.tab)
+                            {
+                                if (is->second.tab->map.count(target->str))
+                                    bHasPropSetter = true;
+                            }
+                        }
+                    }
+
+                    bool bHasDataMember = (obj.tab->map.count(target->str) > 0);
+                    if (bInit || !obj.tab->map.count(L"_meta") || (bHasDataMember && !bHasPropSetter))
                     {
                         if (val.t == Value::Null)
                             obj.tab->map.erase(target->str);
@@ -1595,11 +1867,66 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 Value idx = Eval(target->b, env);
                 if ((obj.t == Value::TableT || obj.t == Value::Func || obj.t == Value::Class) && obj.tab)
                 {
-                    if (idx.t == Value::Num && idx.n == (long long)idx.n &&
-                        idx.n >= 1 && (size_t)(idx.n - 1) == obj.tab->arr.size())
+                    bool bHasMeta = false;
+                    if (!target->bDirect)
                     {
-                        if (val.t != Value::Null)
-                            obj.tab->arr.push_back(val);
+                        bHasMeta = (obj.tab->map.count(L"_meta") > 0);
+                        if (!bHasMeta)
+                        {
+                            auto icc = obj.tab->map.find(L"_metaAnnotated");
+                            if (icc != obj.tab->map.end() && (icc->second.t == Value::Bool || icc->second.t == Value::Num))
+                            {
+                                auto icc2 = obj.tab->map.find(L"_class");
+                                if (icc2 != obj.tab->map.end() && icc2->second.tab && icc2->second.tab->map.count(L"_meta"))
+                                    bHasMeta = true;
+                            }
+                        }
+                    }
+
+                    if (bHasMeta)
+                    {
+                        bool bErr = false;
+                        wstring strErrM;
+                        // For index assignment, ownerAttr is false
+                        if (MetaSet(obj, idx, val, &bErr, &strErrM, /*bOwnerAttr=*/false))
+                        {
+                            if (bErr && err->empty())
+                                (*err) = L"运行错误: " + strErrM;
+                            return;
+                        }
+                        if (bErr && err->empty())
+                        {
+                            (*err) = L"运行错误: " + strErrM;
+                            return;
+                        }
+                    }
+
+                    long long numIdx = -1;
+                    if (idx.t == Value::Num && idx.n == (long long)idx.n && idx.n >= 1)
+                        numIdx = (long long)idx.n;
+                    else if (!idx.ToString().empty() && idx.ToString().find_first_not_of(L"0123456789") == wstring::npos)
+                        numIdx = _wtoi64(idx.ToString().c_str());
+
+                    if (numIdx >= 1)
+                    {
+                        if ((size_t)numIdx <= obj.tab->arr.size())
+                        {
+                            obj.tab->arr[(size_t)(numIdx - 1)] = val;
+                            obj.tab->map.erase(idx.ToString());
+                        }
+                        else if ((size_t)(numIdx - 1) == obj.tab->arr.size())
+                        {
+                            if (val.t != Value::Null)
+                                obj.tab->arr.push_back(val);
+                            obj.tab->map.erase(idx.ToString());
+                        }
+                        else
+                        {
+                            if (val.t == Value::Null)
+                                obj.tab->map.erase(idx.ToString());
+                            else
+                                obj.tab->map[idx.ToString()] = val;
+                        }
                     }
                     else
                     {
@@ -1648,6 +1975,8 @@ Value Interp::EvalClass(const PNode& n, Env* env)
             vClass.t = Value::Class;
             vClass.tab = tb;
             vClass.fn = n->b;
+            vClass.pdefaults = std::make_shared<vector<PNode>>(
+                n->b ? n->b->defaults : vector<PNode>());
             vClass.classBody = n->a;
             for (Env* e = env; e; e = e->parent.get())
                 if (e->nsTable && !e->bNsInst)
@@ -1655,17 +1984,22 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                     vClass.nsClosure = e->nsTable;
                     break;
                 }
+            auto classEnv = std::make_shared<Env>();
+            classEnv->self = classEnv;
+            classEnv->parent = env ? env->self : globals.self;
+            classEnv->nsTable = tb;
+            classEnv->bNsBody = true;
             for (auto& st : n->a->list)
             {
                 if (st->k == Node::Assign && st->a &&
                     st->a->k == Node::Ident)
-                    tb->map[st->a->str] = Eval(st->b, env);
+                    tb->map[st->a->str] = Eval(st->b, classEnv.get());
                 else if (st->k == Node::Assign && st->a &&
                          st->a->k == Node::Index && st->a->a &&
                          st->a->a->k == Node::Ident && st->a->a->str == L"this" &&
                          st->a->b && st->a->b->k == Node::Str)
                 {
-                    tb->map[st->a->b->str] = Eval(st->b, env);
+                    tb->map[st->a->b->str] = Eval(st->b, classEnv.get());
                 }
             }
             // anonymous class (class { ... }) has no name to bind
@@ -1738,25 +2072,22 @@ Value Interp::Exec(const PNode& n, Env* env)
                     // names-form comment below)
                     size_t nT = n->c->list.size() + 1;
                     vector<Value> pre;
-                    pre.reserve(n->b->list.size());
                     for (auto& eN : n->b->list)
-                        pre.push_back(Eval(eN, env));
-                    Value v;
+                    {
+                        Value ev = Eval(eN, env);
+                        pre.push_back(ev);
+                        if (ev.mrets && !ev.mrets->empty())
+                        {
+                            for (auto& mr : *ev.mrets)
+                                pre.push_back(mr);
+                        }
+                    }
+                    Value v = pre.empty() ? Value() : pre[0];
                     for (size_t k2 = 0; k2 < nT; k2++)
                     {
-                        Value item;
-                        if (k2 < pre.size())
-                            item = pre[k2];
-                        else if (v.mrets && k2 - pre.size() <
-                                 v.mrets->size())
-                            item = (*v.mrets)[k2 - pre.size()];
-                        else
-                            item = Value();
+                        Value item = (k2 < pre.size()) ? pre[k2] : Value();
                         if (k2 == 0)
-                        {
-                            v = item;
                             DoAssign(n->a, item, env, L"=");
-                        }
                         else
                             DoAssign(n->c->list[k2 - 1], item, env, L"=");
                     }
@@ -1764,46 +2095,64 @@ Value Interp::Exec(const PNode& n, Env* env)
                 }
                 if (n->names.size() > 1)
                 {
-                    // a,b,c = e1,e2 — positional like var; when the first
-                    // expr yields multi-returns the extras fill the rest.
+                    // a,b,c = e1,e2 — positional like var; when any expr
+                    // yields multi-returns (especially the last or later ones),
+                    // the extras fill subsequent targets.
                     // EVERY rhs is evaluated before any target binds —
-                    // `a,b = b,a+b` must read the old a (fib-style spin
-                    // loops froze otherwise). A packed `...` (bDots)
-                    // expands from index 0 across ALL names.
-                    Value v = Eval(n->a, env);
+                    // `a,b = b,a+b` must read the old a.
+                    // A packed `...` (bDots) expands across all names.
                     size_t extras = n->b ? n->b->list.size() : 0;
-                    vector<Value> pre;
-                    pre.reserve(1 + extras);
-                    pre.push_back(v);
+                    vector<Value> rawExprs;
+                    rawExprs.reserve(1 + extras);
+                    rawExprs.push_back(Eval(n->a, env));
                     for (size_t e = 0; e < extras; e++)
-                        pre.push_back(Eval(n->b->list[e], env));
-                    size_t dotsOff = v.bDots ? 0 : 1;
+                        rawExprs.push_back(Eval(n->b->list[e], env));
+
+                    vector<Value> flatVals;
+                    for (size_t i = 0; i < rawExprs.size(); i++)
+                    {
+                        const Value& ev = rawExprs[i];
+                        if (ev.bDots && ev.mrets)
+                        {
+                            for (auto& mr : *ev.mrets)
+                                flatVals.push_back(mr);
+                        }
+                        else
+                        {
+                            flatVals.push_back(ev);
+                            if (i == rawExprs.size() - 1 && ev.mrets && !ev.mrets->empty())
+                            {
+                                for (auto& mr : *ev.mrets)
+                                    flatVals.push_back(mr);
+                            }
+                        }
+                    }
+
+                    Value v = flatVals.empty() ? Value() : flatVals[0];
                     for (size_t k2 = 0; k2 < n->names.size(); k2++)
                     {
-                        Value item;
-                        if (k2 == 0 && v.bDots && v.mrets &&
-                            !v.mrets->empty())
-                            item = (*v.mrets)[0];
-                        else if (k2 == 0)
-                            item = v;
-                        else if (k2 - 1 < extras)
-                            item = pre[k2];
-                        else if (v.mrets &&
-                                 (k2 - dotsOff) < v.mrets->size())
-                            item = (*v.mrets)[k2 - dotsOff];
-                        else
-                            item = Value();
+                        Value item = (k2 < flatVals.size()) ? flatVals[k2] : Value();
                         if (n->names[k2].empty())
                             continue;   // hole slot: consumed a return value
-                        // bind like a bare-name assignment (local chain ->
-                        // namespace -> global). DoAssignSimple wrote globals
-                        // unconditionally, freezing function-local `a,b = b,a+b`
                         PNode idT = std::make_shared<Node>();
                         idT->k = Node::Ident;
                         idT->str = n->names[k2];
                         DoAssign(idT, item, env, L"=");
                     }
                     return v;
+                }
+                if (n->str == L":=" || n->str == L"::=")
+                {
+                    Value cur;
+                    if (n->a->k == Node::Ident)
+                    {
+                        if (Value* pv = env->Find(n->a->str))
+                            cur = *pv;
+                    }
+                    else if (n->a->k == Node::Member || n->a->k == Node::Index)
+                        cur = Eval(n->a, env);
+                    if (cur.Truthy())
+                        return cur;
                 }
                 Value v = Eval(n->b, env);
                 DoAssign(n->a, v, env, n->str);
@@ -1820,13 +2169,15 @@ Value Interp::Exec(const PNode& n, Env* env)
                 auto BindVar = [env](const wstring& name, const Value& v)
                 {
                     if (name.empty()) return;
-                    env->vars[name] = v;
+                    Value val = v;
+                    val.mrets = nullptr;
+                    env->vars[name] = val;
                     if (env->bNsBody)
                     {
                         if (env->nsTable)
-                            env->nsTable->map[name] = v;
+                            env->nsTable->map[name] = val;
                         else if (env->modTable)
-                            env->modTable->map[name] = v;
+                            env->modTable->map[name] = val;
                     }
                 };
                 // var a = e1, b = e2 — positional init list; all initializers
@@ -1867,6 +2218,12 @@ Value Interp::Exec(const PNode& n, Env* env)
                 Value v = n->a ? Eval(n->a, env) : Value();
                 if (n->names.size() == 1)
                 {
+                    if (v.bDots && v.mrets)
+                    {
+                        Value firstDot = v.mrets->empty() ? Value() : (*v.mrets)[0];
+                        BindVar(n->names[0], firstDot);
+                        return firstDot;
+                    }
                     BindVar(n->names[0], v);
                     return v;
                 }
@@ -2010,7 +2367,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 {
                     while (true)
                     {
-                        Value v = Eval(n->a, env);
+                        Value v = Exec(n->a, env);
                         if (nReturn) return v;
                         if (!v.Truthy())
                             break;
@@ -2047,7 +2404,34 @@ Value Interp::Exec(const PNode& n, Env* env)
             }
             case Node::ForNum:
             {
-                Exec(n->a, env);
+                auto loopEnv = std::make_shared<Env>();
+                loopEnv->self = loopEnv;
+                loopEnv->parent = env ? env->self : globals.self;
+                loopEnv->nsTable = env ? env->nsTable : nullptr;
+                loopEnv->modTable = env ? env->modTable : nullptr;
+
+                // Official aardio: loop variable is strictly local to the for loop.
+                // It does not mutate outer variables with the same name.
+                wstring loopVarName;
+                if (n->a && n->a->k == Node::Assign && n->a->a && n->a->a->k == Node::Ident)
+                {
+                    loopVarName = n->a->a->str;
+                    Value initVal = Eval(n->a->b, env);
+                    loopEnv->vars[loopVarName] = initVal;
+                }
+                else if (n->a && n->a->k == Node::VarDecl && !n->a->names.empty())
+                {
+                    loopVarName = n->a->names[0];
+                    Value initVal;
+                    if (!n->a->defaults.empty() && n->a->defaults[0])
+                        initVal = Eval(n->a->defaults[0], env);
+                    loopEnv->vars[loopVarName] = initVal;
+                }
+                else
+                {
+                    Exec(n->a, loopEnv.get());
+                }
+
                 // The "limit" tag means the middle slot is a plain numeric
                 // bound (the 2-expr form 'for i=1;4' or the descending
                 // 'for i=#t;1;-1'), not a boolean condition. Distinguish
@@ -2065,16 +2449,6 @@ Value Interp::Exec(const PNode& n, Env* env)
                                   !bCmpCond;
                 double dStep = 1;
                 int nDir = 1;
-                if (n->a && n->a->k == Node::Assign && n->a->a &&
-                    n->a->a->k == Node::Ident)
-                {
-                    Value* pv = env->Find(n->a->a->str);
-                    Value lim = n->b ? Eval(n->b, env) : Value();
-                    if (pv && pv->t == Value::Num && lim.t == Value::Num)
-                    {
-                        nDir = BNum(*pv) > BNum(lim) ? -1 : 1;
-                    }
-                }
                 // A literal numeric step ("for i=1;10;2") is folded; anything
                 // else (a variable, i++, i+=2) is executed as a statement
                 // AFTER the body — but the loop variable must still advance,
@@ -2085,39 +2459,50 @@ Value Interp::Exec(const PNode& n, Env* env)
                                   n->c->a && n->c->a->k == Node::Un &&
                                   n->c->a->str == L"-";
                 if (bNumStep)
+                {
                     dStep = n->c->a->num;
+                    if (dStep < 0) nDir = -1;
+                }
                 else if (bUnaryStep)
                 {
-                    dStep = -BNum(Eval(n->c->a->a, env));
-                    nDir = -1;
+                    dStep = -BNum(Eval(n->c->a->a, loopEnv.get()));
+                    if (dStep < 0) nDir = -1;
                 }
-                if (!n->c)
-                    dStep = (double)nDir;   // 2-expr form: derived step
+                // When step is omitted, official aardio default step is ALWAYS 1 (forward).
+                // Descending loops require an explicit negative step (e.g. `for(i=10;1;-1)`).
                 auto bContinue = [&]() -> bool {
                     if (!n->b)
                         return true;        // empty condition slot: forever
                     if (!bLimitForm)
-                        return Eval(n->b, env).Truthy();
-                    if (n->a && n->a->k == Node::Assign &&
-                        n->a->a && n->a->a->k == Node::Ident)
+                        return Eval(n->b, loopEnv.get()).Truthy();
+                    if (!loopVarName.empty())
                     {
-                        Value* pv = env->Find(n->a->a->str);
+                        Value* pv = loopEnv->Find(loopVarName);
                         if (pv && pv->t == Value::Num)
                         {
-                            Value lim = Eval(n->b, env);
+                            Value lim = Eval(n->b, loopEnv.get());
                             return nDir >= 0 ? pv->n <= BNum(lim)
                                              : pv->n >= BNum(lim);
                         }
-                        // limit form with a non-numeric loop variable
-                        // (null start etc.): the loop must not run — a
-                        // numeric comparison against null is false
                         return false;
                     }
-                    return Eval(n->b, env).Truthy();
+                    if (n->a && n->a->k == Node::Assign &&
+                        n->a->a && n->a->a->k == Node::Ident)
+                    {
+                        Value* pv = loopEnv->Find(n->a->a->str);
+                        if (pv && pv->t == Value::Num)
+                        {
+                            Value lim = Eval(n->b, loopEnv.get());
+                            return nDir >= 0 ? pv->n <= BNum(lim)
+                                             : pv->n >= BNum(lim);
+                        }
+                        return false;
+                    }
+                    return Eval(n->b, loopEnv.get()).Truthy();
                 };
                 while (bContinue())
                 {
-                    Value r = ExecBlock(n->d, env);
+                    Value r = ExecBlock(n->d, loopEnv.get());
                     if (nBreak) { nBreak--; break; }
                     if (nContinue) nContinue--;
                     if (nReturn) return r;
@@ -2132,26 +2517,38 @@ Value Interp::Exec(const PNode& n, Env* env)
                     {
                         if (bIdentStep)
                         {
-                            Value vS = Eval(n->c->a, env);
+                            Value vS = Eval(n->c->a, loopEnv.get());
                             if (vS.t == Value::Num) dStep = vS.n;
                         }
-                        if (n->a && n->a->k == Node::Assign && n->a->a &&
+                        if (!loopVarName.empty())
+                        {
+                            Value* pv = loopEnv->Find(loopVarName);
+                            if (pv && pv->t == Value::Num)
+                                *pv = Value::Num_(pv->n + dStep);
+                        }
+                        else if (n->a && n->a->k == Node::Assign && n->a->a &&
                             n->a->a->k == Node::Ident)
                         {
-                            Value* pv = env->Find(n->a->a->str);
+                            Value* pv = loopEnv->Find(n->a->a->str);
                             if (pv && pv->t == Value::Num)
                                 *pv = Value::Num_(pv->n + dStep);
                         }
                     }
                     else if (n->c)
                     {
-                        Exec(n->c, env);
+                        Exec(n->c, loopEnv.get());
+                    }
+                    else if (!loopVarName.empty())
+                    {
+                        Value* pv = loopEnv->Find(loopVarName);
+                        if (pv && pv->t == Value::Num)
+                            *pv = Value::Num_(pv->n + dStep);
                     }
                     else if (n->a && n->a->k == Node::Assign && n->a->a &&
                              n->a->a->k == Node::Ident)
                     {
                         // 2-expr form: no step slot, derive from direction
-                        Value* pv = env->Find(n->a->a->str);
+                        Value* pv = loopEnv->Find(n->a->a->str);
                         if (pv && pv->t == Value::Num)
                             *pv = Value::Num_(pv->n + dStep);
                     }
@@ -2183,10 +2580,13 @@ Value Interp::Exec(const PNode& n, Env* env)
                             return Value();
                         loopEnv->vars.clear();
                         loopEnv->vars[n->names[0]] = r;
-                        if (n->names.size() > 1)
-                            loopEnv->vars[n->names[1]] =
-                                (r.mrets && !r.mrets->empty())
-                                    ? (*r.mrets)[0] : Value();
+                        for (size_t ni = 1; ni < n->names.size(); ni++)
+                        {
+                            size_t mi = ni - 1;
+                            loopEnv->vars[n->names[ni]] =
+                                (r.mrets && mi < r.mrets->size())
+                                    ? (*r.mrets)[mi] : Value();
+                        }
                         Value rb = ExecBlock(n->b, loopEnv.get());
                         if (nBreak) { nBreak--; return Value(); }
                         if (nContinue) { nContinue--; continue; }

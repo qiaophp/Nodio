@@ -43,8 +43,10 @@ namespace NodioVM
             w == L"handle" || w == L"hwnd" || w == L"hkey" ||
             w == L"lpvoid")
             return 5;
-        if (w == L"str" || w == L"strb" || w == L"string" || w == L"lpcstr")
+        if (w == L"str")
             return 6;
+        if (w == L"string" || w == L"strb" || w == L"lpcstr")
+            return 11;
         if (w == L"wstr" || w == L"ustring" || w == L"ustr" ||
             w == L"lpwstr" || w == L"bstr")
             return 7;
@@ -337,19 +339,19 @@ namespace NodioVM
     void* EmitX64CallStub(const ApiSig& sig)
     {
         unsigned char* c = (unsigned char*)VirtualAlloc(
-            nullptr, 256, MEM_COMMIT | MEM_RESERVE,
+            nullptr, 512, MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE);
         int n = 0;
         auto put = [&c, &n](const unsigned char* p, int len)
         { memcpy(c + n, p, (size_t)len); n += len; };
         auto put32 = [&c, &n](unsigned int v)
         { memcpy(c + n, &v, 4); n += 4; };
-        // push rbx ; mov rbx, rcx ; sub rsp,0xC0 (16-aligned: entry ≡8,
-        // push →0, 0xC0 ≡0 → call-site rsp ≡0 mod 16)
+        // push rbx ; mov rbx, rcx ; sub rsp,0x120 (16-aligned: entry ≡8,
+        // push →0, 0x120 ≡0 → call-site rsp ≡0 mod 16)
         const unsigned char sPro[] = {
             0x53,
             0x48, 0x89, 0xCB,
-            0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00 };
+            0x48, 0x81, 0xEC, 0x20, 0x01, 0x00, 0x00 };
         put(sPro, (int)sizeof(sPro));
         // mov REG, [rbx+disp32] — mod 10, reg=dest, rm=011 (rbx)
         //   rcx: 48 8B 8B dd..  rdx: 48 8B 93 dd..
@@ -374,10 +376,11 @@ namespace NodioVM
         // independent numbering put emSize in xmm0 and style in rdx,
         // and GDI+ read garbage → InvalidParameter)
         int nIntReg = 0, nStack = 0;
-        for (size_t i = 0; i < sig.params.size() && i < 14; i++)
+        for (size_t i = 0; i < sig.params.size() && i < 32; i++)
         {
             int pt = sig.params[i] & 0xFF;
-            bool bFloat = (pt == 9 || pt == 10);
+            bool bByRef = (sig.params[i] & 0x100) != 0;
+            bool bFloat = !bByRef && (pt == 9 || pt == 10);
             unsigned int disp = (unsigned int)(8 + 8 * i);
             if (i < 4)
             {
@@ -399,10 +402,19 @@ namespace NodioVM
             // position 5+: stack
             put(kMovRbx[4], 3);               // mov rax,[rbx+disp]
             put32(disp);
-            unsigned char st[4] = {
-                0x48, 0x89, 0x44, 0x24 };     // mov [rsp+d],rax
-            put(st, 4);
-            c[n++] = (unsigned char)(0x20 + 8 * nStack);
+            unsigned int dispStack = (unsigned int)(0x20 + 8 * nStack);
+            if (dispStack < 0x80)
+            {
+                unsigned char st[4] = { 0x48, 0x89, 0x44, 0x24 }; // mov [rsp+disp8], rax
+                put(st, 4);
+                c[n++] = (unsigned char)dispStack;
+            }
+            else
+            {
+                unsigned char st[4] = { 0x48, 0x89, 0x84, 0x24 }; // mov [rsp+disp32], rax
+                put(st, 4);
+                put32(dispStack);
+            }
             nStack++;
         }
         c[n++] = 0xFF; c[n++] = 0x13;   // call qword [rbx]
@@ -419,7 +431,7 @@ namespace NodioVM
             put(movq, 5);
         }
         const unsigned char sEp[] = {
-            0x48, 0x81, 0xC4, 0xC0, 0x00, 0x00, 0x00, // add rsp,0xC0
+            0x48, 0x81, 0xC4, 0x20, 0x01, 0x00, 0x00, // add rsp,0x120
             0x5B,                                     // pop rbx
             0xC3 };                                   // ret
         put(sEp, (int)sizeof(sEp));
@@ -431,7 +443,8 @@ namespace NodioVM
     {
         wstring t = type;
         for (auto& c : t) c = towlower(c);
-        if (arrCount <= 0) arrCount = 1;
+        if (arrCount < 0) arrCount = 0;
+        if (!bIsArray) arrCount = 1;
         if (t == L"byte" || t == L"uchar" || t == L"char" || t == L"int8") return 1 * arrCount;
         if (t == L"word" || t == L"ushort" || t == L"short" || t == L"wchar") return 2 * arrCount;
         if (t == L"int" || t == L"uint" || t == L"long" || t == L"dword" || t == L"bool") return 4 * arrCount;
@@ -445,6 +458,33 @@ namespace NodioVM
         if (t == L"pointer" || t == L"ptr" || t == L"addr" || t == L"handle")
             return (int)sizeof(void*) * arrCount;
         return 4 * arrCount;
+    }
+
+    static Value GetTableElement(const Value& vTab, size_t idx)
+    {
+        if (vTab.t != Value::TableT && vTab.t != Value::Class) return Value();
+        if (!vTab.tab) return Value();
+        if (idx < vTab.tab->arr.size() && vTab.tab->arr[idx].t != Value::Null)
+            return vTab.tab->arr[idx];
+        wstring k = std::to_wstring(idx + 1);
+        auto it = vTab.tab->map.find(k);
+        if (it != vTab.tab->map.end())
+            return it->second;
+        return Value();
+    }
+
+    static size_t GetTableLength(const Value& vTab)
+    {
+        if (vTab.t != Value::TableT && vTab.t != Value::Class) return 0;
+        if (!vTab.tab) return 0;
+        size_t sz = vTab.tab->arr.size();
+        if (sz > 0) return sz;
+        auto ilen = vTab.tab->map.find(L"length");
+        if (ilen != vTab.tab->map.end()) return (size_t)BNum(ilen->second);
+        size_t count = 0;
+        while (vTab.tab->map.find(std::to_wstring(count + 1)) != vTab.tab->map.end())
+            count++;
+        return count;
     }
 
     std::vector<StructFieldDef> ParseStructDef(const Value& vTab)
@@ -485,8 +525,20 @@ namespace NodioVM
                     sname = srest.substr(0, lb);
                     size_t rb = srest.find(L']', lb);
                     wstring snum = (rb != wstring::npos) ? srest.substr(lb + 1, rb - lb - 1) : L"";
-                    nArr = snum.empty() ? 1 : _wtoi(snum.c_str());
-                    if (nArr <= 0) nArr = 1;
+                    nArr = snum.empty() ? 0 : _wtoi(snum.c_str());
+                    while (!sname.empty() && (sname.back() == L' ' || sname.back() == L'\t'))
+                        sname.pop_back();
+                    if (nArr <= 0)
+                    {
+                        if (vTab.t == Value::TableT && vTab.tab)
+                        {
+                            auto iv = vTab.tab->map.find(sname);
+                            if (iv != vTab.tab->map.end() && iv->second.t == Value::TableT && iv->second.tab)
+                            {
+                                nArr = (int)GetTableLength(iv->second);
+                            }
+                        }
+                    }
                 }
                 while (!sname.empty() && (sname.back() == L' ' || sname.back() == L'\t'))
                     sname.pop_back();
@@ -508,8 +560,18 @@ namespace NodioVM
                     stype = t.substr(0, lb);
                     size_t rb = t.find(L']', lb);
                     wstring snum = (rb != wstring::npos) ? t.substr(lb + 1, rb - lb - 1) : L"";
-                    nArr = snum.empty() ? 1 : _wtoi(snum.c_str());
-                    if (nArr <= 0) nArr = 1;
+                    nArr = snum.empty() ? 0 : _wtoi(snum.c_str());
+                    if (nArr <= 0)
+                    {
+                        if (vTab.t == Value::TableT && vTab.tab)
+                        {
+                            auto iv = vTab.tab->map.find(kv.first);
+                            if (iv != vTab.tab->map.end() && iv->second.t == Value::TableT && iv->second.tab)
+                            {
+                                nArr = (int)GetTableLength(iv->second);
+                            }
+                        }
+                    }
                 }
                 fields.push_back({ kv.first, stype, nArr, bArr });
             }
@@ -548,7 +610,7 @@ namespace NodioVM
         {
             wstring t = f.type;
             for (auto& c : t) c = towlower(c);
-            int a;
+            int a = 1;
             if (t == L"struct" && vTab.tab)
             {
                 auto itM = vTab.tab->map.find(f.name);
@@ -556,9 +618,18 @@ namespace NodioVM
                     (itM->second.t == Value::TableT ||
                      itM->second.t == Value::Class) &&
                     itM->second.tab)
-                    a = CalcStructAlign(itM->second);
-                else
-                    a = 1;
+                {
+                    if (f.bIsArray)
+                    {
+                        Value elem = GetTableElement(itM->second, 0);
+                        if (elem.t == Value::TableT || elem.t == Value::Class)
+                            a = CalcStructAlign(elem);
+                    }
+                    else
+                    {
+                        a = CalcStructAlign(itM->second);
+                    }
+                }
             }
             else
                 a = GetStructFieldAlign(f.type);
@@ -586,11 +657,24 @@ namespace NodioVM
                 auto itM = vTab.tab->map.find(f.name);
                 if (itM != vTab.tab->map.end() && (itM->second.t == Value::TableT || itM->second.t == Value::Class))
                 {
-                    int subSz = CalcStructTotalSize(itM->second);
-                    int subA = CalcStructAlign(itM->second);
-                    total = AlignOffset(total, subA);
-                    total += (subSz > 0 ? subSz : 4) * (f.arrCount > 0 ? f.arrCount : 1);
-                    if (subA > maxA) maxA = subA;
+                    if (f.bIsArray)
+                    {
+                        int count = f.arrCount > 0 ? f.arrCount : (int)GetTableLength(itM->second);
+                        Value elem = GetTableElement(itM->second, 0);
+                        int subSz = (elem.t == Value::TableT || elem.t == Value::Class) ? CalcStructTotalSize(elem) : 0;
+                        int subA = (elem.t == Value::TableT || elem.t == Value::Class) ? CalcStructAlign(elem) : 1;
+                        total = AlignOffset(total, subA);
+                        total += (subSz > 0 ? subSz : 4) * (count > 0 ? count : 1);
+                        if (subA > maxA) maxA = subA;
+                    }
+                    else
+                    {
+                        int subSz = CalcStructTotalSize(itM->second);
+                        int subA = CalcStructAlign(itM->second);
+                        total = AlignOffset(total, subA);
+                        total += (subSz > 0 ? subSz : 4);
+                        if (subA > maxA) maxA = subA;
+                    }
                     continue;
                 }
             }
@@ -653,13 +737,38 @@ namespace NodioVM
             {
                 if ((fv.t == Value::TableT || fv.t == Value::Class) && fv.tab)
                 {
-                    int subTotal = 0;
-                    void* pSub = StructSerialize(fv, &subTotal);
-                    if (pSub)
+                    if (f.bIsArray)
                     {
-                        sz = subTotal;
-                        memcpy(buf + off, pSub, subTotal);
-                        HeapFree(GetProcessHeap(), 0, pSub);
+                        int count = f.arrCount > 0 ? f.arrCount : (int)GetTableLength(fv);
+                        Value elem0 = GetTableElement(fv, 0);
+                        int elemSz = (elem0.t == Value::TableT || elem0.t == Value::Class) ? CalcStructTotalSize(elem0) : 0;
+                        if (elemSz <= 0) elemSz = 4;
+                        for (int k = 0; k < count; k++)
+                        {
+                            Value elem = GetTableElement(fv, k);
+                            if ((elem.t == Value::TableT || elem.t == Value::Class) && elem.tab)
+                            {
+                                int subTotal = 0;
+                                void* pSub = StructSerialize(elem, &subTotal);
+                                if (pSub)
+                                {
+                                    memcpy(buf + off + k * elemSz, pSub, subTotal < elemSz ? subTotal : elemSz);
+                                    HeapFree(GetProcessHeap(), 0, pSub);
+                                }
+                            }
+                        }
+                        sz = elemSz * (count > 0 ? count : 1);
+                    }
+                    else
+                    {
+                        int subTotal = 0;
+                        void* pSub = StructSerialize(fv, &subTotal);
+                        if (pSub)
+                        {
+                            sz = subTotal;
+                            memcpy(buf + off, pSub, subTotal);
+                            HeapFree(GetProcessHeap(), 0, pSub);
+                        }
                     }
                 }
             }
@@ -765,17 +874,59 @@ namespace NodioVM
             }
             else if (t == L"float")
             {
-                float flt = (float)BNum(fv);
-                memcpy(buf + off, &flt, sizeof(float));
+                if (f.bIsArray && (fv.t == Value::TableT) && fv.tab)
+                {
+                    auto& arr = fv.tab->arr;
+                    for (int k = 0; k < f.arrCount; k++)
+                    {
+                        float flt = 0.0f;
+                        if (k < (int)arr.size()) flt = (float)BNum(arr[k]);
+                        memcpy(buf + off + k * sizeof(float), &flt, sizeof(float));
+                    }
+                }
+                else
+                {
+                    float flt = (float)BNum(fv);
+                    memcpy(buf + off, &flt, sizeof(float));
+                }
             }
             else if (t == L"double")
             {
-                double dbl = BNum(fv);
-                memcpy(buf + off, &dbl, sizeof(double));
+                if (f.bIsArray && (fv.t == Value::TableT) && fv.tab)
+                {
+                    auto& arr = fv.tab->arr;
+                    for (int k = 0; k < f.arrCount; k++)
+                    {
+                        double dbl = 0.0;
+                        if (k < (int)arr.size()) dbl = BNum(arr[k]);
+                        memcpy(buf + off + k * sizeof(double), &dbl, sizeof(double));
+                    }
+                }
+                else
+                {
+                    double dbl = BNum(fv);
+                    memcpy(buf + off, &dbl, sizeof(double));
+                }
+            }
+            else if (f.bIsArray && t == L"word" && fv.t == Value::Str)
+            {
+                wchar_t* pw = (wchar_t*)(buf + off);
+                int maxC = f.arrCount;
+                for (int k = 0; k < maxC; k++)
+                    pw[k] = (k < (int)fv.s.size()) ? fv.s[k] : 0;
+            }
+            else if (f.bIsArray && t == L"byte" && fv.t == Value::Str)
+            {
+                std::string sA((size_t)WideCharToMultiByte(CP_ACP, 0, fv.s.c_str(), (int)fv.s.size(), nullptr, 0, nullptr, nullptr), 0);
+                if (!sA.empty())
+                    WideCharToMultiByte(CP_ACP, 0, fv.s.c_str(), (int)fv.s.size(), &sA[0], (int)sA.size(), nullptr, nullptr);
+                char* pc = buf + off;
+                for (int k = 0; k < f.arrCount; k++)
+                    pc[k] = (k < (int)sA.size()) ? sA[k] : 0;
             }
             else if (f.bIsArray && (fv.t == Value::TableT) && fv.tab)
             {
-                // numeric element arrays (BYTE Data4[8], INT arr[4], ...):
+                // numeric / pointer element arrays (BYTE Data4[8], ptr p[1], ...):
                 // an aardio array table serializes element-wise; esz is
                 // the PER-ELEMENT size, not the whole-field size
                 auto& arr = fv.tab->arr;
@@ -784,7 +935,12 @@ namespace NodioVM
                 {
                     long long ev = 0;
                     if (k < (int)arr.size())
-                        ev = (long long)BNum(arr[k]);
+                    {
+                        if (arr[k].t == Value::Pointer)
+                            ev = (long long)(INT_PTR)arr[k].ptr;
+                        else
+                            ev = (long long)BNum(arr[k]);
+                    }
                     if (esz == 8) *(__int64*)(buf + off + k * 8) = (__int64)ev;
                     else if (esz == 2) *(unsigned short*)(buf + off + k * 2) = (unsigned short)ev;
                     else if (esz == 1) *(unsigned char*)(buf + off + k) = (unsigned char)ev;
@@ -837,8 +993,27 @@ namespace NodioVM
             {
                 if (iv != vTab.tab->map.end() && (iv->second.t == Value::TableT || iv->second.t == Value::Class) && iv->second.tab)
                 {
-                    sz = CalcStructTotalSize(iv->second);
-                    StructDeserialize(iv->second, buf + off);
+                    if (f.bIsArray)
+                    {
+                        int count = f.arrCount > 0 ? f.arrCount : (int)GetTableLength(iv->second);
+                        Value elem0 = GetTableElement(iv->second, 0);
+                        int elemSz = (elem0.t == Value::TableT || elem0.t == Value::Class) ? CalcStructTotalSize(elem0) : 0;
+                        if (elemSz <= 0) elemSz = 4;
+                        for (int k = 0; k < count; k++)
+                        {
+                            Value elem = GetTableElement(iv->second, k);
+                            if ((elem.t == Value::TableT || elem.t == Value::Class) && elem.tab)
+                            {
+                                StructDeserialize(elem, buf + off + k * elemSz);
+                            }
+                        }
+                        sz = elemSz * (count > 0 ? count : 1);
+                    }
+                    else
+                    {
+                        sz = CalcStructTotalSize(iv->second);
+                        StructDeserialize(iv->second, buf + off);
+                    }
                 }
             }
             else if (t == L"ustring" || t == L"ustr" || t == L"wstr" || t == L"bstr")
@@ -873,6 +1048,64 @@ namespace NodioVM
                         vTab.tab->map[f.name] = Value::Str_(ReadStrA(pc));
                 }
             }
+            else if (f.bIsArray)
+            {
+                // Official aardio: WORD[] and BYTE[] arrays deserialize to string
+                // if the existing field was not initialized/assigned as an array table
+                bool bExistingTable = (iv != vTab.tab->map.end() && iv->second.t == Value::TableT);
+                if (!bExistingTable && t == L"word")
+                {
+                    const wchar_t* pw = (const wchar_t*)(buf + off);
+                    int len = 0;
+                    while (len < f.arrCount && pw[len]) len++;
+                    vTab.tab->map[f.name] = Value::Str_(wstring(pw, len));
+                }
+                else if (!bExistingTable && t == L"byte" && (iv != vTab.tab->map.end() && iv->second.t == Value::Str))
+                {
+                    const char* pc = (const char*)(buf + off);
+                    int len = 0;
+                    while (len < f.arrCount && pc[len]) len++;
+                    vTab.tab->map[f.name] = Value::Str_(ReadStrA(std::string(pc, len).c_str()));
+                }
+                else
+                {
+                    // numeric / pointer / float element arrays read back as an aardio array;
+                    // esz is the PER-ELEMENT size (guard arrCount<=0)
+                    auto at = std::make_shared<Table>();
+                    int esz = f.arrCount > 0 ? sz / f.arrCount : sz;
+                    bool bPointerElem = (t == L"pointer" || t == L"ptr" || t == L"addr");
+                    bool bFloatElem = (t == L"float");
+                    bool bDoubleElem = (t == L"double");
+                    for (int k = 0; k < f.arrCount; k++)
+                    {
+                        if (bFloatElem)
+                        {
+                            float flt = 0;
+                            memcpy(&flt, buf + off + k * sizeof(float), sizeof(float));
+                            at->arr.push_back(Value::Num_(flt));
+                        }
+                        else if (bDoubleElem)
+                        {
+                            double dbl = 0;
+                            memcpy(&dbl, buf + off + k * sizeof(double), sizeof(double));
+                            at->arr.push_back(Value::Num_(dbl));
+                        }
+                        else
+                        {
+                            long long v64 = 0;
+                            if (esz == 8) v64 = *(__int64*)(buf + off + k * 8);
+                            else if (esz == 2) v64 = *(unsigned short*)(buf + off + k * 2);
+                            else if (esz == 1) v64 = *(unsigned char*)(buf + off + k);
+                            else v64 = *(int*)(buf + off + k * 4);
+                            if (bPointerElem)
+                                at->arr.push_back(v64 ? Value::Pointer_((void*)(INT_PTR)v64) : Value());
+                            else
+                                at->arr.push_back(Value::Num_((double)v64));
+                        }
+                    }
+                    vTab.tab->map[f.name] = Value::Table_(at);
+                }
+            }
             else if (t == L"pointer" || t == L"ptr" || t == L"addr")
             {
                 vTab.tab->map[f.name] = Value::Pointer_(*(void**)(buf + off));
@@ -888,23 +1121,6 @@ namespace NodioVM
                 double dbl = 0;
                 memcpy(&dbl, buf + off, sizeof(double));
                 vTab.tab->map[f.name] = Value::Num_(dbl);
-            }
-            else if (f.bIsArray)
-            {
-                // numeric element arrays read back as an aardio array;
-                // esz is the PER-ELEMENT size (guard arrCount<=0)
-                auto at = std::make_shared<Table>();
-                int esz = f.arrCount > 0 ? sz / f.arrCount : sz;
-                for (int k = 0; k < f.arrCount; k++)
-                {
-                    long long v64 = 0;
-                    if (esz == 8) v64 = *(__int64*)(buf + off + k * 8);
-                    else if (esz == 2) v64 = *(unsigned short*)(buf + off + k * 2);
-                    else if (esz == 1) v64 = *(unsigned char*)(buf + off + k);
-                    else v64 = *(int*)(buf + off + k * 4);
-                    at->arr.push_back(Value::Num_((double)v64));
-                }
-                vTab.tab->map[f.name] = Value::Table_(at);
             }
             else
             {
@@ -998,8 +1214,14 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
 
             Value fWrap = NF([this, fn, bUnicode, bCdecl, retType](vector<Value>& a) -> Value {
                 vector<SlotT> slots;
-                std::vector<std::string> tmpA;
-                std::vector<wstring> tmpW;
+                thread_local std::vector<std::string> tl_activeA[16];
+                thread_local std::vector<wstring> tl_activeW[16];
+                thread_local size_t tl_slotIdx = 0;
+                size_t mySlot = (tl_slotIdx++) % 16;
+                auto& tmpA = tl_activeA[mySlot];
+                auto& tmpW = tl_activeW[mySlot];
+                tmpA.clear();
+                tmpW.clear();
                 struct DirectRef {
                     size_t idx;
                     void* pBuf;
@@ -1020,7 +1242,11 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     }
                     else if (v.t == Value::Num)
                     {
+#if defined(_WIN64)
+                        slots.push_back((SlotT)(INT_PTR)(long long)v.n);
+#else
                         slots.push_back((SlotT)(INT_PTR)(int)(unsigned int)(long long)v.n);
+#endif
                     }
                     else if (v.t == Value::Pointer)
                     {
@@ -1028,7 +1254,17 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     }
                     else if (v.t == Value::Str)
                     {
-                        if (bUnicode)
+                        bool bByteString = false;
+                        for (wchar_t c : v.s)
+                        {
+                            if (c == 0) { bByteString = true; break; }
+                        }
+                        if (bByteString)
+                        {
+                            tmpA.push_back(BytesOf(v.s));
+                            slots.push_back((SlotT)(INT_PTR)tmpA.back().data());
+                        }
+                        else if (bUnicode)
                         {
                             tmpW.push_back(v.s);
                             slots.push_back((SlotT)(INT_PTR)tmpW.back().c_str());
@@ -1062,25 +1298,40 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                         }
                         else
                         {
-                        int total = 0;
-                        void* pBuf = StructSerialize(v, &total);
-                        if (pBuf)
-                        {
-                            // aardio auto-maintains cbSize: when a struct's
-                            // first member is named cbSize, every API call
-                            // stamps it with the real size (the official
-                            // WNDCLASSEX default 48 would otherwise fail
-                            // RegisterClassEx's size check on x64)
-                            if (total >= 4 && v.tab &&
-                                v.tab->map.find(L"cbSize") != v.tab->map.end())
-                                *(int*)pBuf = total;
-                            slots.push_back((SlotT)(INT_PTR)pBuf);
-                            outStructs.push_back({ i, pBuf, v });
-                        }
-                        else
-                        {
-                            slots.push_back((SlotT)(INT_PTR)(long long)BNum(v));
-                        }
+                            // If object provides _topointer meta-method (e.g. gdip objects),
+                            // convert to native pointer
+                            Value vp = GetMember(v, L"_topointer");
+                            if (vp.t == Value::Func || vp.native)
+                            {
+                                vector<Value> noArgs;
+                                Value r = CallOwner(vp, v, noArgs);
+                                if (r.t == Value::Pointer)
+                                    slots.push_back((SlotT)(INT_PTR)r.ptr);
+                                else
+                                    slots.push_back((SlotT)(INT_PTR)(long long)BNum(r));
+                            }
+                            else
+                            {
+                                int total = 0;
+                                void* pBuf = StructSerialize(v, &total);
+                                if (pBuf)
+                                {
+                                    // aardio auto-maintains cbSize: when a struct's
+                                    // first member is named cbSize, every API call
+                                    // stamps it with the real size (the official
+                                    // WNDCLASSEX default 48 would otherwise fail
+                                    // RegisterClassEx's size check on x64)
+                                    if (total >= 4 && v.tab &&
+                                        v.tab->map.find(L"cbSize") != v.tab->map.end())
+                                        *(int*)pBuf = total;
+                                    slots.push_back((SlotT)(INT_PTR)pBuf);
+                                    outStructs.push_back({ i, pBuf, v });
+                                }
+                                else
+                                {
+                                    slots.push_back((SlotT)(INT_PTR)(long long)BNum(v));
+                                }
+                            }
                         }
                     }
                     else
@@ -1089,9 +1340,9 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     }
                 }
 
-                if (slots.size() > 14)
+                if (slots.size() > 32)
                 {
-                    if (err->empty()) (*err) = L"运行错误: API 参数超过 14 个";
+                    if (err->empty()) (*err) = L"运行错误: API 参数超过 32 个";
                     return Value();
                 }
 

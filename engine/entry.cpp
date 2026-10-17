@@ -102,7 +102,40 @@ namespace NodioVM
                 pos = comma + 1;
             }
         }
+        // Ensure TMP and TEMP point to a valid physical directory if they contain literal "%TMP%" or "%TEMP%"
+        {
+            wchar_t szTmpVal[MAX_PATH] = L"";
+            DWORD dwLen = GetEnvironmentVariableW(L"TMP", szTmpVal, MAX_PATH);
+            if (dwLen > 0)
+            {
+                if (wcscmp(szTmpVal, L"%TMP%") == 0 || wcscmp(szTmpVal, L"%TEMP%") == 0)
+                {
+                    wchar_t szRealPath[MAX_PATH] = L"";
+                    if (GetTempPathW(MAX_PATH, szRealPath) > 0)
+                    {
+                        // Remove trailing backslash if present for consistency with standard env vars
+                        size_t l = wcslen(szRealPath);
+                        if (l > 1 && szRealPath[l - 1] == L'\\')
+                            szRealPath[l - 1] = L'\0';
+                        SetEnvironmentVariableW(L"TMP", szRealPath);
+                        SetEnvironmentVariableW(L"TEMP", szRealPath);
+                    }
+                }
+            }
+        }
         it.InitBuiltins();
+        // Support NODIO_PAUSE=0: define _CONSOLE_NO_PAUSE = true so console.pause() returns immediately in headless sweeps
+        {
+            wchar_t szPause[16] = L"";
+            if (GetEnvironmentVariableW(L"NODIO_PAUSE", szPause, 16) > 0)
+            {
+                if (wcscmp(szPause, L"0") == 0)
+                {
+                    it.globals.vars[L"_CONSOLE_NO_PAUSE"] = Value::Bool_(true);
+                    it.roots[L"_CONSOLE_NO_PAUSE"] = Value::Bool_(true);
+                }
+            }
+        }
         // preload the official builtin/struct.aardio (defines ::POINT/
         // ::RECT/::PAINTSTRUCT that every GUI library assumes) — `builtin`
         // itself is pre-bound so a plain `import` would never load the
@@ -124,9 +157,12 @@ namespace NodioVM
             if (pPrevErr)
                 *pPrevErr = strPrevErr;
         }
+        auto mainEnv = std::make_shared<Env>();
+        mainEnv->self = mainEnv;
+        mainEnv->parent = it.globals.self;
         try
         {
-            it.ExecBlock(prog, &it.globals);
+            it.ExecBlock(prog, mainEnv.get());
         }
         catch (const std::exception& e)
         {

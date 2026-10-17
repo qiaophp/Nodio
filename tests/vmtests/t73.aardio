@@ -1,0 +1,37 @@
+// t73: `:=` conditional assignment semantics (aardio a := b <=> a = a : b)
+// and gdip.bitmap / canvas scan0+stride construction
+import string;
+
+// 1. null coalescing
+var a;
+a := 10;
+io.print("a=" ++ tostring(a));
+
+// 2. falsy (0, false) coalescing
+var b = 0;
+b := 20;
+io.print("b=" ++ tostring(b));
+
+var c = false;
+c := 30;
+io.print("c=" ++ tostring(c));
+
+// 3. truthy preserving (non-zero number, string)
+var d = 400;
+d := 0;
+io.print("d=" ++ tostring(d));
+
+var e = "hello";
+e := "world";
+io.print("e=" ++ tostring(e));
+
+// 4. short circuit: rhs function is not evaluated when lhs is truthy
+var sideEffect = 0;
+var getVal = function(){
+    sideEffect = 99;
+    return 123;
+}
+d := getVal();
+io.print("sideEffect=" ++ tostring(sideEffect));
+
+io.print("end");

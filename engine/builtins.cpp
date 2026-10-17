@@ -144,13 +144,104 @@ namespace NodioVM
     }
 
     // ---- runtime compilation (eval / loadcode / loadcodex) ----
+    // Transform aardio template syntax (<? ... ?> and ?> raw text <? / <?= expr ?>) into pure aardio code calling print(...)
+    static wstring PreprocessTemplate(const wstring& src)
+    {
+        // Check if template syntax is present
+        size_t pQ = src.find(L"?>");
+        size_t pO = src.find(L"<?");
+        if (pQ == wstring::npos && pO == wstring::npos)
+            return src;
+
+        wstring out;
+        size_t pos = 0;
+        size_t n = src.size();
+        bool inCode = true;
+
+        auto escapeRawString = [](const wstring& s) -> wstring {
+            wstring esc;
+            esc.reserve(s.size() + 10);
+            esc += L"`";
+            for (wchar_t ch : s)
+            {
+                if (ch == L'`')
+                    esc += L"``";
+                else
+                    esc += ch;
+            }
+            esc += L"`";
+            return esc;
+        };
+
+        while (pos < n)
+        {
+            if (inCode)
+            {
+                size_t endCode = src.find(L"?>", pos);
+                if (endCode == wstring::npos)
+                {
+                    out += src.substr(pos);
+                    break;
+                }
+                out += src.substr(pos, endCode - pos);
+                out += L"\n";
+                pos = endCode + 2;
+                inCode = false;
+            }
+            else
+            {
+                size_t startCode = src.find(L"<?", pos);
+                wstring rawText;
+                if (startCode == wstring::npos)
+                {
+                    rawText = src.substr(pos);
+                    pos = n;
+                }
+                else
+                {
+                    rawText = src.substr(pos, startCode - pos);
+                    pos = startCode + 2;
+                    inCode = true;
+                }
+                if (!rawText.empty())
+                {
+                    out += L"..print(" + escapeRawString(rawText) + L");\n";
+                }
+                if (inCode && pos < n)
+                {
+                    if (src[pos] == L'=')
+                    {
+                        pos++;
+                        size_t endExpr = src.find(L"?>", pos);
+                        wstring exprStr;
+                        if (endExpr == wstring::npos)
+                        {
+                            exprStr = src.substr(pos);
+                            pos = n;
+                            inCode = true;
+                        }
+                        else
+                        {
+                            exprStr = src.substr(pos, endExpr - pos);
+                            pos = endExpr + 2;
+                            inCode = false;
+                        }
+                        out += L"..print(" + exprStr + L");\n";
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
     // Compiles 'src' into an anonymous function: the code becomes the body
     // and '...' collects the arguments, because in aardio a loaded code
     // string or file behaves exactly like an anonymous function.
     static PNode CompileToFunc(const wstring& src, wstring* err)
     {
+        wstring processed = PreprocessTemplate(src);
         wstring e;
-        vector<Tok> toks = Lex(src, &e);
+        vector<Tok> toks = Lex(processed, &e);
         if (!e.empty())
         {
             if (err) *err = e;
@@ -236,6 +327,35 @@ namespace NodioVM
         WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(),
                             &s[0], n, nullptr, nullptr);
         return s;
+    }
+
+    // raw memory bytes of an aardio string value:
+    // For byte strings (where each wchar holds one byte <= 0xFF), unpack directly
+    // without codepage conversion so binary data (e.g. PNG headers) is preserved.
+    // For general Unicode text (contains code points > 0xFF), encode as UTF-8.
+    static std::string RawBytesOf(const wstring& w)
+    {
+        if (w.empty()) return std::string();
+        bool allByte = true;
+        for (wchar_t ch : w)
+        {
+            if (ch > 0xFF) { allByte = false; break; }
+        }
+        if (allByte)
+        {
+            std::string out;
+            out.reserve(w.size());
+            for (wchar_t ch : w)
+                out.push_back((char)(unsigned char)ch);
+            return out;
+        }
+        int cb = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                                     nullptr, 0, nullptr, nullptr);
+        std::string out((size_t)max(cb, 0), 0);
+        if (cb > 0)
+            WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                                &out[0], cb, nullptr, nullptr);
+        return out;
     }
 
 // ---- InitBuiltins ----
@@ -424,6 +544,7 @@ void Interp::InitBuiltins()
                     if (en < st) return Value::Str_(L"");
                     return Value::Str_(s.substr((size_t)(st - 1),
                                                 (size_t)(en - st + 1))); });
+                tb->map[L"slice"] = tb->map[L"sub"];
                 // string.reverse(s)
                 tb->map[L"reverse"] = NF([](vector<Value>& a) -> Value {
                     wstring s = BStr(a[0]);
@@ -432,11 +553,31 @@ void Interp::InitBuiltins()
                 tb->map[L"len"] = NF([](vector<Value>& a) {
                     return Value::Num_((double)BStr(a[0]).size()); });
                 tb->map[L"left"] = NF([](vector<Value>& a) {
-                    wstring s = BStr(a[0]); size_t k = (size_t)BNum(a[1]);
-                    return Value::Str_(s.substr(0, min(k, s.size()))); });
+                    if (a.empty()) return Value::Str_(L"");
+                    wstring s = BStr(a[0]);
+                    double nK = a.size() > 1 ? BNum(a[1]) : 1;
+                    if (nK >= 0)
+                    {
+                        size_t k = (size_t)nK;
+                        return Value::Str_(s.substr(0, min(k, s.size())));
+                    }
+                    long long drop = (long long)(-nK) - 1;
+                    if (drop < 0) drop = 0;
+                    if ((size_t)drop >= s.size()) return Value::Str_(L"");
+                    return Value::Str_(s.substr(0, s.size() - (size_t)drop)); });
                 tb->map[L"right"] = NF([](vector<Value>& a) {
-                    wstring s = BStr(a[0]); size_t k = (size_t)BNum(a[1]);
-                    return Value::Str_(k >= s.size() ? s : s.substr(s.size() - k)); });
+                    if (a.empty()) return Value::Str_(L"");
+                    wstring s = BStr(a[0]);
+                    double nK = a.size() > 1 ? BNum(a[1]) : 1;
+                    if (nK >= 0)
+                    {
+                        size_t k = (size_t)nK;
+                        return Value::Str_(k >= s.size() ? s : s.substr(s.size() - k));
+                    }
+                    long long start = (long long)(-nK) - 1;
+                    if (start < 0) start = 0;
+                    if ((size_t)start >= s.size()) return Value::Str_(L"");
+                    return Value::Str_(s.substr((size_t)start)); });
                 tb->map[L"mid"] = NF([](vector<Value>& a) {
                     wstring s = BStr(a[0]);
                     long long st = (long long)BNum(a[1]); if (st < 1) st = 1;
@@ -481,9 +622,116 @@ void Interp::InitBuiltins()
                     size_t e = s.find_last_not_of(set);
                     if (e == wstring::npos) return Value::Str_(L"");
                     return Value::Str_(s.substr(0, e + 1)); });
-                // string.slice(s,i,j) — the lib aliases sub = slice; same
-                // 1-based inclusive contract with negative indices
-                tb->map[L"slice"] = tb->map[L"sub"];
+                // string.escape(str, jsonMode, unicodeEscape)
+                tb->map[L"escape"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t == Value::Null) return Value();
+                    wstring s = BStr(a[0]);
+                    bool bJson = a.size() > 1 && a[1].t == Value::Bool && a[1].b;
+                    bool bUni = a.size() > 2 && a[2].t == Value::Bool && a[2].b;
+                    bool bNeeded = false;
+                    wstring out;
+                    out.reserve(s.size() + 16);
+                    for (size_t i = 0; i < s.size(); i++)
+                    {
+                        wchar_t c = s[i];
+                        if (c == L'\"') { out += L"\\\""; bNeeded = true; }
+                        else if (c == L'\\') { out += L"\\\\"; bNeeded = true; }
+                        else if (c == L'\b') { out += L"\\b"; bNeeded = true; }
+                        else if (c == L'\f') { out += L"\\f"; bNeeded = true; }
+                        else if (c == L'\n') { out += L"\\n"; bNeeded = true; }
+                        else if (c == L'\r') { out += L"\\r"; bNeeded = true; }
+                        else if (c == L'\t') { out += L"\\t"; bNeeded = true; }
+                        else if (c < 0x20 || c == 0x7F)
+                        {
+                            bNeeded = true;
+                            wchar_t buf[8];
+                            swprintf_s(buf, L"\\u%04x", (unsigned int)c);
+                            out += buf;
+                        }
+                        else if (bUni && c > 0x7F)
+                        {
+                            bNeeded = true;
+                            wchar_t buf[8];
+                            swprintf_s(buf, L"\\u%04x", (unsigned int)c);
+                            out += buf;
+                        }
+                        else
+                        {
+                            if (!bJson && c == L'\'') bNeeded = true;
+                            out += c;
+                        }
+                    }
+                    if (!bJson && !bNeeded) return Value();
+                    return Value::Str_(out);
+                });
+
+                // string.unescape(str)
+                tb->map[L"unescape"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t == Value::Null) return Value::Str_(L"");
+                    wstring s = BStr(a[0]);
+                    wstring out;
+                    out.reserve(s.size());
+                    for (size_t i = 0; i < s.size(); i++)
+                    {
+                        if (s[i] == L'\\' && i + 1 < s.size())
+                        {
+                            wchar_t nxt = s[++i];
+                            if (nxt == L'\"') out += L'\"';
+                            else if (nxt == L'\'') out += L'\'';
+                            else if (nxt == L'\\') out += L'\\';
+                            else if (nxt == L'/') out += L'/';
+                            else if (nxt == L'b') out += L'\b';
+                            else if (nxt == L'f') out += L'\f';
+                            else if (nxt == L'n') out += L'\n';
+                            else if (nxt == L'r') out += L'\r';
+                            else if (nxt == L't') out += L'\t';
+                            else if (nxt == L'0') out += L'\0';
+                            else if ((nxt == L'u' || nxt == L'U') && i + 4 <= s.size())
+                            {
+                                int hexLen = (nxt == L'U' && i + 8 <= s.size()) ? 8 : 4;
+                                wstring hexStr = s.substr(i + 1, hexLen);
+                                wchar_t* endp = nullptr;
+                                unsigned long code = wcstoul(hexStr.c_str(), &endp, 16);
+                                if (endp && endp != hexStr.c_str())
+                                {
+                                    i += (size_t)(endp - hexStr.c_str());
+                                    if (code <= 0xFFFF)
+                                    {
+                                        out += (wchar_t)code;
+                                    }
+                                    else if (code <= 0x10FFFF)
+                                    {
+                                        code -= 0x10000;
+                                        out += (wchar_t)(0xD800 + (code >> 10));
+                                        out += (wchar_t)(0xDC00 + (code & 0x3FF));
+                                    }
+                                }
+                                else out += nxt;
+                            }
+                            else if (nxt == L'x' && i + 2 <= s.size())
+                            {
+                                wstring hexStr = s.substr(i + 1, 2);
+                                wchar_t* endp = nullptr;
+                                unsigned long code = wcstoul(hexStr.c_str(), &endp, 16);
+                                if (endp && endp != hexStr.c_str())
+                                {
+                                    i += (size_t)(endp - hexStr.c_str());
+                                    out += (wchar_t)code;
+                                }
+                                else out += nxt;
+                            }
+                            else
+                            {
+                                out += nxt;
+                            }
+                        }
+                        else
+                        {
+                            out += s[i];
+                        }
+                    }
+                    return Value::Str_(out);
+                });
                 // string.crc32(s) — kernel primitive (official engine):
                 // CRC-32 IEEE over the string's bytes, returned as an
                 // unsigned 32-bit number. fsys.update/io.tmpName and ~90
@@ -607,12 +855,15 @@ void Interp::InitBuiltins()
                                 else *pPos = end;
                                 auto outs = std::make_shared
                                     <vector<Value>>();
-                                if (caps.empty())
+                                if (nGroups == 0)
                                     outs->push_back(Value::Str_(
                                         s.substr(p0, end - p0)));
                                 else
-                                    for (auto& c : caps)
-                                        outs->push_back(Value::Str_(c));
+                                {
+                                    for (size_t g = 1; g <= (size_t)nGroups; g++)
+                                        outs->push_back(Value::Str_(
+                                            g < caps.size() ? caps[g] : L""));
+                                }
                                 // the primary return must be non-null or
                                 // the for-in loop reads it as termination;
                                 // match string first, captures as extras
@@ -730,64 +981,186 @@ void Interp::InitBuiltins()
                         if (anchored) break;
                     }
                     return Value(); });
-                tb->map[L"gsub"] = NF([](vector<Value>& a) {
-                    wstring s = BStr(a[0]), pat = BStr(a[1]);
-                    wstring repl = a.size() > 2 ? BStr(a[2]) : L"";
-                    int limit = a.size() > 3 ? (int)BNum(a[3]) : -1;
-                    vector<vector<RE>> br; bool anchored = false;
-                    int nGroups = 0; wstring perr;
-                    if (!RECompile(pat, br, &anchored, &nGroups, &perr))
-                        return Value::Str_(s);
-                    wstring out;
-                    size_t cp = 0, p0 = 0;
-                    int done = 0;
-                    while (p0 <= s.size() && (limit < 0 || done < limit))
+                auto doReplace = [this](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value::Str_(L"");
+                    wstring s = BStr(a[0]);
+                    if (a.size() < 2)
                     {
-                        vector<wstring> caps; size_t end = 0;
-                        if (RETry(br, s, p0, false, caps, &end))
+                        Value vOut = Value::Str_(s);
+                        auto ex = std::make_shared<vector<Value>>();
+                        ex->push_back(Value::Num_(0));
+                        vOut.mrets = ex;
+                        return vOut;
+                    }
+                    wstring pat = BStr(a[1]);
+                    if (pat.empty())
+                    {
+                        Value vOut = Value::Str_(s);
+                        auto ex = std::make_shared<vector<Value>>();
+                        ex->push_back(Value::Num_(0));
+                        vOut.mrets = ex;
+                        return vOut;
+                    }
+                    Value repl = a.size() > 2 ? a[2] : Value();
+                    int limit = a.size() > 3 && a[3].t == Value::Num ? (int)a[3].n : -1;
+                    if (limit == 0) limit = -1;
+
+                    bool bCallable = (repl.t == Value::Func || repl.t == Value::Class);
+                    if (repl.t == Value::TableT && repl.tab)
+                    {
+                        if (repl.tab->map.count(L"_call") || repl.tab->map.count(L"_meta"))
+                            bCallable = true;
+                    }
+
+                    bool bLiteral = false;
+                    wstring litPat = pat;
+                    if (!pat.empty() && pat[0] == L'@')
+                    {
+                        bLiteral = true;
+                        litPat = pat.substr(1);
+                    }
+
+                    wstring out;
+                    long long count = 0;
+
+                    if (bLiteral)
+                    {
+                        if (litPat.empty())
                         {
-                            out += s.substr(cp, p0 - cp);
-                            for (size_t r = 0; r < repl.size(); r++)
+                            Value vOut = Value::Str_(s);
+                            auto ex = std::make_shared<vector<Value>>();
+                            ex->push_back(Value::Num_(0));
+                            vOut.mrets = ex;
+                            return vOut;
+                        }
+                        size_t pos = 0, cp = 0;
+                        while ((pos = s.find(litPat, cp)) != wstring::npos && (limit < 0 || count < limit))
+                        {
+                            out += s.substr(cp, pos - cp);
+                            wstring matched = litPat;
+                            wstring rStr;
+                            if (bCallable)
                             {
-                                if ((repl[r] == L'$' || repl[r] == L'\\') &&
-                                    r + 1 < repl.size() && iswdigit(repl[r + 1]))
-                                {
-                                    int g = repl[r + 1] - L'0';
-                                    if (g == 0)
-                                        out += s.substr(p0, end - p0);
-                                    else if ((size_t)g < caps.size())
-                                        out += caps[(size_t)g];
-                                    r++;
-                                }
-                                else
-                                    out += repl[r];
+                                vector<Value> args{ Value::Str_(matched) };
+                                Value rVal = this->CallOwner(repl, Value(), args);
+                                if (rVal.t == Value::Null) rStr = matched;
+                                else rStr = rVal.ToString();
                             }
-                            done++;
-                            if (end == p0)
+                            else if (repl.t == Value::TableT && repl.tab)
                             {
-                                if (p0 < s.size()) out += s[p0];
-                                p0++;
+                                auto itM = repl.tab->map.find(matched);
+                                if (itM != repl.tab->map.end()) rStr = itM->second.ToString();
+                                else rStr = matched;
                             }
                             else
-                                p0 = end;
-                            cp = p0;
-                            continue;
+                            {
+                                rStr = repl.ToString();
+                            }
+                            out += rStr;
+                            count++;
+                            cp = pos + litPat.size();
                         }
-                        if (p0 >= s.size()) break;
-                        p0++;
+                        out += s.substr(cp);
                     }
-                    out += s.substr(cp);
-                    return Value::Str_(out); });
-                tb->map[L"replace"] = NF([](vector<Value>& a) {
-                    wstring s = BStr(a[0]), f = BStr(a[1]), r = BStr(a[2]);
-                    if (f.empty()) return Value::Str_(s);
-                    size_t pos = 0;
-                    while ((pos = s.find(f, pos)) != wstring::npos)
+                    else
                     {
-                        s.replace(pos, f.size(), r);
-                        pos += r.size();
+                        vector<vector<RE>> br; bool anchored = false;
+                        int nGroups = 0; wstring perr;
+                        if (!RECompile(pat, br, &anchored, &nGroups, &perr))
+                        {
+                            // regex compilation error: fallback to literal match
+                            size_t pos = 0, cp = 0;
+                            while ((pos = s.find(pat, cp)) != wstring::npos && (limit < 0 || count < limit))
+                            {
+                                out += s.substr(cp, pos - cp);
+                                out += repl.ToString();
+                                count++;
+                                cp = pos + pat.size();
+                            }
+                            out += s.substr(cp);
+                        }
+                        else
+                        {
+                            size_t cp = 0, p0 = 0;
+                            while (p0 <= s.size() && (limit < 0 || count < limit))
+                            {
+                                vector<wstring> caps; size_t end = 0;
+                                if (RETry(br, s, p0, false, caps, &end))
+                                {
+                                    out += s.substr(cp, p0 - cp);
+                                    wstring matched = s.substr(p0, end - p0);
+                                    wstring rStr;
+                                    if (bCallable)
+                                    {
+                                        vector<Value> args;
+                                        if (nGroups > 0)
+                                        {
+                                            for (size_t g = 1; g <= (size_t)nGroups; g++)
+                                                args.push_back(Value::Str_(g < caps.size() ? caps[g] : L""));
+                                        }
+                                        else
+                                        {
+                                            args.push_back(Value::Str_(matched));
+                                        }
+                                        Value rVal = this->CallOwner(repl, Value(), args);
+                                        if (rVal.t == Value::Null) rStr = matched;
+                                        else rStr = rVal.ToString();
+                                    }
+                                    else if (repl.t == Value::TableT && repl.tab)
+                                    {
+                                        wstring key = (nGroups > 0 && caps.size() > 1) ? caps[1] : matched;
+                                        auto itM = repl.tab->map.find(key);
+                                        if (itM != repl.tab->map.end()) rStr = itM->second.ToString();
+                                        else rStr = matched;
+                                    }
+                                    else
+                                    {
+                                        // String template expansion (\0..\9, $0..$9)
+                                        wstring tpl = repl.ToString();
+                                        for (size_t r = 0; r < tpl.size(); r++)
+                                        {
+                                            if ((tpl[r] == L'$' || tpl[r] == L'\\') &&
+                                                r + 1 < tpl.size() && iswdigit(tpl[r + 1]))
+                                            {
+                                                int g = tpl[r + 1] - L'0';
+                                                if (g == 0) out += matched;
+                                                else if ((size_t)g < caps.size()) out += caps[(size_t)g];
+                                                r++;
+                                            }
+                                            else
+                                                out += tpl[r];
+                                        }
+                                        goto replaced_str;
+                                    }
+                                    out += rStr;
+                                replaced_str:
+                                    count++;
+                                    if (end == p0)
+                                    {
+                                        if (p0 < s.size()) out += s[p0];
+                                        p0++;
+                                    }
+                                    else
+                                        p0 = end;
+                                    cp = p0;
+                                    if (anchored) break;
+                                    continue;
+                                }
+                                if (p0 >= s.size() || anchored) break;
+                                p0++;
+                            }
+                            out += s.substr(cp);
+                        }
                     }
-                    return Value::Str_(s); });
+
+                    Value vOut = Value::Str_(out);
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Num_((double)count));
+                    vOut.mrets = ex;
+                    return vOut;
+                };
+                tb->map[L"gsub"] = NF(doReplace);
+                tb->map[L"replace"] = NF(doReplace);
                 tb->map[L"split"] = NF([](vector<Value>& a) {
                     wstring s = BStr(a[0]), d = a.size() > 1 ? BStr(a[1]) : L",";
                     auto tb2 = std::make_shared<Table>();
@@ -856,6 +1229,18 @@ void Interp::InitBuiltins()
                     return Value::Str_(out); });
                 tb->map[L"fromUtf16"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
+                    int reqLen = -1;
+                    if (a.size() > 2)
+                    {
+                        if (a[2].t == Value::Num) reqLen = (int)BNum(a[2]);
+                        else if (a[2].b) reqLen = -1;
+                    }
+                    else if (a.size() > 1)
+                    {
+                        if (a[1].t == Value::Num) reqLen = (int)BNum(a[1]);
+                        else if (a[1].b) reqLen = -1;
+                    }
+
                     if (a[0].t == Value::Str)
                     {
                         // decode UTF-16 LE bytes back to text
@@ -863,18 +1248,24 @@ void Interp::InitBuiltins()
                         wstring w;
                         w.reserve(s.size() / 2);
                         for (size_t i = 0; i + 1 < s.size(); i += 2)
-                            w += (wchar_t)(unsigned char)s[i] |
-                                 ((wchar_t)(unsigned char)s[i + 1] << 8);
+                        {
+                            wchar_t ch = (wchar_t)(unsigned char)s[i] |
+                                         ((wchar_t)(unsigned char)s[i + 1] << 8);
+                            if (ch == 0 && reqLen == -1)
+                                break;
+                            w += ch;
+                        }
+                        if (reqLen >= 0 && (size_t)reqLen < w.size())
+                            w.resize((size_t)reqLen);
                         return Value::Str_(w);
                     }
                     if (a[0].t == Value::Pointer || a[0].t == Value::Num)
                     {
                         const wchar_t* p = (const wchar_t*)(INT_PTR)(long long)BNum(a[0]);
                         if (!p) return Value();
-                        if (a.size() > 1 && a[1].t == Value::Num)
+                        if (reqLen >= 0)
                         {
-                            size_t len = (size_t)BNum(a[1]);
-                            return Value::Str_(wstring(p, len));
+                            return Value::Str_(wstring(p, (size_t)reqLen));
                         }
                         return Value::Str_(wstring(p));
                     }
@@ -966,26 +1357,91 @@ void Interp::InitBuiltins()
                         }
                     }
                     return Value::Str_(out); });
-                tb->map[L"load"] = NF([](vector<Value>& a) {
+
+                auto ResolveAardioPathInternal = [](const wstring& rel) -> wstring {
+                    if (rel.empty()) return rel;
+                    if (rel[0] == L'~')
+                        return ResolveTildeDisk(rel);
+                    wstring appRoot;
+                    if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
+                        appRoot = g_interpCurrent->baseDir;
+                    if (appRoot.empty())
+                    {
+                        wchar_t szExe[MAX_PATH] = L"";
+                        GetModuleFileNameW(nullptr, szExe, MAX_PATH);
+                        wchar_t* pSep = wcsrchr(szExe, L'\\');
+                        if (pSep) *pSep = 0;
+                        appRoot = szExe;
+                    }
+                    if (rel.size() >= 2 &&
+                        (rel[0] == L'/' || rel[0] == L'\\') &&
+                        (rel[1] == L'/' || rel[1] == L'\\'))
+                    {
+                        if (rel[0] == L'\\')
+                            return L"";
+                        return rel.substr(1);
+                    }
+                    else if (!rel.empty() && (rel[0] == L'/' || rel[0] == L'\\'))
+                    {
+                        wstring rest = rel.substr(1);
+                        while (!rest.empty() && (rest[0] == L'/' || rest[0] == L'\\'))
+                            rest = rest.substr(1);
+                        if (rest.empty())
+                            return appRoot + L"\\";
+                        return appRoot + L"\\" + rest;
+                    }
+                    wchar_t szFull[MAX_PATH * 2] = L"";
+                    DWORD nFull = GetFullPathNameW(rel.c_str(), MAX_PATH * 2, szFull, nullptr);
+                    if (nFull > 0 && nFull < MAX_PATH * 2)
+                        return szFull;
+                    return rel;
+                };
+
+                tb->map[L"load"] = NF([ResolveAardioPathInternal](vector<Value>& a) {
+                    if (a.empty()) return Value();
+                    wstring resolved = ResolveAardioPathInternal(BStr(a[0]));
                     FILE* pf = nullptr;
-                    if (_wfopen_s(&pf, BStr(a[0]).c_str(), L"rb") != 0 || !pf)
+                    if (_wfopen_s(&pf, resolved.c_str(), L"rb") != 0 || !pf)
                         return Value();
                     std::string raw2;
                     char buf2[4096]; size_t rd;
                     while ((rd = fread(buf2, 1, sizeof(buf2), pf)) > 0)
                         raw2.append(buf2, rd);
                     fclose(pf);
+                    // Binary sniff: NUL byte in the first 4KB or invalid UTF-8
+                    // -> binary payload, store 1:1 byte-per-wchar (aardio byte string model)
+                    bool bBinary = false;
+                    size_t nSniff = min(raw2.size(), (size_t)4096);
+                    for (size_t k = 0; k < nSniff; k++)
+                        if (raw2[k] == 0) { bBinary = true; break; }
+                    if (bBinary)
+                    {
+                        wstring w;
+                        w.resize(raw2.size());
+                        for (size_t k = 0; k < raw2.size(); k++)
+                            w[k] = (wchar_t)(unsigned char)raw2[k];
+                        return Value::Str_(w);
+                    }
                     int off2 = (raw2.size() >= 3 && (BYTE)raw2[0] == 0xEF &&
                                 (BYTE)raw2[1] == 0xBB && (BYTE)raw2[2] == 0xBF) ? 3 : 0;
-                    int w2 = MultiByteToWideChar(CP_UTF8, 0, raw2.data() + off2,
+                    int w2 = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw2.data() + off2,
                                                  (int)(raw2.size() - off2), nullptr, 0);
+                    if (w2 <= 0)
+                    {
+                        wstring w;
+                        w.resize(raw2.size());
+                        for (size_t k = 0; k < raw2.size(); k++)
+                            w[k] = (wchar_t)(unsigned char)raw2[k];
+                        return Value::Str_(w);
+                    }
                     wstring s2((size_t)w2, 0);
-                    if (w2 > 0)
-                        MultiByteToWideChar(CP_UTF8, 0, raw2.data() + off2,
-                                            (int)(raw2.size() - off2), &s2[0], w2);
+                    MultiByteToWideChar(CP_UTF8, 0, raw2.data() + off2,
+                                        (int)(raw2.size() - off2), &s2[0], w2);
                     return Value::Str_(s2); });
                 tb->map[L"hex"] = NF([](vector<Value>& a) {
+                    if (a.empty()) return Value::Str_(L"");
                     wstring str = BStr(a[0]);
+                    wstring prefix = a.size() > 1 ? BStr(a[1]) : L"";
                     int n = WideCharToMultiByte(CP_UTF8, 0, str.c_str(),
                         (int)str.size(), nullptr, 0, nullptr, nullptr);
                     std::string raw((size_t)n, 0);
@@ -995,22 +1451,93 @@ void Interp::InitBuiltins()
                     wstring out;
                     for (unsigned char c : raw)
                     {
+                        if (!prefix.empty()) out += prefix;
                         out += kHex[c >> 4];
                         out += kHex[c & 0xF];
                     }
                     return Value::Str_(out); });
                 tb->map[L"unhex"] = NF([](vector<Value>& a) {
+                    if (a.empty()) return Value::Str_(L"");
                     wstring h = BStr(a[0]);
+                    wstring prefix = a.size() > 1 ? BStr(a[1]) : L"";
                     std::string raw;
-                    for (size_t j = 0; j + 1 < h.size(); j += 2)
-                        raw.push_back((char)wcstoul(h.substr(j, 2).c_str(),
-                                                    nullptr, 16));
-                    int w = MultiByteToWideChar(CP_UTF8, 0, raw.data(),
+                    auto hexVal = [](wchar_t c) -> int {
+                        if (c >= L'0' && c <= L'9') return c - L'0';
+                        if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+                        if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+                        return -1;
+                    };
+                    size_t i = 0;
+                    if (!prefix.empty())
+                    {
+                        while (i < h.size())
+                        {
+                            if (h.compare(i, prefix.size(), prefix) == 0 &&
+                                i + prefix.size() + 1 < h.size())
+                            {
+                                int h1 = hexVal(h[i + prefix.size()]);
+                                int h2 = hexVal(h[i + prefix.size() + 1]);
+                                if (h1 >= 0 && h2 >= 0)
+                                {
+                                    raw.push_back((char)((h1 << 4) | h2));
+                                    i += prefix.size() + 2;
+                                    continue;
+                                }
+                            }
+                            wchar_t ch = h[i++];
+                            if ((unsigned int)ch < 0x80)
+                            {
+                                raw.push_back((char)ch);
+                            }
+                            else
+                            {
+                                char mb[8] = {0};
+                                int nb = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, mb, 8, nullptr, nullptr);
+                                for (int k = 0; k < nb; k++) raw.push_back(mb[k]);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        while (i < h.size())
+                        {
+                            if (i + 1 < h.size())
+                            {
+                                int h1 = hexVal(h[i]);
+                                int h2 = hexVal(h[i + 1]);
+                                if (h1 >= 0 && h2 >= 0)
+                                {
+                                    raw.push_back((char)((h1 << 4) | h2));
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                            wchar_t ch = h[i++];
+                            if ((unsigned int)ch < 0x80)
+                            {
+                                raw.push_back((char)ch);
+                            }
+                            else
+                            {
+                                char mb[8] = {0};
+                                int nb = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, mb, 8, nullptr, nullptr);
+                                for (int k = 0; k < nb; k++) raw.push_back(mb[k]);
+                            }
+                        }
+                    }
+
+                    int w = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(),
                                                 (int)raw.size(), nullptr, 0);
-                    wstring out((size_t)w, 0);
                     if (w > 0)
+                    {
+                        wstring out((size_t)w, 0);
                         MultiByteToWideChar(CP_UTF8, 0, raw.data(),
                                             (int)raw.size(), &out[0], w);
+                        return Value::Str_(out);
+                    }
+                    wstring out((size_t)raw.size(), 0);
+                    for (size_t k = 0; k < raw.size(); k++)
+                        out[k] = (wchar_t)(unsigned char)raw[k];
                     return Value::Str_(out); });
                 tb->map[L"base64"] = NF([](vector<Value>& a) {
                     wstring str = BStr(a[0]);
@@ -1035,9 +1562,11 @@ void Interp::InitBuiltins()
                         j += 3;
                     }
                     return Value::Str_(out); });
-                tb->map[L"save"] = NF([](vector<Value>& a) {
+                tb->map[L"save"] = NF([ResolveAardioPathInternal](vector<Value>& a) {
+                    if (a.empty()) return Value::Bool_(false);
+                    wstring resolved = ResolveAardioPathInternal(BStr(a[0]));
                     FILE* pf = nullptr;
-                    if (_wfopen_s(&pf, BStr(a[0]).c_str(), L"wb") != 0 || !pf)
+                    if (_wfopen_s(&pf, resolved.c_str(), L"wb") != 0 || !pf)
                         return Value::Bool_(false);
                     wstring s2 = BStr(a[1]);
                     int n2 = WideCharToMultiByte(CP_UTF8, 0, s2.c_str(),
@@ -1116,7 +1645,9 @@ void Interp::InitBuiltins()
             {
                 auto tb = GetRoot(L"math").tab;
                 tb->map[L"PI"] = Value::Num_(3.14159265358979323846);
+                tb->map[L"pi"] = tb->map[L"PI"];
                 tb->map[L"E"] = Value::Num_(2.71828182845904523536);
+                tb->map[L"e"] = tb->map[L"E"];
                 tb->map[L"abs"] = NF([](vector<Value>& a) {
                     return Value::Num_(fabs(BNum(a[0]))); });
                 tb->map[L"ceil"] = NF([](vector<Value>& a) {
@@ -1129,6 +1660,8 @@ void Interp::InitBuiltins()
                     return Value::Num_(pow(BNum(a[0]), BNum(a[1]))); });
                 tb->map[L"log"] = NF([](vector<Value>& a) {
                     return Value::Num_(log(BNum(a[0]))); });
+                tb->map[L"log10"] = NF([](vector<Value>& a) {
+                    return Value::Num_(log10(BNum(a[0]))); });
                 tb->map[L"exp"] = NF([](vector<Value>& a) {
                     return Value::Num_(exp(BNum(a[0]))); });
                 tb->map[L"sin"] = NF([](vector<Value>& a) {
@@ -1137,6 +1670,14 @@ void Interp::InitBuiltins()
                     return Value::Num_(cos(BNum(a[0]))); });
                 tb->map[L"tan"] = NF([](vector<Value>& a) {
                     return Value::Num_(tan(BNum(a[0]))); });
+                tb->map[L"asin"] = NF([](vector<Value>& a) {
+                    return Value::Num_(asin(BNum(a[0]))); });
+                tb->map[L"acos"] = NF([](vector<Value>& a) {
+                    return Value::Num_(acos(BNum(a[0]))); });
+                tb->map[L"atan"] = NF([](vector<Value>& a) {
+                    return Value::Num_(atan(BNum(a[0]))); });
+                tb->map[L"atan2"] = NF([](vector<Value>& a) {
+                    return Value::Num_(atan2(BNum(a[0]), a.size() > 1 ? BNum(a[1]) : 0)); });
                 tb->map[L"max"] = NF([](vector<Value>& a) {
                     double m = a.empty() ? 0 : BNum(a[0]);
                     for (size_t i = 1; i < a.size(); i++)
@@ -1153,6 +1694,24 @@ void Interp::InitBuiltins()
                     double hi = a.size() > 2 ? BNum(a[2]) : 255;
                     if (lo > hi) { double t = lo; lo = hi; hi = t; }
                     return Value::Num_(v < lo ? lo : (v > hi ? hi : v)); });
+                tb->map[L"round"] = NF([](vector<Value>& a) {
+                    if (a.empty()) return Value::Num_(0);
+                    return Value::Num_(round(BNum(a[0]))); });
+                tb->map[L"modf"] = NF([](vector<Value>& a) {
+                    if (a.empty()) return Value();
+                    double intPart = 0;
+                    double frac = modf(BNum(a[0]), &intPart);
+                    Value r = Value::Num_(intPart);
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Num_(frac));
+                    r.mrets = ex;
+                    return r; });
+                tb->map[L"mulDiv"] = NF([](vector<Value>& a) {
+                    if (a.size() < 3) return Value::Num_(0);
+                    int r = MulDiv((int)(long long)BNum(a[0]),
+                                   (int)(long long)BNum(a[1]),
+                                   (int)(long long)BNum(a[2]));
+                    return Value::Num_(r); });
                 tb->map[L"random"] = NF([](vector<Value>& a) {
                     static bool seeded = false;
                     if (!seeded) { srand((unsigned)time(nullptr)); seeded = true; }
@@ -1842,6 +2401,9 @@ void Interp::InitBuiltins()
                     fflush(stdout);
                     return Value();
                 };
+                tb->map[L"open"] = NF([](vector<Value>&) { return Value::Bool_(true); });
+                tb->map[L"showLoading"] = NF([](vector<Value>&) { return Value(); });
+                tb->map[L"close"] = NF([](vector<Value>&) { return Value(); });
                 tb->map[L"log"] = NF([writer](vector<Value>& a) {
                     return writer(a, true); });
                 tb->map[L"println"] = tb->map[L"log"];
@@ -1878,6 +2440,250 @@ void Interp::InitBuiltins()
             // ---- time (round 30) ----
             {
                 auto tb = GetRoot(L"time").tab;
+
+                auto timeMeta = std::make_shared<Table>();
+                auto getSelf = [](const vector<Value>& a) -> Value {
+                    Value self = Interp::GetCurrentOwner();
+                    if (self.t == Value::TableT && self.tab) return self;
+                    if (!a.empty() && a[0].t == Value::TableT && a[0].tab) return a[0];
+                    return Value();
+                };
+                auto formatFunc = NF([getSelf](vector<Value>& a) -> Value {
+                    Value self = getSelf(a);
+                    if (!self.tab) return Value::Str_(L"");
+                    wstring fmt = L"%Y/%m/%d %H:%M:%S";
+                    if (!a.empty() && a[0].t == Value::Str)
+                        fmt = a[0].s;
+                    else if (a.size() > 1 && a[1].t == Value::Str)
+                        fmt = a[1].s;
+                    else
+                    {
+                        auto ifmt = self.tab->map.find(L"format");
+                        if (ifmt != self.tab->map.end() && ifmt->second.t == Value::Str)
+                            fmt = ifmt->second.s;
+                    }
+                    tm tmb{};
+                    tmb.tm_year = (int)(long long)BNum(self.tab->map[L"year"]) - 1900;
+                    tmb.tm_mon = (int)(long long)BNum(self.tab->map[L"month"]) - 1;
+                    tmb.tm_mday = (int)(long long)BNum(self.tab->map[L"day"]);
+                    tmb.tm_hour = (int)(long long)BNum(self.tab->map[L"hour"]);
+                    tmb.tm_min = (int)(long long)BNum(self.tab->map[L"minute"]);
+                    tmb.tm_sec = (int)(long long)BNum(self.tab->map[L"second"]);
+                    wchar_t buf[256];
+                    wcsftime(buf, 256, fmt.c_str(), &tmb);
+                    return Value::Str_(buf);
+                });
+                timeMeta->map[L"_tostring"] = formatFunc;
+
+                auto addSecondsFunc = NF([getSelf](vector<Value>& a) -> Value {
+                    Value self = getSelf(a);
+                    if (!self.tab) return self;
+                    double sec = 0;
+                    if (!a.empty()) {
+                        if (a[0].t == Value::Num) sec = BNum(a[0]);
+                        else if (a.size() > 1 && a[1].t == Value::Num) sec = BNum(a[1]);
+                    }
+                    tm tmb{};
+                    tmb.tm_year = (int)(long long)BNum(self.tab->map[L"year"]) - 1900;
+                    tmb.tm_mon = (int)(long long)BNum(self.tab->map[L"month"]) - 1;
+                    tmb.tm_mday = (int)(long long)BNum(self.tab->map[L"day"]);
+                    tmb.tm_hour = (int)(long long)BNum(self.tab->map[L"hour"]);
+                    tmb.tm_min = (int)(long long)BNum(self.tab->map[L"minute"]);
+                    tmb.tm_sec = (int)(long long)BNum(self.tab->map[L"second"]);
+                    time_t t = mktime(&tmb);
+                    t += (time_t)sec;
+                    localtime_s(&tmb, &t);
+                    self.tab->map[L"year"] = Value::Num_(tmb.tm_year + 1900);
+                    self.tab->map[L"month"] = Value::Num_(tmb.tm_mon + 1);
+                    self.tab->map[L"day"] = Value::Num_(tmb.tm_mday);
+                    self.tab->map[L"dayofweek"] = Value::Num_(tmb.tm_wday);
+                    self.tab->map[L"hour"] = Value::Num_(tmb.tm_hour);
+                    self.tab->map[L"minute"] = Value::Num_(tmb.tm_min);
+                    self.tab->map[L"second"] = Value::Num_(tmb.tm_sec);
+                    return self;
+                });
+                timeMeta->map[L"addSeconds"] = addSecondsFunc;
+                timeMeta->map[L"addMinutes"] = NF([addSecondsFunc](vector<Value>& a) -> Value {
+                    vector<Value> na = a;
+                    if (!na.empty() && na[0].t == Value::Num) na[0] = Value::Num_(BNum(na[0]) * 60);
+                    else if (na.size() > 1 && na[1].t == Value::Num) na[1] = Value::Num_(BNum(na[1]) * 60);
+                    return addSecondsFunc.native(na);
+                });
+                timeMeta->map[L"addHours"] = NF([addSecondsFunc](vector<Value>& a) -> Value {
+                    vector<Value> na = a;
+                    if (!na.empty() && na[0].t == Value::Num) na[0] = Value::Num_(BNum(na[0]) * 3600);
+                    else if (na.size() > 1 && na[1].t == Value::Num) na[1] = Value::Num_(BNum(na[1]) * 3600);
+                    return addSecondsFunc.native(na);
+                });
+                timeMeta->map[L"addDays"] = NF([addSecondsFunc](vector<Value>& a) -> Value {
+                    vector<Value> na = a;
+                    if (!na.empty() && na[0].t == Value::Num) na[0] = Value::Num_(BNum(na[0]) * 86400);
+                    else if (na.size() > 1 && na[1].t == Value::Num) na[1] = Value::Num_(BNum(na[1]) * 86400);
+                    return addSecondsFunc.native(na);
+                });
+                timeMeta->map[L"diffSeconds"] = NF([getSelf](vector<Value>& a) -> Value {
+                    Value self = getSelf(a);
+                    Value other;
+                    if (!a.empty()) {
+                        if (a[0].t == Value::TableT && a[0].tab != self.tab) other = a[0];
+                        else if (a.size() > 1 && a[1].t == Value::TableT) other = a[1];
+                    }
+                    if (!self.tab || !other.tab) return Value::Num_(0);
+                    auto toT = [](Table* tab) -> time_t {
+                        tm tmb{};
+                        tmb.tm_year = (int)(long long)BNum(tab->map[L"year"]) - 1900;
+                        tmb.tm_mon = (int)(long long)BNum(tab->map[L"month"]) - 1;
+                        tmb.tm_mday = (int)(long long)BNum(tab->map[L"day"]);
+                        tmb.tm_hour = (int)(long long)BNum(tab->map[L"hour"]);
+                        tmb.tm_min = (int)(long long)BNum(tab->map[L"minute"]);
+                        tmb.tm_sec = (int)(long long)BNum(tab->map[L"second"]);
+                        return mktime(&tmb);
+                    };
+                    return Value::Num_((double)(toT(self.tab.get()) - toT(other.tab.get())));
+                });
+                timeMeta->map[L"diffHours"] = NF([timeMeta](vector<Value>& a) -> Value {
+                    Value v = timeMeta->map[L"diffSeconds"].native(a);
+                    return Value::Num_(BNum(v) / 3600.0);
+                });
+                timeMeta->map[L"diffDays"] = NF([timeMeta](vector<Value>& a) -> Value {
+                    Value v = timeMeta->map[L"diffSeconds"].native(a);
+                    return Value::Num_(BNum(v) / 86400.0);
+                });
+                timeMeta->map[L"format"] = formatFunc;
+                timeMeta->map[L"local"] = NF([getSelf](vector<Value>& a) -> Value {
+                    Value self = getSelf(a);
+                    if (!self.tab) return self;
+                    bool copy = false;
+                    for (auto& arg : a) {
+                        if (arg.t == Value::Bool && arg.b) copy = true;
+                    }
+                    if (copy)
+                    {
+                        auto res = std::make_shared<Table>();
+                        res->map = self.tab->map;
+                        res->arr = self.tab->arr;
+                        return Value::Table_(res);
+                    }
+                    return self;
+                });
+                timeMeta->map[L"utc"] = NF([getSelf](vector<Value>& a) -> Value {
+                    Value self = getSelf(a);
+                    if (!self.tab) return self;
+                    bool copy = false;
+                    for (auto& arg : a) {
+                        if (arg.t == Value::Bool && arg.b) copy = true;
+                    }
+                    if (copy)
+                    {
+                        auto res = std::make_shared<Table>();
+                        res->map = self.tab->map;
+                        res->arr = self.tab->arr;
+                        return Value::Table_(res);
+                    }
+                    return self;
+                });
+                timeMeta->map[L"_call"] = NF([timeMeta](vector<Value>& a) -> Value {
+                    // When invoked through timeMeta._call, a[0] is the owner (time table).
+                    // The actual constructor arguments start at a[1].
+                    vector<Value> ctorArgs;
+                    for (size_t i = 1; i < a.size(); i++)
+                        ctorArgs.push_back(a[i]);
+                    auto ictor = timeMeta->map.find(L"_timeCtor");
+                    if (ictor != timeMeta->map.end() && ictor->second.native)
+                        return ictor->second.native(ctorArgs);
+                    return Value();
+                });
+
+                auto timeCtor = NF([timeMeta](vector<Value>& a) -> Value {
+                    SYSTEMTIME st;
+                    GetLocalTime(&st);
+                    wstring fmt = L"%Y/%m/%d %H:%M:%S";
+                    if (!a.empty())
+                    {
+                        if (a[0].t == Value::Num)
+                        {
+                            time_t t = (time_t)BNum(a[0]);
+                            tm tmb{};
+                            localtime_s(&tmb, &t);
+                            st.wYear = (WORD)(tmb.tm_year + 1900);
+                            st.wMonth = (WORD)(tmb.tm_mon + 1);
+                            st.wDay = (WORD)tmb.tm_mday;
+                            st.wDayOfWeek = (WORD)tmb.tm_wday;
+                            st.wHour = (WORD)tmb.tm_hour;
+                            st.wMinute = (WORD)tmb.tm_min;
+                            st.wSecond = (WORD)tmb.tm_sec;
+                            st.wMilliseconds = 0;
+                        }
+                        else if (a[0].t == Value::Str)
+                        {
+                            if (a.size() > 1 && a[1].t == Value::Str) fmt = a[1].s;
+                            int y = 0, m = 1, d = 1, h = 0, mi = 0, s = 0;
+                            swscanf_s(a[0].s.c_str(), L"%d/%d/%d %d:%d:%d", &y, &m, &d, &h, &mi, &s);
+                            if (y == 0)
+                                swscanf_s(a[0].s.c_str(), L"%d-%d-%d %d:%d:%d", &y, &m, &d, &h, &mi, &s);
+                            if (y == 0)
+                                swscanf_s(a[0].s.c_str(), L"%d-%d-%d", &y, &m, &d);
+                            if (y > 0)
+                            {
+                                st.wYear = (WORD)y;
+                                st.wMonth = (WORD)m;
+                                st.wDay = (WORD)d;
+                                st.wHour = (WORD)h;
+                                st.wMinute = (WORD)mi;
+                                st.wSecond = (WORD)s;
+                                st.wMilliseconds = 0;
+                            }
+                        }
+                        else if (a[0].t == Value::TableT && a[0].tab)
+                        {
+                            auto getF = [&](const wchar_t* k, WORD def) -> WORD {
+                                auto it = a[0].tab->map.find(k);
+                                return it != a[0].tab->map.end() ? (WORD)BNum(it->second) : def;
+                            };
+                            st.wYear = getF(L"year", st.wYear);
+                            st.wMonth = getF(L"month", st.wMonth);
+                            st.wDay = getF(L"day", st.wDay);
+                            st.wHour = getF(L"hour", 0);
+                            st.wMinute = getF(L"minute", 0);
+                            st.wSecond = getF(L"second", 0);
+                            st.wMilliseconds = 0;
+                            if (a.size() > 1 && a[1].t == Value::Str) fmt = a[1].s;
+                        }
+                    }
+                    if (a.size() > 1 && a[1].t == Value::Str) fmt = a[1].s;
+
+                    auto inst = std::make_shared<Table>();
+                    inst->map[L"_struct"] = Value::Str_(L"WORD year;WORD month;WORD dayofweek;WORD day;WORD hour;WORD minute;WORD second;WORD milliseconds;");
+                    inst->map[L"year"] = Value::Num_(st.wYear);
+                    inst->map[L"month"] = Value::Num_(st.wMonth);
+                    inst->map[L"dayofweek"] = Value::Num_(st.wDayOfWeek);
+                    inst->map[L"day"] = Value::Num_(st.wDay);
+                    inst->map[L"hour"] = Value::Num_(st.wHour);
+                    inst->map[L"minute"] = Value::Num_(st.wMinute);
+                    inst->map[L"second"] = Value::Num_(st.wSecond);
+                    inst->map[L"milliseconds"] = Value::Num_(st.wMilliseconds);
+                    inst->map[L"format"] = Value::Str_(fmt);
+                    inst->map[L"_meta"] = Value::Table_(timeMeta);
+                    return Value::Table_(inst);
+                });
+
+                timeMeta->map[L"_timeCtor"] = timeCtor;
+                tb->map[L"_call"] = timeCtor;
+                tb->map[L"_meta"] = Value::Table_(timeMeta);
+                globals.vars[L"time"] = Value::Table_(tb);
+                roots[L"time"] = Value::Table_(tb);
+
+                tb->map[L"is"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
+                        return Value::Bool_(false);
+                    auto is = a[0].tab->map.find(L"_struct");
+                    if (is != a[0].tab->map.end() && is->second.t == Value::Str)
+                    {
+                        if (is->second.s.find(L"WORD year;") != wstring::npos)
+                            return Value::Bool_(true);
+                    }
+                    return Value::Bool_(false);
+                });
                 tb->map[L"now"] = NF([](vector<Value>&) {
                     return Value::Num_((double)time(nullptr)); });
                 tb->map[L"tick"] = NF([](vector<Value>&) {
@@ -1990,53 +2796,60 @@ void Interp::InitBuiltins()
                 clip->map[L"write"] = NF([](vector<Value>& a) {
                     wstring text = a.empty() ? L"" : a[0].ToString();
                     BOOL ok = FALSE;
-                    if (OpenClipboard(nullptr))
+                    for (int retry = 0; retry < 10; retry++)
                     {
-                        EmptyClipboard();
-                        int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
-                            (int)text.size(), nullptr, 0, nullptr, nullptr);
-                        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE,
-                                                (size_t)n + 2);
-                        if (h)
+                        if (OpenClipboard(nullptr))
                         {
-                            char* p = (char*)GlobalLock(h);
-                            WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
-                                (int)text.size(), p, n, nullptr, nullptr);
-                            p[n] = 0; p[n + 1] = 0;
-                            GlobalUnlock(h);
-                            // clipboard text is Unicode: put CF_UNICODETEXT
-                            int w2 = (int)text.size();
-                            HGLOBAL h2 = GlobalAlloc(GMEM_MOVEABLE,
-                                (size_t)(w2 + 1) * 2);
-                            if (h2)
+                            EmptyClipboard();
+                            int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                (int)text.size(), nullptr, 0, nullptr, nullptr);
+                            HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE,
+                                                    (size_t)n + 2);
+                            if (h)
                             {
-                                wchar_t* q = (wchar_t*)GlobalLock(h2);
-                                memcpy(q, text.c_str(), (size_t)w2 * 2);
-                                q[w2] = 0;
-                                GlobalUnlock(h2);
-                                ok = SetClipboardData(CF_UNICODETEXT, h2) != nullptr;
+                                char* p = (char*)GlobalLock(h);
+                                WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                    (int)text.size(), p, n, nullptr, nullptr);
+                                p[n] = 0; p[n + 1] = 0;
+                                GlobalUnlock(h);
+                                // clipboard text is Unicode: put CF_UNICODETEXT
+                                int w2 = (int)text.size();
+                                HGLOBAL h2 = GlobalAlloc(GMEM_MOVEABLE,
+                                    (size_t)(w2 + 1) * 2);
+                                if (h2)
+                                {
+                                    wchar_t* q = (wchar_t*)GlobalLock(h2);
+                                    memcpy(q, text.c_str(), (size_t)w2 * 2);
+                                    q[w2] = 0;
+                                    GlobalUnlock(h2);
+                                    ok = SetClipboardData(CF_UNICODETEXT, h2) != nullptr;
+                                }
+                                GlobalFree(h);
                             }
-                            GlobalFree(h);
+                            CloseClipboard();
+                            if (ok)
+                                Sleep(30);
+                            break;
                         }
-                        CloseClipboard();
-                        // the data is not immediately visible
-                        // to GetClipboardData in the same process;
-                        // give the OS a moment to commit
-                        if (ok)
-                            Sleep(30);
+                        Sleep(10);
                     }
                     return Value::Bool_(ok != FALSE); });
                 clip->map[L"read"] = NF([](vector<Value>&) {
                     wstring out;
-                    if (OpenClipboard(nullptr))
+                    for (int retry = 0; retry < 10; retry++)
                     {
-                        HANDLE h = GetClipboardData(CF_UNICODETEXT);
-                        if (h)
+                        if (OpenClipboard(nullptr))
                         {
-                            wchar_t* q = (wchar_t*)GlobalLock(h);
-                            if (q) { out = q; GlobalUnlock(h); }
+                            HANDLE h = GetClipboardData(CF_UNICODETEXT);
+                            if (h)
+                            {
+                                wchar_t* q = (wchar_t*)GlobalLock(h);
+                                if (q) { out = q; GlobalUnlock(h); }
+                            }
+                            CloseClipboard();
+                            break;
                         }
-                        CloseClipboard();
+                        Sleep(10);
                     }
                     return Value::Str_(out); });
                 // round 42: raw window access + common dialogs
@@ -2125,20 +2938,46 @@ void Interp::InitBuiltins()
                 tb->map[L"str"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
                     const unsigned char* p = nullptr;
+                    void* pSerialized = nullptr;
+                    int totalSz = 0;
                     if (a[0].t == Value::Pointer)
                         p = (const unsigned char*)a[0].ptr;
                     else if (a[0].t == Value::Num)
                         p = (const unsigned char*)(INT_PTR)(long long)
                             BNum(a[0]);
+                    else if ((a[0].t == Value::TableT || a[0].t == Value::Class) && a[0].tab)
+                    {
+                        auto iby = a[0].tab->map.find(L"_bytes");
+                        if (iby != a[0].tab->map.end() && iby->second.t == Value::Str)
+                        {
+                            p = (const unsigned char*)iby->second.s.data();
+                            totalSz = (int)(iby->second.s.size() * sizeof(wchar_t));
+                        }
+                        else
+                        {
+                            pSerialized = StructSerialize(a[0], &totalSz);
+                            p = (const unsigned char*)pSerialized;
+                        }
+                    }
                     if (!p) return Value();
+                    Value retVal;
                     if (a.size() > 1 && a[1].t == Value::Bool && a[1].b)
                     {
                         const wchar_t* pw = (const wchar_t*)p;
                         wstring w;
-                        while (*pw) w += *pw++;
-                        return Value::Str_(w);
+                        if (totalSz > 0)
+                        {
+                            size_t maxChars = (size_t)totalSz / sizeof(wchar_t);
+                            for (size_t i = 0; i < maxChars && pw[i]; i++)
+                                w += pw[i];
+                        }
+                        else
+                        {
+                            while (*pw) w += *pw++;
+                        }
+                        retVal = Value::Str_(w);
                     }
-                    if (a.size() > 1 && a[1].t == Value::Num)
+                    else if (a.size() > 1 && a[1].t == Value::Num)
                     {
                         size_t len = (size_t)BNum(a[1]);
                         UINT cp = (a.size() > 2 && a[2].t == Value::Num)
@@ -2153,15 +2992,56 @@ void Interp::InitBuiltins()
                             MultiByteToWideChar(cp, 0, (const char*)p,
                                 (int)len, &w[0], wl);
                         }
-                        return Value::Str_(w);
+                        retVal = Value::Str_(w);
                     }
-                    // ANSI, NUL-terminated
+                    else
                     {
+                        // ANSI, NUL-terminated
                         const char* pa = (const char*)p;
                         wstring w;
-                        while (*pa) w += (wchar_t)(unsigned char)*pa++;
-                        return Value::Str_(w);
-                    } });
+                        if (totalSz > 0)
+                        {
+                            for (int i = 0; i < totalSz && pa[i]; i++)
+                                w += (wchar_t)(unsigned char)pa[i];
+                        }
+                        else
+                        {
+                            while (*pa) w += (wchar_t)(unsigned char)*pa++;
+                        }
+                        retVal = Value::Str_(w);
+                    }
+                    if (pSerialized)
+                    {
+                        HeapFree(GetProcessHeap(), 0, pSerialized);
+                    }
+                    return retVal;
+                });
+                tb->map[L"array"] = NF([](vector<Value>& a) -> Value {
+                    // raw.array(arrayOrLength, rawTypename, fieldName)
+                    // creates a struct { <rawTypename> <fieldName>[len] = ... }
+                    if (a.size() < 3) return Value();
+                    int len = 0;
+                    auto arrTab = std::make_shared<Table>();
+                    if (a[0].t == Value::Num)
+                    {
+                        len = (int)BNum(a[0]);
+                        if (len < 0) len = 0;
+                        arrTab->arr.resize(len);
+                    }
+                    else if (a[0].t == Value::TableT && a[0].tab)
+                    {
+                        len = (int)a[0].tab->arr.size();
+                        arrTab->arr = a[0].tab->arr;
+                    }
+                    wstring typeName = BStr(a[1]);
+                    wstring fieldName = BStr(a[2]);
+                    wstring structDef = typeName + L" " + fieldName + L"[" + std::to_wstring(len) + L"];";
+
+                    auto res = std::make_shared<Table>();
+                    res->map[L"_struct"] = Value::Str_(structDef);
+                    res->map[fieldName] = Value::Table_(arrTab);
+                    return Value::Table_(res);
+                });
                 tb->map[L"loadDll"] = NF([this](vector<Value>& a)
                     -> Value {
                     HMODULE hMod = nullptr;
@@ -2253,9 +3133,9 @@ void Interp::InitBuiltins()
                         return Value(); });
                     bool bDllCdecl = false;
                     bool bDllUni = false;
-                    if (a.size() > 1)
+                    for (size_t ai = 1; ai < a.size(); ai++)
                     {
-                        wstring conv = BStr(a[1]);
+                        wstring conv = BStr(a[ai]);
                         for (auto& c : conv) c = towlower(c);
                         if (conv.find(L"cdecl") != wstring::npos) bDllCdecl = true;
                         if (conv.find(L"unicode") != wstring::npos) bDllUni = true;
@@ -2263,7 +3143,7 @@ void Interp::InitBuiltins()
                     dll->map[L"_cdecl"] = Value::Bool_(bDllCdecl);
                     dll->map[L"_unicode"] = Value::Bool_(bDllUni);
                     // api(name, signature) -> callable function value
-                    dll->map[L"api"] = NF([this, hMod, memDll](
+                    dll->map[L"api"] = NF([this, hMod, memDll, bDllCdecl](
                         vector<Value>& a2) -> Value {
                         if (a2.empty())
                         {
@@ -2287,7 +3167,31 @@ void Interp::InitBuiltins()
                             (*err) = L"运行错误: API 签名无效: " + sigStr;
                             return Value();
                         }
+                        if (bDllCdecl) sig.bCdecl = true;
+                        if (a2.size() > 2)
+                        {
+                            wstring cc = BStr(a2[2]);
+                            for (auto& c : cc) c = towlower(c);
+                            if (cc.find(L"cdecl") != wstring::npos) sig.bCdecl = true;
+                            else if (cc.find(L"stdcall") != wstring::npos) sig.bCdecl = false;
+                        }
                         bool bNameW = false;   // final export name ends in W
+#if defined(_WIN64)
+                        if (strName.rfind(L"FindFirstFile", 0) == 0)
+                        {
+                            if (sig.ret == ARInt) sig.ret = ARAddr;
+                        }
+                        else if (strName.rfind(L"FindNextFile", 0) == 0)
+                        {
+                            if (!sig.params.empty() && (sig.params[0] & 0xFF) == 0)
+                                sig.params[0] = 5 | (sig.params[0] & 0x100);
+                        }
+                        else if (strName.rfind(L"FindClose", 0) == 0)
+                        {
+                            if (!sig.params.empty() && (sig.params[0] & 0xFF) == 0)
+                                sig.params[0] = 5 | (sig.params[0] & 0x100);
+                        }
+#endif
                         if (!fp && !strName.empty())
                         {
                             std::string strNameA((size_t)
@@ -2401,7 +3305,7 @@ void Interp::InitBuiltins()
                             {
                                 Value v = (i + nOff) < argsEff.size()
                                     ? argsEff[i + nOff] : Value();
-                                if (sig.params[i] == 6 && v.t == Value::Str)
+                                if ((sig.params[i] == 6 || sig.params[i] == 11) && v.t == Value::Str)
                                     nA++;
                                 if (sig.params[i] == 7 && v.t == Value::Str)
                                     nW++;
@@ -2416,6 +3320,7 @@ void Interp::InitBuiltins()
                                 bool bStruct = false;
                                 Value origVal;
                                 bool bNoFree = false;   // caller-owned buffer
+                                size_t bufLen = 0;
                             };
                             std::vector<ApiArgRef> tmpRefs;
                             // bound this (COM vtable): RCX must be the
@@ -2457,7 +3362,7 @@ void Interp::InitBuiltins()
                                     slots.push_back((SlotT)(INT_PTR)pRef);
                                     continue;
                                 }
-                                if (bByRef && (pt == 6 || pt == 7))
+                                if (bByRef && (pt == 6 || pt == 7 || pt == 11))
                                 {
                                     // aardio string-by-ref contract (docs
                                     // raw/datatype.md): a NUMBER is the
@@ -2488,7 +3393,7 @@ void Interp::InitBuiltins()
                                             GetProcessHeap(),
                                             HEAP_ZERO_MEMORY, cb);
                                         tmpRefs.push_back(
-                                            { i, pt, pRef, false, Value() });
+                                            { i, pt, pRef, false, Value(), false, (size_t)nU });
                                         slots.push_back((SlotT)(INT_PTR)pRef);
                                         continue;
                                     }
@@ -2503,6 +3408,23 @@ void Interp::InitBuiltins()
                                                              0, cb);
                                             memcpy(pRef, w.c_str(), cb - 2);
                                             ((wchar_t*)pRef)[w.size()] = 0;
+                                            tmpRefs.push_back(
+                                                { i, pt, pRef, false, v, false, w.size() * 2 });
+                                        }
+                                        else if (pt == 11)
+                                        {
+                                            wstring w = BStr(v);
+                                            std::string sA;
+                                            sA.reserve(w.size());
+                                            for (wchar_t ch : w)
+                                                sA.push_back((char)(unsigned char)ch);
+                                            sA.push_back('\0');
+                                            pRef = HeapAlloc(GetProcessHeap(),
+                                                             0, sA.size());
+                                            memcpy(pRef, sA.c_str(),
+                                                   sA.size());
+                                            tmpRefs.push_back(
+                                                { i, pt, pRef, false, v, false, w.size() });
                                         }
                                         else
                                         {
@@ -2523,9 +3445,9 @@ void Interp::InitBuiltins()
                                                              0, sA.size());
                                             memcpy(pRef, sA.c_str(),
                                                    sA.size());
+                                            tmpRefs.push_back(
+                                                { i, pt, pRef, false, v, false, sA.size() - 1 });
                                         }
-                                        tmpRefs.push_back(
-                                            { i, pt, pRef, false, v });
                                         slots.push_back((SlotT)(INT_PTR)pRef);
                                         continue;
                                     }
@@ -2534,8 +3456,9 @@ void Interp::InitBuiltins()
                                         // caller-owned raw buffer: the
                                         // content is read back but the
                                         // memory is never freed here
+                                        size_t bsz = GetBufferSize(v.ptr);
                                         tmpRefs.push_back(
-                                            { i, pt, v.ptr, false, v, true });
+                                            { i, pt, v.ptr, false, v, true, bsz });
                                         slots.push_back((SlotT)(INT_PTR)v.ptr);
                                         continue;
                                     }
@@ -2650,14 +3573,12 @@ void Interp::InitBuiltins()
                                             slots.push_back((SlotT)0);
                                     }
                                     else if (v.t == Value::Str)
-                                        // a string passed to a pointer
-                                        // parameter hands the API its raw
-                                        // buffer (byte strings / UTF-16
-                                        // text alike) — BNum() made every
-                                        // such call a NULL pointer and
-                                        // memcpy'd straight into a crash
-                                        slots.push_back((SlotT)(INT_PTR)
-                                            v.s.c_str());
+                                    {
+                                        std::string sA = RawBytesOf(v.s);
+                                        sA.push_back('\0');
+                                        tmpA.push_back(std::move(sA));
+                                        slots.push_back((SlotT)(INT_PTR)tmpA.back().data());
+                                    }
                                     else
                                         slots.push_back(v.t == Value::Null
                                             ? (SlotT)0
@@ -2665,6 +3586,7 @@ void Interp::InitBuiltins()
                                                   BNum(v));
                                     break;
                                 case 6:   // str (ANSI)
+                                case 11:  // string (binary)
                                     if (v.t == Value::Null)
                                         slots.push_back((SlotT)0);
                                     else if (v.t == Value::Pointer)
@@ -2676,17 +3598,26 @@ void Interp::InitBuiltins()
                                     else
                                     {
                                         wstring w = BStr(v);
-                                        std::string sA((size_t)
-                                            WideCharToMultiByte(
+                                        std::string sA;
+                                        if (pt == 11)
+                                        {
+                                            sA.reserve(w.size());
+                                            for (wchar_t ch : w)
+                                                sA.push_back((char)(unsigned char)ch);
+                                        }
+                                        else
+                                        {
+                                            sA.resize((size_t)WideCharToMultiByte(
                                                 CP_ACP, 0, w.c_str(),
                                                 (int)w.size(), nullptr,
-                                                0, nullptr, nullptr), 0);
-                                        if (!sA.empty())
-                                            WideCharToMultiByte(CP_ACP,
-                                                0, w.c_str(),
-                                                (int)w.size(), &sA[0],
-                                                (int)sA.size(), nullptr,
-                                                nullptr);
+                                                0, nullptr, nullptr));
+                                            if (!sA.empty())
+                                                WideCharToMultiByte(CP_ACP,
+                                                    0, w.c_str(),
+                                                    (int)w.size(), &sA[0],
+                                                    (int)sA.size(), nullptr,
+                                                    nullptr);
+                                        }
                                         sA.push_back('\0');
                                         tmpA.push_back(std::move(sA));
                                         slots.push_back((SlotT)
@@ -2740,10 +3671,10 @@ void Interp::InitBuiltins()
                                     break;
                                 }
                             }
-                            if (slots.size() > 14)
+                            if (slots.size() > 32)
                             {
                                 (*err) =
-                                    L"运行错误: API 参数超过 14 个";
+                                    L"运行错误: API 参数超过 32 个";
                                 return Value();
                             }
                             // invoke, then interpret the result.
@@ -2892,14 +3823,28 @@ void Interp::InitBuiltins()
                                             break;
                                         case 6:
                                             outVal = Value::Str_(
-                                                ReadStrA((const char*)
-                                                    ref.pBuffer));
+                                                bNameW ? ReadStrW((const wchar_t*)ref.pBuffer)
+                                                       : ReadStrA((const char*)ref.pBuffer));
                                             break;
                                         case 7:
                                             outVal = Value::Str_(
                                                 ReadStrW((const wchar_t*)
                                                     ref.pBuffer));
                                             break;
+                                        case 11:
+                                        {
+                                            // binary string &: pack raw bytes into wstring
+                                            wstring ws;
+                                            size_t len = ref.bufLen;
+                                            if (len == 0 && ref.pBuffer)
+                                                len = strlen((const char*)ref.pBuffer);
+                                            ws.reserve(len);
+                                            const unsigned char* pb = (const unsigned char*)ref.pBuffer;
+                                            for (size_t k = 0; k < len; k++)
+                                                ws += (wchar_t)pb[k];
+                                            outVal = Value::Str_(ws);
+                                            break;
+                                        }
                                         case 9:
                                         {
                                             float f = 0;
@@ -2942,28 +3887,64 @@ void Interp::InitBuiltins()
                         return (void*)(INT_PTR)(long long)v.n;
                     return nullptr;
                 };
-                tb->map[L"buffer"] = NF([this](vector<Value>& a) -> Value {
+                tb->map[L"buffer"] = NF([this, BufPtr](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
                     // raw.buffer(structTable) — serialize a struct instance
-                    // into a persistent raw buffer (official contract; the
-                    // dotNet library passes struct buffers to COM APIs)
-                    if (!a.empty() && (a[0].t == Value::TableT ||
-                                       a[0].t == Value::Class))
+                    if (a[0].t == Value::TableT || a[0].t == Value::Class)
                     {
                         int total = 0;
                         void* pS = StructSerialize(a[0], &total);
                         if (pS)
+                        {
+                            RegisterBuffer(pS, (size_t)total);
                             return Value::Pointer_(pS);
+                        }
+                        return Value();
                     }
-                    size_t n = a.empty() ? 0
-                        : (size_t)(long long)BNum(a[0]);
-                    if (n == 0) return Value::Pointer_(nullptr);
-                    void* p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                                        n);
-                    return Value::Pointer_(p); });
+                    if (a.size() == 1 && a[0].t == Value::Str)
+                    {
+                        // raw.buffer("initialContent") — allocate UTF-8 bytes of string
+                        wstring s = a[0].s;
+                        if (s.empty()) return Value();
+                        int cb = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+                        if (cb <= 0) return Value();
+                        void* p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)cb);
+                        if (!p) return Value();
+                        WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), (char*)p, cb, nullptr, nullptr);
+                        RegisterBuffer(p, (size_t)cb);
+                        return Value::Pointer_(p);
+                    }
+                    size_t n = 0;
+                    if (a[0].t == Value::Num)
+                        n = (size_t)(long long)a[0].n;
+                    if (n == 0) return Value();
+                    void* p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, n);
+                    if (!p) return Value();
+                    if (a.size() > 1)
+                    {
+                        if (a[1].t == Value::Str)
+                        {
+                            wstring s = a[1].s;
+                            int cb = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), (char*)p, (int)n, nullptr, nullptr);
+                            (void)cb;
+                        }
+                        else if (a[1].t == Value::Pointer && a[1].ptr)
+                        {
+                            size_t srcSz = GetBufferSize(a[1].ptr);
+                            if (srcSz > 0)
+                            {
+                                memcpy(p, a[1].ptr, srcSz < n ? srcSz : n);
+                            }
+                        }
+                    }
+                    RegisterBuffer(p, n);
+                    return Value::Pointer_(p);
+                });
                 tb->map[L"free"] = NF([BufPtr](vector<Value>& a) -> Value {
                     if (a.empty()) return Value::Bool_(false);
                     void* p = BufPtr(a[0]);
                     if (!p) return Value::Bool_(true);
+                    UnregisterBuffer(p);
                     return Value::Bool_(
                         HeapFree(GetProcessHeap(), 0, p) != FALSE); });
                 // write(ptr, s): byte string -> raw bytes; text -> UTF-8
@@ -3136,8 +4117,8 @@ void Interp::InitBuiltins()
                         std::string held;
                         if (!a.empty() && a[0].t == Value::Str)
                         {
-                            held = ToA(BStr(a[0]));
-                            p = held.c_str();
+                            held = RawBytesOf(BStr(a[0]));
+                            p = held.data();
                         }
                         else if (!a.empty() && a[0].t == Value::Pointer)
                             p = (const char*)a[0].ptr;
@@ -3159,45 +4140,114 @@ void Interp::InitBuiltins()
                 tb->map[L"ulong"] = NF(mkReader(4));
                 tb->map[L"long"] = NF(mkReader(4));
                 // raw.topointer / raw.tonumber — pointer <-> integer
-                tb->map[L"topointer"] = NF([](vector<Value>& a) -> Value {
+                tb->map[L"topointer"] = NF([this](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t == Value::Null)
                         return Value::Pointer_(nullptr);
-                    if (a[0].t == Value::Pointer) return a[0];
+                    INT_PTR offset = a.size() > 1 ? (INT_PTR)(long long)BNum(a[1]) : 0;
+                    if (a[0].t == Value::Pointer)
+                        return Value::Pointer_((char*)a[0].ptr + offset);
+                    if (a[0].t == Value::TableT || a[0].t == Value::Class)
+                    {
+                        Value vp = GetMember(a[0], L"_topointer");
+                        if (vp.t == Value::Func || vp.native)
+                        {
+                            vector<Value> noArgs;
+                            Value r = CallOwner(vp, a[0], noArgs);
+                            if (r.t == Value::Pointer)
+                                return Value::Pointer_((char*)r.ptr + offset);
+                            return Value::Pointer_((char*)(INT_PTR)(long long)BNum(r) + offset);
+                        }
+                    }
                     if (a[0].t == Value::Num)
-                        return Value::Pointer_((void*)(INT_PTR)(long long)a[0].n);
+                        return Value::Pointer_((char*)(INT_PTR)(long long)a[0].n + offset);
                     if (a[0].t == Value::Str)
-                        return Value::Pointer_((void*)a[0].s.c_str());
+                        return Value::Pointer_((char*)a[0].s.c_str() + offset);
                     return Value::Pointer_(nullptr); });
                 tb->map[L"tonumber"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value::Num_(0);
                     if (a[0].t == Value::Pointer)
                         return Value::Num_((double)(INT_PTR)a[0].ptr);
                     return Value::Num_(BNum(a[0])); });
-                // raw.tostring(ptr,len) — read len bytes from a pointer
+                // raw.tostring(ptr, start=1, stop=-1) — read bytes from pointer/buffer/struct
                 tb->map[L"tostring"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value::Str_(L"");
                     const char* p = nullptr;
-                    if (a[0].t == Value::Pointer) p = (const char*)a[0].ptr;
+                    void* pAllocated = nullptr;
+                    size_t knownSize = 0;
+                    std::string heldStr;
+                    if (a[0].t == Value::Pointer)
+                    {
+                        p = (const char*)a[0].ptr;
+                        if (a[0].ptr && IsBuffer(a[0].ptr))
+                            knownSize = GetBufferSize(a[0].ptr);
+                    }
                     else if (a[0].t == Value::Num)
+                    {
                         p = (const char*)(INT_PTR)(long long)a[0].n;
+                    }
                     else if (a[0].t == Value::Str)
                     {
-                        wstring w = BStr(a[0]);
-                        return Value::Str_(w);
+                        heldStr = RawBytesOf(BStr(a[0]));
+                        p = heldStr.data();
+                        knownSize = heldStr.size();
                     }
-                    if (!p) return Value::Str_(L"");
-                    size_t n = a.size() > 1 ? (size_t)BNum(a[1]) : 0;
-                    if (!n)
+                    else if (a[0].t == Value::TableT && a[0].tab)
                     {
-                        // no length: read to the first NUL
-                        n = 0;
-                        while (n < (1u << 20) && p[n]) n++;
+                        int outTotal = 0;
+                        pAllocated = StructSerialize(a[0], &outTotal);
+                        if (pAllocated && outTotal > 0)
+                        {
+                            p = (const char*)pAllocated;
+                            knownSize = (size_t)outTotal;
+                        }
                     }
+
+                    if (!p)
+                    {
+                        if (pAllocated) HeapFree(GetProcessHeap(), 0, pAllocated);
+                        return Value::Str_(L"");
+                    }
+
+                    long long start = 1;
+                    if (a.size() > 1 && a[1].t == Value::Num)
+                        start = (long long)a[1].n;
+                    if (start < 1) start = 1;
+
+                    size_t n = 0;
+                    if (a.size() > 2 && a[2].t == Value::Num)
+                    {
+                        long long stop = (long long)a[2].n;
+                        if (stop < start)
+                        {
+                            if (pAllocated) HeapFree(GetProcessHeap(), 0, pAllocated);
+                            return Value::Str_(L"");
+                        }
+                        n = (size_t)(stop - start + 1);
+                    }
+                    else if (knownSize > 0)
+                    {
+                        if ((size_t)start <= knownSize)
+                            n = knownSize - (size_t)start + 1;
+                        else
+                            n = 0;
+                    }
+                    else
+                    {
+                        const char* scan = p + (start - 1);
+                        while (n < (1u << 25) && scan[n]) n++;
+                    }
+
+                    p += (start - 1);
                     wstring w;
                     w.resize(n);
                     for (size_t k = 0; k < n; k++)
                         w[k] = (wchar_t)(unsigned char)p[k];
-                    return Value::Str_(w); });
+
+                    if (pAllocated)
+                        HeapFree(GetProcessHeap(), 0, pAllocated);
+
+                    return Value::Str_(w);
+                });
                 // raw.copy(dst,src,size) — raw memory copy, returns dst
                 tb->map[L"copy"] = NF([](vector<Value>& a) -> Value {
                     if (a.size() < 3) return a.empty() ? Value() : a[0];
@@ -3206,7 +4256,7 @@ void Interp::InitBuiltins()
                     if (a[0].t == Value::Pointer) d = a[0].ptr;
                     else if (a[0].t == Value::Num)
                         d = (void*)(INT_PTR)(long long)a[0].n;
-                    if (a[1].t == Value::Str) { held = ToA(BStr(a[1])); s = held.c_str(); }
+                    if (a[1].t == Value::Str) { held = RawBytesOf(BStr(a[1])); s = held.data(); }
                     else if (a[1].t == Value::Pointer) s = (const char*)a[1].ptr;
                     else if (a[1].t == Value::Num)
                         s = (const char*)(INT_PTR)(long long)a[1].n;
@@ -3220,8 +4270,8 @@ void Interp::InitBuiltins()
                     const char* s = nullptr; size_t n = 0;
                     if (a[1].t == Value::Str)
                     {
-                        held = ToA(BStr(a[1]));
-                        s = held.c_str();
+                        held = RawBytesOf(BStr(a[1]));
+                        s = held.data();
                         n = a.size() > 2 ? (size_t)BNum(a[2]) : held.size();
                     }
                     else if (a[1].t == Value::Pointer)
@@ -3239,6 +4289,34 @@ void Interp::InitBuiltins()
                     }
                     return a[0]; });
                 // raw.closehandle(h) — CloseHandle
+                auto rawArrayFunc = NF([](vector<Value>& a) -> Value {
+                    // raw.array / raw.toarray(arrayOrLength, rawTypename, fieldName)
+                    // creates a struct { <rawTypename> <fieldName>[len] = ... }
+                    if (a.size() < 3) return Value();
+                    int len = 0;
+                    auto arrTab = std::make_shared<Table>();
+                    if (a[0].t == Value::Num)
+                    {
+                        len = (int)BNum(a[0]);
+                        if (len < 0) len = 0;
+                        arrTab->arr.resize(len);
+                    }
+                    else if (a[0].t == Value::TableT && a[0].tab)
+                    {
+                        len = (int)a[0].tab->arr.size();
+                        arrTab->arr = a[0].tab->arr;
+                    }
+                    wstring typeName = BStr(a[1]);
+                    wstring fieldName = BStr(a[2]);
+                    wstring structDef = typeName + L" " + fieldName + L"[" + std::to_wstring(len) + L"];";
+
+                    auto res = std::make_shared<Table>();
+                    res->map[L"_struct"] = Value::Str_(structDef);
+                    res->map[fieldName] = Value::Table_(arrTab);
+                    return Value::Table_(res);
+                });
+                tb->map[L"array"] = rawArrayFunc;
+                tb->map[L"toarray"] = rawArrayFunc;
                 tb->map[L"closehandle"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value::Bool_(false);
                     HANDLE h = nullptr;
@@ -3247,16 +4325,31 @@ void Interp::InitBuiltins()
                         h = (HANDLE)(INT_PTR)(long long)a[0].n;
                     if (!h) return Value::Bool_(false);
                     return Value::Bool_(CloseHandle(h) != FALSE); });
-                // raw.realloc(p,size) — heap reallocate
+                // raw.realloc(size, ptr) — official contract: raw.realloc(size, [ptr])
+                // also tolerant to raw.realloc(ptr, size) if someone passes ptr first
                 tb->map[L"realloc"] = NF([](vector<Value>& a) -> Value {
-                    if (a.size() < 2) return Value();
-                    size_t n = (size_t)BNum(a[1]);
+                    if (a.empty()) return Value();
+                    size_t n = 0;
                     void* p = nullptr;
-                    if (a[0].t == Value::Pointer) p = a[0].ptr;
-                    else if (a[0].t == Value::Num && a[0].n != 0)
-                        p = (void*)(INT_PTR)(long long)a[0].n;
-                    if (!n) { if (p) HeapFree(GetProcessHeap(), 0, p);
-                              return Value::Pointer_(nullptr); }
+                    if (a[0].t == Value::Pointer)
+                    {
+                        p = a[0].ptr;
+                        if (a.size() > 1) n = (size_t)BNum(a[1]);
+                    }
+                    else
+                    {
+                        n = (size_t)BNum(a[0]);
+                        if (a.size() > 1)
+                        {
+                            if (a[1].t == Value::Pointer) p = a[1].ptr;
+                            else if (a[1].t == Value::Num && a[1].n != 0)
+                                p = (void*)(INT_PTR)(long long)a[1].n;
+                        }
+                    }
+                    if (!n) {
+                        if (p) HeapFree(GetProcessHeap(), 0, p);
+                        return Value::Pointer_(nullptr);
+                    }
                     void* q = p ? HeapReAlloc(GetProcessHeap(), 0, p, n)
                                 : HeapAlloc(GetProcessHeap(), 0, n);
                     return Value::Pointer_(q); });
@@ -3265,8 +4358,8 @@ void Interp::InitBuiltins()
                 tb->map[L"equal"] = NF([](vector<Value>& a) -> Value {
                     if (a.size() < 2) return Value::Bool_(true);
                     std::string x, y;
-                    if (a[0].t == Value::Str) x = ToA(BStr(a[0]));
-                    if (a[1].t == Value::Str) y = ToA(BStr(a[1]));
+                    if (a[0].t == Value::Str) x = RawBytesOf(BStr(a[0]));
+                    if (a[1].t == Value::Str) y = RawBytesOf(BStr(a[1]));
                     if (x.empty() || y.empty()) return Value::Bool_(x == y);
                     size_t n = a.size() > 2 ? (size_t)BNum(a[2])
                                             : min(x.size(), y.size());
@@ -3571,6 +4664,11 @@ void Interp::InitBuiltins()
                             a[0].tab->arr.push_back(a[si].tab->arr[ai]);
                     }
                     return a[0];
+                });
+                tb->map[L"getAttr"] = NF([this](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
+                    if (a.size() == 1) return a[0];
+                    return this->GetMember(a[0], a[1], false, 0);
                 });
                 tb->map[L"count"] = NF([](vector<Value>& a) {
                     if (a[0].t != Value::TableT || !a[0].tab) return Value::Num_(0);
@@ -5347,7 +6445,10 @@ void Interp::InitBuiltins()
                 case Value::Null: return Value::Str_(L"null");
                 case Value::Bool: return Value::Str_(L"boolean");
                 case Value::Num: return Value::Str_(L"number");
-                case Value::Pointer: return Value::Str_(L"pointer");
+                case Value::Pointer:
+                    if (a[0].ptr && IsBuffer(a[0].ptr))
+                        return Value::Str_(L"buffer");
+                    return Value::Str_(L"pointer");
                 case Value::Str: return Value::Str_(L"string");
                 case Value::TableT: return Value::Str_(L"table");
                 case Value::Class: return Value::Str_(L"class");
@@ -5395,13 +6496,25 @@ void Interp::InitBuiltins()
             });
             globals.vars[L"type"] = vType;
             roots[L"type"] = vType;
-            globals.vars[L"topointer"] = NF([](vector<Value>& a) -> Value {
+            globals.vars[L"topointer"] = NF([this](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t == Value::Null) return Value::Pointer_(nullptr);
-                if (a[0].t == Value::Pointer) return a[0];
-                if (a[0].ptr != nullptr) return Value::Pointer_(a[0].ptr);
-                if (a[0].t == Value::Num) return Value::Pointer_((void*)(INT_PTR)(long long)a[0].n);
-                if (a[0].t == Value::Str) return Value::Pointer_((void*)a[0].s.c_str());
-                return Value::Pointer_((void*)(INT_PTR)(long long)BNum(a[0])); });
+                INT_PTR offset = a.size() > 1 ? (INT_PTR)(long long)BNum(a[1]) : 0;
+                if (a[0].t == Value::Pointer) return Value::Pointer_((char*)a[0].ptr + offset);
+                if (a[0].t == Value::TableT || a[0].t == Value::Class)
+                {
+                    Value vp = GetMember(a[0], L"_topointer");
+                    if (vp.t == Value::Func || vp.native)
+                    {
+                        vector<Value> noArgs;
+                        Value r = CallOwner(vp, a[0], noArgs);
+                        if (r.t == Value::Pointer) return Value::Pointer_((char*)r.ptr + offset);
+                        return Value::Pointer_((char*)(INT_PTR)(long long)BNum(r) + offset);
+                    }
+                }
+                if (a[0].ptr != nullptr) return Value::Pointer_((char*)a[0].ptr + offset);
+                if (a[0].t == Value::Num) return Value::Pointer_((char*)(INT_PTR)(long long)a[0].n + offset);
+                if (a[0].t == Value::Str) return Value::Pointer_((char*)a[0].s.c_str() + offset);
+                return Value::Pointer_((char*)(INT_PTR)(long long)BNum(a[0]) + offset); });
             globals.vars[L"tonumber"] = NF([](vector<Value>& a) {
                 return a.empty() ? Value() : Value::Num_(BNum(a[0])); });
             globals.vars[L"sleep"] = NF([](vector<Value>& a) {
@@ -5612,7 +6725,7 @@ void Interp::InitBuiltins()
                         auto ex = std::make_shared<vector<Value>>();
                         for (size_t i = 1; i < a.size(); i++)
                             ex->push_back(a[i]);
-                        Value r = a.size() > 1 ? a[1] : a[0];
+                        Value r = a[0];
                         r.mrets = ex;
                         return r;
                     }
@@ -5794,34 +6907,90 @@ void Interp::InitBuiltins()
                 for (size_t i = 2; i < a.size(); i++)
                     args.push_back(a[i]);
                 return this->CallOwner(a[0], owner, args); });
-            // callex(f,owner,errHandler,...) — errors go to the handler
+            // callex(errHandler, fn, owner, ...) — standard official signature
             globals.vars[L"callex"] = NF([this](vector<Value>& a) -> Value {
                 if (a.empty())
-                    return Value();
-                Value owner = a.size() > 1 ? a[1] : Value();
-                Value handler = a.size() > 2 ? a[2] : Value();
+                    return Value::Bool_(false);
+                Value handler;
+                Value fn;
+                Value owner;
+                size_t nArgStart = 3;
+
+                auto isCallable = [](const Value& v) -> bool {
+                    if (v.t == Value::Func || v.t == Value::Class) return true;
+                    if (v.t == Value::TableT && v.tab)
+                    {
+                        if (v.tab->map.count(L"_call") || v.tab->map.count(L"_meta"))
+                            return true;
+                    }
+                    return false;
+                };
+
+                if (a.size() >= 2 && isCallable(a[1]))
+                {
+                    // Official standard signature: callex(errHandler, fn, owner, ...)
+                    // or callex(, fn, owner, ...) where a[0] is null/omitted
+                    handler = a[0];
+                    fn = a[1];
+                    owner = a.size() > 2 ? a[2] : Value();
+                    nArgStart = 3;
+                }
+                else if (isCallable(a[0]))
+                {
+                    // Legacy signature: callex(fn, owner, ...)
+                    fn = a[0];
+                    owner = a.size() > 1 ? a[1] : Value();
+                    handler = a.size() > 2 ? a[2] : Value();
+                    nArgStart = 3;
+                }
+                else
+                {
+                    Value vRet = Value::Bool_(false);
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Str_(L"callex: missing callable target"));
+                    vRet.mrets = ex;
+                    return vRet;
+                }
+
                 vector<Value> args;
-                for (size_t i = 3; i < a.size(); i++)
+                for (size_t i = nArgStart; i < a.size(); i++)
                     args.push_back(a[i]);
-                wstring keep = *err;
-                err->clear();
-                Value r = this->CallOwner(a[0], owner, args);
-                if (!err->empty())
+
+                wstring keep = err ? *err : wstring();
+                if (err) err->clear();
+                Value r = this->CallOwner(fn, owner, args);
+                if (err && !err->empty())
                 {
                     wstring msg = *err;
                     err->clear();
-                    if (handler.t == Value::Func)
+                    if (isCallable(handler))
                     {
-                        vector<Value> ha;
-                        ha.push_back(Value::Str_(msg));
-                        r = this->CallVmFunc(handler, ha);
+                        vector<Value> ha{ Value::Str_(msg) };
+                        this->CallOwner(handler, Value(), ha);
+                        if (err) err->clear();
                     }
-                    else
-                        r = Value();
+                    if (!keep.empty() && err && err->empty())
+                        *err = keep;
+                    Value vRet = Value::Bool_(false);
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Str_(msg));
+                    vRet.mrets = ex;
+                    return vRet;
                 }
-                if (keep.empty() == false && err->empty())
+                if (!keep.empty() && err && err->empty())
                     *err = keep;
-                return r; });
+
+                Value vRet = Value::Bool_(true);
+                auto ex = std::make_shared<vector<Value>>();
+                ex->push_back(r);
+                if (r.mrets)
+                {
+                    for (auto& item : *r.mrets)
+                        ex->push_back(item);
+                }
+                vRet.mrets = ex;
+                return vRet;
+            });
             // rget(n,...) — pick the n-th of the trailing values
             globals.vars[L"rget"] = NF([](vector<Value>& a) -> Value {
                 if (a.size() < 2 || a[0].t != Value::Num)

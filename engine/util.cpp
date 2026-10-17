@@ -181,4 +181,37 @@ namespace NodioVM
     // quantifiers * + ? {n} {n,} {n,m} (+ lazy variants), groups with
     // captures, top-level | alternation, ^ $ anchors. Greedy group
     // backtracking takes the first inner match (documented subset).
+
+    static std::mutex s_bufMutex;
+    static std::unordered_map<const void*, size_t> s_bufSizes;
+
+    void RegisterBuffer(void* ptr, size_t size)
+    {
+        if (!ptr) return;
+        std::lock_guard<std::mutex> lock(s_bufMutex);
+        s_bufSizes[ptr] = size;
+    }
+
+    void UnregisterBuffer(void* ptr)
+    {
+        if (!ptr) return;
+        std::lock_guard<std::mutex> lock(s_bufMutex);
+        s_bufSizes.erase(ptr);
+    }
+
+    bool IsBuffer(const void* ptr)
+    {
+        if (!ptr) return false;
+        std::lock_guard<std::mutex> lock(s_bufMutex);
+        return s_bufSizes.find(ptr) != s_bufSizes.end();
+    }
+
+    size_t GetBufferSize(const void* ptr)
+    {
+        if (!ptr) return 0;
+        std::lock_guard<std::mutex> lock(s_bufMutex);
+        auto it = s_bufSizes.find(ptr);
+        return it != s_bufSizes.end() ? it->second : 0;
+    }
 }
+

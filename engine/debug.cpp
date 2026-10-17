@@ -25,7 +25,22 @@ void Interp::DumpVars(Env* env)
                 L"_INVALID_HANDLE_VALUE", L"_HAPPICON", L"_WIN_64",
                 L"_WINXP", L"_WIN7_LATER", L"_WIN10_LATER"
             };
-            for (auto& kv : env->vars)
+            std::vector<std::pair<wstring, Value>> list;
+            if (env && env->parent && env->parent.get() == &globals)
+            {
+                for (const wchar_t* g : { L"User32", L"Kernel32", L"type" })
+                {
+                    auto it = globals.vars.find(g);
+                    if (it != globals.vars.end())
+                        list.push_back({ it->first, it->second });
+                }
+            }
+            if (env)
+            {
+                for (auto& kv : env->vars)
+                    list.push_back({ kv.first, kv.second });
+            }
+            for (auto& kv : list)
             {
                 // built-in namespaces/functions bury the script's own vars; User32, Kernel32 and type kept for debugger
                 if ((roots.count(kv.first) && kv.first != L"User32" && kv.first != L"Kernel32" && kv.first != L"type") ||

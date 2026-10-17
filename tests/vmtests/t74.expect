@@ -1,0 +1,10 @@
+sizeof=84
+s2.id=101
+type(s2.wstr)=string
+s2.wstr=Segoe UI
+type(s2.bstr)=string
+s2.bstr=Hello
+type(sa2.words)=table
+sa2.words[1]=10
+sa2.words[4]=40
+end

@@ -16,6 +16,8 @@ namespace NodioVM
         // M2: static self for meta callbacks fired from static helpers
         static Interp* g_self;
         Interp* self() { return this; }
+        static Value GetCurrentOwner();
+        static void SetCurrentOwner(const Value& v);
         // round 19: aardio root namespaces + module loading
         // (GetRoot/BindModule/DoImport/InitBuiltins defined at the tail)
         int nErrLine = 0;   // last statement line entered (error reporting)
@@ -42,14 +44,25 @@ namespace NodioVM
         // ---- runtime.cpp (evaluation core) ----
         Value Eval(const PNode& n, Env* env);
         double ToNum(const Value& v);
+        bool MetaGet(const Value& obj, const Value& keyVal, Value* out,
+                     bool* pErr, wstring* pErrMsg, int ownerCallMode = 0);
         bool MetaGet(const Value& obj, const wstring& key, Value* out,
                      bool* pErr, wstring* pErrMsg, bool bOwnerCall = false);
+        bool MetaGetLayer(const Value& obj, const Value& mtv,
+                          const Value& keyVal, Value* out, bool* pErr,
+                          wstring* pErrMsg, int ownerCallMode = 0,
+                          bool bInDispatch = false);
         bool MetaGetLayer(const Value& obj, const Value& mtv,
                           const wstring& key, Value* out, bool* pErr,
                           wstring* pErrMsg, bool bOwnerCall,
                           bool bInDispatch = false);
+        bool MetaSet(const Value& obj, const Value& keyVal, const Value& val,
+                     bool* pErr, wstring* pErrMsg, bool bOwnerAttr = true);
         bool MetaSet(const Value& obj, const wstring& key, const Value& val,
                      bool* pErr, wstring* pErrMsg);
+        bool MetaSetLayer(const Value& obj, const Value& mtv,
+                          const Value& keyVal, const Value& val,
+                          bool* pErr, wstring* pErrMsg, bool bOwnerAttr = true);
         bool MetaSetLayer(const Value& obj, const Value& mtv,
                           const wstring& key, const Value& val,
                           bool* pErr, wstring* pErrMsg);
@@ -64,12 +77,15 @@ namespace NodioVM
                                wstring* pErrMsg);
         Value GetMeta(const Value& obj);
         wstring ToStringM(const Value& v);
+        Value GetMember(const Value& obj, const Value& keyVal,
+                        bool bDirect = false, int ownerCallMode = 0);
         Value GetMember(const Value& obj, const wstring& key,
                         bool bDirect = false, bool bOwnerCall = false);
         void RegisterComKernel(Env& globalsEnv);   // com.cpp (COM host)
         Value EvalCall(const PNode& n, Env* env);
         Value EvalBin(const PNode& n, Env* env);
         bool CmpLess(const Value& l, const Value& r);
+        bool ValuesEqual(const Value& l, const Value& r, bool strict);
         Value ApplyOp(const wstring& op, const Value& l, const Value& r);
         void DoAssign(const PNode& target, const Value& v, Env* env,
                       const wstring& op);

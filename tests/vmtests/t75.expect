@@ -1,0 +1,6 @@
+multi-return-tail:null100200
+obj eq self:truetrue
+obj diff ref:falsefalse
+str eq:truetrue
+num str eq:truefalse
+raw.str struct:true*

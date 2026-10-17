@@ -1,5 +1,5 @@
 elseif-multiline:ok
 elseif-noparen:ok
 ustring:5hello
-ctor-multiline:5
+ctor-multiline:15
 fn-multiline:6

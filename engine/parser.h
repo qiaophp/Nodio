@@ -27,7 +27,8 @@ namespace NodioVM
         }
         bool IsPunct(const wchar_t* op) const
         {
-            return Peek().t == TPunct && Peek().text == op;
+            if (Peek().t != TPunct) return false;
+            return Peek().text == op;
         }
         bool IsKw(const wchar_t* kw) const
         {
@@ -35,7 +36,8 @@ namespace NodioVM
         }
         bool EatPunct(const wchar_t* op)
         {
-            if (IsPunct(op)) { p++; return true; }
+            if (Peek().t != TPunct) return false;
+            if (Peek().text == op) { p++; return true; }
             return false;
         }
         bool EatKw(const wchar_t* kw)
@@ -321,7 +323,7 @@ namespace NodioVM
                     bool bRestOfFile = false;
                     if (EatPunct(L";"))
                         bRestOfFile = true;
-                    else if (Peek(-1).t == TNL || (!IsPunct(L"{") && Peek().t != TEnd))
+                    else if (Peek(-1).t == TNL || !IsPunct(L"{"))
                         bRestOfFile = true;
                     if (bRestOfFile)
                     {
@@ -915,11 +917,82 @@ namespace NodioVM
                 // parens are optional: 'elseif cond {' (inet/file.aardio)
                 // as well as 'elseif (cond) {'
                 bool bElseParen = EatPunct(L"(");
-                n->c->list.push_back(ParseExpr());
-                // the condition may span lines with the ')' on its own
-                // line (key/ime.stateBar.aardio), so skip newlines first
+                PNode cond = ParseExpr();
                 SkipNL();
-                if (bElseParen) Expect(L")");
+                bool bElseParenClosed = false;
+                while (IsPunct(L")"))
+                {
+                    size_t saveR = p;
+                    p++;   // ')'
+                    SkipNL();
+                    if (!(Peek().t == TPunct &&
+                          (Peek().text == L"&&" || Peek().text == L"||" ||
+                           Peek().text == L"<" || Peek().text == L">" ||
+                           Peek().text == L"<=" || Peek().text == L">=" ||
+                           Peek().text == L"==" || Peek().text == L"!=" ||
+                           Peek().text == L"===" || Peek().text == L"!==" ||
+                           Peek().text == L"|" || Peek().text == L"&" ||
+                           Peek().text == L"^" || Peek().text == L"<<" ||
+                           Peek().text == L">>")))
+                    {
+                        p = saveR;
+                        break;
+                    }
+                    bElseParenClosed = true;
+                    wstring op = Next().text;
+                    SkipNL();
+                    PNode rhs;
+                    if (IsPunct(L"("))
+                    {
+                        p++;
+                        rhs = ParseExpr();
+                        SkipNL();
+                        Expect(L")");
+                    }
+                    else
+                        rhs = ParseExpr();
+                    PNode bin = New(Node::Bin);
+                    bin->str = op;
+                    bin->a = cond;
+                    bin->b = rhs;
+                    cond = bin;
+                    SkipNL();
+                }
+                if (bElseParen && !bElseParenClosed)
+                {
+                    Expect(L")");
+                    SkipNL();
+                    while (Peek().t == TPunct &&
+                          (Peek().text == L"&&" || Peek().text == L"||" ||
+                           Peek().text == L"<" || Peek().text == L">" ||
+                           Peek().text == L"<=" || Peek().text == L">=" ||
+                           Peek().text == L"==" || Peek().text == L"!=" ||
+                           Peek().text == L"===" || Peek().text == L"!==" ||
+                           Peek().text == L"|" || Peek().text == L"&" ||
+                           Peek().text == L"^" || Peek().text == L"<<" ||
+                           Peek().text == L">>"))
+                    {
+                        wstring op = Next().text;
+                        SkipNL();
+                        PNode rhs;
+                        if (IsPunct(L"("))
+                        {
+                            p++;
+                            rhs = ParseExpr();
+                            SkipNL();
+                            Expect(L")");
+                        }
+                        else
+                            rhs = ParseExpr();
+                        PNode bin = New(Node::Bin);
+                        bin->str = op;
+                        bin->a = cond;
+                        bin->b = rhs;
+                        cond = bin;
+                        SkipNL();
+                    }
+                }
+                n->c->list.push_back(cond);
                 n->c->list.push_back(ParseBody());
                 while (EatPunct(L";")) {}
                 SkipNL();
@@ -1667,11 +1740,12 @@ namespace NodioVM
                     bInAssignLhs = false;
                     m->b = ParseExpr();
                     bInAssignLhs = bOldLhs;
+                    if (getenv("NODIO_PARSER_DEBUG"))
+                        fwprintf(stderr, L"[DEBUG 1748] peek=%s p=%d srcLine=%d\n", Peek().text.c_str(), (int)p, (int)__LINE__);
                     Expect(L"]");
                     e = m;
                 }
-                else if (IsPunct(L"[") && Peek(1).t == TPunct &&
-                         Peek(1).text == L"[")
+                else if (IsPunct(L"[") && Peek(1).t == TPunct && Peek(1).text == L"[" && !Peek(1).bLeadingSpace)
                 {
                     // aardio t[["k"]] — direct-key index, skips metatables
                     p += 2;
@@ -1714,7 +1788,29 @@ namespace NodioVM
                     m->a = e;
                     bool bOldLhs = bInAssignLhs;
                     bInAssignLhs = false;
-                    m->b = ParseExpr();
+                    PNode firstIdx = ParseExpr();
+                    if (IsPunct(L","))
+                    {
+                        PNode arr = New(Node::TableCtor);
+                        int nArr = 0;
+                        PNode k1 = New(Node::Num);
+                        k1->num = ++nArr;
+                        arr->list.push_back(k1);
+                        arr->list.push_back(firstIdx);
+                        while (IsPunct(L","))
+                        {
+                            p++;
+                            PNode ki = New(Node::Num);
+                            ki->num = ++nArr;
+                            arr->list.push_back(ki);
+                            arr->list.push_back(ParseExpr());
+                        }
+                        m->b = arr;
+                    }
+                    else
+                    {
+                        m->b = firstIdx;
+                    }
                     bInAssignLhs = bOldLhs;
                     Expect(L"]");
                     e = m;
@@ -2084,7 +2180,7 @@ namespace NodioVM
                     n->list.push_back(kN);
                     n->list.push_back(ParseExpr());
                     SkipNL();
-                    EatPunct(L",");
+                    while (EatPunct(L",") || EatPunct(L";")) { SkipNL(); }
                 }
                 SkipNL();
                 Expect(L"]");
@@ -2454,11 +2550,12 @@ namespace NodioVM
                     bInAssignLhs = false;
                     m->b = ParseExpr();
                     bInAssignLhs = bOldLhs;
+                    if (getenv("NODIO_PARSER_DEBUG"))
+                        fwprintf(stderr, L"[DEBUG 1748] peek=%s p=%d srcLine=%d\n", Peek().text.c_str(), (int)p, (int)__LINE__);
                     Expect(L"]");
                     e = m;
                 }
-                else if (IsPunct(L"[") && Peek(1).t == TPunct &&
-                         Peek(1).text == L"[")
+                else if (IsPunct(L"[") && Peek(1).t == TPunct && Peek(1).text == L"[" && !Peek(1).bLeadingSpace)
                 {
                     // aardio t[["k"]] — direct-key index, skips metatables
                     p += 2;
@@ -2501,7 +2598,29 @@ namespace NodioVM
                     m->a = e;
                     bool bOldLhs = bInAssignLhs;
                     bInAssignLhs = false;
-                    m->b = ParseExpr();
+                    PNode firstIdx = ParseExpr();
+                    if (IsPunct(L","))
+                    {
+                        PNode arr = New(Node::TableCtor);
+                        int nArr = 0;
+                        PNode k1 = New(Node::Num);
+                        k1->num = ++nArr;
+                        arr->list.push_back(k1);
+                        arr->list.push_back(firstIdx);
+                        while (IsPunct(L","))
+                        {
+                            p++;
+                            PNode ki = New(Node::Num);
+                            ki->num = ++nArr;
+                            arr->list.push_back(ki);
+                            arr->list.push_back(ParseExpr());
+                        }
+                        m->b = arr;
+                    }
+                    else
+                    {
+                        m->b = firstIdx;
+                    }
                     bInAssignLhs = bOldLhs;
                     Expect(L"]");
                     e = m;

@@ -25,9 +25,107 @@ namespace
         auto w = std::make_shared<Table>();
         w->map[L"_object"] = Value::Pointer_((void*)pd);
         w->map[L"_isComObject"] = Value::Bool_(true);
+        static const GUID IID_IDispatchableObject =
+            { 0x7C856F49, 0x0310, 0x40F6, { 0xA1, 0xF2, 0xB7, 0xBB, 0xB4, 0xC4, 0x8F, 0x30 } };
+        static const IID IID_ClrObject =
+            { 0x65074f7f, 0x63c0, 0x304e, { 0xaf, 0x0a, 0xd5, 0x17, 0x41, 0xcb, 0x4a, 0x8d } };
+        IUnknown* pDispObj = nullptr;
+        IUnknown* pClr = nullptr;
+        if (SUCCEEDED(pd->QueryInterface(IID_IDispatchableObject, (void**)&pDispObj)) && pDispObj)
+        {
+            pDispObj->Release();
+            w->map[L"_isNetObject"] = Value::Num_(2);
+        }
+        else if (SUCCEEDED(pd->QueryInterface(IID_ClrObject, (void**)&pClr)) && pClr)
+        {
+            pClr->Release();
+            w->map[L"_isNetObject"] = Value::Num_(1);
+        }
         w->map[L"_meta"] = Value::Table_(
             std::shared_ptr<Table>(ComMeta(), [](Table*) {}));
         return Value::Table_(w);
+    }
+
+    // ---------- Forward Declarations ----------
+    static void VariantFromValue(const Value& v, VARIANT& out, wstring* pErr);
+
+    static SAFEARRAY* CreateSafeArrayFromVector(const vector<Value>& arr, VARTYPE forcedVt)
+    {
+        VARTYPE vt = forcedVt;
+        if (vt == VT_EMPTY || vt == 0 || vt == 0xFFFF)
+        {
+            bool allNum = !arr.empty();
+            bool allStr = !arr.empty();
+            for (const auto& item : arr)
+            {
+                if (item.t != Value::Num) allNum = false;
+                if (item.t != Value::Str) allStr = false;
+            }
+            if (allNum) vt = VT_R8;
+            else if (allStr) vt = VT_BSTR;
+            else vt = VT_VARIANT;
+        }
+
+        SAFEARRAYBOUND rgsabound[1];
+        rgsabound[0].lLbound = 0;
+        rgsabound[0].cElements = (ULONG)arr.size();
+        SAFEARRAY* psa = SafeArrayCreate(vt, 1, rgsabound);
+        if (!psa) return nullptr;
+
+        for (LONG i = 0; i < (LONG)arr.size(); ++i)
+        {
+            const Value& item = arr[i];
+            if (vt == VT_R8)
+            {
+                double d = BNum(item);
+                SafeArrayPutElement(psa, &i, &d);
+            }
+            else if (vt == VT_BSTR)
+            {
+                wstring ws = BStr(item);
+                BSTR bs = SysAllocStringLen(ws.c_str(), (UINT)ws.size());
+                SafeArrayPutElement(psa, &i, bs);
+                SysFreeString(bs);
+            }
+            else if (vt == VT_VARIANT)
+            {
+                VARIANT var;
+                VariantInit(&var);
+                VariantFromValue(item, var, nullptr);
+                SafeArrayPutElement(psa, &i, &var);
+                VariantClear(&var);
+            }
+            else
+            {
+                VARIANT var;
+                VariantInit(&var);
+                VariantFromValue(item, var, nullptr);
+                VARIANT conv;
+                VariantInit(&conv);
+                if (SUCCEEDED(VariantChangeType(&conv, &var, 0, vt)))
+                {
+                    if (vt == VT_I4 || vt == VT_UI4 || vt == VT_INT || vt == VT_UINT)
+                        SafeArrayPutElement(psa, &i, &conv.lVal);
+                    else if (vt == VT_I2 || vt == VT_UI2)
+                        SafeArrayPutElement(psa, &i, &conv.iVal);
+                    else if (vt == VT_I1 || vt == VT_UI1)
+                        SafeArrayPutElement(psa, &i, &conv.bVal);
+                    else if (vt == VT_R4)
+                        SafeArrayPutElement(psa, &i, &conv.fltVal);
+                    else if (vt == VT_R8)
+                        SafeArrayPutElement(psa, &i, &conv.dblVal);
+                    else if (vt == VT_BSTR)
+                        SafeArrayPutElement(psa, &i, conv.bstrVal);
+                    else if (vt == VT_DISPATCH)
+                        SafeArrayPutElement(psa, &i, conv.pdispVal);
+                    else if (vt == VT_UNKNOWN)
+                        SafeArrayPutElement(psa, &i, conv.punkVal);
+                    VariantClear(&conv);
+                }
+                VariantClear(&var);
+            }
+        }
+        return psa;
     }
 
     // ---------- VARIANT -> Value ----------
@@ -54,6 +152,31 @@ namespace
             return Value::Num_((double)in.fltVal);
         case VT_R8:
             return Value::Num_(in.dblVal);
+        case VT_DATE:
+        {
+            SYSTEMTIME st;
+            if (VariantTimeToSystemTime(in.date, &st))
+            {
+                Value vtCtor = g_interpCurrent ? g_interpCurrent->globals.vars[L"time"] : Value();
+                if (vtCtor.t == Value::TableT && vtCtor.tab)
+                {
+                    auto icl = vtCtor.tab->map.find(L"_call");
+                    if (icl != vtCtor.tab->map.end() && icl->second.native)
+                    {
+                        auto inst = std::make_shared<Table>();
+                        inst->map[L"year"] = Value::Num_(st.wYear);
+                        inst->map[L"month"] = Value::Num_(st.wMonth);
+                        inst->map[L"day"] = Value::Num_(st.wDay);
+                        inst->map[L"hour"] = Value::Num_(st.wHour);
+                        inst->map[L"minute"] = Value::Num_(st.wMinute);
+                        inst->map[L"second"] = Value::Num_(st.wSecond);
+                        vector<Value> args = { Value::Table_(inst) };
+                        return icl->second.native(args);
+                    }
+                }
+            }
+            return Value::Num_(in.date);
+        }
         case VT_BSTR:
             return Value::Str_(BStrToW(in.bstrVal));
         case VT_DISPATCH:
@@ -108,6 +231,136 @@ namespace
             return Value::Num_((double)(long)in.lVal);
         default:
         {
+            if (in.vt & VT_ARRAY)
+            {
+                SAFEARRAY* psa = in.parray;
+                if (!psa) return Value::Pointer_(nullptr);
+                VARTYPE vtElem = (in.vt & ~VT_ARRAY);
+                if (vtElem == VT_UI1 || vtElem == VT_I1)
+                {
+                    LONG lBound = 0, uBound = -1;
+                    SafeArrayGetLBound(psa, 1, &lBound);
+                    SafeArrayGetUBound(psa, 1, &uBound);
+                    LONG count = (uBound >= lBound) ? (uBound - lBound + 1) : 0;
+                    if (count <= 0) return Value::Pointer_(nullptr);
+                    void* pData = nullptr;
+                    if (SUCCEEDED(SafeArrayAccessData(psa, &pData)) && pData)
+                    {
+                        void* pBuf = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count);
+                        if (pBuf)
+                        {
+                            memcpy(pBuf, pData, (size_t)count);
+                            RegisterBuffer(pBuf, (size_t)count);
+                        }
+                        SafeArrayUnaccessData(psa);
+                        return Value::Pointer_(pBuf);
+                    }
+                }
+                else
+                {
+                    LONG lBound = 0, uBound = -1;
+                    SafeArrayGetLBound(psa, 1, &lBound);
+                    SafeArrayGetUBound(psa, 1, &uBound);
+                    auto tb = std::make_shared<Table>();
+                    for (LONG idx = lBound; idx <= uBound; ++idx)
+                    {
+                        if (vtElem == VT_R8)
+                        {
+                            double d = 0;
+                            SafeArrayGetElement(psa, &idx, &d);
+                            tb->arr.push_back(Value::Num_(d));
+                        }
+                        else if (vtElem == VT_R4)
+                        {
+                            float f = 0;
+                            SafeArrayGetElement(psa, &idx, &f);
+                            tb->arr.push_back(Value::Num_((double)f));
+                        }
+                        else if (vtElem == VT_I4 || vtElem == VT_INT)
+                        {
+                            LONG l = 0;
+                            SafeArrayGetElement(psa, &idx, &l);
+                            tb->arr.push_back(Value::Num_((double)l));
+                        }
+                        else if (vtElem == VT_UI4 || vtElem == VT_UINT)
+                        {
+                            ULONG ul = 0;
+                            SafeArrayGetElement(psa, &idx, &ul);
+                            tb->arr.push_back(Value::Num_((double)ul));
+                        }
+                        else if (vtElem == VT_I2)
+                        {
+                            SHORT s = 0;
+                            SafeArrayGetElement(psa, &idx, &s);
+                            tb->arr.push_back(Value::Num_((double)s));
+                        }
+                        else if (vtElem == VT_UI2)
+                        {
+                            USHORT us = 0;
+                            SafeArrayGetElement(psa, &idx, &us);
+                            tb->arr.push_back(Value::Num_((double)us));
+                        }
+                        else if (vtElem == VT_BSTR)
+                        {
+                            BSTR bs = nullptr;
+                            SafeArrayGetElement(psa, &idx, &bs);
+                            if (bs)
+                            {
+                                tb->arr.push_back(Value::Str_(BStrToW(bs)));
+                                SysFreeString(bs);
+                            }
+                            else
+                            {
+                                tb->arr.push_back(Value::Str_(L""));
+                            }
+                        }
+                        else if (vtElem == VT_DISPATCH)
+                        {
+                            IDispatch* pDisp = nullptr;
+                            SafeArrayGetElement(psa, &idx, &pDisp);
+                            if (pDisp)
+                                tb->arr.push_back(WrapDispatch(pDisp));
+                            else
+                                tb->arr.push_back(Value());
+                        }
+                        else if (vtElem == VT_UNKNOWN)
+                        {
+                            IUnknown* pUnk = nullptr;
+                            SafeArrayGetElement(psa, &idx, &pUnk);
+                            if (pUnk)
+                            {
+                                IDispatch* pDisp = nullptr;
+                                if (SUCCEEDED(pUnk->QueryInterface(IID_IDispatch, (void**)&pDisp)) && pDisp)
+                                {
+                                    tb->arr.push_back(WrapDispatch(pDisp));
+                                    pUnk->Release();
+                                }
+                                else
+                                {
+                                    tb->arr.push_back(WrapRawThunk(pUnk));
+                                }
+                            }
+                            else
+                            {
+                                tb->arr.push_back(Value());
+                            }
+                        }
+                        else if (vtElem == VT_VARIANT)
+                        {
+                            VARIANT var;
+                            VariantInit(&var);
+                            SafeArrayGetElement(psa, &idx, &var);
+                            tb->arr.push_back(VariantToValue(var, nullptr));
+                            VariantClear(&var);
+                        }
+                        else
+                        {
+                            tb->arr.push_back(Value());
+                        }
+                    }
+                    return Value::Table_(tb);
+                }
+            }
             VARIANT tmp;
             VariantInit(&tmp);
             if (SUCCEEDED(VariantChangeType(&tmp, &in, 0, VT_BSTR)))
@@ -125,6 +378,78 @@ namespace
     }
 
     // ---------- Value -> VARIANT ----------
+    class AardioCallbackDispatch : public IDispatch
+    {
+        LONG m_ref{ 1 };
+        Value m_fn;
+    public:
+        AardioCallbackDispatch(const Value& fn) : m_fn(fn) {}
+
+        STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
+        {
+            if (!ppv) return E_POINTER;
+            if (riid == IID_IUnknown || riid == IID_IDispatch)
+            {
+                *ppv = static_cast<IDispatch*>(this);
+                AddRef();
+                return S_OK;
+            }
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+        STDMETHODIMP_(ULONG) AddRef() override
+        {
+            return InterlockedIncrement(&m_ref);
+        }
+        STDMETHODIMP_(ULONG) Release() override
+        {
+            ULONG r = InterlockedDecrement(&m_ref);
+            if (r == 0) delete this;
+            return r;
+        }
+
+        STDMETHODIMP GetTypeInfoCount(UINT* pctinfo) override
+        {
+            if (pctinfo) *pctinfo = 0;
+            return S_OK;
+        }
+        STDMETHODIMP GetTypeInfo(UINT, LCID, ITypeInfo** ppti) override
+        {
+            if (ppti) *ppti = nullptr;
+            return E_NOTIMPL;
+        }
+        STDMETHODIMP GetIDsOfNames(REFIID, LPOLESTR*, UINT, LCID, DISPID* prgdispids) override
+        {
+            if (prgdispids) *prgdispids = 0;
+            return S_OK;
+        }
+        STDMETHODIMP Invoke(DISPID, REFIID, LCID, WORD,
+                            DISPPARAMS* pDispParams, VARIANT* pVarResult,
+                            EXCEPINFO*, UINT*) override
+        {
+            std::vector<Value> args;
+            if (pDispParams && pDispParams->cArgs > 0)
+            {
+                args.resize(pDispParams->cArgs);
+                for (UINT i = 0; i < pDispParams->cArgs; i++)
+                {
+                    VARIANT& v = pDispParams->rgvarg[pDispParams->cArgs - 1 - i];
+                    wstring err;
+                    args[i] = VariantToValue(v, &err);
+                }
+            }
+            Interp* it = g_interpCurrent;
+            if (!it) return E_FAIL;
+            Value ret = it->CallOwner(m_fn, Value(), args);
+            if (pVarResult)
+            {
+                wstring err;
+                VariantFromValue(ret, *pVarResult, &err);
+            }
+            return S_OK;
+        }
+    };
+
     static void VariantFromValue(const Value& v, VARIANT& out, wstring* pErr)
     {
         VariantInit(&out);
@@ -137,9 +462,25 @@ namespace
             out.vt = VT_BOOL;
             out.boolVal = v.b ? VARIANT_TRUE : VARIANT_FALSE;
             break;
+        case Value::Func:
+        case Value::Class:
+        {
+            auto* pCb = new AardioCallbackDispatch(v);
+            out.vt = VT_DISPATCH;
+            out.pdispVal = pCb;
+            break;
+        }
         case Value::Num:
-            out.vt = VT_R8;
-            out.dblVal = v.n;
+            if (v.n == (long long)v.n && v.n >= -2147483648.0 && v.n <= 2147483647.0)
+            {
+                out.vt = VT_I4;
+                out.lVal = (LONG)(long long)v.n;
+            }
+            else
+            {
+                out.vt = VT_R8;
+                out.dblVal = v.n;
+            }
             break;
         case Value::Str:
             out.vt = VT_BSTR;
@@ -148,33 +489,165 @@ namespace
         case Value::TableT:
             if (v.tab)
             {
-                auto io = v.tab->map.find(L"_object");
-                if (io != v.tab->map.end() &&
-                    io->second.t == Value::Pointer)
+                // Follow chain of _object / _boundDispatch / _dotNetObject
+                Table* curTab = v.tab.get();
+                bool bFoundDisp = false;
+                for (int depth = 0; depth < 5 && curTab; ++depth)
                 {
-                    out.vt = VT_DISPATCH;
-                    out.pdispVal =
-                        reinterpret_cast<IDispatch*>(io->second.ptr);
-                    out.pdispVal->AddRef();
+                    auto io = curTab->map.find(L"_object");
+                    if (io != curTab->map.end() && io->second.t == Value::Pointer && io->second.ptr)
+                    {
+                        out.vt = VT_DISPATCH;
+                        out.pdispVal = reinterpret_cast<IDispatch*>(io->second.ptr);
+                        out.pdispVal->AddRef();
+                        bFoundDisp = true;
+                        break;
+                    }
+                    auto ib = curTab->map.find(L"_boundDispatch");
+                    if (ib != curTab->map.end() && ib->second.t == Value::Pointer && ib->second.ptr)
+                    {
+                        out.vt = VT_DISPATCH;
+                        out.pdispVal = reinterpret_cast<IDispatch*>(ib->second.ptr);
+                        out.pdispVal->AddRef();
+                        bFoundDisp = true;
+                        break;
+                    }
+                    auto idno = curTab->map.find(L"_dotNetObject");
+                    if (idno != curTab->map.end())
+                    {
+                        if (idno->second.t == Value::Pointer && idno->second.ptr)
+                        {
+                            out.vt = VT_DISPATCH;
+                            out.pdispVal = reinterpret_cast<IDispatch*>(idno->second.ptr);
+                            out.pdispVal->AddRef();
+                            bFoundDisp = true;
+                            break;
+                        }
+                        if (idno->second.t == Value::TableT && idno->second.tab)
+                        {
+                            curTab = idno->second.tab.get();
+                            continue;
+                        }
+                    }
                     break;
                 }
-                auto ib = v.tab->map.find(L"_boundDispatch");
-                if (ib != v.tab->map.end() &&
-                    ib->second.t == Value::Pointer)
+                if (bFoundDisp) break;
+
+                // Aardio time struct -> VT_DATE
+                auto is = v.tab->map.find(L"_struct");
+                bool bIsTime = false;
+                if (is != v.tab->map.end() && is->second.t == Value::Str &&
+                    is->second.s.find(L"WORD year;") != wstring::npos)
                 {
-                    out.vt = VT_DISPATCH;
-                    out.pdispVal =
-                        reinterpret_cast<IDispatch*>(ib->second.ptr);
-                    out.pdispVal->AddRef();
-                    break;
+                    bIsTime = true;
+                }
+                else if (v.tab->map.find(L"year") != v.tab->map.end() &&
+                         v.tab->map.find(L"month") != v.tab->map.end() &&
+                         v.tab->map.find(L"day") != v.tab->map.end())
+                {
+                    bIsTime = true;
+                }
+                if (bIsTime)
+                {
+                    SYSTEMTIME st{};
+                    st.wYear = (WORD)BNum(v.tab->map[L"year"]);
+                    st.wMonth = (WORD)BNum(v.tab->map[L"month"]);
+                    st.wDay = (WORD)BNum(v.tab->map[L"day"]);
+                    st.wDayOfWeek = (WORD)BNum(v.tab->map[L"dayofweek"]);
+                    st.wHour = (WORD)BNum(v.tab->map[L"hour"]);
+                    st.wMinute = (WORD)BNum(v.tab->map[L"minute"]);
+                    st.wSecond = (WORD)BNum(v.tab->map[L"second"]);
+                    st.wMilliseconds = (WORD)BNum(v.tab->map[L"milliseconds"]);
+                    double dVal = 0;
+                    if (SystemTimeToVariantTime(&st, &dVal))
+                    {
+                        out.vt = VT_DATE;
+                        out.date = dVal;
+                        break;
+                    }
+                }
+
+                auto ivt = v.tab->map.find(L"vt");
+                auto ival = v.tab->map.find(L"value");
+                if (ivt != v.tab->map.end() && ival != v.tab->map.end() && ivt->second.t == Value::Num)
+                {
+                    VARTYPE reqVt = (VARTYPE)ivt->second.n;
+                    if (ival->second.t == Value::TableT && ival->second.tab && !ival->second.tab->arr.empty())
+                    {
+                        SAFEARRAY* psa = CreateSafeArrayFromVector(ival->second.tab->arr, reqVt & ~VT_ARRAY);
+                        if (psa)
+                        {
+                            out.vt = VT_ARRAY | (reqVt & ~VT_ARRAY ? (reqVt & ~VT_ARRAY) : VT_VARIANT);
+                            out.parray = psa;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        VARIANT raw;
+                        VariantInit(&raw);
+                        VariantFromValue(ival->second, raw, pErr);
+                        if (reqVt == VT_EMPTY || reqVt == raw.vt)
+                        {
+                            out = raw;
+                            break;
+                        }
+                        if (SUCCEEDED(VariantChangeType(&out, &raw, 0, reqVt)))
+                        {
+                            VariantClear(&raw);
+                            break;
+                        }
+                        VariantClear(&raw);
+                    }
+                }
+                if (!v.tab->arr.empty())
+                {
+                    SAFEARRAY* psa = CreateSafeArrayFromVector(v.tab->arr, VT_EMPTY);
+                    if (psa)
+                    {
+                        VARTYPE vtElem = VT_VARIANT;
+                        SafeArrayGetVartype(psa, &vtElem);
+                        out.vt = VT_ARRAY | vtElem;
+                        out.parray = psa;
+                        break;
+                    }
                 }
             }
             if (pErr && pErr->empty())
                 *pErr = L"com: 不支持的参数类型(table)";
             break;
+        case Value::Pointer:
+        {
+            if (!v.ptr)
+            {
+                out.vt = VT_BYREF | VT_UI1;
+                out.byref = nullptr;
+                break;
+            }
+            size_t bufSize = GetBufferSize(v.ptr);
+            if (bufSize > 0)
+            {
+                SAFEARRAY* psa = SafeArrayCreateVector(VT_UI1, 0, (ULONG)bufSize);
+                if (psa)
+                {
+                    void* pData = nullptr;
+                    if (SUCCEEDED(SafeArrayAccessData(psa, &pData)) && pData)
+                    {
+                        memcpy(pData, v.ptr, bufSize);
+                        SafeArrayUnaccessData(psa);
+                    }
+                    out.vt = VT_ARRAY | VT_UI1;
+                    out.parray = psa;
+                    break;
+                }
+            }
+            out.vt = VT_INT;
+            out.intVal = (INT)(INT_PTR)v.ptr;
+            break;
+        }
         default:
             if (pErr && pErr->empty())
-                *pErr = L"com: 不支持的参数类型";
+                *pErr = L"com: 不支持的参数类型 t=" + std::to_wstring((int)v.t);
             break;
         }
     }
@@ -185,37 +658,63 @@ namespace
     // vtable but refuse QI(IID_IDispatch) with E_NOINTERFACE. For those
     // we call GetIDsOfNames (slot 5) / Invoke (slot 6) directly through
     // the vtable.
+    static __int64 SafeCallGetIds(void* fn, void* punk, LPOLESTR nm, DISPID* pDispid)
+    {
+        typedef __int64 (__stdcall *GetIdsFn)(void*, const IID*, LPOLESTR*,
+                                              UINT, ULONG, DISPID*);
+        __try
+        {
+            return ((GetIdsFn)fn)(punk, &IID_NULL, &nm, 1, LOCALE_USER_DEFAULT, pDispid);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return E_FAIL;
+        }
+    }
+
+    static HRESULT SafeCallGetTI(void* fn, void* punk, ITypeInfo** ppTI)
+    {
+        typedef HRESULT (__stdcall *GetTIFn)(void*, UINT, LCID, ITypeInfo**);
+        __try
+        {
+            return fn ? ((GetTIFn)fn)(punk, 0, LOCALE_USER_DEFAULT, ppTI) : E_FAIL;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return E_FAIL;
+        }
+    }
+
     static Value RawDispatchGet(void* punk, const wstring& name,
                                 vector<Value>& args, WORD wFlags,
                                 wstring* pErr)
     {
         void** vtbl = *reinterpret_cast<void***>(punk);
         // slot 5: GetIDsOfNames(riid, rgszNames*, cNames, lcid, rgsid*)
-        typedef __int64 (__stdcall *GetIdsFn)(void*, const IID*, LPOLESTR*,
-                                              UINT, ULONG, DISPID*);
-        GetIdsFn fnIds = nullptr;
+        void* fnIds = nullptr;
         memcpy(&fnIds, &vtbl[5], sizeof(fnIds));
         DISPID dispid = -1;
         LPOLESTR nm = const_cast<LPOLESTR>(name.c_str());
-        __int64 hr = fnIds(punk, &IID_NULL, &nm, 1, LOCALE_USER_DEFAULT,
-                           &dispid);
+        __int64 hr = SafeCallGetIds(fnIds, punk, nm, &dispid);
         if (getenv("NODIO_TRACE"))
+        {
             fwprintf(stderr, L"[raw] GetIDsOfNames(%s) hr=0x%08llX id=%d\n",
                      name.c_str(), (unsigned long long)hr, (int)dispid);
+            for (int si = 0; si < 25; si++)
+                fwprintf(stderr, L"  punk vtbl[%d] = %p\n", si, vtbl[si]);
+        }
         if (hr < 0 || dispid < 0)
         {
             // half-implemented CCW dispatch (E_NOTIMPL): route through
             // ITypeInfo (slot 4: GetTypeInfo) and ITypeInfo::Invoke,
             // the standard late-binding fallback for CLR CCWs
-            typedef __int64 (__stdcall *GetTIFn)(void*, UINT, LCID,
-                                                 ITypeInfo**, HRESULT*);
-            GetTIFn fnTI = nullptr;
+            void* fnTI = nullptr;
             memcpy(&fnTI, &vtbl[4], sizeof(fnTI));
             ITypeInfo* pTI = nullptr;
-            HRESULT hrTI = 0;
-            if (SUCCEEDED(fnTI(punk, 0, LOCALE_USER_DEFAULT, &pTI,
-                               &hrTI)) &&
-                pTI)
+            HRESULT hrCallTI = SafeCallGetTI(fnTI, punk, &pTI);
+            if (getenv("NODIO_TRACE"))
+                fwprintf(stderr, L"[raw] fnTI hr=0x%08X pTI=%p\n", (unsigned int)hrCallTI, (void*)pTI);
+            if (SUCCEEDED(hrCallTI) && pTI)
             {
                 // FUNCDESC walk: find memid by name
                 TYPEATTR* pAttr = nullptr;
@@ -246,59 +745,116 @@ namespace
                     }
                     pTI->ReleaseTypeAttr(pAttr);
                 }
+                pTI->Release();
                 if (dispid < 0)
                 {
-                    pTI->Release();
-                    if (pErr && pErr->empty())
-                        *pErr = L"dotNet: 成员不存在 " + name;
-                    return Value();
+                    // Fallback to _Object below
                 }
-                // invoke via ITypeInfo::Invoke
-                DISPPARAMS dp2{};
-                vector<VARIANT> vars2;
-                if (!args.empty())
+                else
                 {
-                    vars2.resize(args.size());
-                    dp2.cArgs = (int)args.size();
-                    dp2.rgvarg = vars2.data();
-                    for (size_t i = 0; i < args.size(); i++)
-                        VariantFromValue(args[args.size() - 1 - i],
-                                         vars2[i], pErr);
-                    if (pErr && !pErr->empty())
-                        return Value();
-                }
-                EXCEPINFO ex2{};
-                UINT argErr2 = 0;
-                VARIANT ret2;
-                VariantInit(&ret2);
-                UINT argcArgs = (UINT)dp2.cArgs;
-                HRESULT hrInv = pTI->Invoke(punk, dispid, wFlags, &dp2,
-                                            &ret2, &ex2, &argcArgs);
-                for (auto& v : vars2)
-                    VariantClear(&v);
-                pTI->Release();
-                if (FAILED(hrInv))
-                {
-                    if (pErr)
+                    // invoke via ITypeInfo::Invoke
+                    DISPPARAMS dp2{};
+                    vector<VARIANT> vars2;
+                    if (!args.empty())
                     {
-                        wchar_t buf[16];
-                        swprintf(buf, 16, L"%08lX", (unsigned long)hrInv);
-                        *pErr = wstring(L"dotNet: TypeInvoke 失败 hr=0x") +
-                                buf;
+                        vars2.resize(args.size());
+                        dp2.cArgs = (int)args.size();
+                        dp2.rgvarg = vars2.data();
+                        for (size_t i = 0; i < args.size(); i++)
+                            VariantFromValue(args[args.size() - 1 - i],
+                                             vars2[i], pErr);
+                        if (pErr && !pErr->empty())
+                            return Value();
                     }
+                    EXCEPINFO ex2{};
+                    UINT argErr2 = 0;
+                    VARIANT ret2;
+                    VariantInit(&ret2);
+                    UINT argcArgs = (UINT)dp2.cArgs;
+                    HRESULT hrInv = pTI->Invoke(punk, dispid, wFlags, &dp2,
+                                                &ret2, &ex2, &argcArgs);
+                    for (auto& v : vars2)
+                        VariantClear(&v);
+                    if (FAILED(hrInv))
+                    {
+                        if (pErr)
+                        {
+                            wchar_t buf[16];
+                            swprintf(buf, 16, L"%08lX", (unsigned long)hrInv);
+                            *pErr = wstring(L"dotNet: TypeInvoke 失败 hr=0x") +
+                                    buf;
+                        }
+                        VariantClear(&ret2);
+                        return Value();
+                    }
+                    Value r = VariantToValue(ret2, pErr);
                     VariantClear(&ret2);
-                    return Value();
+                    return r;
                 }
-                Value r = VariantToValue(ret2, pErr);
-                VariantClear(&ret2);
-                return r;
             }
+
+            // CLR CCW fallback: check if object implements _Object {65074f7f-63c0-304e-af0a-d51741cb4a8d}
+            static const IID IID_ClrObject = { 0x65074f7f, 0x63c0, 0x304e, { 0xaf, 0x0a, 0xd5, 0x17, 0x41, 0xcb, 0x4a, 0x8d } };
+            IUnknown* pClrObj = nullptr;
+            auto* pUnk = reinterpret_cast<IUnknown*>(punk);
+            if (SUCCEEDED(pUnk->QueryInterface(IID_ClrObject, (void**)&pClrObj)) && pClrObj)
+            {
+                void** objVtbl = *reinterpret_cast<void***>(pClrObj);
+                // slot 7: ToString(BSTR* pRet)
+                typedef HRESULT (__stdcall *ToStringFn)(void*, BSTR*);
+                ToStringFn fnTS = nullptr;
+                memcpy(&fnTS, &objVtbl[7], sizeof(fnTS));
+                BSTR bstr = nullptr;
+                HRESULT hrTS = fnTS ? fnTS(pClrObj, &bstr) : E_FAIL;
+                wstring strVal = (SUCCEEDED(hrTS) && bstr) ? wstring(bstr) : L"";
+                if (bstr)
+                    SysFreeString(bstr);
+                pClrObj->Release();
+
+                if (!strVal.empty())
+                {
+                    if (name == L"ToString")
+                    {
+                        return NF([strVal](vector<Value>&) {
+                            return Value::Str_(strVal);
+                        });
+                    }
+                    if (name == L"FullName")
+                        return Value::Str_(strVal);
+                    if (name == L"Name")
+                    {
+                        size_t comma = strVal.find(L',');
+                        wstring simpleName = (comma != wstring::npos) ? strVal.substr(0, comma) : strVal;
+                        return Value::Str_(simpleName);
+                    }
+                    if (name == L"Version")
+                    {
+                        size_t pos = strVal.find(L"Version=");
+                        if (pos != wstring::npos)
+                        {
+                            size_t start = pos + 8;
+                            size_t end = strVal.find(L',', start);
+                            wstring verStr = (end != wstring::npos) ? strVal.substr(start, end - start) : strVal.substr(start);
+                            auto verTab = std::make_shared<Table>();
+                            verTab->map[L"ToString"] = NF([verStr](vector<Value>&) {
+                                return Value::Str_(verStr);
+                            });
+                            verTab->map[L"_tostring"] = NF([verStr](vector<Value>&) {
+                                return Value::Str_(verStr);
+                            });
+                            return Value::Table_(verTab);
+                        }
+                    }
+                }
+            }
+
             if (pErr && pErr->empty())
                 *pErr = L"dotNet: 成员不存在 " + name;
             return Value();
         }
         // slot 6: Invoke(dispid, riid, lcid, wFlags, dp, ret, ex, argErr)
         DISPPARAMS dp{};
+        DISPID dispidNamed = DISPID_PROPERTYPUT;
         vector<VARIANT> vars;
         if (!args.empty())
         {
@@ -309,6 +865,11 @@ namespace
                 VariantFromValue(args[args.size() - 1 - i], vars[i], pErr);
             if (pErr && !pErr->empty())
                 return Value();
+        }
+        if (wFlags & (DISPATCH_PROPERTYPUT | DISPATCH_PROPERTYPUTREF))
+        {
+            dp.cNamedArgs = 1;
+            dp.rgdispidNamedArgs = &dispidNamed;
         }
         EXCEPINFO ex{};
         UINT argErr = 0;
@@ -364,6 +925,15 @@ namespace
                     io->second.t != Value::Pointer)
                     return Value();
                 wstring key = BStr(a[0]);
+                bool bOwnerCall = (a.size() >= 2 && a[1].t == Value::Bool && a[1].b);
+                if (bOwnerCall)
+                {
+                    auto w = std::make_shared<Table>();
+                    w->map[L"_boundRawThunk"] = io->second;
+                    w->map[L"_boundName"] = Value::Str_(key);
+                    w->map[L"_meta"] = Value::Table_(s_meta);
+                    return Value::Table_(w);
+                }
                 if (getenv("NODIO_TRACE"))
                     fwprintf(stderr, L"[rawget] key=%s\n", key.c_str());
                 vector<Value> noArgs;
@@ -376,6 +946,18 @@ namespace
             s_meta->map[L"_call"] = NF([](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
                     return Value();
+                Interp* it = g_interpCurrent;
+                auto ib = a[0].tab->map.find(L"_boundRawThunk");
+                if (ib != a[0].tab->map.end() && ib->second.t == Value::Pointer)
+                {
+                    auto in = a[0].tab->map.find(L"_boundName");
+                    wstring key = (in != a[0].tab->map.end()) ? in->second.ToString() : L"";
+                    vector<Value> args(a.begin() + 1, a.end());
+                    return RawDispatchGet(ib->second.ptr, key, args,
+                                          DISPATCH_METHOD |
+                                              DISPATCH_PROPERTYGET,
+                                          it ? it->err : nullptr);
+                }
                 auto io = a[0].tab->map.find(L"_object");
                 if (io == a[0].tab->map.end() ||
                     io->second.t != Value::Pointer)
@@ -385,7 +967,6 @@ namespace
                     return Value();
                 wstring key = BStr(a[1]);
                 vector<Value> args(a.begin() + 2, a.end());
-                Interp* it = g_interpCurrent;
                 return RawDispatchGet(io->second.ptr, key, args,
                                       DISPATCH_METHOD |
                                           DISPATCH_PROPERTYGET,
@@ -413,6 +994,7 @@ namespace
                             vector<Value>& args, wstring* pErr)
     {
         DISPPARAMS dp{};
+        DISPID dispidNamed = DISPID_PROPERTYPUT;
         vector<VARIANT> vars;
         if (!args.empty())
         {
@@ -423,6 +1005,17 @@ namespace
                 VariantFromValue(args[args.size() - 1 - i], vars[i], pErr);
             if (pErr && !pErr->empty())
                 return Value();
+        }
+        if (getenv("NODIO_TRACE"))
+        {
+            fwprintf(stderr, L"[InvokeDisp] dispid=%ld cArgs=%d wFlags=0x%04X\n", (long)dispid, (int)dp.cArgs, (int)wFlags);
+            for (size_t i = 0; i < vars.size(); i++)
+                fwprintf(stderr, L"  arg[%d] vt=%d\n", (int)i, (int)vars[i].vt);
+        }
+        if (wFlags & (DISPATCH_PROPERTYPUT | DISPATCH_PROPERTYPUTREF))
+        {
+            dp.cNamedArgs = 1;
+            dp.rgdispidNamedArgs = &dispidNamed;
         }
         EXCEPINFO ex{};
         UINT argErr = 0;
@@ -484,19 +1077,38 @@ namespace
             // bound-member wrapper (callable) for methods, the property
             // value for pure gets
             s_meta->map[L"_get"] = NF([](vector<Value>& a) -> Value {
+                wstring key = (a.size() > 0) ? BStr(a[0]) : L"";
                 if (a.size() < 3 || a[2].t != Value::TableT || !a[2].tab)
                     return Value();
-                auto io = a[2].tab->map.find(L"_object");
-                if (io == a[2].tab->map.end() ||
+                Value targetObj = a[2];
+                auto io = targetObj.tab->map.find(L"_object");
+                if (io == targetObj.tab->map.end() ||
                     io->second.t != Value::Pointer)
                     return Value();
                 auto* pd = reinterpret_cast<IDispatch*>(io->second.ptr);
-                wstring key = BStr(a[0]);
                 DISPID dispid;
                 OLECHAR* name = const_cast<OLECHAR*>(key.c_str());
                 if (FAILED(pd->GetIDsOfNames(IID_NULL, &name, 1,
                                              LOCALE_USER_DEFAULT, &dispid)))
+                {
+                    // Official aardio COM: obj.getFoo / obj.setFoo gets the bound method
+                    // e.g. "getCompile" -> "Compile", "getReference" -> "Reference", "getInvokeObjectMember" -> "InvokeObjectMember"
+                    if (key.size() > 3 && (key.rfind(L"get", 0) == 0 || key.rfind(L"set", 0) == 0) && iswupper(key[3]))
+                    {
+                        wstring methodKey = key.substr(3);
+                        OLECHAR* mname = const_cast<OLECHAR*>(methodKey.c_str());
+                        if (SUCCEEDED(pd->GetIDsOfNames(IID_NULL, &mname, 1,
+                                                        LOCALE_USER_DEFAULT, &dispid)))
+                        {
+                            return WrapBoundMember(pd, dispid, methodKey);
+                        }
+                    }
                     return Value();
+                }
+                bool bOwnerCall = (a.size() >= 2 && a[1].t == Value::Bool && a[1].b);
+                if (bOwnerCall)
+                    return WrapBoundMember(pd, dispid, key);
+
                 wstring err;
                 vector<Value> noArgs;
                 Value v = InvokeDisp(pd, dispid, DISPATCH_PROPERTYGET | DISPATCH_METHOD,
@@ -510,17 +1122,22 @@ namespace
                 // official `asm.GetName().Name` chain works
                 bool bNetThunk = v.t == Value::TableT && v.tab &&
                                  v.tab->map.count(L"_isNetObject") > 0;
-                if (!err.empty() || v.t == Value::Null || bNetThunk)
+                if (!err.empty() || bNetThunk)
                     return WrapBoundMember(pd, dispid, key);
                 return v;
             });
 
-            // _set(k, v, owner) — property put
+            // _set(k, v, ownerAttr, owner) — property put
             s_meta->map[L"_set"] = NF([](vector<Value>& a) -> Value {
-                if (a.size() < 3 || a[2].t != Value::TableT || !a[2].tab)
+                Value targetObj;
+                if (a.size() >= 4 && a[3].t == Value::TableT && a[3].tab)
+                    targetObj = a[3];
+                else if (a.size() >= 3 && a[2].t == Value::TableT && a[2].tab)
+                    targetObj = a[2];
+                else
                     return Value();
-                auto io = a[2].tab->map.find(L"_object");
-                if (io == a[2].tab->map.end() ||
+                auto io = targetObj.tab->map.find(L"_object");
+                if (io == targetObj.tab->map.end() ||
                     io->second.t != Value::Pointer)
                     return Value();
                 auto* pd = reinterpret_cast<IDispatch*>(io->second.ptr);
@@ -559,6 +1176,10 @@ namespace
                     return Value();
                 auto* pd = reinterpret_cast<IDispatch*>(ib->second.ptr);
                 DISPID dispid = (DISPID)(INT_PTR)BNum(ii->second);
+                auto iname = a[0].tab->map.find(L"_boundName");
+                wstring bname = iname != a[0].tab->map.end() ? iname->second.ToString() : L"";
+                if (getenv("NODIO_TRACE"))
+                    fwprintf(stderr, L"[ComMeta._call] boundName=%s dispid=%ld cArgs=%d\n", bname.c_str(), (long)dispid, (int)(a.size() - 1));
                 vector<Value> args(a.begin() + 1, a.end());
                 wstring err;
                 Value r = InvokeDisp(pd, dispid, DISPATCH_METHOD | DISPATCH_PROPERTYGET,
@@ -649,12 +1270,15 @@ namespace
                                void* psa1, void* psa2, void** pOut)
     {
         typedef __int64 (__stdcall *LoadFn)(void*, void*, void*, void*);
+        typedef __int64 (__stdcall *Load3Fn)(void*, void*, void*);
         LoadFn fn = nullptr;
         memcpy(&fn, &target, sizeof(fn));
+        Load3Fn fn3 = nullptr;
+        memcpy(&fn3, &target, sizeof(fn3));
         __try {
             return bTwoArrays
                 ? fn(itf, psa1, psa2, pOut)
-                : fn(itf, psa1, pOut, nullptr);
+                : fn3(itf, psa1, pOut);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             return -1;
         }
@@ -988,28 +1612,156 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         return a[0];
     });
 
-    // com.IsNetObject(v) — true for wrapped .NET CCWs (used by
-    // dotNet.appDomain's object routing)
+    // com.IsNetObject(v) — 1 for .NET CCW, 2 for DispatchableObject, 0 otherwise
     com->map[L"IsNetObject"] = NF([](vector<Value>& a) -> Value {
         if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
-            return Value::Bool_(false);
-        return Value::Bool_(a[0].tab->map.count(L"_isNetObject") > 0);
+            return Value::Num_(0);
+        Table* t = a[0].tab.get();
+        if (t->map.count(L"_dotNetObject"))
+        {
+            auto id = t->map.find(L"_dotNetObject");
+            if (id != t->map.end() && id->second.t == Value::TableT && id->second.tab)
+                t = id->second.tab.get();
+        }
+        auto in = t->map.find(L"_isNetObject");
+        if (in != t->map.end() && in->second.t == Value::Num)
+            return in->second;
+        auto io = t->map.find(L"_object");
+        if (io != t->map.end() && io->second.t == Value::Pointer && io->second.ptr)
+        {
+            IUnknown* punk = reinterpret_cast<IUnknown*>(io->second.ptr);
+            static const GUID IID_IDispatchableObject =
+                { 0x7C856F49, 0x0310, 0x40F6, { 0xA1, 0xF2, 0xB7, 0xBB, 0xB4, 0xC4, 0x8F, 0x30 } };
+            IUnknown* pDispObj = nullptr;
+            if (SUCCEEDED(punk->QueryInterface(IID_IDispatchableObject, (void**)&pDispObj)) && pDispObj)
+            {
+                pDispObj->Release();
+                return Value::Num_(2);
+            }
+            static const IID IID_ClrObject =
+                { 0x65074f7f, 0x63c0, 0x304e, { 0xaf, 0x0a, 0xd5, 0x17, 0x41, 0xcb, 0x4a, 0x8d } };
+            IUnknown* pClr = nullptr;
+            if (SUCCEEDED(punk->QueryInterface(IID_ClrObject, (void**)&pClr)) && pClr)
+            {
+                pClr->Release();
+                return Value::Num_(1);
+            }
+        }
+        if (in != t->map.end() && in->second.Truthy())
+            return Value::Num_(1);
+        return Value::Num_(0);
     });
 
     // com.Release(v)
     com->map[L"Release"] = NF([](vector<Value>& a) -> Value {
-        if (!a.empty() && a[0].t == Value::TableT && a[0].tab)
+        if (!a.empty())
         {
-            auto io = a[0].tab->map.find(L"_object");
-            if (io != a[0].tab->map.end() &&
-                io->second.t == Value::Pointer)
+            if (a[0].t == Value::Pointer && a[0].ptr)
             {
-                auto* pd = reinterpret_cast<IDispatch*>(io->second.ptr);
-                pd->Release();
+                auto* punk = reinterpret_cast<IUnknown*>(a[0].ptr);
+                punk->Release();
                 return Value::Num_(1);
+            }
+            if (a[0].t == Value::TableT && a[0].tab)
+            {
+                auto io = a[0].tab->map.find(L"_object");
+                if (io != a[0].tab->map.end() &&
+                    io->second.t == Value::Pointer && io->second.ptr)
+                {
+                    auto* punk = reinterpret_cast<IUnknown*>(io->second.ptr);
+                    punk->Release();
+                    return Value::Num_(1);
+                }
             }
         }
         return Value::Num_(0);
+    });
+
+    // com.GetIPicture(punkOrObj) -> IPicture COM wrapper table
+    com->map[L"GetIPicture"] = NF([](vector<Value>& a) -> Value {
+        if (a.empty()) return Value();
+        IUnknown* punk = nullptr;
+        if (a[0].t == Value::Pointer)
+            punk = (IUnknown*)a[0].ptr;
+        else if (a[0].t == Value::Num)
+            punk = (IUnknown*)(INT_PTR)(long long)a[0].n;
+        else if (a[0].t == Value::TableT && a[0].tab)
+        {
+            auto io = a[0].tab->map.find(L"_object");
+            if (io != a[0].tab->map.end() && io->second.t == Value::Pointer)
+                punk = (IUnknown*)io->second.ptr;
+        }
+        if (!punk) return Value();
+
+        IPicture* pPic = nullptr;
+        punk->QueryInterface(IID_IPicture, (void**)&pPic);
+        IDispatch* pd = nullptr;
+        punk->QueryInterface(IID_IDispatch, (void**)&pd);
+
+        std::shared_ptr<Table> w;
+        if (pd)
+        {
+            Value vObj = WrapDispatch(pd);
+            w = vObj.tab;
+            pd->Release();
+        }
+        else
+        {
+            w = std::make_shared<Table>();
+            punk->AddRef();
+            w->map[L"_object"] = Value::Pointer_(punk);
+            w->map[L"_isComObject"] = Value::Bool_(true);
+            w->map[L"_meta"] = Value::Table_(
+                std::shared_ptr<Table>(ComMeta(), [](Table*) {}));
+        }
+
+        w->map[L"_type"] = Value::Str_(L"com.IPicture");
+        w->map[L"_topointer"] = NF([punk](vector<Value>&) {
+            return Value::Pointer_(punk);
+        });
+
+        // CopyHandle(cx=0, cy=0) -> (hNewHandle, imgType)
+        w->map[L"CopyHandle"] = NF([punk](vector<Value>& args) -> Value {
+            IPicture* pI = nullptr;
+            if (FAILED(punk->QueryInterface(IID_IPicture, (void**)&pI)) || !pI)
+                return Value();
+
+            OLE_HANDLE hSrc = 0;
+            pI->get_Handle(&hSrc);
+            SHORT picType = 0;
+            pI->get_Type(&picType);
+
+            int cx = (args.size() > 0 && args[0].t == Value::Num) ? (int)args[0].n : 0;
+            int cy = (args.size() > 1 && args[1].t == Value::Num) ? (int)args[1].n : 0;
+
+            HANDLE hCopy = nullptr;
+            int imgType = 0;
+            if (picType == PICTYPE_BITMAP)
+            {
+                imgType = 0; // _IMAGE_BITMAP
+                hCopy = CopyImage((HANDLE)(INT_PTR)hSrc, IMAGE_BITMAP, cx, cy, LR_COPYRETURNORG);
+            }
+            else if (picType == PICTYPE_ICON)
+            {
+                imgType = 1; // _IMAGE_ICON
+                hCopy = (HANDLE)CopyIcon((HICON)(INT_PTR)hSrc);
+            }
+            else
+            {
+                imgType = 0;
+                hCopy = CopyImage((HANDLE)(INT_PTR)hSrc, IMAGE_BITMAP, cx, cy, LR_COPYRETURNORG);
+            }
+            pI->Release();
+
+            Value first = Value::Pointer_(hCopy);
+            auto outs = std::make_shared<vector<Value>>();
+            outs->push_back(Value::Num_(imgType));
+            first.mrets = outs;
+            return first;
+        });
+
+        if (pPic) pPic->Release();
+        return Value::Table_(w);
     });
 
     // com.GetIUnknown(obj, iidStr) -> raw IUnknown* QI'd to the given
@@ -1152,6 +1904,141 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         }
         // not an automation object: keep the raw pointer reachable
         return a[0];
+    });
+
+    // com.Variant(val, vt, byRef)
+    com->map[L"Variant"] = NF([](vector<Value>& a) -> Value {
+        auto tb = std::make_shared<Table>();
+        tb->map[L"_isComVariant"] = Value::Bool_(true);
+        VARTYPE vt = VT_EMPTY;
+        if (a.empty())
+        {
+            tb->map[L"vt"] = Value::Num_(VT_EMPTY);
+            tb->map[L"value"] = Value();
+        }
+        else
+        {
+            Value val = a[0];
+            if (a.size() > 1 && a[1].t == Value::Num)
+                vt = (VARTYPE)a[1].n;
+            else if (val.t == Value::Null)
+                vt = VT_NULL;
+            else if (val.t == Value::Bool)
+                vt = VT_BOOL;
+            else if (val.t == Value::Num)
+                vt = (val.n == (long long)val.n) ? VT_I4 : VT_R8;
+            else if (val.t == Value::Str)
+                vt = VT_BSTR;
+            else if (val.t == Value::TableT)
+                vt = VT_ARRAY | VT_VARIANT;
+            else
+                vt = VT_EMPTY;
+
+            tb->map[L"vt"] = Value::Num_((double)vt);
+            tb->map[L"value"] = val;
+            if (a.size() > 2 && a[2].Truthy())
+                tb->map[L"byRef"] = Value::Bool_(true);
+        }
+        return Value::Table_(tb);
+    });
+
+    // com.each(obj)
+    com->map[L"each"] = NF([](vector<Value>& a) -> Value {
+        if (a.empty())
+            return Value();
+        Value target = a[0];
+        // If target is an aardio table with array elements, iterate its array
+        if (target.t == Value::TableT && target.tab && !target.tab->arr.empty())
+        {
+            auto pIdx = std::make_shared<int>(0);
+            auto arrCopy = target.tab->arr;
+            return NF([pIdx, arrCopy](vector<Value>&) -> Value {
+                if (*pIdx < (int)arrCopy.size())
+                {
+                    Value retVal = arrCopy[*pIdx];
+                    (*pIdx)++;
+                    Value res = Value::Num_((double)*pIdx);
+                    res.mrets = std::make_shared<vector<Value>>();
+                    res.mrets->push_back(retVal);
+                    return res;
+                }
+                return Value();
+            });
+        }
+        // If target has IEnumVARIANT or is a COM dispatch with _NewEnum (DISPID_NEWENUM = -4)
+        IDispatch* pDisp = nullptr;
+        if (target.t == Value::TableT && target.tab)
+        {
+            auto io = target.tab->map.find(L"_object");
+            if (io != target.tab->map.end() && io->second.t == Value::Pointer)
+                pDisp = reinterpret_cast<IDispatch*>(io->second.ptr);
+            else
+            {
+                auto ib = target.tab->map.find(L"_boundDispatch");
+                if (ib != target.tab->map.end() && ib->second.t == Value::Pointer)
+                    pDisp = reinterpret_cast<IDispatch*>(ib->second.ptr);
+            }
+        }
+        if (pDisp)
+        {
+            DISPPARAMS dpNoArgs = { nullptr, nullptr, 0, 0 };
+            VARIANT varEnum;
+            VariantInit(&varEnum);
+            HRESULT hr = pDisp->Invoke(DISPID_NEWENUM, IID_NULL, LOCALE_USER_DEFAULT,
+                                       DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+                                       &dpNoArgs, &varEnum, nullptr, nullptr);
+            IEnumVARIANT* pEnum = nullptr;
+            if (SUCCEEDED(hr))
+            {
+                if (varEnum.vt == VT_UNKNOWN && varEnum.punkVal)
+                    varEnum.punkVal->QueryInterface(IID_IEnumVARIANT, (void**)&pEnum);
+                else if (varEnum.vt == VT_DISPATCH && varEnum.pdispVal)
+                    varEnum.pdispVal->QueryInterface(IID_IEnumVARIANT, (void**)&pEnum);
+                VariantClear(&varEnum);
+            }
+            if (pEnum)
+            {
+                auto pIdx = std::make_shared<int>(0);
+                auto spEnum = std::shared_ptr<IEnumVARIANT>(pEnum, [](IEnumVARIANT* pe) { if (pe) pe->Release(); });
+                return NF([spEnum, pIdx](vector<Value>&) -> Value {
+                    VARIANT varItem;
+                    VariantInit(&varItem);
+                    ULONG fetched = 0;
+                    HRESULT hrNext = spEnum->Next(1, &varItem, &fetched);
+                    if (hrNext == S_OK && fetched == 1)
+                    {
+                        (*pIdx)++;
+                        Value val = VariantToValue(varItem, nullptr);
+                        VariantClear(&varItem);
+                        Value res = Value::Num_((double)*pIdx);
+                        res.mrets = std::make_shared<vector<Value>>();
+                        res.mrets->push_back(val);
+                        return res;
+                    }
+                    VariantClear(&varItem);
+                    return Value();
+                });
+            }
+        }
+        // Fallback: table key-value or index iterator
+        if (target.t == Value::TableT && target.tab)
+        {
+            auto pIdx = std::make_shared<int>(0);
+            auto arrCopy = target.tab->arr;
+            return NF([pIdx, arrCopy](vector<Value>&) -> Value {
+                if (*pIdx < (int)arrCopy.size())
+                {
+                    Value retVal = arrCopy[*pIdx];
+                    (*pIdx)++;
+                    Value res = Value::Num_((double)*pIdx);
+                    res.mrets = std::make_shared<vector<Value>>();
+                    res.mrets->push_back(retVal);
+                    return res;
+                }
+                return Value();
+            });
+        }
+        return Value();
     });
 
     globalsEnv.vars[L"com"] = Value::Table_(com);

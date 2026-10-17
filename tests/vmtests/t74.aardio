@@ -1,0 +1,34 @@
+// t74: struct WORD[] / BYTE[] string bidirectional serialization & deserialization (LOGFONT face name etc.)
+import string;
+
+// 1. struct with WORD[] string and BYTE[] string
+var S = class {
+    int id = 101;
+    WORD wstr[32] = "Segoe UI";
+    BYTE bstr[16] = "Hello";
+}
+
+var s1 = S();
+var buf = raw.buffer(s1);
+io.print("sizeof=" ++ tostring(raw.sizeof(s1)));
+
+// 2. convert buffer back to struct
+var s2 = raw.convert(buf, S());
+io.print("s2.id=" ++ tostring(s2.id));
+io.print("type(s2.wstr)=" ++ type(s2.wstr));
+io.print("s2.wstr=" ++ tostring(s2.wstr));
+io.print("type(s2.bstr)=" ++ type(s2.bstr));
+io.print("s2.bstr=" ++ tostring(s2.bstr));
+
+// 3. numeric array preservation when initialized as array
+var SArr = class {
+    WORD words[4] = [10, 20, 30, 40];
+}
+var sa1 = SArr();
+var bufArr = raw.buffer(sa1);
+var sa2 = raw.convert(bufArr, SArr());
+io.print("type(sa2.words)=" ++ type(sa2.words));
+io.print("sa2.words[1]=" ++ tostring(sa2.words[1]));
+io.print("sa2.words[4]=" ++ tostring(sa2.words[4]));
+
+io.print("end");

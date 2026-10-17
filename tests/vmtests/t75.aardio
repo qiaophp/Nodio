@@ -1,0 +1,29 @@
+// t75: 多赋值尾部多返回值展开 + 引用相等性/恒等操作符 (===, !==, ==, !=) + raw.str 结构体解出
+var a, b, c;
+var f = function() {
+    return 100, 200;
+};
+a, b, c = null, f();
+io.print("multi-return-tail:", a, b, c);
+
+var o1 = { x = 1 };
+var o2 = { x = 1 };
+var o3 = o1;
+io.print("obj eq self:", o1 == o3, o1 === o3);
+io.print("obj diff ref:", o1 == o2, o1 === o2);
+
+var s = "hello";
+var s2 = "hello";
+io.print("str eq:", s == s2, s === s2);
+
+var num = 123;
+var numStr = "123";
+io.print("num str eq:", num == numStr, num === numStr);
+
+// raw.str with struct
+class MyWord {
+    WORD bytes[1] = { 42 };
+}
+var w = MyWord();
+var str = raw.str(w, true);
+io.print("raw.str struct:", str == "*", str);
