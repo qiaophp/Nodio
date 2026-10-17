@@ -39,10 +39,10 @@ namespace NodioVM
             return 3;
         if (w == L"bool" || w == L"boolean")
             return 4;
-        if (w == L"addr" || w == L"ptr" || w == L"pointer" ||
-            w == L"handle" || w == L"hwnd" || w == L"hkey" ||
-            w == L"lpvoid")
+        if (w == L"ptr" || w == L"pointer" || w == L"lpvoid")
             return 5;
+        if (w == L"addr" || w == L"handle" || w == L"hwnd" || w == L"hkey")
+            return 12;
         if (w == L"str")
             return 6;
         if (w == L"string" || w == L"strb" || w == L"lpcstr")
@@ -84,6 +84,12 @@ namespace NodioVM
             {
                 void* p = *(void**)pArg;
                 args.push_back(p ? Value::Pointer_(p) : Value());
+                pArg += 4;
+            }
+            else if (pt == 12)
+            {
+                unsigned int v = *(unsigned int*)pArg;
+                args.push_back(Value::Num_((double)v));
                 pArg += 4;
             }
             else if (pt == 4)
@@ -1382,7 +1388,14 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
             {
                 std::string tryW = (suffix ? bareName : strNameA) + "W";
                 fp = ::GetProcAddress(hMod, tryW.c_str());
-                if (fp) bUnicode = true;
+                if (fp)
+                {
+                    bUnicode = true;
+                    if (suffix == 'L') { retType = ARI64; }
+                    else if (suffix == 'P') { retType = ARPtr; }
+                    else if (suffix == 'D' || suffix == 'F') { retType = ARDbl; }
+                    else if (suffix == 'B') { retType = ARBool; }
+                }
             }
 
             // Step 4: if not found, try appending 'A'
@@ -1390,11 +1403,32 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
             {
                 std::string tryA = (suffix ? bareName : strNameA) + "A";
                 fp = ::GetProcAddress(hMod, tryA.c_str());
-                if (fp) bUnicode = false;
+                if (fp)
+                {
+                    bUnicode = false;
+                    if (suffix == 'L') { retType = ARI64; }
+                    else if (suffix == 'P') { retType = ARPtr; }
+                    else if (suffix == 'D' || suffix == 'F') { retType = ARDbl; }
+                    else if (suffix == 'B') { retType = ARBool; }
+                }
             }
 
             if (!fp)
                 return Value(); // not found
+
+            std::string checkName = suffix ? bareName : strNameA;
+            if (retType == ARInt && suffix == 0)
+            {
+                if (checkName == "LoadCursor" || checkName == "LoadIcon" ||
+                    checkName == "LoadImage" || checkName == "LoadBitmap" ||
+                    checkName == "GetCursor" || checkName == "CreateCursor" ||
+                    checkName == "CreateIcon" || checkName == "CreateIconIndirect" ||
+                    checkName == "GetDC" || checkName == "GetWindowDC" ||
+                    checkName == "CreateCompatibleDC")
+                {
+                    retType = ARPtr;
+                }
+            }
 
             fp = ResolveLongPtrAlias(hMod, fp, strNameA);
 

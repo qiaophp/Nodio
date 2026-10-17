@@ -3227,8 +3227,7 @@ void Interp::InitBuiltins()
                     }
                     return Value::Bool_(false);
                 });
-                tb->map[L"now"] = NF([](vector<Value>&) {
-                    return Value::Num_((double)time(nullptr)); });
+                tb->map[L"now"] = timeCtor;
                 tb->map[L"tick"] = NF([](vector<Value>&) {
                     return Value::Num_((double)GetTickCount()); });
                 tb->map[L"date"] = NF([](vector<Value>& a) {
@@ -3889,7 +3888,7 @@ void Interp::InitBuiltins()
                                 // & out-params: allocate scratch memory, copy initial value if passed
                                 if (bByRef && (pt == 0 || pt == 1 || pt == 2 ||
                                                pt == 3 || pt == 4 || pt == 5 ||
-                                               pt == 9 || pt == 10))
+                                               pt == 9 || pt == 10 || pt == 12))
                                 {
                                     void* pRef = HeapAlloc(
                                         GetProcessHeap(),
@@ -3898,7 +3897,7 @@ void Interp::InitBuiltins()
                                     else if (pt == 1) *(__int64*)pRef = (__int64)BNum(v);
                                     else if (pt == 2) *(unsigned short*)pRef = (unsigned short)(unsigned int)(long long)BNum(v);
                                     else if (pt == 3) *(unsigned char*)pRef = (unsigned char)(unsigned int)(long long)BNum(v);
-                                    else if (pt == 5) *(INT_PTR*)pRef = (INT_PTR)(long long)BNum(v);
+                                    else if (pt == 5 || pt == 12) *(INT_PTR*)pRef = (INT_PTR)(v.t == Value::Pointer ? (INT_PTR)v.ptr : (INT_PTR)(long long)BNum(v));
                                     else if (pt == 9) { float f = (float)BNum(v); memcpy(pRef, &f, sizeof(float)); }
                                     else if (pt == 10) { double d = BNum(v); memcpy(pRef, &d, sizeof(double)); }
                                     tmpRefs.push_back({ i, pt, pRef, false, v });
@@ -4083,6 +4082,12 @@ void Interp::InitBuiltins()
                                 case 4:   // bool
                                     slots.push_back(
                                         BNum(v) != 0 ? 1 : 0);
+                                    break;
+                                case 12:  // addr / hwnd / handle
+                                    if (v.t == Value::Pointer)
+                                        slots.push_back((SlotT)(INT_PTR)v.ptr);
+                                    else
+                                        slots.push_back((SlotT)(INT_PTR)(long long)BNum(v));
                                     break;
                                 case 5:   // pointer (hwnd / buffer)
                                     if (v.t == Value::Pointer)
@@ -4390,6 +4395,9 @@ void Interp::InitBuiltins()
                                                           *(INT_PTR*)
                                                               ref.pBuffer)
                                                 : Value();
+                                            break;
+                                        case 12:
+                                            outVal = Value::Num_((double)*(INT_PTR*)ref.pBuffer);
                                             break;
                                         case 6:
                                             outVal = Value::Str_(

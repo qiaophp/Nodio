@@ -191,14 +191,75 @@ namespace NodioVM
                         case L'r': s += L'\r'; break;
                         case L't': s += L'\t'; break;
                         case L'0': s += L'\0'; break;
+                        case L'a': s += L'\a'; break;
+                        case L'b': s += L'\b'; break;
+                        case L'f': s += L'\f'; break;
+                        case L'v': s += L'\v'; break;
+                        case L'e': s += L'\x1b'; break;
                         case L'\\': s += L'\\'; break;
                         case L'"': s += L'"'; break;
                         case L'\'': s += L'\''; break;
-                        default:
-                            if (e == L'x' && i + 2 < n)
+                        case L'u':
+                        {
+                            int hexLen = 0;
+                            while (hexLen < 4 && i + 1 + hexLen < n && iswxdigit(src[i + 1 + hexLen]))
+                                hexLen++;
+                            if (hexLen > 0)
                             {
-                                s += (wchar_t)wcstoul(src.substr(i + 1, 2).c_str(), nullptr, 16);
-                                i += 2;
+                                unsigned long cp = wcstoul(src.substr(i + 1, hexLen).c_str(), nullptr, 16);
+                                s += (wchar_t)cp;
+                                i += hexLen;
+                            }
+                            else
+                            {
+                                s += L'\\';
+                                s += L'u';
+                            }
+                            break;
+                        }
+                        case L'U':
+                        {
+                            int hexLen = 0;
+                            while (hexLen < 8 && i + 1 + hexLen < n && iswxdigit(src[i + 1 + hexLen]))
+                                hexLen++;
+                            if (hexLen > 0)
+                            {
+                                unsigned long cp = wcstoul(src.substr(i + 1, hexLen).c_str(), nullptr, 16);
+                                if (cp <= 0xFFFF)
+                                {
+                                    s += (wchar_t)cp;
+                                }
+                                else if (cp <= 0x10FFFF)
+                                {
+                                    cp -= 0x10000;
+                                    s += (wchar_t)((cp >> 10) + 0xD800);
+                                    s += (wchar_t)((cp & 0x3FF) + 0xDC00);
+                                }
+                                i += hexLen;
+                            }
+                            else
+                            {
+                                s += L'\\';
+                                s += L'U';
+                            }
+                            break;
+                        }
+                        default:
+                            if (e == L'x')
+                            {
+                                int hexLen = 0;
+                                while (hexLen < 2 && i + 1 + hexLen < n && iswxdigit(src[i + 1 + hexLen]))
+                                    hexLen++;
+                                if (hexLen > 0)
+                                {
+                                    s += (wchar_t)wcstoul(src.substr(i + 1, hexLen).c_str(), nullptr, 16);
+                                    i += hexLen;
+                                }
+                                else
+                                {
+                                    s += L'\\';
+                                    s += L'x';
+                                }
                             }
                             else
                             {
@@ -207,6 +268,7 @@ namespace NodioVM
                                 s += L'\\';
                                 s += e;
                             }
+                            break;
                         }
                         i++;
                     }

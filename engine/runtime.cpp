@@ -885,12 +885,28 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                     auto it = obj.tab->map.find(key);
                     if (it != obj.tab->map.end())
                     {
-                        if (ownerCallMode && it->second.t != Value::Func && !it->second.native && !bDirect)
+                        auto isCallable = [](const Value& v) -> bool {
+                            if (v.t == Value::Func || v.native || v.t == Value::Class)
+                                return true;
+                            if (v.t == Value::TableT && v.tab)
+                            {
+                                auto im = v.tab->map.find(L"_meta");
+                                if (im != v.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                                {
+                                    auto icl = im->second.tab->map.find(L"_call");
+                                    if (icl != im->second.tab->map.end() &&
+                                        (icl->second.t == Value::Func || icl->second.native))
+                                        return true;
+                                }
+                            }
+                            return false;
+                        };
+                        if (ownerCallMode && !isCallable(it->second) && !bDirect)
                         {
                             bool bErr = false;
                             wstring strErrM;
                             Value r;
-                            if (MetaGet(obj, keyVal, &r, &bErr, &strErrM, ownerCallMode) && (r.t == Value::Func || r.native))
+                            if (MetaGet(obj, keyVal, &r, &bErr, &strErrM, ownerCallMode) && isCallable(r))
                                 return r;
                         }
                         return it->second;
@@ -1047,11 +1063,18 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             Value f;
             Value vThis;
             bool bMethod = false;
-            if (n->a->k == Node::Member && !n->a->bRoot)
+            if (n->a->k == Node::Member)
             {
-                bMethod = true;
-                vThis = Eval(n->a->a, env);
-                f = GetMember(vThis, n->a->str, false, /*bOwnerCall=*/true);
+                if (n->a->bRoot)
+                {
+                    f = GetMember(Value(), n->a->str, false, /*bOwnerCall=*/false);
+                }
+                else
+                {
+                    bMethod = true;
+                    vThis = Eval(n->a->a, env);
+                    f = GetMember(vThis, n->a->str, false, /*bOwnerCall=*/true);
+                }
             }
             else if (n->a->k == Node::Index)
             {
@@ -1732,6 +1755,13 @@ bool Interp::ValuesEqual(const Value& l, const Value& r, bool strict)
                     double v = wcstod(s.c_str(), &endp);
                     if (endp && *endp == 0)
                         return n == v;
+                }
+                if ((l.t == Value::Pointer && r.t == Value::Num) || (l.t == Value::Num && r.t == Value::Pointer))
+                {
+                    INT_PTR p = (l.t == Value::Pointer) ? (INT_PTR)l.ptr : (INT_PTR)r.ptr;
+                    double n = (l.t == Value::Num) ? l.n : r.n;
+                    if ((double)p == n || (double)(UINT_PTR)p == n)
+                        return true;
                 }
                 if (l.t == Value::TableT && l.tab)
                 {
