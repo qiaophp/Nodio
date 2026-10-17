@@ -758,7 +758,9 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             Value old = ret;
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;
             nReturn = nBreak = nContinue = 0;
-            Value r = ExecBlock(f.fn, local.get());
+            ret = Value();
+            ExecBlock(f.fn, local.get());
+            Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR; nBreak = oldB; nContinue = oldC;
             ret = old;
             s_currentOwner = oldOwner;
@@ -885,29 +887,32 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                     auto it = obj.tab->map.find(key);
                     if (it != obj.tab->map.end())
                     {
-                        auto isCallable = [](const Value& v) -> bool {
-                            if (v.t == Value::Func || v.native || v.t == Value::Class)
-                                return true;
-                            if (v.t == Value::TableT && v.tab)
+                        if (ownerCallMode)
+                        {
+                            bool isCallable = false;
+                            if (it->second.t == Value::Func || it->second.native)
+                                isCallable = true;
+                            else if (it->second.t == Value::TableT && it->second.tab)
                             {
-                                auto im = v.tab->map.find(L"_meta");
-                                if (im != v.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                                auto imC = it->second.tab->map.find(L"_meta");
+                                if (imC != it->second.tab->map.end() && imC->second.t == Value::TableT && imC->second.tab)
                                 {
-                                    auto icl = im->second.tab->map.find(L"_call");
-                                    if (icl != im->second.tab->map.end() &&
-                                        (icl->second.t == Value::Func || icl->second.native))
-                                        return true;
+                                    auto icl = imC->second.tab->map.find(L"_call");
+                                    if (icl != imC->second.tab->map.end() && (icl->second.t == Value::Func || icl->second.native))
+                                        isCallable = true;
                                 }
                             }
-                            return false;
-                        };
-                        if (ownerCallMode && !isCallable(it->second) && !bDirect)
-                        {
-                            bool bErr = false;
-                            wstring strErrM;
-                            Value r;
-                            if (MetaGet(obj, keyVal, &r, &bErr, &strErrM, ownerCallMode) && isCallable(r))
-                                return r;
+                            if (!isCallable && !bDirect)
+                            {
+                                bool bErr = false;
+                                wstring strErrM;
+                                Value r;
+                                if (MetaGet(obj, keyVal, &r, &bErr, &strErrM, ownerCallMode))
+                                {
+                                    if (r.t != Value::Null)
+                                        return r;
+                                }
+                            }
                         }
                         return it->second;
                     }
@@ -1532,7 +1537,9 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             Value old = ret;
             int oldR = nReturn;
             nReturn = 0;
-            Value r = ExecBlock(f.fn, local.get());
+            ret = Value();
+            ExecBlock(f.fn, local.get());
+            Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR;
             ret = old;
             return r;
@@ -3157,7 +3164,9 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             Value oldRet = ret;
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;
             nReturn = 0;
-            Value r = ExecBlock(f.fn, local.get());
+            ret = Value();
+            ExecBlock(f.fn, local.get());
+            Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR;
             nBreak = oldB;
             nContinue = oldC;
