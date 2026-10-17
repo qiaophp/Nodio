@@ -1197,20 +1197,6 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     local->vars[L"owner"] = vThis;   // owner = dot-left
                 local->vars[L"this"] = vInst;
 
-                if (f.classBody)
-                {
-                    Value oldRet = ret;
-                    int oldR = nReturn, oldB = nBreak, oldC = nContinue;
-                    nReturn = nBreak = nContinue = 0;
-                    ExecBlock(f.classBody, local.get());
-                    nReturn = oldR; nBreak = oldB; nContinue = oldC;
-                    ret = oldRet;
-                    auto itThis = local->vars.find(L"this");
-                    if (itThis != local->vars.end() &&
-                        itThis->second.t == Value::TableT)
-                        vInst = itThis->second;
-                }
-
                 if (f.fn)
                 {
                     local->vars[L"this"] = vInst;
@@ -1366,6 +1352,21 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                             vInst.tab->map[L"_struct"] = Value::Str_(strInst);
                         }
                     }
+                }
+
+                if (f.classBody)
+                {
+                    local->vars[L"this"] = vInst;
+                    Value oldRet = ret;
+                    int oldR = nReturn, oldB = nBreak, oldC = nContinue;
+                    nReturn = nBreak = nContinue = 0;
+                    ExecBlock(f.classBody, local.get());
+                    nReturn = oldR; nBreak = oldB; nContinue = oldC;
+                    ret = oldRet;
+                    auto itThis = local->vars.find(L"this");
+                    if (itThis != local->vars.end() &&
+                        itThis->second.t == Value::TableT)
+                        vInst = itThis->second;
                 }
                 return vInst;
             }

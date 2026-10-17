@@ -467,10 +467,10 @@ namespace NodioVM
                             idxV->b = kV;
                             asgV->a = idxV;
                             if (EatPunct(L"="))
+                            {
                                 asgV->b = ParseExpr();
-                            else
-                                asgV->b = New(Node::NullK);
-                            n->a->list.push_back(asgV);
+                                n->a->list.push_back(asgV);
+                            }
                             SkipNL();
                             EatPunct(L";");
                             EatPunct(L",");
@@ -2274,14 +2274,10 @@ namespace NodioVM
                         asg->a = idx;
                         // struct member with initializer: INT cbSize = 48;
                         if (EatPunct(L"="))
-                            asg->b = ParseExpr();
-                        else
                         {
-                            // default-init the struct member as null
-                            PNode nn = New(Node::NullK);
-                            asg->b = nn;
+                            asg->b = ParseExpr();
+                            n->a->list.push_back(asg);
                         }
-                        n->a->list.push_back(asg);
                         SkipNL();
                         EatPunct(L";");
                         EatPunct(L",");
@@ -2412,7 +2408,8 @@ namespace NodioVM
                             n->list.push_back(ParseExpr());
                         else
                         {
-                            PNode nn = New(Node::NullK);
+                            PNode nn = New(Node::Num);
+                            nn->num = 0;
                             n->list.push_back(nn);
                         }
                         SkipNL();
