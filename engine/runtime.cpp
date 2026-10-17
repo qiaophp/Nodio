@@ -2884,13 +2884,16 @@ Value Interp::Exec(const PNode& n, Env* env)
                         if (r.t == Value::Null)
                             return Value();
                         loopEnv->vars.clear();
-                        loopEnv->vars[n->names[0]] = r;
+                        Value r0 = r;
+                        r0.mrets = nullptr;
+                        loopEnv->vars[n->names[0]] = r0;
                         for (size_t ni = 1; ni < n->names.size(); ni++)
                         {
                             size_t mi = ni - 1;
-                            loopEnv->vars[n->names[ni]] =
-                                (r.mrets && mi < r.mrets->size())
+                            Value rm = (r.mrets && mi < r.mrets->size())
                                     ? (*r.mrets)[mi] : Value();
+                            rm.mrets = nullptr;
+                            loopEnv->vars[n->names[ni]] = rm;
                         }
                         Value rb = ExecBlock(n->b, loopEnv.get());
                         if (nBreak) { nBreak--; return Value(); }

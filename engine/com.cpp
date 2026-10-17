@@ -82,7 +82,7 @@ namespace
             for (const auto& item : arr)
             {
                 if (item.t != Value::Num) allNum = false;
-                if (item.t != Value::Str) allStr = false;
+                if (item.t != Value::Str && !(item.t == Value::TableT && item.tab && item.tab->arr.empty() && item.tab->map.empty())) allStr = false;
             }
             if (allNum) vt = VT_R8;
             else if (allStr) vt = VT_BSTR;
