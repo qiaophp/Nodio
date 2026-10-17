@@ -331,6 +331,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 auto modEnv2 = std::make_shared<Env>();
                 modEnv2->self = modEnv2;
                 modEnv2->parent = globals.self;
+                modEnv2->vars[L"owner"] = modPlaceholder2;
                 bool bIsBuiltin2 = (n->names.size() == 1 && n->names[0] == L"builtin");
                 if (!bIsBuiltin2)
                 {
@@ -540,6 +541,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             auto modEnv = std::make_shared<Env>();
             modEnv->self = modEnv;
             modEnv->parent = globals.self;
+            modEnv->vars[L"owner"] = modPlaceholder;
             bool bIsBuiltin = (n->names.size() == 1 && n->names[0] == L"builtin");
             if (!bIsBuiltin)
             {

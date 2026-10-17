@@ -496,6 +496,27 @@ namespace NodioVM
                             p++;                     // 'ctor'
                             n->b = ParseFuncRest();  // FuncLit: params+body
                         }
+                        else if (IsPunct(L"{") || IsPunct(L"["))
+                        {
+                            // array item in class body (e.g. `class table { {"White";0xFFFFFF}; ... }`)
+                            PNode asg = New(Node::Assign);
+                            asg->str = L"=";
+                            PNode id = New(Node::Index);
+                            PNode th = New(Node::Ident);
+                            th->str = L"this";
+                            PNode key = New(Node::Num);
+                            key->num = (double)(n->a->list.size() + 1);
+                            id->a = th;
+                            id->b = key;
+                            asg->a = id;
+                            asg->b = ParseExpr();
+                            n->a->list.push_back(asg);
+                            SkipNL();
+                            EatPunct(L";");
+                            EatPunct(L",");
+                            SkipNL();
+                            continue;
+                        }
                         else
                         {
                             PNode st = ParseStatement();
@@ -2323,6 +2344,27 @@ namespace NodioVM
                     {
                         p++;                     // 'ctor'
                         n->b = ParseFuncRest();  // FuncLit: params+body
+                    }
+                    else if (IsPunct(L"{") || IsPunct(L"["))
+                    {
+                        // array item in class body (e.g. `table = class { {"White";0xFFFFFF}; ... }`)
+                        PNode asg = New(Node::Assign);
+                        asg->str = L"=";
+                        PNode id = New(Node::Index);
+                        PNode th = New(Node::Ident);
+                        th->str = L"this";
+                        PNode key = New(Node::Num);
+                        key->num = (double)(n->a->list.size() + 1);
+                        id->a = th;
+                        id->b = key;
+                        asg->a = id;
+                        asg->b = ParseExpr();
+                        n->a->list.push_back(asg);
+                        SkipNL();
+                        EatPunct(L";");
+                        EatPunct(L",");
+                        SkipNL();
+                        continue;
                     }
                     else
                     {
