@@ -1284,7 +1284,7 @@ namespace NodioVM
             if (!EatPunct(L";"))
                 EatPunct(L",");
             SkipNL();
-            if (!IsPunct(L")"))
+            if (!IsPunct(L")") && !IsPunct(L"{"))
                 n->c = ParseStatement(); // step (may be absent)
             // the unparenthesized form has no closing paren to consume
             SkipNL();
