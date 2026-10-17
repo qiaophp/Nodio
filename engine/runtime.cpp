@@ -2940,14 +2940,14 @@ Value Interp::Exec(const PNode& n, Env* env)
                     auto loopEnv = std::make_shared<Env>();
                     loopEnv->self = loopEnv;
                     loopEnv->parent = env ? env->self : globals.self;
+                    vector<Value> iterArgs;
                     for (;;)
                     {
-                        vector<Value> noArgs;
                         // native iterators (fiber.generator, io.file
                         // each/lines) must not go through CallVmFunc —
                         // they have no AST body
-                        Value r = it.native ? it.native(noArgs)
-                                            : CallVmFunc(it, noArgs);
+                        Value r = it.native ? it.native(iterArgs)
+                                            : CallVmFunc(it, iterArgs);
                         if (r.t == Value::Null)
                             return Value();
                         loopEnv->vars.clear();
@@ -2964,8 +2964,9 @@ Value Interp::Exec(const PNode& n, Env* env)
                         }
                         Value rb = ExecBlock(n->b, loopEnv.get());
                         if (nBreak) { nBreak--; return Value(); }
-                        if (nContinue) { nContinue--; continue; }
+                        if (nContinue) { nContinue--; }
                         if (nReturn) { ret = rb; return ret; }
+                        iterArgs = { r0 };
                     }
                 }
                 if (it.t != Value::TableT || !it.tab)

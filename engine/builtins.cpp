@@ -2820,6 +2820,17 @@ void Interp::InitBuiltins()
                     if (RemoveDirectoryW(p.c_str()))
                         return Value::Bool_(true);
                     return Value::Bool_(false); });
+                // io.rename(oldPath, newPath)
+                tb->map[L"rename"] = NF([](vector<Value>& a) -> Value {
+                    if (a.size() < 2 || a[0].t != Value::Str || a[1].t != Value::Str)
+                        return Value::Bool_(false);
+                    wstring src = ResolveTildeDisk(BStr(a[0]));
+                    wstring dst = ResolveTildeDisk(BStr(a[1]));
+                    if (src.empty() || dst.empty())
+                        return Value::Bool_(false);
+                    if (MoveFileExW(src.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+                        return Value::Bool_(true);
+                    return Value::Bool_(false); });
                 // io.exist(path,mode) — docs/builtin/io/path.md: returns the
                 // ABSOLUTE path when the file exists, otherwise null. The
                 // return value is a path (not a boolean), which is what the
@@ -5660,6 +5671,7 @@ void Interp::InitBuiltins()
                     size_t start = 0;
                     if (a.size() > 1 && a[1].t != Value::Null)
                     {
+                        bool bFound = false;
                         for (size_t i = 0; i < keys.size(); i++)
                         {
                             bool eq = a[1].t == keys[i].t &&
@@ -5667,8 +5679,9 @@ void Interp::InitBuiltins()
                                            ? BNum(a[1]) == keys[i].n
                                            : (keys[i].t == Value::Str &&
                                               a[1].s == keys[i].s));
-                            if (eq) { start = i + 1; break; }
+                            if (eq) { start = i + 1; bFound = true; break; }
                         }
+                        if (!bFound) return Value();
                     }
                     if (start >= keys.size()) return Value();
                     Value vK = keys[start];
