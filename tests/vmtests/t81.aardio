@@ -1,0 +1,40 @@
+// Test table member vs metatable _get precedence:
+// 1. Raw member on table wins over generic _meta._get
+// 2. Specific metaProperty (_meta[key]._get) wins over raw member
+// 3. Method invocation on non-function raw member falls back to _meta._get
+
+var tab = {
+    rawFunc = function(x) { return "rawFunc:" + x; };
+    rawStr = "hello_raw";
+    shadowedByMeta = "stale_val";
+};
+
+tab@ = {
+    shadowedByMeta = {
+        _get = function(ownerCall) {
+            return "live_meta_prop";
+        }
+    };
+    _get = function(k, ownerCall) {
+        if (k == "metaOnly") return "from_meta_get";
+        if (k == "rawStr" && ownerCall) {
+            return function() { return "callable_from_meta"; };
+        }
+        return null;
+    }
+};
+
+// 1. Raw function called as method
+io.print("raw_func_call:", tab.rawFunc("123"));
+
+// 2. Raw string read as property
+io.print("raw_str_prop:", tab.rawStr);
+
+// 3. Calling rawStr as method should hit _get fallback because rawStr is not a function
+io.print("raw_str_call:", tab.rawStr());
+
+// 4. Property with specific descriptor in _meta wins over raw field
+io.print("meta_prop_win:", tab.shadowedByMeta);
+
+// 5. Absent property falls back to _get
+io.print("meta_fallback:", tab.metaOnly);

@@ -858,13 +858,6 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                                     (ig->second.t == Value::Func || ig->second.native))
                                     hasMetaGet = true;
                             }
-                            if (!hasMetaGet)
-                            {
-                                auto ig0 = im0->second.tab->map.find(L"_get");
-                                if (ig0 != im0->second.tab->map.end() &&
-                                    (ig0->second.t == Value::Func || ig0->second.native))
-                                    hasMetaGet = true;
-                            }
                             if (hasMetaGet)
                             {
                                 bool bErr = false;
@@ -891,7 +884,17 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                     }
                     auto it = obj.tab->map.find(key);
                     if (it != obj.tab->map.end())
+                    {
+                        if (ownerCallMode && it->second.t != Value::Func && !it->second.native && !bDirect)
+                        {
+                            bool bErr = false;
+                            wstring strErrM;
+                            Value r;
+                            if (MetaGet(obj, keyVal, &r, &bErr, &strErrM, ownerCallMode) && (r.t == Value::Func || r.native))
+                                return r;
+                        }
                         return it->second;
+                    }
                     // 1-based numeric index = array access (aardio arrays)
                     if (!key.empty() &&
                         key.find_first_not_of(L"0123456789") == wstring::npos)

@@ -1,0 +1,5 @@
+raw_func_call:rawFunc:123
+raw_str_prop:hello_raw
+raw_str_call:callable_from_meta
+meta_prop_win:live_meta_prop
+meta_fallback:from_meta_get
