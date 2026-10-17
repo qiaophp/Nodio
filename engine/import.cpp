@@ -214,7 +214,24 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     bSkipShadow)
                     return roots[n->names[0]];
             }
-            // 2) file module: baseDir\a\b\c.aardio for `import a.b.c`
+            // 2) For multi-segment imports (e.g. `import win.ui.ctrl.splitter`),
+            // ensure the root package (e.g. `win` -> `win\_.aardio`) is loaded first
+            // if its official package module exists and has not yet been loaded.
+            if (n->names.size() > 1)
+            {
+                wstring rootCand = LibCand(n->names[0], true, L"aardio");
+                if (!Exists(rootCand))
+                    rootCand = LibCand(n->names[0], false, L"aardio");
+                if (Exists(rootCand) && modules.find(rootCand) == modules.end())
+                {
+                    PNode rootNode = std::make_shared<Node>();
+                    rootNode->k = Node::Import;
+                    rootNode->names = { n->names[0] };
+                    DoImport(rootNode, env);
+                }
+            }
+
+            // 3) file module: baseDir\a\b\c.aardio for `import a.b.c`
             wstring rel;
             for (size_t i = 0; i < n->names.size(); i++)
             {
