@@ -214,20 +214,28 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     bSkipShadow)
                     return roots[n->names[0]];
             }
-            // 2) For multi-segment imports (e.g. `import win.ui.ctrl.splitter`),
-            // ensure the root package (e.g. `win` -> `win\_.aardio`) is loaded first
-            // if its official package module exists and has not yet been loaded.
+            // 2) For multi-segment imports (e.g. `import win.ui.ctrl.thread`),
+            // ensure each enclosing package folder module (e.g. win, win.ui, win.ui.ctrl)
+            // is loaded in sequence if its official package module (_\.aardio) exists
+            // and has not yet been loaded.
             if (n->names.size() > 1)
             {
-                wstring rootCand = LibCand(n->names[0], true, L"aardio");
-                if (!Exists(rootCand))
-                    rootCand = LibCand(n->names[0], false, L"aardio");
-                if (Exists(rootCand) && modules.find(rootCand) == modules.end())
+                wstring prefixRel;
+                vector<wstring> prefixNames;
+                for (size_t p = 0; p + 1 < n->names.size(); p++)
                 {
-                    PNode rootNode = std::make_shared<Node>();
-                    rootNode->k = Node::Import;
-                    rootNode->names = { n->names[0] };
-                    DoImport(rootNode, env);
+                    if (p) prefixRel += L"\\";
+                    prefixRel += n->names[p];
+                    prefixNames.push_back(n->names[p]);
+
+                    wstring cand = LibCand(prefixRel, true, L"aardio");
+                    if (Exists(cand) && modules.find(cand) == modules.end())
+                    {
+                        PNode prefixNode = std::make_shared<Node>();
+                        prefixNode->k = Node::Import;
+                        prefixNode->names = prefixNames;
+                        DoImport(prefixNode, env);
+                    }
                 }
             }
 
