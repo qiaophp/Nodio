@@ -5279,6 +5279,15 @@ void Interp::InitBuiltins()
                 tb->map[L"tocdecl"] = fnTocdecl;
                 globals.vars[L"tostdcall"] = fnCallback;
                 globals.vars[L"tocdecl"] = fnTocdecl;
+
+                auto tbThread = GetRoot(L"thread").tab;
+                if (tbThread)
+                {
+                    tbThread->map[L"callback"] = fnCallback;
+                    tbThread->map[L"tostdcall"] = fnCallback;
+                    tbThread->map[L"tocdecl"] = fnTocdecl;
+                    tbThread->map[L"tofastcall"] = fnCallback;
+                }
             }
             // ---- table ----
             {
