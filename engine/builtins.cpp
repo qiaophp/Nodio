@@ -1952,15 +1952,32 @@ void Interp::InitBuiltins()
                     if (_wfopen_s(&pf, resolved.c_str(), L"wb") != 0 || !pf)
                         return Value::Bool_(false);
                     wstring s2 = BStr(a[1]);
-                    int n2 = WideCharToMultiByte(CP_UTF8, 0, s2.c_str(),
-                                                 (int)s2.size(), nullptr, 0,
-                                                 nullptr, nullptr);
-                    std::string out2((size_t)n2, 0);
-                    if (n2 > 0)
-                        WideCharToMultiByte(CP_UTF8, 0, s2.c_str(),
-                                            (int)s2.size(), &out2[0], n2,
-                                            nullptr, nullptr);
-                    fwrite(out2.data(), 1, out2.size(), pf);
+                    bool bTextIn = false;
+                    for (wchar_t c : s2)
+                    {
+                        if ((unsigned short)c > 0xFF) { bTextIn = true; break; }
+                    }
+                    if (!bTextIn)
+                    {
+                        // Byte string / binary data: write raw bytes directly without UTF-8 re-encoding
+                        std::string raw;
+                        raw.resize(s2.size());
+                        for (size_t i = 0; i < s2.size(); i++)
+                            raw[i] = (char)(unsigned char)s2[i];
+                        fwrite(raw.data(), 1, raw.size(), pf);
+                    }
+                    else
+                    {
+                        int n2 = WideCharToMultiByte(CP_UTF8, 0, s2.c_str(),
+                                                     (int)s2.size(), nullptr, 0,
+                                                     nullptr, nullptr);
+                        std::string out2((size_t)n2, 0);
+                        if (n2 > 0)
+                            WideCharToMultiByte(CP_UTF8, 0, s2.c_str(),
+                                                (int)s2.size(), &out2[0], n2,
+                                                nullptr, nullptr);
+                        fwrite(out2.data(), 1, out2.size(), pf);
+                    }
                     fclose(pf);
                     return Value::Bool_(true); });
                 // round 43: fromto(s, from, to) — transcoding. Strings in

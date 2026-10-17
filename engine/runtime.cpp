@@ -1412,7 +1412,9 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     Value oldRet = ret;
                     int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                     nReturn = nBreak = nContinue = 0;
+                    local->bClassBody = true;
                     ExecBlock(f.classBody, local.get());
+                    local->bClassBody = false;
                     nReturn = oldR; nBreak = oldB; nContinue = oldC;
                     ret = oldRet;
                     auto itThis = local->vars.find(L"this");
@@ -1998,6 +2000,10 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                     {
                         eFound->modTable->map[target->str] = val;
                         eFound->modTable->scopeVars[target->str] = val;
+                    }
+                    else if (eFound->bNsInst && eFound->nsTable && eFound->bClassBody)
+                    {
+                        eFound->nsTable->map[target->str] = val;
                     }
                 }
                 else if (eNs && eNs->nsTable)
