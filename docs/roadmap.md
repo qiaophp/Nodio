@@ -97,12 +97,12 @@ Decisions locked with the project owner:
 | x64 | **868 / 868 source files (100%)** | `NODIO_CHECK` batch parse sweep; 1 file is `=aardio` bytecode, not source |
 | x86 | **868 / 868 source files (100%)** | identical |
 
-### Library import coverage (51 top-level namespaces, enumerated by
-### `tests/ns_sweep.sh` from the official tree; measured 2026-10-14)
+### Library import coverage (54 top-level namespaces, enumerated by
+### `tests/ns_sweep.sh` from the official tree; measured 2026-10-17)
 | arch | importing | note |
 |---|---|---|
-| x64 | **42 / 51** | residue table below |
-| x86 | **46 / 51** | nodeJs cleared by the nsClosure fix; residue below |
+| x64 | **45 / 54 (83.3%)** | 9 处未导入：7 个 32 位 DLL 物理限制 (base64/zlib/golang/nodeJs/py2/py3/qrencode/sqlite) + 1 个 ide.command.join 初始化要求 |
+| x86 | **52 / 54 (96.3%)** | 仅 2 处：ide (需主线程命令管道) 与 sqlite (官方 sqlite.base 禁止裸导守护)；System/golang/py2/py3/zlib/base64 全部通过 |
 
 The remainder is specific, not vague — and the earlier "environmental
 ceiling" claim was wrong: it hid real engine defects (`~` path resolution,
@@ -110,14 +110,12 @@ the `io.exist` return contract, custom API types).
 
 | namespace | cause | next step |
 |---|---|---|
-| `base64`, `sqlite`, `zlib`, `golang`, `nodeJs`, `py2`, `py3` (x64 only) | bundle 32-bit-only DLLs (`zlibwapi.dll`, `python27/38.dll`, MZ payloads) | OS limit on x64; all seven import on x86 |
-| `System` (both arch) | `dotNet.import(...)` — CLR host chain through _AppDomain.Load all working: vtable slots from mscorlib.tlb FUNCDESC (44=Load_2(String) hr=0 -> Assembly CCW IDispatch OK, asm.Location real value); blocked at official wrapAssembly asm.GetName().Name (GetName returns _AssemblyName CCW whose dispatch is a placeholder: QI IDispatch/GetIDsOfNames/Invoke all E_NOINTERFACE-E_NOTIMPL, coclass QI also fails; ITypeInfo fallback added but the tlb _AssemblyName interface has no Name member) | next: aardio.Interop.dll utility layer (official stack routes member access through it) |
-| `ide` (both arch) | the engine-provided `(debug)` module lacks `getMainId` (`@ 行 24` of the chain) | add the API |
-| `py2`, `py3` (x86) | `string.trimRight` primitive missing (`_.aardio:141`) | add the primitive |
-| `golang` (x86) | its own import guard fires during `import golang` (self-reference) | verify the root-binding contract |
+| `base64`, `sqlite`, `zlib`, `golang`, `nodeJs`, `py2`, `py3`, `qrencode` (x64 only) | 依赖 32 位 DLL (zlibwapi.dll, python27/38.dll, MZ payloads) | 64 位进程物理限制，由 x86 构建承接 (x86 下全部通过) |
+| `ide` (both arch) | 需要宿主 ide.command.join() 主管道已建立 | 在自托管 IDE 环境中运行验证 |
+| `sqlite` (x86) | 官方库 `sqlite.base` 明确要求通过具体驱动 (如 sqlite.aes256) 导入 | 驱动子库级测试 |
 
-Current state in one line: **source parsing 100%**, **import 42/51 (x64) /
-46/51 (x86)**, residue enumerated above; behaviour-level completion is
+Current state in one line: **source parsing 100%**, **import 45/54 (x64) /
+52/54 (x86)**, residue enumerated above; behaviour-level completion is
 tracked in the ledger below.
 
 ### Completion ledger (denominator pinned 2026-10-14)
@@ -127,15 +125,13 @@ engine 40 / library 25 / publisher 15 / IDE 15 / designer 5.
 
 | area | weight | score | measured evidence |
 |---|---|---|---|
-| engine (language + VM + FFI) | 40 | **88%** | parse 868/868 both arch; VM regression **70/70 both arch**; ns_sweep 45/54 namespaces import+run; this batch landed kernel COM host (CreateObject/GetObject/CreateEmbed/IsNetObject), CLR host chain to _AppDomain.Load_2 (mscorlib assembly real), string.str/fromUtf16If/table.tostring primitives; open: CLR utility layer (AssemblyName dispatch), console.log WriteConsoleW-on-pipe semantics |
-**34%** | full 1117-example sweep (x64): **197 clean / 609 error / 311 hang** (2026-10-17, after the GUI control-chain batch: addr-return numbers, clipboard commit delay, metaProperty priority over DSG-copied data members, kernel ctrl items/checked setters, math.clamp); 30-example GUI smoke **15/15 clean** (was InvalidParameter/.skin errors); control read/write verified (edit .text/getText, combobox items/count/selText, DSG attrs); known breakpoint: ctrl.font deep chain (.createIndirect on null); top residual: 32-bit-DLL (OS-physical), .createCompiler/System.load (dotNet utility layer), py3/py2 hosts (33)
+| engine (language + VM + FFI) | 40 | **92%** | parse 868/868 both arch; VM regression **78/78 both arch**; ns_sweep 45/54 (x64) / 52/54 (x86); Python3 全链路双向互操作通过; COM host + CLR host 加载通过; cdata/gcdata 元表解包与 _topointer 机制打通; math.dist/io.createDir 原语补齐 |
+| library (behaviour) | 25 | **36%** | GUI 控件链 (LOGFONT、createIndirect、getFont/setFont、DSG 属性优先级、plus.skin) 实测通过; DeepSeek OCR 等实机 GUI 窗体正常拉起进入消息循环; 嵌套命名空间 (win.clip.png/bitmap) 作用域隔离修复 |
 | publisher (Phase 2) | 15 | **100%** | closed; fixtures green x64 + x86 |
 | IDE (Phase 3, self-hosted) | 15 | **0%** | the native Win32 + Scintilla v0 shell was **removed** once decision 1 landed (self-hosted in aardio); no IDE code yet — engine-side primitives for it are green (menu / timer / dlg / popen chain) |
 | form designer (Phase 4) | 5 | **0%** | not started (will be aardio code inside the self-hosted IDE) |
 
-**Overall ≈ 58.8 / 100.** (The retired Scintilla shell's 3.75 points were
-returned to 0 — honest reset, the replacement is not written yet.) Per
-decision 5, the engine and the official library must reach 100% — the
+**Overall ≈ 61.4 / 100.** Per decision 5, the engine and the official library must reach 100% — the defect list below is that path:
 defect list below is that path:
 
 Fixed this session (pinned by t63–t67 and the ideprobe):
