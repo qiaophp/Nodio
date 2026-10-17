@@ -473,6 +473,182 @@ namespace
         }
     };
 
+    class AardioTableDispatch : public IDispatch
+    {
+        LONG m_ref{ 1 };
+        Value m_tab;
+        std::unordered_map<DISPID, wstring> m_idToName;
+        std::unordered_map<wstring, DISPID> m_nameToId;
+        DISPID m_nextDispId{ 1 };
+
+    public:
+        AardioTableDispatch(const Value& tab) : m_tab(tab) {}
+
+        STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
+        {
+            if (!ppv) return E_POINTER;
+            if (riid == IID_IUnknown || riid == IID_IDispatch)
+            {
+                *ppv = static_cast<IDispatch*>(this);
+                AddRef();
+                return S_OK;
+            }
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+        STDMETHODIMP_(ULONG) AddRef() override
+        {
+            return InterlockedIncrement(&m_ref);
+        }
+        STDMETHODIMP_(ULONG) Release() override
+        {
+            ULONG r = InterlockedDecrement(&m_ref);
+            if (r == 0) delete this;
+            return r;
+        }
+
+        STDMETHODIMP GetTypeInfoCount(UINT* pctinfo) override
+        {
+            if (pctinfo) *pctinfo = 0;
+            return S_OK;
+        }
+        STDMETHODIMP GetTypeInfo(UINT, LCID, ITypeInfo** ppti) override
+        {
+            if (ppti) *ppti = nullptr;
+            return E_NOTIMPL;
+        }
+        STDMETHODIMP GetIDsOfNames(REFIID, LPOLESTR* rgszNames, UINT cNames, LCID, DISPID* prgdispids) override
+        {
+            if (!rgszNames || !prgdispids || cNames == 0) return E_INVALIDARG;
+            for (UINT i = 0; i < cNames; i++)
+            {
+                wstring name = rgszNames[i];
+                auto it = m_nameToId.find(name);
+                if (it != m_nameToId.end())
+                {
+                    prgdispids[i] = it->second;
+                }
+                else
+                {
+                    DISPID newId = m_nextDispId++;
+                    m_nameToId[name] = newId;
+                    m_idToName[newId] = name;
+                    prgdispids[i] = newId;
+                }
+            }
+            return S_OK;
+        }
+        STDMETHODIMP Invoke(DISPID dispIdMember, REFIID, LCID, WORD wFlags,
+                            DISPPARAMS* pDispParams, VARIANT* pVarResult,
+                            EXCEPINFO*, UINT*) override
+        {
+            Interp* it = g_interpCurrent;
+            if (!it) return E_FAIL;
+
+            auto itName = m_idToName.find(dispIdMember);
+            if (itName == m_idToName.end()) return DISP_E_MEMBERNOTFOUND;
+            wstring memberName = itName->second;
+
+            // Handle InvokeMember method call: target.InvokeMember("method", args...)
+            if (memberName == L"InvokeMember" && (wFlags & (DISPATCH_METHOD | DISPATCH_PROPERTYGET)))
+            {
+                if (pDispParams && pDispParams->cArgs >= 1)
+                {
+                    // In DISPPARAMS, args are in reverse order
+                    VARIANT& vMethod = pDispParams->rgvarg[pDispParams->cArgs - 1];
+                    wstring invokedMethod;
+                    if (vMethod.vt == VT_BSTR && vMethod.bstrVal)
+                        invokedMethod = vMethod.bstrVal;
+                    else
+                    {
+                        wstring errV;
+                        Value vm = VariantToValue(vMethod, &errV);
+                        invokedMethod = vm.ToString();
+                    }
+
+                    std::vector<Value> subArgs;
+                    for (int i = (int)pDispParams->cArgs - 2; i >= 0; i--)
+                    {
+                        wstring errV;
+                        subArgs.push_back(VariantToValue(pDispParams->rgvarg[i], &errV));
+                    }
+
+                    Value fn = it->GetMember(m_tab, Value::Str_(invokedMethod), false, 1);
+                    if (fn.t == Value::Func || fn.native)
+                    {
+                        Value ret = it->CallOwner(fn, m_tab, subArgs);
+                        if (pVarResult)
+                        {
+                            wstring err;
+                            VariantFromValue(ret, *pVarResult, &err);
+                        }
+                        return S_OK;
+                    }
+                    else
+                    {
+                        // Maybe property get
+                        if (pVarResult)
+                        {
+                            wstring err;
+                            VariantFromValue(fn, *pVarResult, &err);
+                        }
+                        return S_OK;
+                    }
+                }
+            }
+
+            // Normal method call or property get
+            if (wFlags & (DISPATCH_METHOD | DISPATCH_PROPERTYGET))
+            {
+                Value memberVal = it->GetMember(m_tab, Value::Str_(memberName), false, (wFlags & DISPATCH_METHOD) ? 1 : 0);
+                if ((wFlags & DISPATCH_METHOD) && (memberVal.t == Value::Func || memberVal.native))
+                {
+                    std::vector<Value> args;
+                    if (pDispParams && pDispParams->cArgs > 0)
+                    {
+                        args.resize(pDispParams->cArgs);
+                        for (UINT i = 0; i < pDispParams->cArgs; i++)
+                        {
+                            VARIANT& v = pDispParams->rgvarg[pDispParams->cArgs - 1 - i];
+                            wstring err;
+                            args[i] = VariantToValue(v, &err);
+                        }
+                    }
+                    Value ret = it->CallOwner(memberVal, m_tab, args);
+                    if (pVarResult)
+                    {
+                        wstring err;
+                        VariantFromValue(ret, *pVarResult, &err);
+                    }
+                    return S_OK;
+                }
+                else
+                {
+                    if (pVarResult)
+                    {
+                        wstring err;
+                        VariantFromValue(memberVal, *pVarResult, &err);
+                    }
+                    return S_OK;
+                }
+            }
+            else if (wFlags & (DISPATCH_PROPERTYPUT | DISPATCH_PROPERTYPUTREF))
+            {
+                if (pDispParams && pDispParams->cArgs > 0)
+                {
+                    wstring err;
+                    Value val = VariantToValue(pDispParams->rgvarg[0], &err);
+                    bool bErr = false;
+                    wstring strErr;
+                    it->MetaSet(m_tab, memberName, val, &bErr, &strErr);
+                    return S_OK;
+                }
+            }
+
+            return DISP_E_MEMBERNOTFOUND;
+        }
+    };
+
     static void VariantFromValue(const Value& v, VARIANT& out, wstring* pErr)
     {
         VariantInit(&out);
@@ -635,6 +811,12 @@ namespace
                         break;
                     }
                 }
+
+                // General aardio table passed as COM parameter -> wrap as IDispatch
+                auto* pTableDisp = new AardioTableDispatch(v);
+                out.vt = VT_DISPATCH;
+                out.pdispVal = pTableDisp;
+                break;
             }
             if (pErr && pErr->empty())
                 *pErr = L"com: 不支持的参数类型(table)";
@@ -1321,6 +1503,19 @@ namespace
         }
     }
 
+    // SEH-guarded GetAssemblies(SAFEARRAY** pRet) call
+    static __int64 TryGetAssembliesSlot(void* itf, void* target, SAFEARRAY** pOut)
+    {
+        typedef __int64 (__stdcall *GetAsmsFn)(void*, SAFEARRAY**);
+        GetAsmsFn fn = nullptr;
+        memcpy(&fn, &target, sizeof(fn));
+        __try {
+            return fn(itf, pOut);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return -1;
+        }
+    }
+
     static Table* AppDomainMeta()
     {
         static std::shared_ptr<Table> s_meta;
@@ -1344,11 +1539,19 @@ namespace
                     // CCW stub result for these getters is unreliable
                     // (S_OK with garbage BSTR) — do not surface them
                     return Value();
+                if (key == L"GetAssemblies")
+                {
+                    auto w = std::make_shared<Table>();
+                    w->map[L"_boundSlot"] = Value::Num_(57.0);
+                    w->map[L"_boundAppDomain"] = Value::Pointer_(itf);
+                    w->map[L"_meta"] = Value::Table_(s_meta);
+                    return Value::Table_(w);
+                }
                 if (key == L"Load_3" || key == L"Load_4" ||
                     key == L"Load_2")
                 {
                     // bound member: calling it runs the vtable slot
-                    // (Load_2 = Load(String) = slot 48 — diagnostic path)
+                    // (Load_2 = Load(String) = slot 44)
                     auto w = std::make_shared<Table>();
                     w->map[L"_boundSlot"] = Value::Num_(
                         (double)((key == L"Load_3") ? 45
@@ -1373,6 +1576,59 @@ namespace
                     return Value();
                 int slot = (int)(INT_PTR)BNum(ib->second);
                 auto* itf = ip->second.ptr;
+                void** vtbl = *reinterpret_cast<void***>(itf);
+
+                if (slot == 57)
+                {
+                    // GetAssemblies() = slot 57: HRESULT GetAssemblies(SAFEARRAY** pRet)
+                    SAFEARRAY* psa = nullptr;
+                    __int64 hr = TryGetAssembliesSlot(itf, vtbl[slot], &psa);
+                    if (hr < 0 || !psa)
+                    {
+                        Interp* it = g_interpCurrent;
+                        if (it)
+                        {
+                            wchar_t buf[16];
+                            swprintf(buf, 16, L"%08lX", (unsigned long)hr);
+                            *it->err = wstring(L"dotNet: GetAssemblies 失败 hr=0x") + buf;
+                        }
+                        return Value();
+                    }
+
+                    auto resTable = std::make_shared<Table>();
+                    long lBound = 0, uBound = -1;
+                    SafeArrayGetLBound(psa, 1, &lBound);
+                    SafeArrayGetUBound(psa, 1, &uBound);
+
+                    IUnknown** pElems = nullptr;
+                    if (SUCCEEDED(SafeArrayAccessData(psa, (void**)&pElems)))
+                    {
+                        for (long i = lBound; i <= uBound; i++)
+                        {
+                            IUnknown* pUnk = pElems[i - lBound];
+                            if (pUnk)
+                            {
+                                IDispatch* pDisp = nullptr;
+                                if (SUCCEEDED(pUnk->QueryInterface(IID_IDispatch, (void**)&pDisp)))
+                                {
+                                    resTable->arr.push_back(WrapDispatch(pDisp));
+                                }
+                                else
+                                {
+                                    pUnk->AddRef();
+                                    resTable->arr.push_back(Value::Pointer_(pUnk));
+                                }
+                            }
+                            else
+                            {
+                                resTable->arr.push_back(Value());
+                            }
+                        }
+                        SafeArrayUnaccessData(psa);
+                    }
+                    SafeArrayDestroy(psa);
+                    return Value::Table_(resTable);
+                }
 
                 // marshal the byte[] argument(s): aardio byte string
                 // (one byte per wchar) -> flat SAFEARRAY of UI1
@@ -1414,7 +1670,6 @@ namespace
                 SAFEARRAY* psa2 = (slot == 46 && a.size() > 2)
                     ? MakeByteArray(a[2]) : nullptr;
                 void* pAsm = nullptr;
-                void** vtbl = *reinterpret_cast<void***>(itf);
                 __int64 hr;
                 if (slot == 44)
                 {

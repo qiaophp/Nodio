@@ -58,7 +58,7 @@ namespace NodioVM
         L"var", L"function", L"if", L"else", L"elseif", L"while", L"for",
         L"in", L"break", L"continue", L"return", L"null", L"true", L"false",
         L"and", L"or", L"not", L"do", L"end", L"import", L"namespace",
-        L"try", L"catch", L"class", L"lambda", L"select", L"case", L"with",
+        L"try", L"catch", L"class", L"lambda", L"λ", L"select", L"case", L"with",
         nullptr
     };
 
