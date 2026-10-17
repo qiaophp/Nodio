@@ -298,10 +298,15 @@ namespace NodioVM
                 // a trailing lowercase 'u' marks a UTF-16 (ustring) string
                 // (docs/datatype/string.md). Values are already wide, so
                 // just consume the marker and emit the string token.
+                bool bIsU = false;
                 if (i < n && src[i] == L'u' &&
                     !(i + 1 < n && IsIdentChar(src[i + 1])))
+                {
                     i++;
-                pushTok({ TStr, s, 0, line });
+                    bIsU = true;
+                }
+                Tok tokStr = { TStr, s, 0, line, false, bIsU };
+                pushTok(tokStr);
                 continue;
             }
             // numbers

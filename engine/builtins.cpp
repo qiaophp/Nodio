@@ -935,6 +935,36 @@ void Interp::InitBuiltins()
                     return Value::Str_(s); });
                 tb->map[L"len"] = NF([](vector<Value>& a) {
                     return Value::Num_((double)BStr(a[0]).size()); });
+                // string.charCodeAt(str, pos = 1) -> unicode code point
+                tb->map[L"charCodeAt"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t == Value::Null) return Value();
+                    wstring s = BStr(a[0]);
+                    long long pos = a.size() > 1 ? (long long)BNum(a[1]) : 1;
+                    if (pos < 1) return Value();
+                    long long curChar = 1;
+                    for (size_t i = 0; i < s.size(); i++)
+                    {
+                        wchar_t c = s[i];
+                        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.size() && s[i + 1] >= 0xDC00 && s[i + 1] <= 0xDFFF)
+                        {
+                            if (curChar == pos)
+                            {
+                                unsigned int cp = 0x10000 + (((unsigned int)c - 0xD800) << 10) + ((unsigned int)s[i + 1] - 0xDC00);
+                                return Value::Num_((double)cp);
+                            }
+                            i++;
+                        }
+                        else
+                        {
+                            if (curChar == pos)
+                            {
+                                return Value::Num_((double)(unsigned short)c);
+                            }
+                        }
+                        curChar++;
+                    }
+                    return Value();
+                });
                 tb->map[L"left"] = NF([](vector<Value>& a) {
                     if (a.empty()) return Value::Str_(L"");
                     wstring s = BStr(a[0]);
@@ -1755,6 +1785,20 @@ void Interp::InitBuiltins()
                         w += (wchar_t)(unsigned char)s[i] |
                              ((wchar_t)(unsigned char)s[i + 1] << 8);
                     return Value::Str_(w); });
+                // string.sliceUtf16(s, i = 1, j = -1) -> 1-based character slice of UTF-16 text
+                tb->map[L"sliceUtf16"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t == Value::Null) return Value::Str_(L"");
+                    wstring s = BStr(a[0]);
+                    long long n = (long long)s.size();
+                    long long st = a.size() > 1 && a[1].t != Value::Null ? (long long)BNum(a[1]) : 1;
+                    long long en = a.size() > 2 && a[2].t != Value::Null ? (long long)BNum(a[2]) : n;
+                    if (st < 0) st = n + st + 1;
+                    if (en < 0) en = n + en + 1;
+                    if (st < 1) st = 1;
+                    if (en > n) en = n;
+                    if (en < st) return Value::Str_(L"");
+                    return Value::Str_(s.substr((size_t)(st - 1), (size_t)(en - st + 1)));
+                });
                 tb->map[L"pack"] = NF([](vector<Value>& a) -> Value {
                     wstring out;
                     std::function<void(const Value&)> addVal = [&](const Value& v) {
@@ -3656,7 +3700,7 @@ void Interp::InitBuiltins()
                         {
                             while (*pw) w += *pw++;
                         }
-                        retVal = Value::Str_(w);
+                        retVal = Value::Str_(w, /*isUtf16=*/true);
                     }
                     else if (a.size() > 1 && a[1].t == Value::Num)
                     {

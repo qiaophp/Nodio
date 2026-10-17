@@ -34,7 +34,7 @@ Value Interp::Eval(const PNode& n, Env* env)
                     }
                     return Value::Str_(key);
                 }
-                return Value::Str_(s);
+                return Value::Str_(s, n->bUtf16);
             }
             case Node::Bool: return Value::Bool_(n->num != 0);
             case Node::NullK: return Value();
@@ -105,6 +105,13 @@ Value Interp::Eval(const PNode& n, Env* env)
                 // text indexes its UTF-8 encoding.
                 if (obj.t == Value::Str && idx.t == Value::Num)
                 {
+                    if (obj.bUtf16)
+                    {
+                        long long i = (long long)idx.n;
+                        if (i >= 1 && i <= (long long)obj.s.size())
+                            return Value::Num_((double)(unsigned short)obj.s[(size_t)(i - 1)]);
+                        return Value();
+                    }
                     bool bFake = true;
                     for (wchar_t c : obj.s)
                         if ((unsigned int)c > 0xFF) { bFake = false; break; }

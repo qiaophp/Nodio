@@ -42,6 +42,7 @@ namespace NodioVM
         double num = 0;
         int line = 1;
         bool bLeadingSpace = false;
+        bool bUtf16 = false;
     };
 
     // aardio compiled (bytecode) modules begin with the literal '=aardio'
@@ -92,6 +93,7 @@ namespace NodioVM
         shared_ptr<vector<PNode>> pdefaults;  // FuncLit param defaults
         shared_ptr<vector<Value>> mrets;      // aardio extra return values
         bool bDots = false;             // `...` packed value: mrets holds ALL varargs
+        bool bUtf16 = false;            // UTF-16 (ustring) flag
         shared_ptr<Value> thisVal;            // lexical this captured at function definition
         shared_ptr<Value> ownerVal;           // lexical owner captured at function definition
         // native builtin (round 19): C++-backed callable surfaced as a Func
@@ -99,7 +101,7 @@ namespace NodioVM
         NativeFn native;
         static Value Num_(double v) { Value x; x.t = Num; x.n = v; return x; }
         static Value Bool_(bool v) { Value x; x.t = Bool; x.b = v; return x; }
-        static Value Str_(const wstring& v) { Value x; x.t = Str; x.s = v; return x; }
+        static Value Str_(const wstring& v, bool isUtf16 = false) { Value x; x.t = Str; x.s = v; x.bUtf16 = isUtf16; return x; }
         static Value Table_(shared_ptr<Table> tb) { Value x; x.t = TableT; x.tab = tb; return x; }
         static Value Native_(NativeFn f) { Value x; x.t = Func; x.native = std::move(f); return x; }
         static Value Pointer_(void* p) { Value x; x.t = Pointer; x.ptr = p; return x; }
@@ -799,6 +801,7 @@ namespace NodioVM
         bool bSafe = false;          // Member/Index: '?.' null-conditional
         bool bDirect = false;        // Index: [["k"]] skips metatables
         bool bMeta = false;          // Postfix: 'tab@' metatable access
+        bool bUtf16 = false;         // Str literal: '...'u UTF-16 string
         int line = 0;                // source line (round 30 error reporting)
     };
 

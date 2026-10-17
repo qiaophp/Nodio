@@ -2071,7 +2071,7 @@ namespace NodioVM
                 n->str = ResolveEmbedPath(strPath);
                 return n;
             }
-            if (t.t == TStr) { p++; PNode n = New(Node::Str); n->str = t.text; return n; }
+            if (t.t == TStr) { p++; PNode n = New(Node::Str); n->str = t.text; n->bUtf16 = t.bUtf16; return n; }
             if (t.t == TIdent)
             {
                 p++;
@@ -2425,6 +2425,7 @@ namespace NodioVM
                 PNode n = New(Node::TableCtor);
                 SkipNL();
                 wstring structDesc;
+                int arrayIdx = 1;
                 while (!IsPunct(L"}") && Peek().t != TEnd)
                 {
                     SkipNL();
@@ -2514,13 +2515,15 @@ namespace NodioVM
                         }
                         else
                             Expect(L"=");
+                        if (key->k == Node::Num && (int)key->num >= arrayIdx)
+                            arrayIdx = (int)key->num + 1;
                         n->list.push_back(key);
                         n->list.push_back(ParseExpr());
                     }
                     else
                     {
                         PNode idx = New(Node::Num);
-                        idx->num = (double)n->list.size() / 2 + 1;   // 1-based
+                        idx->num = (double)(arrayIdx++);   // 1-based sequential array index
                         n->list.push_back(idx);
                         n->list.push_back(ParseExpr());
                     }

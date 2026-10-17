@@ -1177,15 +1177,32 @@ namespace NodioVM
                     if (f.bIsArray)
                     {
                         int count = f.arrCount > 0 ? f.arrCount : (int)GetTableLength(iv->second);
+                        if (f.arrCount <= 0 && (iv->second.t == Value::TableT || iv->second.t == Value::Class) && iv->second.tab)
+                        {
+                            auto itLen = iv->second.tab->map.find(L"length");
+                            if (itLen != iv->second.tab->map.end() && itLen->second.t == Value::Num)
+                            {
+                                int dynCount = (int)itLen->second.n;
+                                if (dynCount > count) count = dynCount;
+                            }
+                        }
                         Value elem0 = GetTableElement(iv->second, 0);
                         int elemSz = (elem0.t == Value::TableT || elem0.t == Value::Class) ? CalcStructTotalSize(elem0) : 0;
                         if (elemSz <= 0) elemSz = 4;
+                        if (iv->second.tab && (int)iv->second.tab->arr.size() < count && (elem0.t == Value::TableT || elem0.t == Value::Class))
+                        {
+                            Value tmpl = elem0;
+                            while ((int)iv->second.tab->arr.size() < count)
+                                iv->second.tab->arr.push_back(DeepCopy(tmpl));
+                        }
                         for (int k = 0; k < count; k++)
                         {
                             Value elem = GetTableElement(iv->second, k);
                             if ((elem.t == Value::TableT || elem.t == Value::Class) && elem.tab)
                             {
                                 StructDeserialize(elem, buf + off + k * elemSz);
+                                if (iv->second.tab && k < (int)iv->second.tab->arr.size())
+                                    iv->second.tab->arr[k] = elem;
                             }
                         }
                         sz = elemSz * (count > 0 ? count : 1);
@@ -1320,6 +1337,29 @@ namespace NodioVM
                 }
             }
             off += sz;
+        }
+        if (vTab.tab && !vTab.tab->arr.empty() && vTab.tab->map.count(L"length"))
+        {
+            auto itLen = vTab.tab->map.find(L"length");
+            int count = (itLen != vTab.tab->map.end() && itLen->second.t == Value::Num)
+                ? (int)itLen->second.n : 0;
+            if (count > 0 && vTab.tab->arr.size() == 1)
+            {
+                Value elemTemplate = vTab.tab->arr[0];
+                int elemSz = (elemTemplate.t == Value::TableT || elemTemplate.t == Value::Class)
+                    ? CalcStructTotalSize(elemTemplate) : 0;
+                if (elemSz > 0)
+                {
+                    vTab.tab->arr.clear();
+                    for (int k = 0; k < count; k++)
+                    {
+                        Value elem = DeepCopy(elemTemplate);
+                        StructDeserialize(elem, buf + off + k * elemSz);
+                        vTab.tab->arr.push_back(elem);
+                    }
+                    off += count * elemSz;
+                }
+            }
         }
     }
 
