@@ -744,6 +744,12 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                     }
                 }
             }
+            if (f.t == Value::Class)
+            {
+                Value r = InstantiateClass(f, args, owner, true);
+                s_currentOwner = oldOwner;
+                return r;
+            }
             if (f.t != Value::Func || !f.fn)
             {
                 (*err) = L"运行错误: 元表回调不是函数";
@@ -1095,6 +1101,226 @@ Value Interp::GetMember(const Value& obj, const wstring& key,
             return GetMember(obj, Value::Str_(key), bDirect, bOwnerCall ? 1 : 0);
         }
 
+// ---- InstantiateClass ----
+Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
+                               const Value& vThis, bool bMethod)
+        {
+            auto inst = std::make_shared<Table>();
+            if (f.tab)
+            {
+                auto itS = f.tab->map.find(L"_struct");
+                if (itS != f.tab->map.end())
+                    inst->map[L"_struct"] = itS->second;
+                inst->map[L"_class"] = f;
+            }
+            Value vInst = Value::Table_(inst);
+            if (!f.classBody && !f.fn && f.tab)
+            {
+                auto itNC = f.tab->map.find(L"ctor");
+                if (itNC != f.tab->map.end() &&
+                    itNC->second.t == Value::Func && itNC->second.native)
+                {
+                    vector<Value> nargs = args;
+                    nargs.push_back(vInst);
+                    Value rN = itNC->second.native(nargs);
+                    if (rN.t == Value::TableT && rN.tab)
+                        return rN;
+                    if (rN.t == Value::Null)
+                        return Value();
+                    return rN;
+                }
+            }
+            auto classNsEnv = std::make_shared<Env>();
+            classNsEnv->self = classNsEnv;
+            auto definingNsEnv = std::make_shared<Env>();
+            definingNsEnv->self = definingNsEnv;
+            if (f.tab)
+            {
+                classNsEnv->nsTable = f.tab;
+                classNsEnv->vars[L"self"] = f;
+            }
+            shared_ptr<Env> lexicalParent = f.envUp ? f.envUp : globals.self;
+            if (f.nsClosure)
+            {
+                definingNsEnv->parent = lexicalParent;
+                definingNsEnv->nsTable = f.nsClosure;
+                classNsEnv->parent = definingNsEnv;
+            }
+            else
+                classNsEnv->parent = lexicalParent;
+            auto local = std::make_shared<Env>();
+            local->self = local;
+            local->parent = f.tab ? classNsEnv
+                                  : (f.nsClosure ? definingNsEnv
+                                                 : lexicalParent);
+            local->nsTable = inst;
+            local->bNsInst = true;   // instance scope: never capture as nsClosure
+            local->bInstInit = true;
+            if (bMethod)
+                local->vars[L"owner"] = vThis;   // owner = dot-left
+            local->vars[L"this"] = vInst;
+
+            if (f.fn)
+            {
+                local->vars[L"this"] = vInst;
+                for (size_t i = 0; i < f.fn->names.size(); i++)
+                {
+                    if (i < args.size())
+                        local->vars[f.fn->names[i]] = args[i];
+                    else if (f.pdefaults &&
+                             i < f.pdefaults->size() &&
+                             (*f.pdefaults)[i])
+                        local->vars[f.fn->names[i]] =
+                            Eval((*f.pdefaults)[i], local.get());
+                    else
+                        local->vars[f.fn->names[i]] = Value();
+                }
+                if (f.fn->names.size() && f.fn->names.back() == L"...")
+                {
+                    if (args.size() > f.fn->names.size() - 1)
+                    {
+                        auto vargs = std::make_shared<vector<Value>>();
+                        auto tbV = std::make_shared<Table>();
+                        for (size_t k = f.fn->names.size() - 1; k < args.size(); k++)
+                        {
+                            vargs->push_back(args[k]);
+                            tbV->arr.push_back(args[k]);
+                        }
+                        Value vDots = tbV->arr.empty() ? Value()
+                                                       : Value::Table_(tbV);
+                        if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
+                        local->vars[L"..."] = vDots;
+                        local->vars[L"arg"] = vDots;
+                        for (size_t i = 0; i + 1 < f.fn->names.size(); i++)
+                            if (f.fn->names[i] == L"arg" && i < args.size())
+                                local->vars[L"arg"] = args[i];
+                    }
+                    else
+                    {
+                        local->vars[L"..."] = Value();
+                        local->vars[L"arg"] = Value();
+                        for (size_t i = 0; i < f.fn->names.size(); i++)
+                            if (f.fn->names[i] == L"arg" && i < args.size())
+                                local->vars[L"arg"] = args[i];
+                    }
+                }
+                Value oldRet = ret;
+                int oldR = nReturn, oldB = nBreak, oldC = nContinue;
+                nReturn = nBreak = nContinue = 0;
+                ret = Value();
+                ExecBlock(f.fn->a, local.get());
+                bool bCtorRet = (nReturn > 0);
+                Value ctorRet = ret;
+                nReturn = oldR; nBreak = oldB; nContinue = oldC;
+                ret = oldRet;
+                local->bInstInit = false;
+                if (bCtorRet)
+                {
+                    if (ctorRet.t == Value::Null)
+                        return ctorRet;
+                    if (ctorRet.t == Value::TableT && ctorRet.tab && vInst.tab)
+                    {
+                        for (auto& kv : vInst.tab->map)
+                        {
+                            if (ctorRet.tab->map.find(kv.first) == ctorRet.tab->map.end())
+                                ctorRet.tab->map[kv.first] = kv.second;
+                        }
+                    }
+                    return ctorRet;
+                }
+                auto itThis = local->vars.find(L"this");
+                if (itThis != local->vars.end() &&
+                    itThis->second.t == Value::TableT)
+                {
+                    if (itThis->second.tab != vInst.tab && vInst.tab)
+                    {
+                        auto rebindVal = [&](Value& val) {
+                            if (val.t == Value::Func && val.thisVal &&
+                                val.thisVal->tab == vInst.tab)
+                            {
+                                *val.thisVal = itThis->second;
+                            }
+                        };
+                        for (auto& kv : vInst.tab->map)
+                        {
+                            rebindVal(kv.second);
+                            if (itThis->second.tab->map.find(kv.first) == itThis->second.tab->map.end())
+                                itThis->second.tab->map[kv.first] = kv.second;
+                        }
+                        for (auto& kv : itThis->second.tab->map)
+                        {
+                            rebindVal(kv.second);
+                        }
+                        for (auto& kv : local->vars)
+                        {
+                            rebindVal(kv.second);
+                        }
+                        local->nsTable = itThis->second.tab;
+                    }
+                    vInst = itThis->second;
+                }
+                if (vInst.tab && f.tab)
+                {
+                    auto itCls = f.tab->map.find(L"_struct");
+                    if (itCls != f.tab->map.end() &&
+                        itCls->second.t == Value::Str)
+                    {
+                        auto itI = vInst.tab->map.find(L"_struct");
+                        wstring strCls = itCls->second.s;
+                        wstring strInst = (itI != vInst.tab->map.end() &&
+                                           itI->second.t == Value::Str)
+                                              ? itI->second.s : L"";
+                        while (!strInst.empty() && strInst.back() == L';')
+                            strInst.pop_back();
+                        size_t pos = 0;
+                        while (pos < strCls.size())
+                        {
+                            size_t semi = strCls.find(L';', pos);
+                            if (semi == wstring::npos)
+                                semi = strCls.size();
+                            wstring item = strCls.substr(pos, semi - pos);
+                            pos = semi + 1;
+                            size_t sp = item.find_first_of(L" \t");
+                            if (sp == wstring::npos) continue;
+                            wstring name = item.substr(sp + 1);
+                            size_t lb = name.find(L'[');
+                            if (lb != wstring::npos)
+                                name = name.substr(0, lb);
+                            while (!name.empty() &&
+                                   (name.back() == L' ' || name.back() == L'\t'))
+                                name.pop_back();
+                            if (name.empty()) continue;
+                            if (strInst.find(name) != wstring::npos)
+                                continue;
+                            if (!strInst.empty())
+                                strInst += L";";
+                            strInst += item;
+                        }
+                        if (!strInst.empty()) strInst += L";";
+                        vInst.tab->map[L"_struct"] = Value::Str_(strInst);
+                    }
+                }
+            }
+
+            if (f.classBody)
+            {
+                local->vars[L"this"] = vInst;
+                Value oldRet = ret;
+                int oldR = nReturn, oldB = nBreak, oldC = nContinue;
+                nReturn = nBreak = nContinue = 0;
+                local->bClassBody = true;
+                ExecBlock(f.classBody, local.get());
+                local->bClassBody = false;
+                nReturn = oldR; nBreak = oldB; nContinue = oldC;
+                ret = oldRet;
+                auto itThis = local->vars.find(L"this");
+                if (itThis != local->vars.end() &&
+                    itThis->second.t == Value::TableT)
+                    vInst = itThis->second;
+            }
+            return vInst;
+        }
+
 // ---- EvalCall ----
 Value Interp::EvalCall(const PNode& n, Env* env)
         {
@@ -1292,256 +1518,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             };
             if (f.t == Value::Class)
             {
-                // instantiation: copy template members, run ctor with `this`
                 vector<Value> args = evalCallArgs(n->list);
-                auto inst = std::make_shared<Table>();
-                if (f.tab)
-                {
-                    auto itS = f.tab->map.find(L"_struct");
-                    if (itS != f.tab->map.end())
-                        inst->map[L"_struct"] = itS->second;
-                    // @-annotation metatables may be assigned AFTER the
-                    // class definition (::RECT._meta = {...}) — keep the class reference so
-                    // member lookups can resolve the meta late
-                    inst->map[L"_class"] = f;
-                }
-                Value vInst = Value::Table_(inst);
-                // native ctor (kernel classes such as io.file): the class
-                // table carries a C++ "ctor" native. It receives the script
-                // args plus the fresh instance appended last and returns the
-                // instance on success; Null means construction failed and
-                // the instantiation itself yields null (e.g. io.file()
-                // returns null for an unopenable file), any other value is
-                // handed back as-is (io.open() with no args reports console
-                // state for the console library).
-                if (!f.classBody && !f.fn && f.tab)
-                {
-                    auto itNC = f.tab->map.find(L"ctor");
-                    if (itNC != f.tab->map.end() &&
-                        itNC->second.t == Value::Func && itNC->second.native)
-                    {
-                        vector<Value> nargs = args;
-                        nargs.push_back(vInst);
-                        Value rN = itNC->second.native(nargs);
-                        if (rN.t == Value::TableT && rN.tab)
-                            return rN;
-                        if (rN.t == Value::Null)
-                            return Value();
-                        return rN;
-                    }
-                }
-                auto classNsEnv = std::make_shared<Env>();
-                classNsEnv->self = classNsEnv;
-                auto definingNsEnv = std::make_shared<Env>();
-                definingNsEnv->self = definingNsEnv;
-                if (f.tab)
-                {
-                    classNsEnv->nsTable = f.tab;
-                    classNsEnv->vars[L"self"] = f;
-                }
-                shared_ptr<Env> lexicalParent = f.envUp ? f.envUp : globals.self;
-                if (f.nsClosure)
-                {
-                    // the ctor and member code see the DEFINING
-                    // namespace as an upvalue (captured in EvalClass).
-                    // Bare names resolve instance -> class -> namespace ->
-                    // global; dropping the namespace level made the bare
-                    // `in_addr()` inside wsock.sockaddr_in resolve null.
-                    definingNsEnv->parent = lexicalParent;
-                    definingNsEnv->nsTable = f.nsClosure;
-                    classNsEnv->parent = definingNsEnv;
-                }
-                else
-                    classNsEnv->parent = lexicalParent;
-                auto local = std::make_shared<Env>();
-                local->self = local;
-                local->parent = f.tab ? classNsEnv
-                                      : (f.nsClosure ? definingNsEnv
-                                                     : lexicalParent);
-                local->nsTable = inst;
-                local->bNsInst = true;   // instance scope: never capture as nsClosure
-                local->bInstInit = true;
-                if (bMethod)
-                    local->vars[L"owner"] = vThis;   // owner = dot-left
-                local->vars[L"this"] = vInst;
-
-                if (f.fn)
-                {
-                    local->vars[L"this"] = vInst;
-                    for (size_t i = 0; i < f.fn->names.size(); i++)
-                    {
-                        if (i < args.size())
-                            local->vars[f.fn->names[i]] = args[i];
-                        else if (f.pdefaults &&
-                                 i < f.pdefaults->size() &&
-                                 (*f.pdefaults)[i])
-                            local->vars[f.fn->names[i]] =
-                                Eval((*f.pdefaults)[i], local.get());
-                        else
-                            local->vars[f.fn->names[i]] = Value();
-                    }
-                    if (f.fn->names.size() && f.fn->names.back() == L"...")
-                    {
-                        if (args.size() > f.fn->names.size() - 1)
-                        {
-                            auto vargs = std::make_shared<vector<Value>>();
-                            auto tbV = std::make_shared<Table>();
-                            for (size_t k = f.fn->names.size() - 1; k < args.size(); k++)
-                            {
-                                vargs->push_back(args[k]);
-                                tbV->arr.push_back(args[k]);
-                            }
-                            // `arg` is the alias for the varargs
-                            // table; `...` expands it at call sites. An
-                            // empty table reads as null so `if(!...)`
-                            // recursion guards work.
-                            Value vDots = tbV->arr.empty() ? Value()
-                                                           : Value::Table_(tbV);
-                            if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
-                            local->vars[L"..."] = vDots;
-                            local->vars[L"arg"] = vDots;
-                            // an explicit `arg` parameter (gdip.bitmap's
-                            // ctor) must win over the vararg alias
-                            for (size_t i = 0; i + 1 < f.fn->names.size(); i++)
-                                if (f.fn->names[i] == L"arg" && i < args.size())
-                                    local->vars[L"arg"] = args[i];
-                        }
-                        else
-                        {
-                            local->vars[L"..."] = Value();
-                            local->vars[L"arg"] = Value();
-                            for (size_t i = 0; i < f.fn->names.size(); i++)
-                                if (f.fn->names[i] == L"arg" && i < args.size())
-                                    local->vars[L"arg"] = args[i];
-                        }
-                    }
-                    Value oldRet = ret;
-                    int oldR = nReturn, oldB = nBreak, oldC = nContinue;
-                    nReturn = nBreak = nContinue = 0;
-                    ret = Value();
-                    ExecBlock(f.fn->a, local.get());
-                    bool bCtorRet = (nReturn > 0);
-                    Value ctorRet = ret;
-                    nReturn = oldR; nBreak = oldB; nContinue = oldC;
-                    ret = oldRet;
-                    // member-initialization privilege ends with the ctor:
-                    // the frame stays alive as the closure parent of every
-                    // method, and a lingering bInstInit made `this.x = v`
-                    // inside ANY method bypass the metatable's _set
-                    local->bInstInit = false;
-                    if (bCtorRet)
-                    {
-                        if (ctorRet.t == Value::Null)
-                            return ctorRet;
-                        if (ctorRet.t == Value::TableT && ctorRet.tab && vInst.tab)
-                        {
-                            for (auto& kv : vInst.tab->map)
-                            {
-                                if (ctorRet.tab->map.find(kv.first) == ctorRet.tab->map.end())
-                                    ctorRet.tab->map[kv.first] = kv.second;
-                            }
-                        }
-                        return ctorRet;
-                    }
-                    // `this = <other>` inside the ctor rebinds the
-                    // instance (fake-window / control wrappers)
-                    auto itThis = local->vars.find(L"this");
-                    if (itThis != local->vars.end() &&
-                        itThis->second.t == Value::TableT)
-                    {
-                        if (itThis->second.tab != vInst.tab && vInst.tab)
-                        {
-                            auto rebindVal = [&](Value& val) {
-                                if (val.t == Value::Func && val.thisVal &&
-                                    val.thisVal->tab == vInst.tab)
-                                {
-                                    *val.thisVal = itThis->second;
-                                }
-                            };
-                            for (auto& kv : vInst.tab->map)
-                            {
-                                rebindVal(kv.second);
-                                if (itThis->second.tab->map.find(kv.first) == itThis->second.tab->map.end())
-                                    itThis->second.tab->map[kv.first] = kv.second;
-                            }
-                            for (auto& kv : itThis->second.tab->map)
-                            {
-                                rebindVal(kv.second);
-                            }
-                            for (auto& kv : local->vars)
-                            {
-                                rebindVal(kv.second);
-                            }
-                            local->nsTable = itThis->second.tab;
-                        }
-                        vInst = itThis->second;
-                    }
-                    // a base-class ctor swap (`this = baseClass()`) keeps
-                    // the base _struct; the class body's own member
-                    // declarations (T name = proto) must extend it, or
-                    // vtable interfaces (dotNet clr) lose their slots
-                    if (vInst.tab && f.tab)
-                    {
-                        auto itCls = f.tab->map.find(L"_struct");
-                        if (itCls != f.tab->map.end() &&
-                            itCls->second.t == Value::Str)
-                        {
-                            auto itI = vInst.tab->map.find(L"_struct");
-                            wstring strCls = itCls->second.s;
-                            wstring strInst = (itI != vInst.tab->map.end() &&
-                                               itI->second.t == Value::Str)
-                                                  ? itI->second.s : L"";
-                            while (!strInst.empty() && strInst.back() == L';')
-                                strInst.pop_back();
-                            // append only class members missing from the
-                            // instance layout (dedupe by member name)
-                            size_t pos = 0;
-                            while (pos < strCls.size())
-                            {
-                                size_t semi = strCls.find(L';', pos);
-                                if (semi == wstring::npos)
-                                    semi = strCls.size();
-                                wstring item = strCls.substr(pos, semi - pos);
-                                pos = semi + 1;
-                                size_t sp = item.find_first_of(L" \t");
-                                if (sp == wstring::npos) continue;
-                                wstring name = item.substr(sp + 1);
-                                size_t lb = name.find(L'[');
-                                if (lb != wstring::npos)
-                                    name = name.substr(0, lb);
-                                while (!name.empty() &&
-                                       (name.back() == L' ' || name.back() == L'\t'))
-                                    name.pop_back();
-                                if (name.empty()) continue;
-                                if (strInst.find(name) != wstring::npos)
-                                    continue;
-                                if (!strInst.empty())
-                                    strInst += L";";
-                                strInst += item;
-                            }
-                            if (!strInst.empty()) strInst += L";";
-                            vInst.tab->map[L"_struct"] = Value::Str_(strInst);
-                        }
-                    }
-                }
-
-                if (f.classBody)
-                {
-                    local->vars[L"this"] = vInst;
-                    Value oldRet = ret;
-                    int oldR = nReturn, oldB = nBreak, oldC = nContinue;
-                    nReturn = nBreak = nContinue = 0;
-                    local->bClassBody = true;
-                    ExecBlock(f.classBody, local.get());
-                    local->bClassBody = false;
-                    nReturn = oldR; nBreak = oldB; nContinue = oldC;
-                    ret = oldRet;
-                    auto itThis = local->vars.find(L"this");
-                    if (itThis != local->vars.end() &&
-                        itThis->second.t == Value::TableT)
-                        vInst = itThis->second;
-                }
-                return vInst;
+                return InstantiateClass(f, args, vThis, bMethod);
             }
             if (f.native)
             {

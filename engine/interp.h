@@ -91,6 +91,8 @@ namespace NodioVM
                       const wstring& op);
         Value ExecBlock(const PNode& blk, Env* env);
         Value EvalClass(const PNode& n, Env* env);
+        Value InstantiateClass(const Value& f, vector<Value>& args,
+                               const Value& vThis, bool bMethod = false);
         Value Exec(const PNode& n, Env* env);
         Value GetRoot(const wstring& name);
         Value NsPath(const vector<wstring>& names, Env* env = nullptr,

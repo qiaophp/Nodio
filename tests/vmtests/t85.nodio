@@ -1,0 +1,17 @@
+class TestClass {
+    ctor(a, b) {
+        this.a = a;
+        this.b = b;
+    };
+    sum = function() {
+        return this.a + this.b;
+    };
+}
+
+var ok, inst = call(TestClass, null, 10, 20);
+assert(ok, "call(TestClass) should succeed");
+assert(inst.a == 10, "inst.a should be 10");
+assert(inst.b == 20, "inst.b should be 20");
+assert(inst.sum() == 30, "inst.sum() should return 30");
+
+io.print("call class instantiation OK:", inst.sum());
