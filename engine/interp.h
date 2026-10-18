@@ -18,7 +18,7 @@ namespace NodioVM
         Interp* self() { return this; }
         static Value GetCurrentOwner();
         static void SetCurrentOwner(const Value& v);
-        // round 19: aardio root namespaces + module loading
+        // root namespaces + module loading
         // (GetRoot/BindModule/DoImport/InitBuiltins defined at the tail)
         int nErrLine = 0;   // last statement line entered (error reporting)
         // round 31: console mini-debugger
@@ -28,7 +28,7 @@ namespace NodioVM
         std::unordered_map<wstring, Value> roots;    // string/math/io/...
         std::unordered_map<wstring, Value> modules;  // import cache by path
         // engine-provided modules with no backing file, keyed by the name
-        // passed to import (aardio's "(debug)" introspection module)
+        // passed to import ("(debug)" introspection module)
         std::unordered_map<wstring, Value> namedModules;
         wstring baseDir;                             // import file resolution
         std::unordered_map<wstring, wstring> embedded;   // payload v2 files

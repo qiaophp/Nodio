@@ -1,0 +1,183 @@
+﻿// Nodio IDE — self-hosted: aardio running on the Nodio VM.
+// M0-3 skeleton: project tree + editor + output pane + F5 run
+// (process.popen streamed through winform setInterval polling).
+import win.ui;
+import win.form;
+import win.ui.menu;
+import win.ui.ctrl.treeview;
+import win.ui.ctrl.edit;
+import win.ui.ctrl.static;
+import process.popen;
+import fsys.dlg;
+import fsys.file;
+
+var NODIO_EXE = ..string.getenv("NODIO_EXE") : "nodio.exe";
+
+// ---------- state ----------
+var filePath = null;      // file being edited
+var runProc = null;       // active process.popen
+var outText = "";
+
+// ---------- main form ----------
+var wf = win.form(text="Nodio IDE";right=960;bottom=640)
+
+// ---------- controls ----------
+var tv = win.ui.ctrl.treeview(wf,{
+	left=8; top=8; right=228; bottom=590;
+	});
+io.print("C1-tv");
+var ed = win.ui.ctrl.edit(wf,{
+	left=236; top=8; right=950; bottom=440;
+	multiline=true; vscroll=true; hscroll=true;
+	});
+io.print("C2-ed");
+var out = win.ui.ctrl.edit(wf,{
+	left=236; top=448; right=950; bottom=600;
+	multiline=true; vscroll=true; readonly=true;
+	});
+io.print("C3-out");
+var st = win.ui.ctrl.static(wf,{
+	left=236; top=606; right=950; bottom=626;
+	text="就绪";
+	});
+io.print("C4-st");
+
+// project tree root
+var hRoot = tv.insertItem({ text="project" } );
+
+// ---------- output pane ----------
+appendOut = function(s){
+	outText = outText .. s;
+	out.text = outText;
+}
+
+setStatus = function(s){ st.text = s; }
+
+// ---------- file ops ----------
+openFile = function(){
+	var f = fsys.dlg.open("aardio 文件|*.aardio;*.nodio|所有文件|*.*||","打开脚本");
+	if(!f) return;
+	filePath = f;
+	ed.text = ..io.readFile(f);
+	var name = ..io.splitpath(f).name;
+	tv.setItemText(tv.insertItem({ text=name },hRoot),name);
+	setStatus("已打开: " .. f);
+}
+
+saveFile = function(){
+	if(!filePath){
+		filePath = fsys.dlg.save("aardio 文件|*.aardio;*.nodio||","保存脚本");
+		if(!filePath) return false;
+	}
+	..io.writeFile(filePath,ed.text);
+	setStatus("已保存: " .. filePath);
+	return true;
+}
+
+// ---------- run (F5) ----------
+stopRunWatch = function(){
+	if(runWatchId){
+		wf.clearInterval(runWatchId);
+		runWatchId = null;
+	}
+}
+
+runScript = function(){
+	io.print("RS-ENTER");
+	if(runProc){
+		appendOut("\r\n[运行中——先等待当前脚本结束]\r\n");
+		return;
+	}
+	if(!saveFile()) return;
+	if(!filePath) return;
+	io.print("RS-SAVED");
+
+	var cmd = """" .. NODIO_EXE .. """ """ .. filePath .. """";
+	io.print("RS-CMD:" .. cmd);
+	runProc = process.popen(cmd);
+	io.print("RS-POPPED:" .. tostring(runProc));
+	if(!runProc){
+		appendOut("[启动失败: " .. NODIO_EXE .. "]\r\n");
+		return;
+	}
+	outText = "";
+	appendOut("[运行] " .. filePath .. "\r\n");
+	io.print("RS-APPENDED");
+	setStatus("运行中...");
+	io.print("RS-STATUS");
+	runWatchId = wf.setInterval(function(){
+		io.print("POLL");
+		var p = runProc;
+		var w1 = p.process.waitOne(0);
+		io.print("P1-w1:" .. tostring(w1));
+		var o,e = p.peek(0);
+		io.print("P2-peek:" .. tostring(o) .. "/" .. tostring(e));
+		if(o !== null && o !== false && #o) appendOut(o);
+		io.print("P3-append");
+		if(e !== null && e !== false && #e) appendOut(e);
+		io.print("P4-e");
+		// done when the process has exited and both pipes are drained
+		if(p.process && p.process.waitOne(0)){
+			io.print("P5-done");
+			var o2,e2 = runProc.peek(0);
+			io.print("P6-peek2:" .. tostring(o2) .. "/" .. tostring(e2));
+			if(o2 && #o2) appendOut(o2);
+			if(e2 && #e2) appendOut(e2);
+			appendOut("\r\n[运行结束]\r\n");
+			io.print("P7-endmark");
+			runProc.close();
+			io.print("P8-closed");
+			runProc = null;
+			stopRunWatch();
+			setStatus("就绪");
+			io.print("P9-done");
+		}
+		io.print("P10-ret");
+	},100);
+}
+
+// F5 accelerator (window hotkey; WM_HOTKEY dispatch)
+io.print("PRE-HOTKEY");
+wf.reghotkey( function(id,mod,vk){ runScript() },0,0x74/*_VK_F5*/ );
+io.print("POST-HOTKEY");
+
+// ---------- menu ----------
+io.print("PRE-MENU");
+wf.menu = win.ui.menu(wf,{
+	{ "文件";{
+		{ "打开"; function(id){ openFile() } };
+		{ "保存"; function(id){ saveFile() } };
+		{ "退出"; function(id){ wf.close() } };
+	} };
+	{ "运行";{
+		{ "运行脚本  F5"; function(id){ runScript() } };
+	} };
+});
+
+// ---------- smoke mode (headless test hook) ----------
+if( ..string.getenv("NODIO_IDE_SMOKE") ){
+	io.print("SMOKE-BRANCH");
+	ed.text = `io.print("ide-smoke-echo")`;
+	filePath = ..io.fullpath("/ide_smoke_target.aardio");
+	..io.writeFile(filePath,ed.text);
+	io.print("SMOKE-FILE:" .. tostring(filePath));
+	wf.setInterval(function(){
+		io.print("T1-FIRED");
+		try{ runScript() }catch(e){ io.print("RUN-ERR:" .. tostring(e)) };
+	},600);
+	wf.setInterval(function(){
+		if(!runProc && ..string.indexOf(outText,"[运行结束]")){
+			var sOk = ..string.indexOf(outText,"ide-smoke-echo") ? "OK" : "NO-ECHO";
+			..string.setenv("NODIO_IDE_SMOKE_RESULT",sOk);
+			..io.print("IDE-SMOKE-" .. sOk);
+			io.print("SMOKE-OUT:" .. outText);
+			wf.close();
+		}
+	},1200);
+	wf.setInterval(function(){ io.print("HEARTBEAT") },700);
+}
+
+io.print("PRE-SHOW");
+wf.show();
+io.print("POST-SHOW");
+return win.loopMessage();

@@ -12,7 +12,7 @@ namespace NodioVM
         wstring* err;
         // compile-time file embedding ($"path"): resolution bases —
         // strEmbedBase = directory of the file being parsed,
-        // strEmbedRoot = aardio root (parent of NODIO_LIBDIR) for "~/"
+        // strEmbedRoot = root (parent of NODIO_LIBDIR) for "~/"
         wstring strEmbedBase;
         wstring strEmbedRoot;
 
@@ -95,7 +95,7 @@ namespace NodioVM
             SkipNL();
             if (Peek().t == TEnd)
                 return nullptr;      // trailing newlines/comments at EOF
-            // aardio statement label: 'EACH:' / 'LEXLOOP:' — the target of
+            // statement label: 'EACH:' / 'LEXLOOP:' — the target of
             // 'break NAME' / 'continue NAME'. It labels the statement that
             // follows, so parse and discard it.
             if (Peek().t == TIdent && Peek(1).t == TPunct &&
@@ -148,7 +148,7 @@ namespace NodioVM
                     if (!PeekIsStmtEnd())
                     {
                         n->a = ParseExpr();
-                        // aardio multi-return: return a, b, c — empty
+                        // multi-return: return a, b, c — empty
                         // slots ("return a,,b" / ",,,addr") are null
                         while (true)
                         {
@@ -281,7 +281,7 @@ namespace NodioVM
                 }
                 if (t.text == L"import")
                 {
-                    // import a.b.c — builtin roots or <scriptdir>\a\b\c.aardio
+                    // import a.b.c — builtin roots or <scriptdir>\a\b\c
                     // import ..a.b — root-prefixed form (library root)
                     p++;
                     PNode n = New(Node::Import);
@@ -317,7 +317,7 @@ namespace NodioVM
                     // namespace a.b { ... } — bare assignments inside the
                     // block land in the (resolved-or-created) namespace
                     // table; 'namespace a.b;' scopes the REST OF FILE
-                    // aardio also supports 'namespace ..Name' (global root prefix)
+                    // supports 'namespace ..Name' (global root prefix)
                     p++;
                     PNode n = New(Node::Namespace);
                     if (IsPunct(L"..") || IsPunct(L"::"))
@@ -345,7 +345,7 @@ namespace NodioVM
                             break;
                         }
                     }
-                    // aardio: 'namespace a.b;' or 'namespace a.b\n' (newline/EOF/non-brace)
+                    // 'namespace a.b;' or 'namespace a.b\n' (newline/EOF/non-brace)
                     // scopes the rest of the file
                     bool bRestOfFile = false;
                     if (EatPunct(L";"))
@@ -377,7 +377,7 @@ namespace NodioVM
                 if (t.text == L"class")
                 {
                     // class Name { ctor(p){...}; member = v; fn = function(){} }
-                    // aardio also allows dotted names: class win.form {...}
+                    // dotted names: class win.form {...}
                     // (declares into the namespace path); 'class ::Name'
                     // declares on the global root
                     p++;
@@ -427,7 +427,7 @@ namespace NodioVM
                         // union member: 'union name = { struct x = Cls(); }'
                         // declares an overlapping sub-struct. The inner
                         // initializer references classes that may be
-                        // declared later in the file (mouse/_.aardio), so
+                        // declared later in the file, so
                         // it must be stored as a table literal, not
                         // evaluated at definition time.
                         if (Peek().t == TIdent && Peek().text == L"union" &&
@@ -574,7 +574,7 @@ namespace NodioVM
                 }
             }
             // expression / assignment
-            // multi-target assign: a,b,c = e — aardio target unpack. Targets
+            // multi-target assign: a,b,c = e — target unpack. Targets
             // may be plain names, member paths, root-qualified names
             // ('..response,..request,..session = a,b,c'), or empty slots
             // ('files,,dirs = f()' — a hole still consumes a return value).
@@ -735,8 +735,8 @@ namespace NodioVM
 
         wstring ExpectIdent()
         {
-            // aardio's keywords are contextual: shipped library code uses
-            // them as names ('namespace class{...}' in java/class.aardio,
+            // keywords are contextual: shipped library code uses
+            // them as names ('namespace class{...}',
             // 'import java.class;'). Any keyword is a valid name here.
             if (Peek().t == TIdent || Peek().t == TKw)
                 return Next().text;
@@ -754,7 +754,7 @@ namespace NodioVM
             PNode fn = New(Node::FuncLit);
             if (!IsPunct(L")"))
             {
-                // aardio varargs: function(f, ...) — "..." collects the
+                // varargs: function(f, ...) — "..." collects the
                 // remaining arguments into a 1-based table
                 if (IsPunct(L"..."))
                 {
@@ -764,10 +764,10 @@ namespace NodioVM
                 }
                 else
                 {
-                    // aardio default params: function(a, b=1, c="x") — the
+                    // default params: function(a, b=1, c="x") — the
                     // default expression is evaluated at call time when the
                     // argument is missing. The list may be split across
-                    // lines with a LEADING comma (fsys/file.aardio's ctor),
+                    // lines with a LEADING comma,
                     // so skip newlines before testing for ','.
                     fn->names.push_back(ExpectIdent());
                     SkipNL();
@@ -829,7 +829,7 @@ namespace NodioVM
             return fn;
         }
 
-        // body: '{block}' or a single unbraced statement (aardio form)
+        // body: '{block}' or a single unbraced statement
         PNode ParseBody()
         {
             SkipNL();
@@ -853,14 +853,14 @@ namespace NodioVM
             n->c = New(Node::Block);   // elseif/else chain lives here
             bool bHadParen = EatPunct(L"(");
             SkipNL();          // 'if(' may be followed by a line break
-            // aardio lib sources span if-conds across lines with inline
-            // `return` (win.ui): sequence exprs; last value is the cond,
+            // lib sources span if-conds across lines with inline
+            // `return`: sequence exprs; last value is the cond,
             // an inline return unwinds during evaluation
             bool bIfParenClosed = false;
             {
                 PNode seq = New(Node::Block);
                 seq->list.push_back(ParseExpr());
-                // shipped lib code writes `if( a = b )` (win.ui 2101) — a
+                // lib code writes `if( a = b )` — a
                 // lone '=' at cond level reads as equality
                 while (IsPunct(L"=") && Peek(1).t != TEnd)
                 {
@@ -875,7 +875,7 @@ namespace NodioVM
                 while (IsPunct(L")") || IsPunct(L"("))
                 {
                     // inline `return` continuation only applies while the
-                    // if-( group is still open (win.ui multi-line conds);
+                    // if-( group is still open;
                     // a paren-less `if cond return x` has return as BODY
                     SkipNL();
                     if (!(Peek().t == TKw && Peek().text == L"return"))
@@ -887,7 +887,7 @@ namespace NodioVM
                     n->a = seq;
                 else
                     n->a = seq->list[0];
-            // aardio allows `if( a ) && ( b ) { }` — after the if-( closer
+            // allows `if( a ) && ( b ) { }` — after the if-( closer
             // the condition may continue with a binary operator, on the same
             // line or the next (`if( x )\n && ( y ) return;`, `if(x)<0
             // return;`). Only operators that cannot START an expression are
@@ -932,8 +932,8 @@ namespace NodioVM
                 SkipNL();
             }
             }
-            // aardio sugar: if( cond { body } ) — the closing ')' may
-            // trail the body (win.ui 421-432 uses this form)
+            // if( cond { body } ) — the closing ')' may
+            // trail the body
             if (IsPunct(L"{"))
             {
                 nIfParenOpen++;   // a stray ')' inside the body belongs to if(
@@ -962,7 +962,7 @@ namespace NodioVM
                 SkipNL();
                 if (!IsKw(L"elseif")) break;
                 p++;
-                // parens are optional: 'elseif cond {' (inet/file.aardio)
+                // parens are optional: 'elseif cond {'
                 // as well as 'elseif (cond) {'
                 bool bElseParen = EatPunct(L"(");
                 PNode cond = ParseExpr();
@@ -1278,7 +1278,7 @@ namespace NodioVM
             // numeric: for(i=1;cond;step){} — step/cond may be omitted;
             // 2-expr form for(i=n;limit) counts n..limit (1 if limit<n).
             // The parens are optional in the numeric form too: the library
-            // writes 'for x=x1;x2;step { ... }' (mouse/_.aardio).
+            // writes 'for x=x1;x2;step { ... }'.
             PNode n = New(Node::ForNum);
             if (!paren && IsPunct(L"("))
             {
@@ -1287,8 +1287,7 @@ namespace NodioVM
             }
             n->a = ParseStatement();     // init (assign)
             // slot separators: ';' normally. A dialect spells all three
-            // slots with commas — 'for(i=1,len,1)' (fsys/aar.aardio,
-            // dotNet/_.aardio). Accept ',' where ';' was expected.
+            // slots with commas — 'for(i=1,len,1)'. Accept ',' where ';' was expected.
             if (!EatPunct(L";"))
                 EatPunct(L",");
             SkipNL();
@@ -1346,7 +1345,7 @@ namespace NodioVM
 
         // expressions (precedence climbing)
         bool bNoCoalesce = false;   // inside a ternary's middle branch
-        int nIfParenOpen = 0;       // aardio if( cond { } ) sugar
+        int nIfParenOpen = 0;       // if( cond { } ) syntax
 
         // A nested expression scope — '(...)', '[...]', '{...}', a function
         // body — starts fresh, so ':' is the coalesce operator again there.
@@ -1363,7 +1362,7 @@ namespace NodioVM
         PNode ParseTernary()
         {
             PNode l = ParseOr();
-            // aardio also lets the ? start the next line (win/_.aardio 315)
+            // '?' may start the next line
             size_t saveT = p;
             SkipNL();
             bool bQ = IsPunct(L"?");
@@ -1389,7 +1388,7 @@ namespace NodioVM
                     n->c = ParseExpr();
                     return n;      // true ternary cond ? a : b
                 }
-                // aardio `a ? b` guard: null/false → false, else b (lazy);
+                // `a ? b` guard: null/false → false, else b (lazy);
                 // encode as Bin "?" — eval: a truthy ? b : false
                 n->str = L"?";
                 return n;
@@ -1418,7 +1417,7 @@ namespace NodioVM
                 n->b = ParseAnd();
                 l = n;
             }
-            // aardio a:b — null coalesce (b evaluated lazily)
+            // a:b — null coalesce (b evaluated lazily)
             if (bNoCoalesce)
                 return l;
             while (true)
@@ -1448,8 +1447,7 @@ namespace NodioVM
             PNode l = ParseEq();
             while (true)
             {
-                // aardio: a binary operator may start the NEXT line
-                // aardio: a binary operator may start the NEXT line —
+                // a binary operator may start the NEXT line —
                 // peek past newlines and restore when no operator follows
                 size_t save = p;
                 SkipNL();
@@ -1523,7 +1521,7 @@ namespace NodioVM
                 }
                 p++;
                 PNode n = New(Node::Bin);
-                n->str = L"^";   // aardio: ^ is bitwise XOR (** is exponent)
+                n->str = L"^";   // ^ is bitwise XOR (** is exponent)
                 n->a = l;
                 SkipNL();
                 n->b = ParseBitAnd();
@@ -1639,7 +1637,7 @@ namespace NodioVM
                 size_t save = p;
                 SkipNL();
                 bool bSkippedNL = (p != save);
-                // aardio postfix 'expr++' (increment statement): when '++'
+                // postfix 'expr++' (increment statement): when '++'
                 // is followed by a statement/argument end it binds to the
                 // left expr, not concat. ')' and ',' matter for the
                 // for(...) step slot and call argument lists.
@@ -1725,7 +1723,7 @@ namespace NodioVM
         PNode ParsePow()
         {
             PNode l = ParsePostfix();
-            // aardio: ** is exponent; ^ is bitwise XOR (ParseBitXor)
+            // ** is exponent; ^ is bitwise XOR (ParseBitXor)
             size_t save = p;
             SkipNL();
             if (!IsPunct(L"**"))
@@ -1795,7 +1793,7 @@ namespace NodioVM
                 }
                 else if (IsPunct(L"[") && Peek(1).t == TPunct && Peek(1).text == L"[" && !Peek(1).bLeadingSpace)
                 {
-                    // aardio t[["k"]] — direct-key index, skips metatables
+                    // t[["k"]] — direct-key index, skips metatables
                     p += 2;
                     PNode m = New(Node::Index);
                     m->a = e;
@@ -1810,7 +1808,7 @@ namespace NodioVM
                 }
                 else if (IsPunct(L"@") && Peek(1).t != TIdent)
                 {
-                    // aardio 'tab@' — metatable get/set (postfix @ not
+                    // 'tab@' — metatable get/set (postfix @ not
                     // followed by an ident path; '@path' is the M2 form)
                     p++;
                     PNode m = New(Node::Member);
@@ -1821,7 +1819,7 @@ namespace NodioVM
                 }
                 else if (IsPunct(L"#"))
                 {
-                    // postfix # — aardio expr# = length (string chars /
+                    // postfix # — expr# = length (string chars /
                     // table array length)
                     p++;
                     PNode n = New(Node::Un);
@@ -1874,7 +1872,7 @@ namespace NodioVM
                     NcReset ncReset(&bNoCoalesce);   // ':' works inside f(...)
                     if (!IsPunct(L")"))
                     {
-                        // aardio f(,,,,1): leading empty slots
+                        // f(,,,,1): leading empty slots
                         if (IsPunct(L",") )
                             c->list.push_back(New(Node::NullK));
                         else if (IsPunct(L")"))
@@ -1884,7 +1882,7 @@ namespace NodioVM
                                  Peek(1).t == TPunct &&
                                  Peek(1).text == L"=")
                         {
-                            // aardio passes a table through the argument list
+                            // passes a table through the argument list
                             // without braces: f( name = v; ["k"] = v2 ).
                             // Keys may be names, keywords or string literals,
                             // and the separator is ';' or ','.
@@ -1968,6 +1966,12 @@ namespace NodioVM
         wstring ResolveEmbedPath(const wstring& strPath)
         {
             wstring rel = strPath;
+            bool bOptional = false;
+            if (!rel.empty() && rel[0] == L'?')
+            {
+                bOptional = true;
+                rel = rel.substr(1);
+            }
             wstring rootForm;
             if (!rel.empty() && rel[0] == L'~' &&
                 rel.size() > 1 && (rel[1] == L'/' || rel[1] == L'\\'))
@@ -1976,27 +1980,39 @@ namespace NodioVM
                     : strEmbedRoot + L"\\" + rel.substr(2);
                 rel = rel.substr(2);
             }
+            wstring normRel = rel;
+            while (!normRel.empty() && (normRel[0] == L'/' || normRel[0] == L'\\'))
+                normRel = normRel.substr(1);
+
             // candidates: ~ root first, then the parsing file's dir,
             // then verbatim (absolute paths hit this last branch)
             wstring cand;
             if (!rootForm.empty() && _waccess(rootForm.c_str(), 0) == 0)
                 cand = rootForm;
-            else if (!strEmbedBase.empty() &&
-                     _waccess((strEmbedBase + L"\\" + rel).c_str(), 0) == 0)
-                cand = strEmbedBase + L"\\" + rel;
+            else if (!strEmbedBase.empty() && !normRel.empty() &&
+                     _waccess((strEmbedBase + L"\\" + normRel).c_str(), 0) == 0)
+                cand = strEmbedBase + L"\\" + normRel;
+            else if (!normRel.empty() && _waccess(normRel.c_str(), 0) == 0)
+                cand = normRel;
             else if (_waccess(rel.c_str(), 0) == 0)
                 cand = rel;
+            else if (!strEmbedRoot.empty() && !normRel.empty() &&
+                     _waccess((strEmbedRoot + L"\\" + normRel).c_str(), 0) == 0)
+                cand = strEmbedRoot + L"\\" + normRel;
             else if (!rootForm.empty())
                 cand = rootForm;
+            else if (!strEmbedBase.empty() && !normRel.empty())
+                cand = strEmbedBase + L"\\" + normRel;
             else
-                cand = strEmbedBase.empty() ? rel
-                       : strEmbedBase + L"\\" + rel;
+                cand = rel;
 
             FILE* pf = nullptr;
             if (_wfopen_s(&pf, cand.c_str(), L"rb") != 0 || !pf)
             {
+                if (bOptional)
+                    return L"";
                 // Unresolved. A "~\" path that exists neither on disk nor
-                // in the aardio root is a published-payload resource: the
+                // in the engine root is a published-payload resource: the
                 // embed map only exists at runtime, so mark the path for
                 // deferred resolution instead of inlining the path text
                 // (which would make raw.loadDll fail on a nonexistent file).
@@ -2055,7 +2071,7 @@ namespace NodioVM
                 return n;
             }
             if (t.t == TNum) { p++; PNode n = New(Node::Num); n->num = t.num; return n; }
-            // compile-time file embed: $"path" — official aardio inlines
+            // compile-time file embed: $"path" — inlines
             // the file at parse time. Text files embed their content;
             // binary payloads (dll/ico/...) embed their raw bytes as a
             // byte string so raw.loadDll maps them from memory.
@@ -2092,7 +2108,7 @@ namespace NodioVM
                 // continue postfix chain from the member
                 return ParsePostfixFrom(m);
             }
-            // '::ident' / '::io.print' — same root scope (aardio ::)
+            // '::ident' / '::io.print' — same root scope (::)
             if (IsPunct(L"::") && Peek(1).t == TIdent)
             {
                 p += 2;
@@ -2135,7 +2151,7 @@ namespace NodioVM
                 p++;
                 return ParseFuncRest();
             }
-            // aardio lambda: lambda(a,b) expr — implicit return
+            // lambda: lambda(a,b) expr — implicit return
             if (t.t == TKw && (t.text == L"lambda" || t.text == L"λ"))
             {
                 p++;
@@ -2198,7 +2214,7 @@ namespace NodioVM
             }
             if (IsPunct(L"["))
             {
-                // aardio array literal: [a,b,c] — 1-based table array
+                // array literal: [a,b,c] — 1-based table array
                 // and [@meta] / [@meta, a, b]
                 p++;
                 PNode n = New(Node::TableCtor);
@@ -2232,7 +2248,7 @@ namespace NodioVM
                 Expect(L"]");
                 return n;
             }
-            // aardio class expression: ::MSG = class{ ... } (no name)
+            // class expression: ::MSG = class{ ... } (no name)
             if (t.t == TKw && t.text == L"class")
             {
                 p++;
@@ -2407,9 +2423,9 @@ namespace NodioVM
                 }
                 return n;
             }
-            // M7: `return` in expression position — aardio allows
+            // `return` in expression position — allows
             // `if( cond
-            //      return f(x) )` in lib sources (win.ui): the inline
+            //      return f(x) )` in lib sources: the inline
             // return exits the enclosing function with the value
             if (t.t == TKw && t.text == L"return")
             {
@@ -2431,7 +2447,7 @@ namespace NodioVM
                     SkipNL();
                     if (IsPunct(L"}")) break;
                     // round M2: '@path;' — meta reference (stores under
-                    // the "_meta" key; aardio tables/classes attach their
+                    // the "_meta" key; tables/classes attach their
                     // metatable this way)
                     if (IsPunct(L"@"))
                     {
@@ -2486,8 +2502,8 @@ namespace NodioVM
                         SkipNL();
                         continue;
                     }
-                    // pair: name = expr | name: expr (aardio allows both separators;
-                    // win/_.aardio uses {max: 3;min: 6}) | "name" = expr |
+                    // pair: name = expr | name: expr (allows both separators;
+                    // e.g. {max: 3;min: 6}) | "name" = expr |
                     // "name": expr | ["k"] = expr | ["k"]: expr |
                     // expr (array item)
                     if ((Peek().t == TIdent || Peek().t == TKw ||
@@ -2607,7 +2623,7 @@ namespace NodioVM
                 }
                 else if (IsPunct(L"[") && Peek(1).t == TPunct && Peek(1).text == L"[" && !Peek(1).bLeadingSpace)
                 {
-                    // aardio t[["k"]] — direct-key index, skips metatables
+                    // t[["k"]] — direct-key index, skips metatables
                     p += 2;
                     PNode m = New(Node::Index);
                     m->a = e;
@@ -2622,7 +2638,7 @@ namespace NodioVM
                 }
                 else if (IsPunct(L"@") && Peek(1).t != TIdent)
                 {
-                    // aardio 'tab@' — metatable get/set (postfix @ not
+                    // 'tab@' — metatable get/set (postfix @ not
                     // followed by an ident path; '@path' is the M2 form)
                     p++;
                     PNode m = New(Node::Member);
@@ -2633,7 +2649,7 @@ namespace NodioVM
                 }
                 else if (IsPunct(L"#"))
                 {
-                    // postfix # — aardio expr# = length (string chars /
+                    // postfix # — expr# = length (string chars /
                     // table array length)
                     p++;
                     PNode n = New(Node::Un);
@@ -2686,7 +2702,7 @@ namespace NodioVM
                     NcReset ncReset(&bNoCoalesce);   // ':' works inside f(...)
                     if (!IsPunct(L")"))
                     {
-                        // aardio f(,,,,1): leading empty slots
+                        // f(,,,,1): leading empty slots
                         if (IsPunct(L",") )
                             c->list.push_back(New(Node::NullK));
                         else if (IsPunct(L")"))
@@ -2696,7 +2712,7 @@ namespace NodioVM
                                  Peek(1).t == TPunct &&
                                  Peek(1).text == L"=")
                         {
-                            // aardio passes a table through the argument list
+                            // passes a table through the argument list
                             // without braces: f( name = v; ["k"] = v2 ).
                             // Keys may be names, keywords or string literals,
                             // and the separator is ';' or ','.

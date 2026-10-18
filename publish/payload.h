@@ -7,7 +7,7 @@
 //
 // manifest lines (UTF-8): "<lib-relative key>\t<size>\n", in the same
 // order as the file bytes were appended. Keys use '\\' separators so
-// engine imports ("win\\ui\\_.aardio") resolve straight from the map.
+// engine imports resolve straight from the map.
 #pragma once
 
 #include <windows.h>
@@ -93,7 +93,7 @@ namespace NodioPayload
         return true;
     }
 
-    // Payload bytes -> engine string map. Aardio strings hold arbitrary
+    // Payload bytes -> engine string map. Engine strings hold arbitrary
     // bytes one-per-wchar (the engine's byte-string convention), so raw
     // payloads survive the round trip unchanged.
     inline void ToWideMap(const std::map<std::wstring, std::string>& in,

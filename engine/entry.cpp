@@ -40,17 +40,44 @@ namespace NodioVM
                  szMod,
                  g_curModuleFile.c_str(),
                  g_interpCurrent ? g_interpCurrent->nErrLine : 0);
+        if (ep->ExceptionRecord->NumberParameters >= 2)
+        {
+            fwprintf(stderr, L"  AccessViolation: op=%lld target=%p\n",
+                     (long long)ep->ExceptionRecord->ExceptionInformation[0],
+                     (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+        }
+#if defined(_M_IX86)
+        if (ep->ContextRecord)
+        {
+            fwprintf(stderr, L"  EIP=%08X EAX=%08X ECX=%08X EDX=%08X EBX=%08X ESP=%08X EBP=%08X ESI=%08X EDI=%08X\n",
+                     ep->ContextRecord->Eip, ep->ContextRecord->Eax, ep->ContextRecord->Ecx, ep->ContextRecord->Edx,
+                     ep->ContextRecord->Ebx, ep->ContextRecord->Esp, ep->ContextRecord->Ebp, ep->ContextRecord->Esi, ep->ContextRecord->Edi);
+        }
+#else
+        if (ep->ContextRecord)
+        {
+            fwprintf(stderr, L"  RIP=%p RAX=%p RCX=%p RDX=%p RBX=%p RSP=%p RBP=%p RSI=%p RDI=%p\n",
+                     (void*)ep->ContextRecord->Rip, (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rcx,
+                     (void*)ep->ContextRecord->Rdx, (void*)ep->ContextRecord->Rbx, (void*)ep->ContextRecord->Rsp,
+                     (void*)ep->ContextRecord->Rbp, (void*)ep->ContextRecord->Rsi, (void*)ep->ContextRecord->Rdi);
+        }
+#endif
         fflush(stderr);
         ExitProcess((UINT)ep->ExceptionRecord->ExceptionCode);
         return EXCEPTION_EXECUTE_HANDLER;
     }
 
-    // aardio root for compile-time embed paths ("~/...") — the parent of
+    // install root for compile-time embed paths ("~/...") — the parent of
     // NODIO_LIBDIR (install-root\lib). Empty when no lib dir is set.
     wstring EmbedRoot()
     {
         wchar_t szLib[MAX_PATH] = L"";
-        GetEnvironmentVariableW(L"NODIO_LIBDIR", szLib, MAX_PATH);
+        if (GetEnvironmentVariableW(L"NODIO_LIBDIR", szLib, MAX_PATH) == 0)
+        {
+            wstring cfgLib = GetNodioConfig().libDir;
+            if (!cfgLib.empty())
+                wcsncpy_s(szLib, cfgLib.c_str(), _TRUNCATE);
+        }
         wstring strLib = szLib;
         if (strLib.size() < 2) return L"";
         while (strLib.size() > 1 &&
@@ -60,11 +87,14 @@ namespace NodioVM
         return sl == wstring::npos ? wstring() : strLib.substr(0, sl);
     }
 
+    static void SilentInvalidParameterHandler(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, uintptr_t) {}
+
     int RunSource(const wstring& src, wstring* strError,
                   const wstring* pBaseDir,
                   const std::unordered_map<wstring, wstring>* pEmbedded,
                   bool bDebug, const wstring* pBreakLines)
     {
+        _set_invalid_parameter_handler(SilentInvalidParameterHandler);
         SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
         SetUnhandledExceptionFilter(CrashFilter);
         setvbuf(stderr, nullptr, _IONBF, 0);
@@ -136,8 +166,8 @@ namespace NodioVM
                 }
             }
         }
-        // preload the official builtin/struct.aardio (defines ::POINT/
-        // ::RECT/::PAINTSTRUCT that every GUI library assumes) — `builtin`
+        // preload builtin.struct (defines ::POINT/
+        // ::RECT/::PAINTSTRUCT that GUI libraries assume) — `builtin`
         // itself is pre-bound so a plain `import` would never load the
         // file body. NON-FATAL: failures are swallowed; when no NODIO_LIBDIR
         // is set (plain VM tests) there is simply nothing to preload.
@@ -147,7 +177,7 @@ namespace NodioVM
             wstring* pPrevErr = it.err;
             it.err = &strBootErr;
             vector<Tok> toksBoot = Lex(
-                L"import builtin.struct; import builtin.com; import builtin.math; ::NMHDR = class { addr hwndFrom; ADDR idFrom; INT code; };", &strBootErr);
+                L"import builtin; import builtin.struct; import builtin.com; import builtin.math; ::NMHDR = class { addr hwndFrom; ADDR idFrom; INT code; };", &strBootErr);
             Parser psBoot{ toksBoot, 0, &strBootErr };
             psBoot.strEmbedBase = pBaseDir ? *pBaseDir : wstring();
             psBoot.strEmbedRoot = EmbedRoot();

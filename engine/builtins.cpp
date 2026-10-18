@@ -6,7 +6,7 @@
 
 namespace NodioVM
 {
-    // UTF-16 (engine internal) -> UTF-8 (aardio byte semantics)
+    // UTF-16 (engine internal) -> UTF-8 (byte semantics)
     static std::string WToU8(const std::wstring& s)
     {
         int len = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
@@ -19,10 +19,8 @@ namespace NodioVM
     }
 
     // ---- fibers (纤程) ----
-    // docs/language-reference/datatype/datatype.md: a fiber has its own
-    // stack and can be suspended and resumed, but it is not a thread and
-    // fibers never run concurrently. Implemented on Win32 fibers, which is
-    // also how aardio does it.
+    // A fiber has its own stack and can be suspended and resumed, but it is not
+    // a thread and fibers never run concurrently. Implemented on Win32 fibers.
     struct VMFiber
     {
         void* hFiber = nullptr;
@@ -144,7 +142,7 @@ namespace NodioVM
     }
 
     // ---- runtime compilation (eval / loadcode / loadcodex) ----
-    // Transform aardio template syntax (<? ... ?> and ?> raw text <? / <?= expr ?>) into pure aardio code calling print(...)
+    // Transform template syntax (<? ... ?> and ?> raw text <? / <?= expr ?>) into pure code calling print(...)
     static wstring PreprocessTemplate(const wstring& src)
     {
         auto escapeRawString = [](const wstring& s) -> wstring {
@@ -198,8 +196,8 @@ namespace NodioVM
         {
             inCode = true;
             pos = firstNonWs + 2;
-            if (pos + 6 <= n && src.compare(pos, 6, L"aardio") == 0)
-                pos += 6;
+            while (pos < n && iswalpha(src[pos]))
+                pos++;
         }
         else if (firstNonWs + 1 < n && src[firstNonWs] == L'?' && src[firstNonWs + 1] == L'>')
         {
@@ -248,9 +246,11 @@ namespace NodioVM
                 }
                 if (inCode && pos < n)
                 {
-                    if (src[pos] == L'=')
+                    size_t pExpr = pos;
+                    while (pExpr < n && (src[pExpr] == L' ' || src[pExpr] == L'\t' || src[pExpr] == L'\r' || src[pExpr] == L'\n')) pExpr++;
+                    if (pExpr < n && src[pExpr] == L'=')
                     {
-                        pos++;
+                        pos = pExpr + 1;
                         size_t endExpr = src.find(L"?>", pos);
                         wstring exprStr;
                         if (endExpr == wstring::npos)
@@ -274,9 +274,9 @@ namespace NodioVM
     }
 
     // Compiles 'src' into an anonymous function: the code becomes the body
-    // and '...' collects the arguments, because in aardio a loaded code
+    // and '...' collects the arguments, because a loaded code
     // string or file behaves exactly like an anonymous function.
-    static PNode CompileToFunc(const wstring& src, wstring* err)
+    static PNode CompileToFunc(const wstring& src, const wstring* pBaseDir, wstring* err)
     {
         wstring processed = PreprocessTemplate(src);
         wstring e;
@@ -287,7 +287,9 @@ namespace NodioVM
             return nullptr;
         }
         Parser ps{ toks, 0, &e };
-        if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
+        if (pBaseDir && !pBaseDir->empty())
+            ps.strEmbedBase = *pBaseDir;
+        else if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
             ps.strEmbedBase = g_interpCurrent->baseDir;
         ps.strEmbedRoot = EmbedRoot();
         PNode blk = ps.ParseBlock();
@@ -304,7 +306,7 @@ namespace NodioVM
         return fn;
     }
 
-    // aardio loadcode/loadcodex accept either a code string or a file path.
+    // loadcode/loadcodex accept either a code string or a file path.
     // Root-relative ('/x') resolves against the app root, '~' against the
     // installation root; a multi-line argument is always code.
     static bool ReadCodeFile(const wstring& s, wstring* out)
@@ -368,19 +370,33 @@ namespace NodioVM
         return s;
     }
 
-    // raw memory bytes of an aardio string value:
-    // For byte strings (where each wchar holds one byte <= 0xFF), unpack directly
-    // without codepage conversion so binary data (e.g. PNG headers) is preserved.
-    // For general Unicode text (contains code points > 0xFF), encode as UTF-8.
-    static std::string RawBytesOf(const wstring& w)
+    // raw memory bytes of a string value:
+    // When bRawBytes is set (e.g. from raw.tostring or binary string& out-params),
+    // unpack each byte directly without codepage conversion so binary data is preserved.
+    // Otherwise, text strings encode as standard UTF-8.
+    static std::string RawBytesOf(const Value& v)
+    {
+        if (v.s.empty()) return std::string();
+        if (v.bRawBytes)
+        {
+            std::string out;
+            out.reserve(v.s.size());
+            for (wchar_t ch : v.s)
+                out.push_back((char)(unsigned char)ch);
+            return out;
+        }
+        int cb = WideCharToMultiByte(CP_UTF8, 0, v.s.c_str(), (int)v.s.size(),
+                                     nullptr, 0, nullptr, nullptr);
+        std::string out((size_t)max(cb, 0), 0);
+        if (cb > 0)
+            WideCharToMultiByte(CP_UTF8, 0, v.s.c_str(), (int)v.s.size(),
+                                &out[0], cb, nullptr, nullptr);
+        return out;
+    }
+    static std::string RawBytesOf(const wstring& w, bool bRawBytes = false)
     {
         if (w.empty()) return std::string();
-        bool allByte = true;
-        for (wchar_t ch : w)
-        {
-            if (ch > 0xFF) { allByte = false; break; }
-        }
-        if (allByte)
+        if (bRawBytes)
         {
             std::string out;
             out.reserve(w.size());
@@ -844,10 +860,10 @@ void Interp::InitBuiltins()
                 }
             });
 
-            // ---- string (1-based, aardio/Lua style) ----
+            // ---- string (1-based index) ----
             {
                 auto tb = GetRoot(L"string").tab;
-                // string.str(v) — official kernel primitive: coerce a
+                // string.str(v) — kernel primitive: coerce a
                 // pointer / byte buffer / number to a text value
                 // (win.version csdVersion, D3D info fields etc.)
                 tb->map[L"str"] = NF([](vector<Value>& a) -> Value {
@@ -865,7 +881,7 @@ void Interp::InitBuiltins()
                 // string.indexAny(str, bytes [, startPos]) — position (1-based,
                 // in bytes) of the first byte of `str` at or after startPos
                 // that also occurs in `bytes`; 0 when none matches.
-                // aardio's second argument may name a byte code numerically.
+                // The second argument may name a byte code numerically.
                 tb->map[L"indexAny"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty())
                         return Value::Num_(0.0);
@@ -903,7 +919,7 @@ void Interp::InitBuiltins()
                 // string.concat(v [, ...]) — join the tostring of every
                 // argument, ignoring nulls (the ++ operator throws on
                 // null); no args or all-null returns null.
-                // builtin/_.aardio's lasterr() builds its error text here.
+                // lasterr() builds its error text here.
                 tb->map[L"concat"] = NF([](vector<Value>& a) -> Value {
                     bool bAny = false;
                     wstring out;
@@ -1810,15 +1826,38 @@ void Interp::InitBuiltins()
                         {
                             out += v.s;
                         }
+                        else if (v.t == Value::Pointer && v.ptr && IsBuffer(v.ptr))
+                        {
+                            size_t bsz = GetBufferSize(v.ptr);
+                            const unsigned char* pData = (const unsigned char*)v.ptr;
+                            for (size_t i = 0; i < bsz; i++)
+                                out += (wchar_t)pData[i];
+                        }
                         else if (v.t == Value::TableT && v.tab)
                         {
-                            for (auto& item : v.tab->arr)
-                                addVal(item);
+                            if (!v.tab->arr.empty())
+                            {
+                                for (auto& item : v.tab->arr)
+                                    addVal(item);
+                            }
+                            else
+                            {
+                                for (size_t i = 1;; i++)
+                                {
+                                    auto it = v.tab->map.find(std::to_wstring(i));
+                                    if (it != v.tab->map.end())
+                                        addVal(it->second);
+                                    else
+                                        break;
+                                }
+                            }
                         }
                     };
                     for (auto& arg : a)
                         addVal(arg);
-                    return Value::Str_(out); });
+                    Value ret = Value::Str_(out);
+                    ret.bRawBytes = true;
+                    return ret; });
                 tb->map[L"unpack"] = NF([](vector<Value>& a) -> Value {
                     auto t = std::make_shared<Table>();
                     if (a.empty()) return Value::Table_(t);
@@ -1869,7 +1908,7 @@ void Interp::InitBuiltins()
                     }
                     return Value::Str_(out); });
 
-                auto ResolveAardioPathInternal = [](const wstring& rel) -> wstring {
+                auto ResolveScriptPathInternal = [](const wstring& rel) -> wstring {
                     if (rel.empty()) return rel;
                     if (rel[0] == L'~')
                         return ResolveTildeDisk(rel);
@@ -1908,9 +1947,9 @@ void Interp::InitBuiltins()
                     return rel;
                 };
 
-                tb->map[L"load"] = NF([ResolveAardioPathInternal](vector<Value>& a) {
+                tb->map[L"load"] = NF([ResolveScriptPathInternal](vector<Value>& a) {
                     if (a.empty()) return Value();
-                    wstring resolved = ResolveAardioPathInternal(BStr(a[0]));
+                    wstring resolved = ResolveScriptPathInternal(BStr(a[0]));
                     FILE* pf = nullptr;
                     if (_wfopen_s(&pf, resolved.c_str(), L"rb") != 0 || !pf)
                         return Value();
@@ -1920,7 +1959,7 @@ void Interp::InitBuiltins()
                         raw2.append(buf2, rd);
                     fclose(pf);
                     // Binary sniff: NUL byte in the first 4KB or invalid UTF-8
-                    // -> binary payload, store 1:1 byte-per-wchar (aardio byte string model)
+                    // -> binary payload, store 1:1 byte-per-wchar (byte string model)
                     bool bBinary = false;
                     size_t nSniff = min(raw2.size(), (size_t)4096);
                     for (size_t k = 0; k < nSniff; k++)
@@ -1949,22 +1988,93 @@ void Interp::InitBuiltins()
                     MultiByteToWideChar(CP_UTF8, 0, raw2.data() + off2,
                                         (int)(raw2.size() - off2), &s2[0], w2);
                     return Value::Str_(s2); });
+                tb->map[L"loadBuffer"] = NF([ResolveScriptPathInternal](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
+                    if (a[0].t == Value::Pointer && a[0].ptr) return a[0];
+                    wstring path = BStr(a[0]);
+                    if (path.empty()) return Value();
+
+                    std::string rawData;
+                    bool bLoaded = false;
+                    if (g_interpCurrent)
+                    {
+                        wstring key = path;
+                        if (!key.empty() && key[0] == L'~') key = key.substr(1);
+                        if (!key.empty() && (key[0] == L'\\' || key[0] == L'/')) key = key.substr(1);
+                        auto eit = g_interpCurrent->embedded.find(key);
+                        if (eit == g_interpCurrent->embedded.end() && key != path)
+                            eit = g_interpCurrent->embedded.find(path);
+                        if (eit != g_interpCurrent->embedded.end())
+                        {
+                            rawData.resize(eit->second.size());
+                            for (size_t k = 0; k < eit->second.size(); k++)
+                                rawData[k] = (char)(unsigned char)eit->second[k];
+                            bLoaded = true;
+                        }
+                    }
+                    if (!bLoaded)
+                    {
+                        wstring resolved = ResolveScriptPathInternal(path);
+                        FILE* pf = nullptr;
+                        if (_wfopen_s(&pf, resolved.c_str(), L"rb") == 0 && pf)
+                        {
+                            char buf[4096];
+                            size_t rd;
+                            while ((rd = fread(buf, 1, sizeof(buf), pf)) > 0)
+                                rawData.append(buf, rd);
+                            fclose(pf);
+                            bLoaded = true;
+                        }
+                    }
+                    if (!bLoaded || rawData.empty()) return Value();
+                    void* p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, rawData.size());
+                    if (!p) return Value();
+                    memcpy(p, rawData.data(), rawData.size());
+                    RegisterBuffer(p, rawData.size());
+                    return Value::Pointer_(p);
+                });
                 tb->map[L"hex"] = NF([](vector<Value>& a) {
                     if (a.empty()) return Value::Str_(L"");
-                    wstring str = BStr(a[0]);
                     wstring prefix = a.size() > 1 ? BStr(a[1]) : L"";
-                    int n = WideCharToMultiByte(CP_UTF8, 0, str.c_str(),
-                        (int)str.size(), nullptr, 0, nullptr, nullptr);
-                    std::string raw((size_t)n, 0);
-                    WideCharToMultiByte(CP_UTF8, 0, str.c_str(),
-                        (int)str.size(), &raw[0], n, nullptr, nullptr);
                     static const wchar_t* kHex = L"0123456789ABCDEF";
                     wstring out;
-                    for (unsigned char c : raw)
+                    if (a[0].t == Value::Pointer && a[0].ptr && IsBuffer(a[0].ptr))
                     {
-                        if (!prefix.empty()) out += prefix;
-                        out += kHex[c >> 4];
-                        out += kHex[c & 0xF];
+                        size_t bsz = GetBufferSize(a[0].ptr);
+                        const unsigned char* pData = (const unsigned char*)a[0].ptr;
+                        for (size_t i = 0; i < bsz; i++)
+                        {
+                            if (!prefix.empty()) out += prefix;
+                            out += kHex[pData[i] >> 4];
+                            out += kHex[pData[i] & 0xF];
+                        }
+                        return Value::Str_(out);
+                    }
+                    wstring str = BStr(a[0]);
+                    if (a[0].t == Value::Str && a[0].bRawBytes)
+                    {
+                        // Byte string / binary data: read raw bytes directly without UTF-8 expansion
+                        for (wchar_t c : str)
+                        {
+                            unsigned char b = (unsigned char)c;
+                            if (!prefix.empty()) out += prefix;
+                            out += kHex[b >> 4];
+                            out += kHex[b & 0xF];
+                        }
+                    }
+                    else
+                    {
+                        int n = WideCharToMultiByte(CP_UTF8, 0, str.c_str(),
+                            (int)str.size(), nullptr, 0, nullptr, nullptr);
+                        std::string raw((size_t)n, 0);
+                        WideCharToMultiByte(CP_UTF8, 0, str.c_str(),
+                            (int)str.size(), &raw[0], n, nullptr, nullptr);
+                        for (unsigned char c : raw)
+                        {
+                            if (!prefix.empty()) out += prefix;
+                            out += kHex[c >> 4];
+                            out += kHex[c & 0xF];
+                        }
                     }
                     return Value::Str_(out); });
                 tb->map[L"unhex"] = NF([](vector<Value>& a) {
@@ -2073,12 +2183,34 @@ void Interp::InitBuiltins()
                         j += 3;
                     }
                     return Value::Str_(out); });
-                tb->map[L"save"] = NF([ResolveAardioPathInternal](vector<Value>& a) {
+                tb->map[L"save"] = NF([ResolveScriptPathInternal](vector<Value>& a) {
                     if (a.empty()) return Value::Bool_(false);
-                    wstring resolved = ResolveAardioPathInternal(BStr(a[0]));
+                    wstring resolved = ResolveScriptPathInternal(BStr(a[0]));
+                    size_t lastSlash = resolved.find_last_of(L"\\/");
+                    if (lastSlash != wstring::npos && lastSlash > 2)
+                    {
+                        wstring dir = resolved.substr(0, lastSlash);
+                        for (size_t i = 3; i <= dir.size(); i++)
+                        {
+                            if (i == dir.size() || dir[i] == L'\\' || dir[i] == L'/')
+                            {
+                                wstring part = dir.substr(0, i);
+                                if (!part.empty() && part[part.size() - 1] != L':')
+                                    CreateDirectoryW(part.c_str(), nullptr);
+                            }
+                        }
+                    }
                     FILE* pf = nullptr;
                     if (_wfopen_s(&pf, resolved.c_str(), L"wb") != 0 || !pf)
                         return Value::Bool_(false);
+                    if (a.size() > 1 && a[1].t == Value::Pointer && a[1].ptr && IsBuffer(a[1].ptr))
+                    {
+                        size_t bsz = GetBufferSize(a[1].ptr);
+                        if (bsz > 0)
+                            fwrite(a[1].ptr, 1, bsz, pf);
+                        fclose(pf);
+                        return Value::Bool_(true);
+                    }
                     wstring s2 = BStr(a[1]);
                     bool bTextIn = false;
                     for (wchar_t c : s2)
@@ -2167,7 +2299,9 @@ void Interp::InitBuiltins()
                     for (int k = 0; k < nTo; k++)
                         res[(size_t)k] =
                             (wchar_t)(unsigned char)out[(size_t)k];
-                    return Value::Str_(res); });
+                    Value ret = Value::Str_(res);
+                    ret.bRawBytes = true;
+                    return ret; });
             }
             // ---- math ----
             {
@@ -2316,6 +2450,7 @@ void Interp::InitBuiltins()
                         return Value::Bool_(false);
                     return Value::Bool_(IsSize64(a[0]));
                 });
+                CreateSize64(0);
                 if (g_size64_meta)
                     tb->map[L"_size64_meta"] = Value::Table_(g_size64_meta);
             }
@@ -2363,7 +2498,7 @@ void Interp::InitBuiltins()
                     out->map[L"path"] = Value::Str_(p);
                     return Value::Table_(out); });
 
-                // Official aardio built-in io properties: _exepath, _exedir, _exefile
+                // Built-in io properties: _exepath, _exedir, _exefile
                 wchar_t szModExe[MAX_PATH] = L"";
                 GetModuleFileNameW(nullptr, szModExe, MAX_PATH);
                 wstring exePathStr = szModExe;
@@ -2391,9 +2526,8 @@ void Interp::InitBuiltins()
                 tb->map[L"println"] = NF([writer](vector<Value>& a) {
                     return writer(a, L"", true); });
                 // ---- io.file / io.open — kernel file class ----
-                // Official aardio: io.file is a kernel class; io.open is its
-                // legacy alias (builtin/io.aardio calls f.size()/f.seek on
-                // open() results). The ctor takes a path (text) or an OS
+                // io.file is a kernel class; io.open is its
+                // alias. The ctor takes a path (text) or an OS
                 // handle (pointer/num), plus a CRT mode string. Byte
                 // contract (engine convention, see string.fromto): file
                 // content flows as byte strings — one wchar per raw byte,
@@ -2408,7 +2542,9 @@ void Interp::InitBuiltins()
                     wstring s((size_t)raw.size(), 0);
                     for (size_t k = 0; k < raw.size(); k++)
                         s[k] = (wchar_t)(unsigned char)raw[k];
-                    return Value::Str_(s);
+                    Value ret = Value::Str_(s);
+                    ret.bRawBytes = true;
+                    return ret;
                 };
                 auto ioFileArgBytes = [](const Value& v,
                                          std::string& out) -> bool {
@@ -2630,7 +2766,7 @@ void Interp::InitBuiltins()
                 };
                 // ctor: path or OS handle + CRT mode string. io.open() with
                 // no args stays the console library's "is a console
-                // attached" query (console/_.aardio calls it bare).
+                // attached" query.
                 auto ioFileCtor = NF([ioFileMake](vector<Value>& a) -> Value {
                     if (a.size() < 2 || a[0].t == Value::Null)
                         return Value::Bool_(GetConsoleWindow() != nullptr);
@@ -2661,7 +2797,7 @@ void Interp::InitBuiltins()
                     {
                         // wrap an OS handle: the CRT fd takes ownership
                         // (closing the file closes the handle) — matches
-                        // aardio io.file semantics for popen pipes.
+                        // io.file semantics for popen pipes.
                         // CRT text mode is fatal on live pipes: a short
                         // translated read loops on ReadFile until EOF, so
                         // every fd is binary; io.file is byte-oriented and
@@ -2756,11 +2892,17 @@ void Interp::InitBuiltins()
                             // re-encoding through UTF-8 would inflate
                             // multi-byte sequences and corrupt binaries.
                             s3 = eit->second;
+                            if (enc3 == L"raw")
+                            {
+                                Value ret = Value::Str_(s3);
+                                ret.bRawBytes = true;
+                                return ret;
+                            }
                         }
                     }
                     if (!bHit)
                     {
-                        // aardio "~" = the aardio install root (parent of
+                        // "~" = the install root (parent of
                         // NODIO_LIBDIR when set, else the exe's directory)
                         wstring strPath = ResolveTildeDisk(BStr(a[0]));
                         FILE* pf = nullptr;
@@ -2778,7 +2920,9 @@ void Interp::InitBuiltins()
                             for (size_t k = 0; k < raw3.size(); k++)
                                 s3[k] =
                                     (wchar_t)(unsigned char)raw3[k];
-                            return Value::Str_(s3);
+                            Value ret = Value::Str_(s3);
+                            ret.bRawBytes = true;
+                            return ret;
                         }
                         UINT cp3 = CodepageOf(a.size() > 1 ? a[1] : Value());
                         size_t off3 = 0;
@@ -2796,8 +2940,8 @@ void Interp::InitBuiltins()
                                 (int)(raw3.size() - off3), &s3[0], w3);
                     }
                     return Value::Str_(s3); });
-                // io.fullpath(path) — convert an aardio-style path to an
-                // absolute system path (docs/library-guide/builtin/io/path.md):
+                // io.fullpath(path) — convert a relative path to an
+                // absolute system path:
                 //   '~…'      → EXE/installation root
                 //   '/…' '\…' → 应用程序根目录 (the running project's dir)
                 //   '//…'     → the first slash is dropped (drive root)
@@ -2887,50 +3031,72 @@ void Interp::InitBuiltins()
                 // %XX escapes decoded; anything that is not a file URL or
                 // an existing plain path form passes through as-is when it
                 // is relative, http(s):// and other schemes return null
+                // io.localpath(path) — path specification:
+                // Only converts path starting with single '\', '/', or '~' to absolute path.
+                // - Starts with '\\': returns null
+                // - Starts with '//': removes first slash
+                // - Starts with single '\' or '/': resolves relative to application base directory
+                // - Starts with '~/' or '~\' (or single '~'): resolves relative to EXE / root directory
+                // - Other formats do not convert, returns null.
                 tb->map[L"localpath"] = NF([](vector<Value>& a) -> Value {
                     wstring s = a.empty() ? L"" : BStr(a[0]);
                     if (s.empty()) return Value();
+
                     auto ieq = [](const wchar_t* p, const wchar_t* pre) {
                         while (*pre)
                             if (towlower(*p++) != towlower(*pre++))
                                 return false;
                         return true; };
-                    wstring out;
+                    bool bFileUrl = false;
                     if (ieq(s.c_str(), L"file:///"))
-                        out = s.substr(8);
-                    else if (ieq(s.c_str(), L"file://"))
-                        out = s.substr(7);
-                    else
                     {
-                        // an explicit scheme that is not file: -> null
-                        size_t sc = s.find(L"://");
-                        if (sc != wstring::npos && sc > 1)
-                            return Value();
-                        // a drive-qualified or rooted path passes through
+                        s = s.substr(8);
+                        bFileUrl = true;
+                    }
+                    else if (ieq(s.c_str(), L"file://"))
+                    {
+                        s = s.substr(7);
+                        bFileUrl = true;
+                    }
+                    if (bFileUrl)
+                    {
+                        for (auto& ch : s)
+                            if (ch == L'/') ch = L'\\';
                         return Value::Str_(s);
                     }
-                    // URL-decode %XX and normalise separators
-                    wstring dec;
-                    for (size_t i = 0; i < out.size(); i++)
+
+                    if (s.size() >= 2 && s[0] == L'\\' && s[1] == L'\\')
+                        return Value(); // UNC or \\ starts with double backslash -> null
+                    if (s.size() >= 2 && s[0] == L'/' && s[1] == L'/')
+                        return Value::Str_(s.substr(1));
+
+                    if (!s.empty() && s[0] == L'~')
+                        return Value::Str_(ResolveTildeDisk(s));
+
+                    if (!s.empty() && (s[0] == L'/' || s[0] == L'\\'))
                     {
-                        if (out[i] == L'%' && i + 2 < out.size() &&
-                            iswxdigit(out[i + 1]) && iswxdigit(out[i + 2]))
+                        wstring appRoot;
+                        if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
+                            appRoot = g_interpCurrent->baseDir;
+                        if (appRoot.empty())
                         {
-                            wchar_t hb = out[i + 1] <= L'9'
-                                ? out[i + 1] - L'0'
-                                : (towlower(out[i + 1]) - L'a' + 10);
-                            wchar_t lb = out[i + 2] <= L'9'
-                                ? out[i + 2] - L'0'
-                                : (towlower(out[i + 2]) - L'a' + 10);
-                            dec += (wchar_t)(hb * 16 + lb);
-                            i += 2;
+                            wchar_t szExe[MAX_PATH] = L"";
+                            GetModuleFileNameW(nullptr, szExe, MAX_PATH);
+                            wchar_t* pSep = wcsrchr(szExe, L'\\');
+                            if (pSep) *pSep = 0;
+                            appRoot = szExe;
                         }
-                        else dec += out[i];
+                        wstring rest = s.substr(1);
+                        while (!rest.empty() && (rest[0] == L'/' || rest[0] == L'\\'))
+                            rest = rest.substr(1);
+                        if (rest.empty())
+                            return Value::Str_(appRoot + L"\\");
+                        return Value::Str_(appRoot + L"\\" + rest);
                     }
-                    for (auto& c : dec)
-                        if (c == L'/') c = L'\\';
-                    return Value::Str_(dec); });
-                tb->map[L"exist"] = NF([](vector<Value>& a) -> Value {                    if (a.empty() || a[0].t != Value::Str)
+
+                    return Value(); });
+                tb->map[L"exist"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t != Value::Str)
                         return Value();      // null
                     wstring strPath = BStr(a[0]);
                     if (strPath.empty())
@@ -2952,14 +3118,38 @@ void Interp::InitBuiltins()
                               g_interpCurrent->embedded.count(strPath))))
                             return Value::Str_(ResolveTildeDisk(strPath));
                     }
-                    wstring full = ResolveTildeDisk(strPath);
-                    // make it absolute (a relative path resolves against cwd)
-                    wchar_t szFull[MAX_PATH * 2] = L"";
-                    DWORD nFull = GetFullPathNameW(full.c_str(),
-                                                  MAX_PATH * 2, szFull,
-                                                  nullptr);
-                    if (nFull > 0 && nFull < MAX_PATH * 2)
-                        full = szFull;
+                    wstring full;
+                    if (!strPath.empty() && strPath[0] == L'~')
+                        full = ResolveTildeDisk(strPath);
+                    else if (!strPath.empty() && (strPath[0] == L'/' || strPath[0] == L'\\') &&
+                             !(strPath.size() >= 2 && strPath[0] == L'\\' && strPath[1] == L'\\'))
+                    {
+                        wstring appRoot;
+                        if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
+                            appRoot = g_interpCurrent->baseDir;
+                        if (appRoot.empty())
+                        {
+                            wchar_t szExe[MAX_PATH] = L"";
+                            GetModuleFileNameW(nullptr, szExe, MAX_PATH);
+                            wchar_t* pSep = wcsrchr(szExe, L'\\');
+                            if (pSep) *pSep = 0;
+                            appRoot = szExe;
+                        }
+                        wstring rest = strPath.substr(1);
+                        while (!rest.empty() && (rest[0] == L'/' || rest[0] == L'\\'))
+                            rest = rest.substr(1);
+                        full = rest.empty() ? (appRoot + L"\\") : (appRoot + L"\\" + rest);
+                    }
+                    else
+                    {
+                        full = ResolveTildeDisk(strPath);
+                        wchar_t szFull[MAX_PATH * 2] = L"";
+                        DWORD nFull = GetFullPathNameW(full.c_str(),
+                                                      MAX_PATH * 2, szFull,
+                                                      nullptr);
+                        if (nFull > 0 && nFull < MAX_PATH * 2)
+                            full = szFull;
+                    }
                     int acc = 0;
                     if (mode == 2 || mode == 6)
                         acc |= 2;
@@ -3105,6 +3295,28 @@ void Interp::InitBuiltins()
                         auto ifmt = self.tab->map.find(L"format");
                         if (ifmt != self.tab->map.end() && ifmt->second.t == Value::Str)
                             fmt = ifmt->second.s;
+                    }
+                    bool bUtc = false;
+                    if (!fmt.empty() && fmt[0] == L'!')
+                    {
+                        bUtc = true;
+                        fmt = fmt.substr(1);
+                    }
+                    if (fmt.find(L'%') == wstring::npos)
+                    {
+                        wstring converted;
+                        for (size_t fi = 0; fi < fmt.size(); )
+                        {
+                            if (fmt.compare(fi, 4, L"yyyy") == 0) { converted += L"%Y"; fi += 4; }
+                            else if (fmt.compare(fi, 2, L"yy") == 0) { converted += L"%y"; fi += 2; }
+                            else if (fmt.compare(fi, 2, L"MM") == 0) { converted += L"%m"; fi += 2; }
+                            else if (fmt.compare(fi, 2, L"dd") == 0) { converted += L"%d"; fi += 2; }
+                            else if (fmt.compare(fi, 2, L"HH") == 0) { converted += L"%H"; fi += 2; }
+                            else if (fmt.compare(fi, 2, L"mm") == 0) { converted += L"%M"; fi += 2; }
+                            else if (fmt.compare(fi, 2, L"ss") == 0) { converted += L"%S"; fi += 2; }
+                            else { converted += fmt[fi++]; }
+                        }
+                        fmt = converted;
                     }
                     tm tmb{};
                     tmb.tm_year = (int)(long long)BNum(self.tab->map[L"year"]) - 1900;
@@ -3508,14 +3720,14 @@ void Interp::InitBuiltins()
                     return vx; });
                 tb->map[L"msgbox"] = NF([](vector<Value>& a) {
                     wstring text = a.empty() ? L"" : a[0].ToString();
-                    wstring title = a.size() > 1 ? a[1].ToString() : L"aardio";
+                    wstring title = a.size() > 1 ? a[1].ToString() : GetNodioConfig().defaultTitle;
                     UINT flag = a.size() > 2 ? (UINT)BNum(a[2]) : 0u;
                     int rc = MessageBoxW(nullptr, text.c_str(), title.c_str(),
                                          MB_OK | flag);
                     return Value::Num_((double)rc); });
                 tb->map[L"msgboxTest"] = NF([](vector<Value>& a) {
                     wstring text = a.empty() ? L"" : a[0].ToString();
-                    wstring title = a.size() > 1 ? a[1].ToString() : L"aardio";
+                    wstring title = a.size() > 1 ? a[1].ToString() : GetNodioConfig().defaultTitle;
                     return Value::Bool_(MessageBoxW(nullptr, text.c_str(),
                         title.c_str(), MB_OKCANCEL | MB_ICONQUESTION) == IDOK); });
                 clip->map[L"write"] = NF([](vector<Value>& a) {
@@ -3611,7 +3823,7 @@ void Interp::InitBuiltins()
                 auto dlg = std::make_shared<Table>();
                 tb->map[L"dlg"] = Value::Table_(dlg);
                 // open(formOrHwnd, title, filter, initDir, initFile) -> path
-                // filter uses aardio pipe form: "文本|*.txt|所有|*.*"
+                // filter uses pipe form: "文本|*.txt|所有|*.*"
                 auto dlgImpl = [HwndOf](vector<Value>& a, bool bSave)
                     -> Value {
                     HWND hOwner = a.empty() ? nullptr : HwndOf(a[0]);
@@ -3928,58 +4140,79 @@ void Interp::InitBuiltins()
                                     strName.c_str(), (int)strName.size(),
                                     &strNameA[0], (int)strNameA.size(),
                                     nullptr, nullptr);
+                            char suffix = 0;
+                            std::string bareName = strNameA;
+                            if (strNameA.size() > 1 && strNameA.find('@') == std::string::npos)
+                            {
+                                char last = strNameA.back();
+                                if (last == 'W' || last == 'A' || last == 'L' || last == 'P' ||
+                                    last == 'D' || last == 'F' || last == 'B')
+                                {
+                                    suffix = last;
+                                    bareName = strNameA.substr(0, strNameA.size() - 1);
+                                }
+                            }
+
                             if (memDll->bOk)
                             {
-                                // memory DLL: GetProcAddress does not work
-                                // on a manually mapped image
-                                fp = MemDllGetProc(memDll->pImage,
-                                                   strNameA.c_str());
+                                fp = MemDllGetProc(memDll->pImage, strNameA.c_str());
+                                if (!fp && suffix)
+                                    fp = MemDllGetProc(memDll->pImage, bareName.c_str());
                             }
                             else
                             {
-                            fp = ::GetProcAddress(hMod,
-                                strNameA.c_str());
-                            // Win32 dual exports: bare name -> W -> A, and
-                            // W-suffixed declarations of ANSI-only exports
-                            // (user32 "CopyImageW" exists only as CopyImage —
-                            // the original VM strips the trailing W on miss)
-                            if (!fp && strNameA.find('@') == std::string::npos)
-                            {
-                                std::string w = strNameA + "W";
-                                fp = ::GetProcAddress(hMod, w.c_str());
-                                if (fp) bNameW = true;
+                                // 1. Exact export name
+                                fp = ::GetProcAddress(hMod, strNameA.c_str());
+
+                                // 2. Bare export name without suffix
+                                if (!fp && suffix)
+                                {
+                                    fp = ::GetProcAddress(hMod, bareName.c_str());
+                                    if (fp)
+                                    {
+                                        if (suffix == 'W') bNameW = true;
+                                        else if (suffix == 'A') bNameW = false;
+                                    }
+                                }
+
+                                // 3. Unicode variant (appending 'W')
+                                if (!fp && strNameA.find('@') == std::string::npos)
+                                {
+                                    std::string w = (suffix ? bareName : strNameA) + "W";
+                                    fp = ::GetProcAddress(hMod, w.c_str());
+                                    if (fp) bNameW = true;
+                                }
+
+                                // 4. ANSI variant (appending 'A')
+                                if (!fp && strNameA.find('@') == std::string::npos)
+                                {
+                                    std::string an = (suffix ? bareName : strNameA) + "A";
+                                    fp = ::GetProcAddress(hMod, an.c_str());
+                                    if (fp) bNameW = false;
+                                }
                             }
-                            if (!fp && strNameA.size() > 1 &&
-                                strNameA.back() == 'W' &&
-                                strNameA.find('@') == std::string::npos)
-                            {
-                                std::string bare = strNameA.substr(0,
-                                    strNameA.size() - 1);
-                                fp = ::GetProcAddress(hMod, bare.c_str());
-                                if (fp) bNameW = false;
-                            }
-                            }
-                            if (!fp)
-                            {
-                                std::string an = strNameA + "A";
-                                fp = ::GetProcAddress(hMod, an.c_str());
-                                if (fp) bNameW = false;
-                            }
-                            else if (!bNameW && strNameA.size() > 1 &&
-                                     strNameA.back() == 'W')
-                                bNameW = true;   // explicit W in the decl
+                            if (!bNameW && suffix == 'W')
+                                bNameW = true;
                             if (fp)
                                 fp = ResolveLongPtrAlias(hMod, fp, strNameA);
                         }
                         if (!fp)
                         {
-                            // official aardio quirk: api() on a missing
+                            // api() on a missing
                             // export returns null (callers guard with
-                            // try/catch — process/_.aardio WoW64 block)
-                            if (a2.size() == 1)
+                            // try/catch)
+                            if (a2.size() <= 1 || a2[1].t == Value::Null)
                                 return Value();
                             (*err) = L"运行错误: 找不到 API: " + strName;
                             return Value();
+                        }
+                        if (a2.size() <= 1 || a2[1].t == Value::Null)
+                        {
+                            // dll.api("symbol") with no signature
+                            // returns the exported symbol address as a pointer
+                            // (e.g. PyBool_Type = ::Python3.api("PyBool_Type"), _Py_NoneStruct,
+                            // or feature probe: if (::Kernel32.api("SomeFunc")))
+                            return Value::Pointer_((void*)fp);
                         }
                         void* fn = (void*)fp;
                         // raw.interface / COM vtable: app.api(fnPtr, proto,
@@ -4059,12 +4292,10 @@ void Interp::InitBuiltins()
                                 Value v = (i + nOff) < argsEff.size()
                                     ? argsEff[i + nOff] : Value();
                                 int pt = sig.params[i] & 0xFF;
-                                // aardio contract: a W-suffixed export takes
+                                // a W-suffixed export takes
                                 // `str` params as UTF-16 (string.getenv with
                                 // GetEnvironmentVariable passes "str name" to
-                                // the auto-W'd GetEnvironmentVariableW — an
-                                // ANSI re-encode scrambled the name and the
-                                // lookup silently failed)
+                                // the auto-W'd GetEnvironmentVariableW)
                                 if (bNameW && pt == 6) pt = 7;
                                 bool bByRef =
                                     (sig.params[i] & 0x100) != 0;
@@ -4089,8 +4320,7 @@ void Interp::InitBuiltins()
                                 }
                                 if (bByRef && (pt == 6 || pt == 7 || pt == 11))
                                 {
-                                    // aardio string-by-ref contract (docs
-                                    // raw/datatype.md): a NUMBER is the
+                                    // string-by-ref contract: a NUMBER is the
                                     // buffer length — bytes for string &,
                                     // wchars for ustring & — zeroed, plus
                                     // a 2-byte null tail; 0 passes a null
@@ -4198,7 +4428,7 @@ void Interp::InitBuiltins()
                                         void* pBuf = StructSerialize(v, &total);
                                         if (pBuf)
                                         {
-                                            // aardio auto-maintains cbSize:
+                                            // auto-maintains cbSize:
                                             // a struct whose first member is
                                             // cbSize gets it stamped with the
                                             // real size on every API call
@@ -4227,7 +4457,7 @@ void Interp::InitBuiltins()
                                 switch (pt)
                                 {
                                 case 0:   // int
-                                    // wrap modulo 2^32 (aardio doubles:
+                                    // wrap modulo 2^32 (numbers:
                                     // 0xFFFFFFF0 must arrive as -16, not
                                     // the MSVC saturate value)
                                     slots.push_back((SlotT)(
@@ -4332,7 +4562,7 @@ void Interp::InitBuiltins()
                                     }
                                     else if (v.t == Value::Str)
                                     {
-                                        std::string sA = RawBytesOf(v.s);
+                                        std::string sA = RawBytesOf(v);
                                         sA.push_back('\0');
                                         tmpA.push_back(std::move(sA));
                                         slots.push_back((SlotT)(INT_PTR)tmpA.back().data());
@@ -4359,9 +4589,7 @@ void Interp::InitBuiltins()
                                         std::string sA;
                                         if (pt == 11)
                                         {
-                                            sA.reserve(w.size());
-                                            for (wchar_t ch : w)
-                                                sA.push_back((char)(unsigned char)ch);
+                                            sA = RawBytesOf(v);
                                         }
                                         else
                                         {
@@ -4501,17 +4729,15 @@ void Interp::InitBuiltins()
                                 vRet = Value::Bool_((int)r != 0);
                                 break;
                             case ARPtr:
-                                // official aardio types pointer returns as
-                                // cdata; type(arg)=="pointer" drives lib
-                                // dispatch (gdip.graphics(hdc))
+                                // pointer returns typed as pointer;
+                                // type(arg)=="pointer" drives lib dispatch
                                 vRet = (INT_PTR)r
                                     ? Value::Pointer_((void*)(INT_PTR)r)
                                     : Value();
                                 break;
                             case ARAddr:
-                                // official aardio: `addr` returns are
-                                // plain numbers (win/api.aardio feeds
-                                // ::SendMessage results straight back
+                                // `addr` returns are plain numbers
+                                // (feeds ::SendMessage results straight back
                                 // into length params)
                                 vRet = Value::Num_((double)(INT_PTR)r);
                                 break;
@@ -4529,7 +4755,7 @@ void Interp::InitBuiltins()
                                 vRet = Value::Num_((double)r);
                                 break;
                             }
-                            // aardio by-ref out-params come back as extra
+                            // by-ref out-params come back as extra
                             // return values (var len,str = formatMessage(..))
                             if (!tmpRefs.empty())
                             {
@@ -4604,6 +4830,7 @@ void Interp::InitBuiltins()
                                             for (size_t k = 0; k < len; k++)
                                                 ws += (wchar_t)pb[k];
                                             outVal = Value::Str_(ws);
+                                            outVal.bRawBytes = true;
                                             break;
                                         }
                                         case 9:
@@ -4638,9 +4865,136 @@ void Interp::InitBuiltins()
                             retFn.ptr = fn;
                             return retFn;
                         });
+
+                    auto fnApi = dll->map[L"api"];
+                    auto dmeta = std::make_shared<Table>();
+                    dmeta->map[L"_get"] = NF([this, fnApi, hMod, memDll, bDllCdecl, bDllUni, dllWeak = std::weak_ptr<Table>(dll)](vector<Value>& a) -> Value {
+                        if (a.empty() || a[0].t != Value::Str) return Value();
+                        wstring name = a[0].s;
+                        if (name.empty()) return Value();
+
+                        auto pDll = dllWeak.lock();
+                        if (pDll)
+                        {
+                            auto it = pDll->map.find(name);
+                            if (it != pDll->map.end()) return it->second;
+                        }
+
+                        // Determine return type and bare export name from API suffix
+                        // Suffix rule: preceded by lowercase letter
+                        wchar_t suffix = 0;
+                        wstring bareName = name;
+                        if (name.size() >= 2 && iswlower(name[name.size() - 2]))
+                        {
+                            wchar_t last = name.back();
+                            if (last == L'P' || last == L'L' || last == L'D' ||
+                                last == L'F' || last == L'B' || last == L'W' || last == L'A')
+                            {
+                                suffix = last;
+                                if (last != L'W' && last != L'A')
+                                    bareName = name.substr(0, name.size() - 1);
+                            }
+                        }
+
+                        std::string bareNameA = RawBytesOf(Value::Str_(bareName));
+                        std::string nameA = RawBytesOf(Value::Str_(name));
+                        FARPROC fp = nullptr;
+                        if (memDll->bOk)
+                        {
+                            fp = MemDllGetProc(memDll->pImage, nameA.c_str());
+                            if (!fp && suffix)
+                                fp = MemDllGetProc(memDll->pImage, bareNameA.c_str());
+                        }
+                        else if (hMod)
+                        {
+                            fp = ::GetProcAddress(hMod, nameA.c_str());
+                            if (!fp && suffix)
+                                fp = ::GetProcAddress(hMod, bareNameA.c_str());
+                            if (!fp && nameA.find('@') == std::string::npos)
+                            {
+                                std::string w = (suffix ? bareNameA : nameA) + "W";
+                                fp = ::GetProcAddress(hMod, w.c_str());
+                            }
+                            if (!fp && nameA.find('@') == std::string::npos)
+                            {
+                                std::string an = (suffix ? bareNameA : nameA) + "A";
+                                fp = ::GetProcAddress(hMod, an.c_str());
+                            }
+                        }
+                        if (!fp)
+                            return Value();
+
+                        // Create a dynamic invoker function that synthesizes signature on first call
+                        Value dynFn = NF([this, fnApi, name, bareName, suffix, bDllCdecl, bDllUni, dllWeak](vector<Value>& args) -> Value {
+                            wstring retType = L"addr";
+                            if (suffix == L'P') retType = L"pointer";
+                            else if (suffix == L'L') retType = L"long";
+                            else if (suffix == L'D') retType = L"double";
+                            else if (suffix == L'F') retType = L"float";
+                            else if (suffix == L'B') retType = L"bool";
+
+                            bool isUnicode = (suffix == L'W') || bDllUni;
+
+                            wstring sig = retType + L"(";
+                            for (size_t i = 0; i < args.size(); ++i)
+                            {
+                                if (i > 0) sig += L",";
+                                const auto& arg = args[i];
+                                if (arg.t == Value::Str)
+                                {
+                                    sig += isUnicode ? L"ustring" : L"string";
+                                }
+                                else if (arg.t == Value::TableT || arg.t == Value::Class)
+                                {
+                                    sig += L"struct&";
+                                }
+                                else if (arg.t == Value::Pointer)
+                                {
+                                    sig += L"pointer";
+                                }
+                                else if (arg.t == Value::Bool)
+                                {
+                                    sig += L"bool";
+                                }
+                                else if (arg.t == Value::Num)
+                                {
+                                    sig += L"int";
+                                }
+                                else
+                                {
+                                    sig += L"pointer";
+                                }
+                            }
+                            if (bDllCdecl) sig += (args.empty() ? L"cdecl" : L",cdecl");
+                            sig += L")";
+
+                            vector<Value> apiArgs{ Value::Str_(bareName), Value::Str_(sig) };
+                            Value boundApi = fnApi.native(apiArgs);
+                            if (boundApi.t != Value::Func)
+                            {
+                                if (bareName != name)
+                                {
+                                    vector<Value> apiArgs2{ Value::Str_(name), Value::Str_(sig) };
+                                    boundApi = fnApi.native(apiArgs2);
+                                }
+                            }
+                            if (boundApi.t == Value::Func)
+                            {
+                                auto pDll = dllWeak.lock();
+                                if (pDll)
+                                    pDll->map[name] = boundApi;
+                                return this->CallVmFunc(boundApi, args);
+                            }
+                            return Value();
+                        });
+                        return dynFn;
+                    });
+                    dll->map[L"_meta"] = Value::Table_(dmeta);
+                    dll->bExplicitMeta = true;
+
                     return Value::Table_(dll); });
                 // raw memory: a raw.buffer is a distinct pointer value
-                // (aardio buffer type). Numbers still work as addresses for
+                // (buffer type). Numbers still work as addresses for
                 // backwards compatibility of older scripts.
                 auto BufPtr = [](const Value& v) -> void* {
                     if (v.t == Value::Pointer) return v.ptr;
@@ -4696,6 +5050,14 @@ void Interp::InitBuiltins()
                             {
                                 memcpy(p, a[1].ptr, srcSz < n ? srcSz : n);
                             }
+                            else
+                            {
+                                memcpy(p, a[1].ptr, n);
+                            }
+                        }
+                        else if (a[1].t == Value::Num && a[1].n != 0)
+                        {
+                            memcpy(p, (void*)(INT_PTR)(long long)a[1].n, n);
                         }
                     }
                     RegisterBuffer(p, n);
@@ -4786,7 +5148,7 @@ void Interp::InitBuiltins()
                 });
                 tb->map[L"sizeof"] = tb->map[L"sizeOf"];
                 // raw.len: string byte length, or the struct's total size.
-                // builtin/raw.aardio relies on it for equal()/typeOfArray.
+                // raw library relies on it for equal()/typeOfArray.
                 tb->map[L"len"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t == Value::Null) return Value();
                     if (a[0].t == Value::Str)
@@ -5021,7 +5383,9 @@ void Interp::InitBuiltins()
                     if (pAllocated)
                         HeapFree(GetProcessHeap(), 0, pAllocated);
 
-                    return Value::Str_(w);
+                    Value ret = Value::Str_(w);
+                    ret.bRawBytes = true;
+                    return ret;
                 });
                 // raw.copy(dst,src,size) — raw memory copy, returns dst
                 tb->map[L"copy"] = NF([](vector<Value>& a) -> Value {
@@ -5234,7 +5598,7 @@ void Interp::InitBuiltins()
                         h = (void*)(INT_PTR)(long long)BNum(a[0]);
                     if (!h) return Value::Bool_(false);
                     return Value::Bool_(CloseHandle(h) != 0); });
-                // raw._release(obj) — aardio forces a reference release.
+                // raw._release(obj) — forces a reference release.
                 // The VM's lifetimes are ARC-managed, so dropping the last
                 // reference happens naturally when callers null the field;
                 // keep this as an accepted no-op so library code
@@ -5337,8 +5701,7 @@ void Interp::InitBuiltins()
                     if (sMatch.native) return sMatch.native(args);
                     return Value();
                 });
-                // M5: preloaded system DLLs, mirroring builtin/_.aardio's
-                // ::User32/::Kernel32 — api.aardio assumes they exist
+                // preloaded system DLLs (::User32 / ::Kernel32)
                 {
                     auto uDll = tb->map[L"loadDll"];
                     vector<Value> ua{ Value::Str_(L"User32.dll") };
@@ -5353,9 +5716,8 @@ void Interp::InitBuiltins()
                         globals.vars[L"Kernel32"] = uDll.native(ka);
                         roots[L"Kernel32"] = globals.vars[L"Kernel32"];
                     }
-                    // win/_.aardio also calls ::Shell32 / ::Gdi32 /
-                    // ::Comctl32 style roots - preload the common ones
-                    // console/_.aardio's crtReopen() uses ::Msvcrt to reopen
+                    // Preload common system library roots (::Shell32 / ::Gdi32 / ::Comctl32)
+                    // crtReopen() uses ::Msvcrt to reopen
                     // the CRT streams. Modern MSVCRT no longer exports
                     // __iob_func (removed in VS2015+), so the library's
                     // "stdin + 32" FILE arithmetic would write through a null
@@ -5382,7 +5744,9 @@ void Interp::InitBuiltins()
                         L"Ole32.dll", L"OleAut32.dll", L"Advapi32.dll",
                         L"Comctl32.dll", L"Comdlg32.dll", L"Uxtheme.dll",
                         L"Version.dll", L"Winmm.dll", L"Msimg32.dll",
-                        L"Rpcrt4.dll", nullptr };
+                        L"Rpcrt4.dll", L"Ntdll.dll", L"Wininet.dll",
+                        L"Shlwapi.dll", L"Secur32.dll", L"Crypt32.dll",
+                        L"Imm32.dll", nullptr };
                     for (int di = 0; DLLS[di]; di++)
                     {
                         vector<Value> da{ Value::Str_(DLLS[di]) };
@@ -5458,8 +5822,8 @@ void Interp::InitBuiltins()
             // ---- table ----
             {
                 auto tb = GetRoot(L"table").tab;
-                // table.tostring(t) — official kernel primitive:
-                // serialize a table to aardio source format (array part
+                // table.tostring(t) — kernel primitive:
+                // serialize a table to source format (array part
                 // separated by ';', named members as k=v;), strings
                 // quoted with escapes; scalars pass through
                 tb->map[L"tostring"] = NF([](vector<Value>& a) -> Value {
@@ -5544,7 +5908,7 @@ void Interp::InitBuiltins()
                     wstring out;
                     serTbl(a[0], out, 0);
                     return Value::Str_(out); });
-                // table.slice(array,start,end) — aardio 1-based slice
+                // table.slice(array,start,end) — 1-based slice
                 tb->map[L"slice"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
                         return Value();
@@ -5677,7 +6041,7 @@ void Interp::InitBuiltins()
                 tb->map[L"unpack"] = fnUnpack;
                 tb->map[L"unpackArgs"] = fnUnpack;
 
-                // table.next(t[, key]) — aardio walks tables in insertion
+                // table.next(t[, key]) — walks tables in insertion
                 // order; the array part is ordered, the hash part's order
                 // is not recorded yet, so next() covers the array first,
                 // then hash members in unordered_map order (pinned in the
@@ -5697,7 +6061,7 @@ void Interp::InitBuiltins()
                     for (auto& kv : t->map)
                     {
                         // a numeric-string key was written as a number
-                        // (form._ctrlHwnd[hwndNumber] = ctrl): aardio
+                        // (form._ctrlHwnd[hwndNumber] = ctrl):
                         // iterates it back as a NUMBER — handing a string
                         // to win.getStyle(string) marshals the string's
                         // raw buffer as the hwnd and misreads the style
@@ -5986,7 +6350,7 @@ void Interp::InitBuiltins()
                 // sort: default compares numbers numerically, everything
                 // else by ToString; a custom comparator (function value)
                 // is invoked re-entrantly and must return truthy when the
-                // first argument belongs before the second (Lua/aardio)
+                // first argument belongs before the second
                 tb->map[L"sort"] = NF([this](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t != Value::TableT || !a[0].tab)
                         return a.empty() ? Value() : a[0];
@@ -6238,39 +6602,23 @@ void Interp::InitBuiltins()
                         return Value::Bool_(false);
                     return Value::Bool_(ResumeThread(h) != (DWORD)-1); });
                 // thread.call(funcOrName, owner, ...) - official contract: run fn in
-// a fresh thread and WAIT for it; a string first arg names a function
-// in the thread-shared map. Returns every value the thread fn produced.
+                // the thread-shared area (critical section locked by g_threadSharedMutex).
+                // A string first arg names a function in the thread-shared map.
+                // Returns every value the thread fn produced.
                 tb->map[L"call"] = NF([this](vector<Value>& a) -> Value {
                     if (a.empty())
                         return Value();
                     Value fn = a[0];
+                    std::lock_guard<std::recursive_mutex> lk(g_threadSharedMutex);
                     if (fn.t == Value::Str)
                     {
-                        std::lock_guard<std::mutex> lk(g_threadSharedMutex);
                         auto it = g_threadSharedMap.find(fn.s);
                         if (it != g_threadSharedMap.end())
                             fn = it->second;
                         else
                             fn = Value();
                     }
-                    if (fn.t == Value::Func && !fn.fn && fn.native)
-                    {
-                        // native (like thread.create called from
-                        // builtin invoke) cannot cross threads - call in place
-                        vector<Value> nArgs;
-                        for (size_t i = 2; i < a.size(); i++)
-                            nArgs.push_back(a[i]);
-                        Value r = this->CallOwner(fn,
-                            a.size() > 1 ? a[1] : Value(), nArgs);
-                        if (r.mrets && !r.mrets->empty())
-                        {
-                            Value first = (*r.mrets)[0];
-                            first.mrets = r.mrets;
-                            return first;
-                        }
-                        return r;
-                    }
-                    if (fn.t != Value::Func || !fn.fn)
+                    if (fn.t != Value::Func && !fn.native && !(fn.t == Value::TableT && fn.tab))
                     {
                         (*err) = L"\u8fd0\u884c\u9519\u8bef: thread.call \u9700\u8981\u51fd\u6570";
                         return Value();
@@ -6278,43 +6626,29 @@ void Interp::InitBuiltins()
                     Value owner = a.size() > 1 ? a[1] : Value();
                     vector<Value> args;
                     for (size_t i = 2; i < a.size(); i++)
-                        args.push_back(DeepCopy(a[i]));
-                    auto st = std::make_shared<ThreadState>();
-                    PNode fnBody = fn.fn;
-                    vector<wstring> params = fn.params;
-                    // worker frame: params + trailing owner slot (official
-                    // thread functions receive owner as the first param
-                    // when the call site passed one)
-                    vector<Value> callArgs = args;
-                    HANDLE hTh = CreateThread(
-                        nullptr, 0, ThreadWorkerProc,
-                        new ThreadJob{ st, fnBody, params, callArgs, owner }, 0,
-                        nullptr);
-                    if (hTh)
+                        args.push_back(a[i]);
+                    // Thread-shared functions execute in global namespace without enclosing lexical scopes
+                    fn.nsClosure = nullptr;
+                    fn.envUp = nullptr;
+                    return this->CallOwner(fn, owner, args); });
+                tb->map[L"acquire"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
+                    wstring key = BStr(a[0]);
+                    double timeout = a.size() > 1 ? BNum(a[1]) : -1.0;
+                    DWORD start = GetTickCount();
+                    while (true)
                     {
                         {
-                            std::lock_guard<std::mutex> lk(g_threadStatesMutex);
-                            g_threadStates[hTh] = st;
+                            std::lock_guard<std::recursive_mutex> lock(g_threadSharedMutex);
+                            auto it = g_threadSharedMap.find(key);
+                            if (it != g_threadSharedMap.end() && it->second.t != Value::Null)
+                                return it->second;
                         }
-                        while (!st->done)
-                            Sleep(5);
-                        CloseHandle(hTh);
-                        std::lock_guard<std::mutex> lk2(g_threadStatesMutex);
-                        g_threadStates.erase(hTh);
+                        if (timeout >= 0 && (GetTickCount() - start) >= (DWORD)timeout)
+                            return Value();
+                        Sleep(5);
                     }
-                    if (!st->error.empty())
-                    {
-                        (*err) = L"\u8fd0\u884c\u9519\u8bef: \u7ebf\u7a0b\u5185\u9519\u8bef: " + st->error;
-                        return Value();
-                    }
-                    Value r = st->result;
-                    if (r.mrets && !r.mrets->empty())
-                    {
-                        Value first = (*r.mrets)[0];
-                        first.mrets = r.mrets;
-                        return first;
-                    }
-                    return r; });
+                });
                 tb->map[L"waitOne"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty())
                         return Value();
@@ -6369,8 +6703,8 @@ void Interp::InitBuiltins()
                             args.push_back(a[i]);
                         return this->CallVmFunc(a[1], args);
                     }
-                    // Without a function the lock is advisory (aardio uses
-                    // this as "already open?" guard): report whether it can
+                    // Without a function the lock is advisory (used
+                    // as "already open?" guard): report whether it can
                     // be taken instead of blocking a single-threaded VM.
                     if (m->try_lock())
                     {
@@ -6400,14 +6734,14 @@ void Interp::InitBuiltins()
                     return Value::Bool_(CloseHandle(h) != 0); });
                 tb->map[L"get"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
-                    std::lock_guard<std::mutex> lock(g_threadSharedMutex);
+                    std::lock_guard<std::recursive_mutex> lock(g_threadSharedMutex);
                     auto it = g_threadSharedMap.find(BStr(a[0]));
                     if (it != g_threadSharedMap.end()) return it->second;
                     return Value();
                 });
                 tb->map[L"set"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
-                    std::lock_guard<std::mutex> lock(g_threadSharedMutex);
+                    std::lock_guard<std::recursive_mutex> lock(g_threadSharedMutex);
                     if (a.size() > 1 && a[1].t != Value::Null)
                         g_threadSharedMap[BStr(a[0])] = a[1];
                     else
@@ -6424,8 +6758,8 @@ void Interp::InitBuiltins()
                     return Value();
                 });
                 // __waitForMultipleObjects(timeout, waitall, handles,
-                // flags) — official kernel global consumed by
-                // builtin\thread.aardio threadwait. With a QS_* wake
+                // flags) — kernel global consumed by
+                // threadwait. With a QS_* wake
                 // mask it must be MsgWaitForMultipleObjects so that
                 // "input satisfied" returns WAIT_OBJECT_0+count (the
                 // caller then pumps and retries); without one it is a
@@ -6463,9 +6797,8 @@ void Interp::InitBuiltins()
                                              bAll ? TRUE : FALSE, ms);
                         return Value::Num_((double)rc);
                     });
-                // ---- kernel message-loop primitives (official aardio
-                // injects these as __-prefixed globals; win/_.aardio binds
-                // them at module load: `var getMessage = ..__messageGet`)
+                // ---- kernel message-loop primitives
+                // injects these as __-prefixed globals
                 auto fillMsgTable = [](Value& vMsg, const MSG& m) -> Value {
                     auto tb = (vMsg.t == Value::TableT && vMsg.tab)
                                   ? vMsg.tab
@@ -6577,8 +6910,8 @@ void Interp::InitBuiltins()
                     for (size_t i = 1; i < a.size(); i++)
                         args.push_back(DeepCopy(a[i]));
                     auto st = std::make_shared<ThreadState>();
-                    // official contract: thread.create returns a real
-                    // Win32 thread HANDLE (number) — builtin/thread.aardio
+                    // thread.create returns a real
+                    // Win32 thread HANDLE (number)
                     // feeds it into waitOne/waitAll/raw.closeHandle
                     HANDLE hTh = CreateThread(
                         nullptr, 0, ThreadWorkerProc,
@@ -6789,7 +7122,7 @@ void Interp::InitBuiltins()
                     FormState* fs = new FormState();
                     fs->it = this;
                     HWND hwnd = CreateWindowExW(
-                        0, L"AardioRE_form", strText.c_str(),
+                        0, GetNodioConfig().windowClass.c_str(), strText.c_str(),
                         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                         nW, nH, nullptr, nullptr, GetModuleHandle(nullptr),
                         nullptr);
@@ -6977,7 +7310,7 @@ void Interp::InitBuiltins()
                         return Value::Table_(popup); });
                     form->map[L"add"] = NF([form, fs, hwnd, this, hGui](
                         vector<Value>& a2) -> Value {
-                    // aardio: winform.add(name={cls="button";text=..;left=..},
+                    // winform.add(name={cls="button";text=..;left=..},
                     // name2={...}) — the named-argument syntax collapses all
                     // of them into ONE table whose keys are the control
                     // names and whose values are the init tables. Accept
@@ -7041,7 +7374,7 @@ void Interp::InitBuiltins()
                             return it != ci.vInit.tab->map.end() &&
                                    it->second.t == Value::Str
                                 ? BStr(it->second) : L""; };
-                        // aardio geometry: left/top/right/bottom in client
+                        // geometry: left/top/right/bottom in client
                         // coordinates; width/height are derived from them
                         double dL = GetI(L"left", 0), dT = GetI(L"top", 0);
                         double dR = GetI(L"right", 0), dB = GetI(L"bottom", 0);
@@ -7197,7 +7530,7 @@ void Interp::InitBuiltins()
                                     (LPARAM)hC);
                                 return Value(); });
                         }
-                        // every aardio control exposes its HWND
+                        // every control exposes its HWND
                         ctrl->map[L"hwnd"] = Value::Num_(
                             (double)(INT_PTR)hC);
                         ctrl->map[L"text"] = NF([hC](vector<Value>&)
@@ -7352,7 +7685,7 @@ void Interp::InitBuiltins()
                             return this->CallVmFunc(ib->second, noArgs); });
                         form->map[strName] = Value::Table_(ctrl);
                     }
-                    // aardio returns the LAST added control
+                    // returns the LAST added control
                     Value vLast;
                     if (!vCtls.empty() && form->map.size())
                     {
@@ -7365,7 +7698,22 @@ void Interp::InitBuiltins()
 
             // first-class scalar builtins (also reachable via fast paths)
             globals.vars[L"tostring"] = NF([](vector<Value>& a) {
-                return Value::Str_(a.empty() ? L"null" : a[0].ToString()); });
+                if (a.empty()) return Value::Str_(L"null");
+                Interp* it = g_interpCurrent;
+                if (it && a[0].t == Value::TableT && a[0].tab)
+                {
+                    auto im = a[0].tab->map.find(L"_meta");
+                    if (im != a[0].tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                    {
+                        auto itFn = im->second.tab->map.find(L"_tostring");
+                        if (itFn != im->second.tab->map.end() && (itFn->second.t == Value::Func || itFn->second.native))
+                        {
+                            vector<Value> extraArgs(a.begin() + 1, a.end());
+                            return it->CallOwner(itFn->second, a[0], extraArgs);
+                        }
+                    }
+                }
+                return Value::Str_(a[0].ToString()); });
             Value vType = NF([](vector<Value>& a) -> Value {
                 if (a.empty()) return Value::Str_(L"null");
                 switch (a[0].t)
@@ -7424,6 +7772,25 @@ void Interp::InitBuiltins()
             vType.tab->map[L"isClass"] = NF([](vector<Value>& a) -> Value {
                 return Value::Bool_(!a.empty() && a[0].t == Value::Class);
             });
+            // type.rget(v) — gets custom type defined by _type property / metatable
+            vType.tab->map[L"rget"] = NF([](vector<Value>& a) -> Value {
+                if (a.empty()) return Value();
+                const Value& v = a[0];
+                if ((v.t == Value::TableT || v.t == Value::Class || v.t == Value::Pointer) && v.tab)
+                {
+                    auto it = v.tab->map.find(L"_type");
+                    if (it != v.tab->map.end() && it->second.t == Value::Str)
+                        return it->second;
+                    auto im = v.tab->map.find(L"_meta");
+                    if (im != v.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                    {
+                        auto it2 = im->second.tab->map.find(L"_type");
+                        if (it2 != im->second.tab->map.end() && it2->second.t == Value::Str)
+                            return it2->second;
+                    }
+                }
+                return Value();
+            });
             globals.vars[L"type"] = vType;
             roots[L"type"] = vType;
             globals.vars[L"topointer"] = NF([this](vector<Value>& a) -> Value {
@@ -7445,14 +7812,182 @@ void Interp::InitBuiltins()
                 if (a[0].t == Value::Num) return Value::Pointer_((char*)(INT_PTR)(long long)a[0].n + offset);
                 if (a[0].t == Value::Str) return Value::Pointer_((char*)a[0].s.c_str() + offset);
                 return Value::Pointer_((char*)(INT_PTR)(long long)BNum(a[0]) + offset); });
-            globals.vars[L"tonumber"] = NF([](vector<Value>& a) {
-                return a.empty() ? Value() : Value::Num_(BNum(a[0])); });
+            auto fnToNumber = NF([this](vector<Value>& a) -> Value {
+                if (a.empty()) return Value();
+                if (a[0].t == Value::Null) return Value();
+                if (a[0].t == Value::Num) return a[0];
+                if (a[0].t == Value::Pointer) return Value::Num_((double)(INT_PTR)a[0].ptr);
+                if (a[0].t == Value::Bool) return Value::Num_(a[0].b ? 1.0 : 0.0);
+                if (a[0].t == Value::TableT && a[0].tab)
+                {
+                    auto im = a[0].tab->map.find(L"_meta");
+                    if (im != a[0].tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                    {
+                        auto it = im->second.tab->map.find(L"_tonumber");
+                        if (it != im->second.tab->map.end() && (it->second.t == Value::Func || it->second.native))
+                        {
+                            vector<Value> noArgs;
+                            Value r = this->CallOwner(it->second, a[0], noArgs);
+                            if (r.t == Value::Num) return r;
+                        }
+                    }
+                }
+                if (a[0].t == Value::Str)
+                {
+                    std::string rawBytes = RawBytesOf(BStr(a[0]));
+                    if (rawBytes.empty()) return Value();
+
+                    int radix = (a.size() > 1 && a[1].t == Value::Num) ? (int)BNum(a[1]) : 0;
+                    int pos = (a.size() > 2 && a[2].t == Value::Num) ? (int)BNum(a[2]) : 1;
+                    char decimal = (a.size() > 3 && a[3].t == Value::Num) ? (char)(int)BNum(a[3]) : 0;
+
+                    if (pos < 1 || (size_t)(pos - 1) >= rawBytes.size())
+                        return Value();
+
+                    const char* startPtr = rawBytes.data() + (pos - 1);
+                    const char* p = startPtr;
+
+                    if (pos == 1)
+                    {
+                        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+                            p++;
+                    }
+
+                    if (!*p) return Value();
+
+                    char* endPtr = nullptr;
+                    double numVal = 0.0;
+                    bool success = false;
+
+                    if (radix == 0)
+                    {
+                        if ((p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) ||
+                            ((p[0] == '+' || p[0] == '-') && p[1] == '0' && (p[2] == 'x' || p[2] == 'X')))
+                        {
+                            radix = 16;
+                        }
+                        else if ((p[0] == '0' && (p[1] == 'b' || p[1] == 'B')) ||
+                                 ((p[0] == '+' || p[0] == '-') && p[1] == '0' && (p[2] == 'b' || p[2] == 'B')))
+                        {
+                            radix = 2;
+                        }
+                    }
+
+                    if (radix == 16)
+                    {
+                        bool neg = (*p == '-');
+                        if (*p == '+' || *p == '-') p++;
+                        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+                        unsigned __int64 u = _strtoui64(p, &endPtr, 16);
+                        if (endPtr > p)
+                        {
+                            numVal = neg ? -(double)(__int64)u : (double)(__int64)u;
+                            success = true;
+                        }
+                    }
+                    else if (radix == 2)
+                    {
+                        bool neg = (*p == '-');
+                        if (*p == '+' || *p == '-') p++;
+                        if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B')) p += 2;
+                        unsigned __int64 u = _strtoui64(p, &endPtr, 2);
+                        if (endPtr > p)
+                        {
+                            numVal = neg ? -(double)(__int64)u : (double)(__int64)u;
+                            success = true;
+                        }
+                    }
+                    else if (radix > 0 && radix != 10)
+                    {
+                        bool neg = (*p == '-');
+                        if (*p == '+' || *p == '-') p++;
+                        unsigned __int64 u = _strtoui64(p, &endPtr, radix);
+                        if (endPtr > p)
+                        {
+                            numVal = neg ? -(double)(__int64)u : (double)(__int64)u;
+                            success = true;
+                        }
+                    }
+                    else
+                    {
+                        std::string tempStr;
+                        const char* parseStr = p;
+                        if (decimal != 0 && decimal != '.')
+                        {
+                            tempStr = p;
+                            for (char& ch : tempStr) {
+                                if (ch == decimal) ch = '.';
+                            }
+                            parseStr = tempStr.c_str();
+                        }
+                        numVal = strtod(parseStr, &endPtr);
+                        if (endPtr > parseStr)
+                        {
+                            success = true;
+                            size_t consumed = (size_t)(endPtr - parseStr);
+                            endPtr = (char*)p + consumed;
+                        }
+                    }
+
+                    if (success && endPtr > startPtr)
+                    {
+                        size_t totalConsumed = (size_t)(endPtr - startPtr);
+                        Value ret = Value::Num_(numVal);
+                        ret.mrets = std::make_shared<vector<Value>>();
+                        ret.mrets->push_back(Value::Num_((double)totalConsumed));
+                        return ret;
+                    }
+                    return Value();
+                }
+                return Value();
+            });
+            globals.vars[L"tonumber"] = fnToNumber;
+            roots[L"tonumber"] = fnToNumber;
             globals.vars[L"sleep"] = NF([](vector<Value>& a) {
                 if (!a.empty()) Sleep((DWORD)BNum(a[0]));
                 return Value(); });
             globals.vars[L"_HINSTANCE"] = Value::Pointer_(GetModuleHandleW(nullptr));
             globals.vars[L"_HAPPICON"] = Value::Pointer_(LoadIconW(nullptr, IDI_APPLICATION));
             globals.vars[L"_INVALID_HANDLE_VALUE"] = Value::Pointer_(INVALID_HANDLE_VALUE);
+            roots[L"_HINSTANCE"] = globals.vars[L"_HINSTANCE"];
+            roots[L"_HAPPICON"] = globals.vars[L"_HAPPICON"];
+            roots[L"_INVALID_HANDLE_VALUE"] = globals.vars[L"_INVALID_HANDLE_VALUE"];
+            {
+                BOOL isWow64 = FALSE;
+                IsWow64Process(GetCurrentProcess(), &isWow64);
+                bool bWin64 = (sizeof(void*) == 8) || (isWow64 != FALSE);
+                globals.vars[L"_WIN_64"] = Value::Bool_(bWin64);
+                roots[L"_WIN_64"] = Value::Bool_(bWin64);
+
+                typedef void (WINAPI *RtlGetNtVersionNumbersFn)(DWORD*, DWORD*, DWORD*);
+                HMODULE hNt = GetModuleHandleW(L"ntdll.dll");
+                if (hNt)
+                {
+                    auto fnRtl = (RtlGetNtVersionNumbersFn)GetProcAddress(hNt, "RtlGetNtVersionNumbers");
+                    if (fnRtl)
+                    {
+                        DWORD dwMajor = 0, dwMinor = 0, dwBuild = 0;
+                        fnRtl(&dwMajor, &dwMinor, &dwBuild);
+                        dwBuild &= 0xFFFF;
+                        globals.vars[L"_WIN_VER_MAJOR"] = Value::Num_(dwMajor);
+                        globals.vars[L"_WIN_VER_MINOR"] = Value::Num_(dwMinor);
+                        globals.vars[L"_WIN_VER_BUILD"] = Value::Num_(dwBuild);
+                        roots[L"_WIN_VER_MAJOR"] = globals.vars[L"_WIN_VER_MAJOR"];
+                        roots[L"_WIN_VER_MINOR"] = globals.vars[L"_WIN_VER_MINOR"];
+                        roots[L"_WIN_VER_BUILD"] = globals.vars[L"_WIN_VER_BUILD"];
+
+                        bool bWinXP = (dwMajor < 6);
+                        bool bWin7Later = (dwMajor > 6 || (dwMajor == 6 && dwMinor >= 1));
+                        bool bWin10Later = (dwMajor >= 10);
+                        globals.vars[L"_WINXP"] = Value::Bool_(bWinXP);
+                        globals.vars[L"_WIN7_LATER"] = Value::Bool_(bWin7Later);
+                        globals.vars[L"_WIN10_LATER"] = Value::Bool_(bWin10Later);
+                        roots[L"_WINXP"] = Value::Bool_(bWinXP);
+                        roots[L"_WIN7_LATER"] = Value::Bool_(bWin7Later);
+                        roots[L"_WIN10_LATER"] = Value::Bool_(bWin10Later);
+                    }
+                }
+            }
             {
                 auto fnGcData = NF([this](vector<Value>& a) -> Value {
                     void* p = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 1);
@@ -7468,7 +8003,7 @@ void Interp::InitBuiltins()
             }
 
             // ---- global namespace + VM introspection (Phase 3) ----
-            // debug/_.aardio opens with global.import("(debug)"), so `global`
+            // debug module opens with global.import("(debug)"), so `global`
             // must resolve to a table carrying a runtime import entry.
             {
                 Value fnGlobalImport = NF([this](vector<Value>& a) -> Value {
@@ -7481,10 +8016,8 @@ void Interp::InitBuiltins()
                 });
                 auto gtab = std::make_shared<Table>();
                 gtab->map[L"import"] = fnGlobalImport;
-                // In aardio `global` is not a namespace of its own: global.x
-                // reads/writes the ROOT (::) namespace. builtin/io.aardio
-                // opens with `self.io = global.io;`, so a plain table here
-                // would wipe the io namespace at the moment it is read.
+                // In runtime `global` is not a namespace of its own: global.x
+                // reads/writes the ROOT (::) namespace.
                 auto gmeta = std::make_shared<Table>();
                 gmeta->map[L"_get"] = NF([this](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t != Value::Str)
@@ -7496,6 +8029,12 @@ void Interp::InitBuiltins()
                     auto ig = globals.vars.find(k);
                     if (ig != globals.vars.end())
                         return ig->second;
+                    {
+                        std::lock_guard<std::recursive_mutex> lk(g_threadSharedMutex);
+                        auto ish = g_threadSharedMap.find(k);
+                        if (ish != g_threadSharedMap.end())
+                            return ish->second;
+                    }
                     return Value();
                 });
                 gmeta->map[L"_set"] = NF([this](vector<Value>& a) -> Value {
@@ -7503,6 +8042,10 @@ void Interp::InitBuiltins()
                         return Value();
                     globals.vars[a[0].s] = a[1];
                     roots[a[0].s] = a[1];
+                    {
+                        std::lock_guard<std::recursive_mutex> lk(g_threadSharedMutex);
+                        g_threadSharedMap[a[0].s] = a[1];
+                    }
                     return Value();
                 });
                 gtab->map[L"_meta"] = Value::Table_(gmeta);
@@ -7512,8 +8055,8 @@ void Interp::InitBuiltins()
                 // ---- the (debug) introspection module ----
                 auto dbg = std::make_shared<Table>();
                 RegisterComKernel(globals);   // com.cpp: kernel COM host
-                // debug.queryinfo(level,[what]) — console's test runner and
-                // debug/_.aardio read source.src / currentline from it
+                // debug.queryinfo(level,[what]) — test runner and
+                // debug tools read source.src / currentline from it
                 dbg->map[L"queryinfo"] = NF([](vector<Value>& a) -> Value {
                     wstring what = a.size() > 1 ? BStr(a[1]) : L"";
                     auto tb = std::make_shared<Table>();
@@ -7681,7 +8224,7 @@ void Interp::InitBuiltins()
             // assert2(level,value,...) — asserts the value after the error
             // level; on success returns every argument AFTER it, so
             // `assert2(2, resume(fib))` yields the resumed values (the
-            // builtin/_.aardio fiber.generator iterator relies on this to
+            // fiber.generator iterator relies on this to
             // hand for-in the yielded value, not the ok flag)
             globals.vars[L"assert2"] = NF([this](vector<Value>& a) -> Value {
                 if (a.size() > 1 && a[1].Truthy())
@@ -7776,11 +8319,11 @@ void Interp::InitBuiltins()
                     }
                 }
                 wstring e;
-                PNode fn = CompileToFunc(L"return " + src, &e);
+                PNode fn = CompileToFunc(L"return " + src, nullptr, &e);
                 if (!fn)
                 {
                     e.clear();
-                    fn = CompileToFunc(src, &e);
+                    fn = CompileToFunc(src, nullptr, &e);
                     if (!fn)
                     {
                         (*err) = L"运行错误: eval: " + e;
@@ -7798,10 +8341,34 @@ void Interp::InitBuiltins()
                 if (a.empty() || a[0].t != Value::Str)
                     return Value();
                 wstring src = BStr(a[0]), text;
+                wstring fileDir;
                 if (ReadCodeFile(src, &text))
+                {
                     src = text;
+                    wstring p = BStr(a[0]);
+                    if (p[0] == L'/' || p[0] == L'\\')
+                    {
+                        wstring root;
+                        if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
+                            root = g_interpCurrent->baseDir;
+                        if (root.empty())
+                        {
+                            wchar_t szExe[MAX_PATH] = L"";
+                            GetModuleFileNameW(nullptr, szExe, MAX_PATH);
+                            wchar_t* q = wcsrchr(szExe, L'\\');
+                            if (q) *q = 0;
+                            root = szExe;
+                        }
+                        p = root + L"\\" + p.substr(1);
+                    }
+                    else if (p[0] == L'~')
+                        p = ResolveTildeDisk(p);
+                    size_t slash = p.find_last_of(L"\\/");
+                    if (slash != wstring::npos)
+                        fileDir = p.substr(0, slash);
+                }
                 wstring e;
-                PNode fn = CompileToFunc(src, &e);
+                PNode fn = CompileToFunc(src, fileDir.empty() ? nullptr : &fileDir, &e);
                 if (!fn)
                 {
                     // null + error message, exactly as the docs specify
@@ -7822,10 +8389,34 @@ void Interp::InitBuiltins()
                 else if (a[0].t == Value::Str)
                 {
                     wstring src = BStr(a[0]), text;
+                    wstring fileDir;
                     if (ReadCodeFile(src, &text))
+                    {
                         src = text;
+                        wstring p = BStr(a[0]);
+                        if (p[0] == L'/' || p[0] == L'\\')
+                        {
+                            wstring root;
+                            if (g_interpCurrent && !g_interpCurrent->baseDir.empty())
+                                root = g_interpCurrent->baseDir;
+                            if (root.empty())
+                            {
+                                wchar_t szExe[MAX_PATH] = L"";
+                                GetModuleFileNameW(nullptr, szExe, MAX_PATH);
+                                wchar_t* q = wcsrchr(szExe, L'\\');
+                                if (q) *q = 0;
+                                root = szExe;
+                            }
+                            p = root + L"\\" + p.substr(1);
+                        }
+                        else if (p[0] == L'~')
+                            p = ResolveTildeDisk(p);
+                        size_t slash = p.find_last_of(L"\\/");
+                        if (slash != wstring::npos)
+                            fileDir = p.substr(0, slash);
+                    }
                     wstring e;
-                    PNode fn = CompileToFunc(src, &e);
+                    PNode fn = CompileToFunc(src, fileDir.empty() ? nullptr : &fileDir, &e);
                     if (!fn)
                     {
                         (*err) = L"运行错误: loadcodex: " + e;
@@ -8072,7 +8663,7 @@ void Interp::InitBuiltins()
             // dumpcode — no bytecode emitter yet
             globals.vars[L"dumpcode"] = NF([](vector<Value>&) -> Value {
                 return Value(); });
-            // Preload builtin (official aardio VM preloads builtin on startup)
+            // Preload builtin (VM preloads builtin on startup)
             {
                 PNode nImp = std::make_shared<Node>();
                 nImp->k = Node::Import;

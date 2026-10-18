@@ -30,7 +30,7 @@ if (Test-Path $srvPy) {
     }
 }
 
-Get-ChildItem $tests -Filter 't??.aardio' | Sort-Object Name | ForEach-Object {
+Get-ChildItem $tests -File | Where-Object { $_.BaseName -match '^t\d\d$' -and ($_.Extension -eq '.aardio' -or $_.Extension -eq '.nodio') } | Sort-Object BaseName -Unique | ForEach-Object {
     $name = $_.BaseName
     if ($onlySet.Count -gt 0 -and -not $onlySet[$name]) { return }
     # optional tNN.envcheck.aardio — environment gate. Run the probe first;

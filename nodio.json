@@ -1,0 +1,14 @@
+{
+  "extensions": [
+    ".nodio",
+    ".aardio"
+  ],
+  "magicHeaders": [
+    "=nodio",
+    "=bytecode",
+    "=aardio"
+  ],
+  "defaultTitle": "Nodio",
+  "windowClass": "Nodio_Form",
+  "userAgent": "Nodio/1.0"
+}

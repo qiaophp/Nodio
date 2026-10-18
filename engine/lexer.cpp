@@ -131,8 +131,8 @@ namespace NodioVM
             // strings
             if (c == L'"' || c == L'`')
             {
-                // aardio raw string: 双引号/反引号 = 原样字符串，不处理反斜杠
-                // 转义 (docs/datatype/string.md)。但两个连续的同类引号表示
+                // raw string: 双引号/反引号 = 原样字符串，不处理反斜杠
+                // 转义。但两个连续的同类引号表示
                 // 该引号自身，所以 "a""b" 是 a"b，`a``b` 是 a`b。
                 wchar_t q = c;
                 i++;
@@ -170,12 +170,19 @@ namespace NodioVM
                     pushTok({ TNum, std::to_wstring((long long)val), val, line });
                     continue;
                 }
-                pushTok({ TStr, s, 0, line });
+                bool bIsRawU = false;
+                if (i < n && src[i] == L'u' &&
+                    !(i + 1 < n && IsIdentChar(src[i + 1])))
+                {
+                    i++;
+                    bIsRawU = true;
+                }
+                pushTok({ TStr, s, 0, line, false, bIsRawU });
                 continue;
             }
             if (c == L'\'')
             {
-                // aardio escaped string: 单引号 = 编译时转义字符串,
+                // escaped string: 单引号 = 编译时转义字符串,
                 // C-like \ escapes ('\\' == "\"" per the original docs)
                 wchar_t q = c;
                 i++;
@@ -190,7 +197,28 @@ namespace NodioVM
                         case L'n': s += L'\n'; break;
                         case L'r': s += L'\r'; break;
                         case L't': s += L'\t'; break;
-                        case L'0': s += L'\0'; break;
+                        case L'0': case L'1': case L'2': case L'3': case L'4':
+                        case L'5': case L'6': case L'7': case L'8': case L'9':
+                        {
+                            // If \0 is immediately followed by a newline:
+                            // "如果只想表示'\0'，并且后面有其他不相关的数字，可以在\0后面加一个换行"
+                            if (e == L'0' && i + 1 < n && (src[i + 1] == L'\r' || src[i + 1] == L'\n'))
+                            {
+                                if (src[i + 1] == L'\r' && i + 2 < n && src[i + 2] == L'\n') i += 2;
+                                else i++;
+                                s += L'\0';
+                                break;
+                            }
+                            int val = (e - L'0');
+                            int digits = 1;
+                            while (digits < 3 && i + 1 < n && src[i + 1] >= L'0' && src[i + 1] <= L'9')
+                            {
+                                val = val * 10 + (src[++i] - L'0');
+                                digits++;
+                            }
+                            s += (wchar_t)(val & 0xFF);
+                            break;
+                        }
                         case L'a': s += L'\a'; break;
                         case L'b': s += L'\b'; break;
                         case L'f': s += L'\f'; break;
@@ -199,6 +227,8 @@ namespace NodioVM
                         case L'\\': s += L'\\'; break;
                         case L'"': s += L'"'; break;
                         case L'\'': s += L'\''; break;
+                        case L'[': s += L'['; break;
+                        case L']': s += L']'; break;
                         case L'u':
                         {
                             int hexLen = 0;
@@ -332,7 +362,7 @@ namespace NodioVM
                     pushTok(t);
                     continue;
                 }
-                // aardio radix literal: <radix>#<digits> (e.g. 2#100, 8#77, 16#FF, 36#Z)
+                // radix literal: <radix>#<digits> (e.g. 2#100, 8#77, 16#FF, 36#Z)
                 size_t digEnd = i;
                 while (digEnd < n && src[digEnd] >= L'0' && src[digEnd] <= L'9') digEnd++;
                 if (digEnd < n && src[digEnd] == L'#' && digEnd + 1 < n && iswalnum(src[digEnd + 1]))

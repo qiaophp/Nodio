@@ -10,7 +10,7 @@
 //   NODIO_BREAK="3,7"             seed breakpoints (implies debug)
 //   NODIO_CONSOLE=1               force-allocate a console (io.print)
 //   NODIO_PAUSE=1                 keep the console open afterwards
-//   NODIO_PUBLISH=<main.aardio>   build a standalone exe
+//   NODIO_PUBLISH=<entry_script> build a standalone exe
 //   NODIO_PUBOUT=<out.exe>        output path (default <dir>\dist\<name>.exe)
 //   NODIO_ICON=<icon.ico>         optional icon stamped into the output
 //   NODIO_PUBVER="1.2.3.4"        PE version resource (needs NODIO_PUBMANIFEST=1)
@@ -32,6 +32,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #pragma comment(lib, "comctl32.lib")
+#include "engine/common.h"
 #include "engine/NodioVM.h"
 #include "publish/payload.h"
 #include "publish/publish.h"
@@ -129,7 +130,7 @@ int wmain(int argc, wchar_t** argv)
     InitCommonControlsEx(&icc);
 
     // NODIO_CHECK=<listfile>: parse-only sweep for coverage measurement.
-    // The list file holds one .aardio path per line; each is lexed and
+    // The list file holds one script path per line; each is lexed and
     // parsed (no execution) and reported as "OK <path>" / "FAIL <path> <err>".
     wchar_t szCheckList[MAX_PATH];
     if (GetEnvironmentVariableW(L"NODIO_CHECK", szCheckList, MAX_PATH) > 0)
@@ -164,8 +165,7 @@ int wmain(int argc, wchar_t** argv)
             std::wstring se;
             if (NodioVM::IsCompiledModule(src))
             {
-                // '=aardio' + bytecode: a compiled module, not source text
-                // (lib/ide/aifix.aardio ships this way). Source syntax does
+                // Compiled bytecode, not source text. Source syntax does
                 // not apply, so it is counted separately from parse failures.
                 nCompiled++;
                 WriteStdoutUtf8(L"COMPILED " + line);
@@ -206,8 +206,8 @@ int wmain(int argc, wchar_t** argv)
         return strErr.empty() ? 0 : 1;
     }
 
-    // a script path as the first command-line argument runs it directly
-    // (aardio.exe behaviour): forward it into the NODIO_RUN harness below.
+    // a script path as the first command-line argument runs it directly:
+    // forward it into the NODIO_RUN harness below.
     // The self-hosted IDE's F5 spawns `nodio.exe <script>` and streams the
     // child's output through process.popen.
     if (argc > 1 && argv[1][0])
@@ -345,8 +345,8 @@ int wmain(int argc, wchar_t** argv)
             std::unordered_map<std::wstring, std::wstring> wide;
             NodioPayload::ToWideMap(raw, wide);
 
-            // entry = top-level main.aardio / main.nodio, else the first
-            // top-level .aardio / .nodio file
+            // entry = top-level main script, else the first
+            // top-level script file matching configured extensions
             std::wstring strEntry;
             for (auto& kv : wide)
             {
@@ -354,15 +354,12 @@ int wmain(int argc, wchar_t** argv)
                 if (k.find(L'\\') != std::wstring::npos) continue;
                 std::wstring lower = k;
                 for (auto& c : lower) c = towlower(c);
-                if (lower == L"main.aardio" || lower == L"main.nodio")
+                if (lower.rfind(L"main.", 0) == 0 && NodioVM::HasScriptExtension(lower))
                 {
                     strEntry = k;
                     break;
                 }
-                bool bScript = (lower.size() > 7 &&
-                                lower.substr(lower.size() - 7) == L".aardio") ||
-                               (lower.size() > 6 &&
-                                lower.substr(lower.size() - 6) == L".nodio");
+                bool bScript = NodioVM::HasScriptExtension(lower);
                 if (strEntry.empty() && bScript)
                     strEntry = k;
             }
@@ -386,7 +383,7 @@ int wmain(int argc, wchar_t** argv)
     }
 
     EnsureConsole(false);
-    wprintf(L"Nodio aardio engine host — set NODIO_RUN=<script> to run a "
+    wprintf(L"Nodio engine host — set NODIO_RUN=<script> to run a "
             L"script, or see docs/roadmap.md\n");
     return 0;
 }

@@ -8,7 +8,7 @@ namespace NodioPublish
 {
     struct Options
     {
-        std::wstring strEntry;      // main.aardio / *.nodio
+        std::wstring strEntry;      // entry script path
         std::wstring strOut;        // output exe path
         std::wstring strLibDir;     // NODIO_LIBDIR
         bool bConsole = true;       // console subsystem in the output exe
@@ -23,7 +23,7 @@ namespace NodioPublish
         std::wstring strCopyright;
 
         // Application manifest. bDpiAware stamps a per-monitor DPI-aware
-        // manifest (aardio apps are pixel-positioned); strUacLevel picks the
+        // manifest (apps are pixel-positioned); strUacLevel picks the
         // requestedExecutionLevel — "" (default) omits the element, or
         // "asInvoker" / "requireAdministrator" / "highestAvailable".
         bool bDpiAware = true;

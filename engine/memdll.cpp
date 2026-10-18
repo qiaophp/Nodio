@@ -1,6 +1,6 @@
 // memdll.cpp — memory DLL loading (raw.loadDll with in-memory bytes).
 //
-// aardio can load a DLL from a string: the bytes are embedded at compile
+// Load a DLL from a string: the bytes are embedded at compile
 // time with $"path" (or read from a published payload) and handed to
 // raw.loadDll, which maps the image into memory and returns a dll object
 // whose .api() works exactly like a disk-loaded module.
@@ -9,7 +9,7 @@
 // image at its preferred base (falling back to a fresh allocation),
 // copies sections, applies base relocations, resolves the import table,
 // and calls DllMain. It deliberately does NOT run TLS callbacks or
-// handle delay-load/SEH edge cases — the aardio docs warn that only
+// handle delay-load/SEH edge cases — only
 // simple, dependency-free DLLs support memory loading.
 #include "engine/common.h"
 #include "engine/interp.h"

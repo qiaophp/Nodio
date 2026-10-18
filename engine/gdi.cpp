@@ -259,7 +259,7 @@ namespace NodioVM
         wc.hInstance = GetModuleHandle(nullptr);
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.lpszClassName = L"AardioRE_form";
+        wc.lpszClassName = GetNodioConfig().windowClass.c_str();
         bDone = RegisterClassExW(&wc) != 0;
         return bDone;
     }

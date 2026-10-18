@@ -1,4 +1,5 @@
 #include "engine/interp.h"
+#include <deque>
 
 namespace NodioVM
 {
@@ -326,7 +327,7 @@ namespace NodioVM
                 out->ret = ARStrA;
             else if (rt == L"wstr" || rt == L"ustring")
                 out->ret = ARStrW;
-            // official aardio: `addr` returns are plain NUMBERS;
+            // `addr` returns are plain NUMBERS;
             // `pointer` returns are the pointer datatype (type()=="pointer")
             else if (rt == L"addr" || rt == L"handle")
                 out->ret = ARAddr;
@@ -354,7 +355,7 @@ namespace NodioVM
             {
                 bool bRef = false;
                 int p = ApiTypeOf(t, &bRef);
-                // aardio api signatures may name custom types (a struct or
+                // api signatures may name custom types (a struct or
                 // opaque handle, e.g. py2's "PyObject o"). They are passed
                 // as a machine word, so treat an unknown type as a pointer
                 // rather than rejecting the whole signature.
@@ -799,8 +800,8 @@ namespace NodioVM
             if (f.bPtrArray)
             {
                 int count = f.arrCount > 0 ? f.arrCount : (int)GetTableLength(fv);
-                thread_local std::vector<std::string> s_bytesKeep;
-                thread_local std::vector<std::wstring> s_wstrKeep;
+                thread_local std::deque<std::string> s_bytesKeep;
+                thread_local std::deque<std::wstring> s_wstrKeep;
                 for (int k = 0; k < count; k++)
                 {
                     Value elem = GetTableElement(fv, k);
@@ -911,7 +912,7 @@ namespace NodioVM
                     // wchar) must be re-packed into a real UTF-16 buffer
                     // or every high byte becomes a NUL and Windows reads
                     // only the first character ("CLSH[..." -> "C")
-                    thread_local std::vector<std::wstring> sKeep;
+                    thread_local std::deque<std::wstring> sKeep;
                     wstring u16;
                     const wstring* src = nullptr;
                     if (iv != vTab.tab->map.end() && iv->second.t == Value::Str)
@@ -978,7 +979,7 @@ namespace NodioVM
                 {
                     if (fv.t == Value::Str)
                     {
-                        thread_local std::vector<std::string> s_ansiKeep;
+                        thread_local std::deque<std::string> s_ansiKeep;
                         std::string sA;
                         bool bIsBytes = true;
                         for (wchar_t c : fv.s)
@@ -1074,7 +1075,7 @@ namespace NodioVM
             else if (f.bIsArray && (fv.t == Value::TableT) && fv.tab)
             {
                 // numeric / pointer element arrays (BYTE Data4[8], ptr p[1], ...):
-                // an aardio array table serializes element-wise; esz is
+                // an array table serializes element-wise; esz is
                 // the PER-ELEMENT size, not the whole-field size
                 auto& arr = fv.tab->arr;
                 int esz = f.arrCount > 0 ? sz / f.arrCount : sz;
@@ -1248,7 +1249,7 @@ namespace NodioVM
             }
             else if (f.bIsArray)
             {
-                // Official aardio: WORD[] and BYTE[] arrays deserialize to string
+                // WORD[] and BYTE[] arrays deserialize to string
                 // if the existing field was not initialized/assigned as an array table
                 bool bExistingTable = (iv != vTab.tab->map.end() && iv->second.t == Value::TableT);
                 if (!bExistingTable && t == L"word")
@@ -1267,7 +1268,7 @@ namespace NodioVM
                 }
                 else
                 {
-                    // numeric / pointer / float element arrays read back as an aardio array;
+                    // numeric / pointer / float element arrays read back as an array;
                     // esz is the PER-ELEMENT size (guard arrCount<=0)
                     auto at = std::make_shared<Table>();
                     int esz = f.arrCount > 0 ? sz / f.arrCount : sz;
@@ -1579,11 +1580,10 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                                 void* pBuf = StructSerialize(v, &total);
                                 if (pBuf)
                                 {
-                                    // aardio auto-maintains cbSize: when a struct's
+                                    // auto-maintains cbSize: when a struct's
                                     // first member is named cbSize, every API call
-                                    // stamps it with the real size (the official
-                                    // WNDCLASSEX default 48 would otherwise fail
-                                    // RegisterClassEx's size check on x64)
+                                    // stamps it with the real size (WNDCLASSEX default
+                                    // 48 would otherwise fail RegisterClassEx's size check on x64)
                                     if (total >= 4 && v.tab &&
                                         v.tab->map.find(L"cbSize") != v.tab->map.end())
                                         *(int*)pBuf = total;
@@ -1596,6 +1596,19 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                                 }
                             }
                         }
+                    }
+                    else if (v.t == Value::Func)
+                    {
+                        // Bare script function passed to dynamic FFI: auto-wrap as stdcall callback
+                        CbCtx* ctx = new CbCtx();
+                        ctx->fn = v;
+                        ctx->sig.bCdecl = false;
+                        ctx->sig.ret = ARI64;
+                        for (int p = 0; p < 8; p++) ctx->sig.params.push_back(ARI64);
+                        ctx->interp = this;
+                        CallbackTrampoline(ctx);
+                        g_cbs.push_back(ctx);
+                        slots.push_back((SlotT)(INT_PTR)ctx->code);
                     }
                     else
                     {

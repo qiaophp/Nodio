@@ -53,7 +53,7 @@ Value Interp::Eval(const PNode& n, Env* env)
                 {
                     for (Env* e = env; e; e = e->parent.get())
                     {
-                        if (e->nsTable)
+                        if (e->nsTable && e->nsTable->bExplicitMeta)
                         {
                             auto im = e->nsTable->map.find(L"_meta");
                             if (im != e->nsTable->map.end() && im->second.t == Value::TableT)
@@ -98,8 +98,8 @@ Value Interp::Eval(const PNode& n, Env* env)
                 if (n->bSafe && obj.t == Value::Null)
                     return Value();   // '?[': null short-circuits
                 Value idx = Eval(n->b, env);
-                // aardio byte-string model: s[i] reads the i-th BYTE
-                // (1-based) as a number — the official string library is
+                // byte-string model: s[i] reads the i-th BYTE
+                // (1-based) as a number — string indexing is
                 // built on this primitive. Byte-per-wchar strings (from
                 // fromto/raw IO, all chars <= 0xFF) index directly; real
                 // text indexes its UTF-8 encoding.
@@ -164,7 +164,7 @@ Value Interp::Eval(const PNode& n, Env* env)
                 if (n->str == L"!" || n->str == L"not") return Value::Bool_(!v.Truthy());
                 if (n->str == L"~")
                 {
-                    // aardio style=~0: bitwise NOT over 32-bit width
+                    // style=~0: bitwise NOT over 32-bit width
                     unsigned int u = (unsigned int)(INT_PTR)(long long)ToNum(v);
                     return Value::Num_((double)(int)~u);
                 }
@@ -172,16 +172,11 @@ Value Interp::Eval(const PNode& n, Env* env)
                 {
                     if (v.t == Value::Str)
                     {
-                        // aardio byte-string model: #s = UTF-8 BYTE length.
-                        // Storage is wstring, so raw byte strings produced
-                        // by fromto/io.readFile("raw") live as one byte
-                        // per wchar (all chars <= 0xFF) — for those the
-                        // wchar count IS the byte count; real text (any
-                        // char > 0xFF) counts its UTF-8 encoding.
-                        bool bFake = true;
-                        for (wchar_t c : v.s)
-                            if ((unsigned int)c > 0xFF) { bFake = false; break; }
-                        if (bFake)
+                        // byte-string model: #s = UTF-8 BYTE length.
+                        // Storage is wstring. Raw binary byte strings (marked with bRawBytes)
+                        // hold one byte per wchar — for those the wchar count IS the byte count.
+                        // Normal text strings return their UTF-8 byte length.
+                        if (v.bRawBytes)
                             return Value::Num_((double)v.s.size());
                         int cb = WideCharToMultiByte(CP_UTF8, 0,
                                                      v.s.c_str(),
@@ -203,14 +198,39 @@ Value Interp::Eval(const PNode& n, Env* env)
                             size_t sz = v.tab->arr.size();
                             while (sz > 0 && v.tab->arr[sz - 1].t == Value::Null)
                                 sz--;
+                            if (sz > 0)
+                                return Value::Num_((double)sz);
+
+                            auto im = v.tab->map.find(L"_meta");
+                            if (im != v.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                            {
+                                static const wchar_t* lenNames[] = { L"_len", L"_length", L"len", L"length", nullptr };
+                                for (int i = 0; lenNames[i]; i++)
+                                {
+                                    auto it = im->second.tab->map.find(lenNames[i]);
+                                    if (it != im->second.tab->map.end())
+                                    {
+                                        if (it->second.t == Value::Func || it->second.native)
+                                        {
+                                            vector<Value> noArgs;
+                                            Value r = this->CallOwner(it->second, v, noArgs);
+                                            if (r.t == Value::Num)
+                                                return r;
+                                        }
+                                        else if (it->second.t == Value::Num)
+                                        {
+                                            return it->second;
+                                        }
+                                    }
+                                }
+                            }
                             return Value::Num_((double)sz);
                         }
                         return Value::Num_(0);
                     }
                 }
-                // aardio: #null is 0 — lib code sizes optional tables with
-                // it (publish's for(i=#q;1;-1) over an unregistered topic);
-                // returning null made the for-loop start value null and the
+                // #null is 0 — code sizes optional tables with
+                // it; returning null made the for-loop start value null and the
                 // body ran once against a null subscriber.
                 if (v.t == Value::Null) return Value::Num_(0);
                 return Value();
@@ -223,9 +243,9 @@ Value Interp::Eval(const PNode& n, Env* env)
                 f.params = n->names;
                 f.pdefaults = std::make_shared<vector<PNode>>(
                     n->defaults);
-                // aardio upvalues: capture the defining frame chain. The
+                // lexical upvalues: capture the defining frame chain. The
                 // closure's call frame parents into it (CallVmFunc/
-                // CallOwner), so enclosing locals like the fiber shim's
+                // CallOwner), so enclosing locals like
                 // `fib`/`result` stay visible and mutable.
                 if (env && env->self)
                     f.envUp = env->self;
@@ -729,7 +749,7 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             }
             auto local = std::make_shared<Env>();
             local->self = local;
-            // aardio upvalues: the captured defining frame chain replaces
+            // lexical upvalues: the captured defining frame chain replaces
             // the bare globals jump
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;
@@ -763,11 +783,11 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                         vargs->push_back(args[k]);
                         tbV->arr.push_back(args[k]);
                     }
-                    // aardio scripts read varargs through `arg`, while the
+                    // scripts read varargs through `arg`, while the
                     // `...` spelling expands them at a call site — bind both
                     // names to the same table. An EMPTY table must read as
                     // null: library code guards recursion with `if(!...)`,
-                    // and an empty table is truthy in aardio.
+                    // and an empty table is truthy in the runtime.
                     Value vDots = tbV->arr.empty() ? Value()
                                                    : Value::Table_(tbV);
                     if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
@@ -923,7 +943,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                         if (ownerCallMode)
                         {
                             bool isCallable = false;
-                            if (it->second.t == Value::Func || it->second.native)
+                            if (it->second.t == Value::Func || it->second.native || it->second.t == Value::Class)
                                 isCallable = true;
                             else if (it->second.t == Value::TableT && it->second.tab)
                             {
@@ -949,7 +969,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                         }
                         return it->second;
                     }
-                    // 1-based numeric index = array access (aardio arrays)
+                    // 1-based numeric index = array access
                     if (!key.empty() &&
                         key.find_first_not_of(L"0123456789") == wstring::npos)
                     {
@@ -1014,7 +1034,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                 }
                 return Value();
             }
-            // aardio root namespaces visible on a null object (..string / module)
+            // root namespaces visible on a null object (..string / module)
             if (obj.t == Value::Null)
             {
                 auto it = roots.find(key);
@@ -1024,6 +1044,36 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                 auto ig = globals.vars.find(key);
                 if (ig != globals.vars.end())
                     return ig->second;
+
+                // On-demand load system / dynamic DLLs when accessed via ::DllName
+                if (!key.empty() && key[0] != L'.' && key[0] != L'_')
+                {
+                    wstring dllName = key;
+                    if (dllName.size() < 4 || _wcsicmp(dllName.c_str() + dllName.size() - 4, L".dll") != 0)
+                        dllName += L".dll";
+                    HMODULE hMod = LoadLibraryW(dllName.c_str());
+                    if (hMod)
+                    {
+                        FreeLibrary(hMod);
+                        auto ir = roots.find(L"raw");
+                        if (ir != roots.end() && ir->second.t == Value::TableT && ir->second.tab)
+                        {
+                            auto il = ir->second.tab->map.find(L"loadDll");
+                            if (il != ir->second.tab->map.end() && il->second.native)
+                            {
+                                vector<Value> da{ Value::Str_(dllName) };
+                                Value dv = il->second.native(da);
+                                if (dv.t == Value::TableT && dv.tab)
+                                {
+                                    roots[key] = dv;
+                                    globals.vars[key] = dv;
+                                    return dv;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 static bool bDbgR =
                     GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
                 if (bDbgR)
@@ -1060,27 +1110,50 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             if (n->a->k == Node::Ident && n->a->str == L"print")
             {
-                wstring out;
-                for (auto& arg : n->list)
-                    out += ToStringM(Eval(arg, env));
-                out += L"\n";
-                WriteU8(stdout, out);
-                fflush(stdout);
-                return Value();
+                Value* vShadow = env ? env->Find(L"print") : nullptr;
+                auto itGlob = globals.vars.find(L"print");
+                Value* pGlob = (itGlob != globals.vars.end()) ? &itGlob->second : nullptr;
+                // Only take the global console print fast path if not shadowed by a local or namespace member
+                if (!vShadow || vShadow == pGlob)
+                {
+                    wstring out;
+                    for (auto& arg : n->list)
+                        out += ToStringM(Eval(arg, env));
+                    out += L"\n";
+                    WriteU8(stdout, out);
+                    fflush(stdout);
+                    return Value();
+                }
             }
             if (n->a->k == Node::Ident && n->a->str == L"tostring")
             {
-                return n->list.empty() ? Value() :
-                    Value::Str_(ToStringM(Eval(n->list[0], env)));
+                if (n->list.empty()) return Value();
+                Value v = Eval(n->list[0], env);
+                vector<Value> extraArgs;
+                for (size_t ai = 1; ai < n->list.size(); ai++)
+                    extraArgs.push_back(Eval(n->list[ai], env));
+                if (v.t == Value::TableT && v.tab)
+                {
+                    auto im = v.tab->map.find(L"_meta");
+                    if (im != v.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                    {
+                        auto it = im->second.tab->map.find(L"_tostring");
+                        if (it != im->second.tab->map.end() && (it->second.t == Value::Func || it->second.native))
+                        {
+                            return CallOwner(it->second, v, extraArgs);
+                        }
+                    }
+                }
+                return Value::Str_(ToStringM(v));
             }
-            if (n->a->k == Node::Ident && n->a->str == L"tonumber")
+            if (n->a->k == Node::Ident && n->a->str == L"tonumber" && n->list.size() == 1)
             {
-                return n->list.empty() ? Value() :
-                    Value::Num_(ToNum(Eval(n->list[0], env)));
+                Value v0 = Eval(n->list[0], env);
+                if (v0.t == Value::Num) return v0;
             }
             if (n->a->k == Node::Ident && n->a->str == L"error")
             {
-                // aardio error(): raise a runtime error message; annotate
+                // error(): raise a runtime error message; annotate
                 // with the module file so library-raised errors are
                 // traceable to their source
                 Value vErr = n->list.empty() ? Value() : Eval(n->list[0], env);
@@ -1119,7 +1192,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 bMethod = true;
                 vThis = Eval(n->a->a, env);
                 Value idx = Eval(n->a->b, env);
-                f = GetMember(vThis, idx.ToString(), n->a->bDirect, /*bOwnerCall=*/true);
+                f = GetMember(vThis, idx.ToString(), n->a->bDirect, /*bOwnerCall=*/false);
             }
             else
             {
@@ -1134,10 +1207,10 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             if (s_callDepth > 500)
             {
                 // depth-guard contract: runaway recursion surfaces a
-                // catchable 运行错误 (official 栈溢出 shape) instead of an
-                // uncatchable OS EXCEPTION_STACK_OVERFLOW. 500 aardio
+                // catchable 运行错误 (栈溢出) instead of an
+                // uncatchable OS EXCEPTION_STACK_OVERFLOW. 500
                 // frames fit the host's 16 MB reserve (~14 KB C++ stack
-                // per aardio call); the guard must stay well below the
+                // per call); the guard must stay well below the
                 // physical crash point.
                 wstring fnName = f.fname;
                 if (fnName.empty() && n->a->k == Node::Member) fnName = n->a->str;
@@ -1161,7 +1234,16 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     if (a->k == Node::Ident && a->str == L"...")
                     {
                         Value vDots = Eval(a, env);
-                        if (vDots.t == Value::TableT && vDots.tab)
+                        if (vDots.bDots && vDots.mrets)
+                        {
+                            for (auto& item : *vDots.mrets)
+                            {
+                                Value elem = item;
+                                elem.mrets = nullptr;
+                                res.push_back(elem);
+                            }
+                        }
+                        else if (vDots.t == Value::TableT && vDots.tab)
                         {
                             for (auto& item : vDots.tab->arr)
                             {
@@ -1180,7 +1262,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     else
                     {
                         Value v = Eval(a, env);
-                        // aardio: a multi-return call in the LAST argument
+                        // a multi-return call in the LAST argument
                         // position expands into the parameter list —
                         // `assert2(2, resume(fib))` must receive (2, true,
                         // yielded) so the fiber shim's assert2 sees the
@@ -1217,8 +1299,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     if (itS != f.tab->map.end())
                         inst->map[L"_struct"] = itS->second;
                     // @-annotation metatables may be assigned AFTER the
-                    // class definition (::RECT._meta = {...} in
-                    // builtin/struct.aardio) — keep the class reference so
+                    // class definition (::RECT._meta = {...}) — keep the class reference so
                     // member lookups can resolve the meta late
                     inst->map[L"_class"] = f;
                 }
@@ -1227,7 +1308,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 // table carries a C++ "ctor" native. It receives the script
                 // args plus the fresh instance appended last and returns the
                 // instance on success; Null means construction failed and
-                // the instantiation itself yields null (aardio io.file()
+                // the instantiation itself yields null (e.g. io.file()
                 // returns null for an unopenable file), any other value is
                 // handed back as-is (io.open() with no args reports console
                 // state for the console library).
@@ -1252,26 +1333,29 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 auto definingNsEnv = std::make_shared<Env>();
                 definingNsEnv->self = definingNsEnv;
                 if (f.tab)
+                {
                     classNsEnv->nsTable = f.tab;
+                    classNsEnv->vars[L"self"] = f;
+                }
+                shared_ptr<Env> lexicalParent = f.envUp ? f.envUp : globals.self;
                 if (f.nsClosure)
                 {
-                    // aardio: the ctor and member code see the DEFINING
+                    // the ctor and member code see the DEFINING
                     // namespace as an upvalue (captured in EvalClass).
                     // Bare names resolve instance -> class -> namespace ->
                     // global; dropping the namespace level made the bare
-                    // `in_addr()` inside wsock.sockaddr_in resolve null
-                    // (15+ examples).
-                    definingNsEnv->parent = globals.self;
+                    // `in_addr()` inside wsock.sockaddr_in resolve null.
+                    definingNsEnv->parent = lexicalParent;
                     definingNsEnv->nsTable = f.nsClosure;
                     classNsEnv->parent = definingNsEnv;
                 }
                 else
-                    classNsEnv->parent = globals.self;
+                    classNsEnv->parent = lexicalParent;
                 auto local = std::make_shared<Env>();
                 local->self = local;
                 local->parent = f.tab ? classNsEnv
                                       : (f.nsClosure ? definingNsEnv
-                                                     : globals.self);
+                                                     : lexicalParent);
                 local->nsTable = inst;
                 local->bNsInst = true;   // instance scope: never capture as nsClosure
                 local->bInstInit = true;
@@ -1305,7 +1389,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                                 vargs->push_back(args[k]);
                                 tbV->arr.push_back(args[k]);
                             }
-                            // `arg` is aardio's spelling for the varargs
+                            // `arg` is the alias for the varargs
                             // table; `...` expands it at call sites. An
                             // empty table reads as null so `if(!...)`
                             // recursion guards work.
@@ -1357,8 +1441,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                         }
                         return ctorRet;
                     }
-                    // aardio: `this = <other>` inside the ctor rebinds the
-                    // instance (win.ui fake-window / control wrappers)
+                    // `this = <other>` inside the ctor rebinds the
+                    // instance (fake-window / control wrappers)
                     auto itThis = local->vars.find(L"this");
                     if (itThis != local->vars.end() &&
                         itThis->second.t == Value::TableT)
@@ -1509,7 +1593,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             vector<Value> args = evalCallArgs(n->list);
             auto local = std::make_shared<Env>();
             local->self = local;
-            // aardio: functions see globals AND the defining frame chain
+            // functions see globals AND the defining frame chain
             // (upvalues). Plain functions capture only globals; nested
             // functions capture their enclosing frame via envUp.
             local->parent = f.envUp ? f.envUp : globals.self;
@@ -1520,7 +1604,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     local->vars[L"this"] = *f.thisVal;
                 else
                     local->vars[L"this"] = vThis;   // obj.fn() receiver as this
-                // aardio owner = the dot-left object of this call
+                // owner = the dot-left object of this call
                 local->vars[L"owner"] = vThis;
             }
             else
@@ -1544,8 +1628,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 else
                     local->vars[f.params[i]] = Value();
             }
-            // "..." varargs: leftover arguments as a 1-based table. aardio
-            // spells the table `arg` in scripts and `...` at call sites, so
+            // "..." varargs: leftover arguments as a 1-based table.
+            // Spelled `arg` in scripts and `...` at call sites, so
             // bind both names.
             if (f.params.size() && f.params.back() == L"..." &&
                 f.fn)
@@ -1559,7 +1643,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 }
                 // An EMPTY varargs table must read as null: library code
                 // guards recursion with `if(!...)`, and an empty table is
-                // truthy in aardio.
+                // truthy in the runtime.
                 Value vDots = tbV->arr.empty() ? Value()
                                                : Value::Table_(tbV);
                 if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
@@ -1587,7 +1671,7 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             if (op == L"?:")   // lazy ternary
                 return Eval(n->a, env).Truthy() ? Eval(n->b, env)
                                                 : Eval(n->c, env);
-            if (op == L"?")    // aardio guard: a ? b — a truthy ? b : false
+            if (op == L"?")    // guard: a ? b — a truthy ? b : false
             {
                 Value l = Eval(n->a, env);
                 return l.Truthy() ? Eval(n->b, env) : Value::Bool_(0);
@@ -1597,9 +1681,8 @@ Value Interp::EvalBin(const PNode& n, Env* env)
                 Value l = Eval(n->a, env);
                 return l.Truthy() ? Eval(n->b, env) : l;
             }
-            if (op == L":")   // aardio falsy coalescing: a:b returns b when
-                             // a is falsy (null/false/0/""), else a — see
-                             // docs/language-reference/operator/logical.md
+            if (op == L":")   // falsy coalescing: a:b returns b when
+                             // a is falsy (null/false/0/""), else a
             {
                 Value l = Eval(n->a, env);
                 return l.Truthy() ? l : Eval(n->b, env);
@@ -1621,16 +1704,14 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             if (op == L"..")
             {
                 if (l.t == Value::TableT || r.t == Value::TableT)
-                    return l;   // aardio table concat quirk; keep simple
+                    return l;   // table concat quirk; keep simple
                 return Value::Str_(l.ToString() + r.ToString());
             }
             if (op == L"++")
-                return Value::Str_(ToStringM(l) + ToStringM(r));  // aardio concat
-            // aardio: '+' concatenates whenever either operand is a
-            // non-numeric string, or a string meets a non-string
-            // (docs/operator/concat.md: "引号前后的 + 将自动转换为字符串
-            // 连接运算符 ++"). A numeric string plus a number stays
-            // arithmetic, matching the documented '1 + "2"' -> 3.
+                return Value::Str_(ToStringM(l) + ToStringM(r));  // string concat
+            // '+' concatenates whenever either operand is a
+            // non-numeric string, or a string meets a non-string.
+            // A numeric string plus a number stays arithmetic ('1 + "2"' -> 3).
             if (op == L"+")
             {
                 bool bLStr = l.t == Value::Str, bRStr = r.t == Value::Str;
@@ -1753,17 +1834,17 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             if (op == L"*") return Value::Num_(a * b);
             if (op == L"/") return Value::Num_(b != 0 ? a / b : 0);
             if (op == L"%" || op == L"%=") return Value::Num_(b != 0 ? fmod(a, b) : 0);
-            // M2: bitwise (32-bit width, aardio DWORD semantics)
+            // bitwise (32-bit width, DWORD semantics)
             unsigned int ua = (unsigned int)(INT_PTR)(long long)a;
             unsigned int ub = (unsigned int)(INT_PTR)(long long)b;
             if (op == L"&") return Value::Num_((double)(int)(ua & ub));
             if (op == L"|") return Value::Num_((double)(int)(ua | ub));
-            if (op == L"^") return Value::Num_((double)(int)(ua ^ ub));   // aardio: ^ is XOR
+            if (op == L"^") return Value::Num_((double)(int)(ua ^ ub));   // ^ is XOR
             if (op == L"<<") return Value::Num_((double)(int)(ua << (ub & 31)));
             if (op == L">>") return Value::Num_((double)(int)(ua >> (ub & 31)));
             if (op == L">>>")
                 return Value::Num_((double)((long long)(ua >> (ub & 31))));
-            if (op == L"**") return Value::Num_(pow(a, b));   // aardio: ** is exponent
+            if (op == L"**") return Value::Num_(pow(a, b));   // ** is exponent
             if (op == L"<") return Value::Bool_(a < b && l.t == r.t ? true : CmpLess(l, r));
             if (op == L">") return Value::Bool_(CmpLess(r, l));
             if (op == L"<=") return Value::Bool_(!CmpLess(r, l));
@@ -1892,7 +1973,7 @@ Value Interp::ApplyOp(const wstring& op, const Value& l, const Value& r)
             if (op == L"..")
                 return Value::Str_(l.ToString() + r.ToString());
             if (op == L"++")
-                return Value::Str_(ToStringM(l) + ToStringM(r));   // aardio concat
+                return Value::Str_(ToStringM(l) + ToStringM(r));   // string concat
             if (op == L"+" || op == L"-" || op == L"*" || op == L"/" || op == L"%" || op == L"%=" ||
                 op == L"<<" || op == L">>" || op == L"<" || op == L"<=" || op == L">" || op == L">=")
             {
@@ -1943,10 +2024,10 @@ Value Interp::ApplyOp(const wstring& op, const Value& l, const Value& r)
             if (op == L"*") return Value::Num_(a * b);
             if (op == L"/") return Value::Num_(b != 0 ? a / b : 0);
             if (op == L"%" || op == L"%=") return Value::Num_(b != 0 ? fmod(a, b) : 0);
-            // aardio: ** is exponent, ^ is bitwise XOR (32-bit)
+            // ** is exponent, ^ is bitwise XOR (32-bit)
             if (op == L"**") return Value::Num_(pow(a, b));
             if (op == L"^") return Value::Num_((double)(int)(((int)(INT_PTR)(long long)a) ^ ((int)(INT_PTR)(long long)b)));
-            // bitwise: 32-bit width, aardio DWORD semantics (matches EvalBin)
+            // bitwise: 32-bit width, DWORD semantics (matches EvalBin)
             unsigned int ua = (unsigned int)(INT_PTR)(long long)a;
             unsigned int ub = (unsigned int)(INT_PTR)(long long)b;
             if (op == L"&") return Value::Num_((double)(int)(ua & ub));
@@ -1997,7 +2078,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
             }
             if (target->k == Node::Ident)
             {
-                // aardio: inside a namespace scope, bare names are
+                // inside a namespace scope, bare names are
                 // namespace members — only locals (var/params) resolve
                 // before the namespace table. Check if target was declared
                 // as a lexical variable in any enclosing env frame (stopping
@@ -2021,7 +2102,22 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 while (eNs && !eNs->nsTable) eNs = eNs->parent.get();
                 Env* eMod = env;
                 while (eMod && !eMod->modTable) eMod = eMod->parent.get();
-                if (eFound)
+                bool bFoundInOrBelowClass = false;
+                if (eNs && eNs->bClassBody && eNs->bNsInst && eNs->nsTable)
+                {
+                    for (Env* cur = env; cur; cur = cur->parent.get())
+                    {
+                        if (cur == eFound) { bFoundInOrBelowClass = true; break; }
+                        if (cur == eNs) break;
+                    }
+                }
+                if (eNs && eNs->bClassBody && eNs->bNsInst && eNs->nsTable && !bFoundInOrBelowClass)
+                {
+                    // In class body: member definition (e.g. `method = function() {}` or `each = function() {}`)
+                    // writes to the instance table only, and NEVER overwrites outer namespace/global variables.
+                    eNs->nsTable->map[target->str] = val;
+                }
+                else if (eFound)
                 {
                     eFound->vars[target->str] = val;
                     if (eFound->bNsBody && eFound->nsTable)
@@ -2031,6 +2127,13 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                     }
                     else if (eFound->bNsBody && eFound->modTable)
                     {
+                        if (val.t == Value::TableT && val.tab && !env->nsTable)
+                        {
+                            // If assigning a table to the module name itself before 'namespace ...'
+                            // (e.g. debug = global["(debug)"]), copy all members into the module
+                            for (auto& kv : val.tab->map)
+                                eFound->modTable->map[kv.first] = kv.second;
+                        }
                         eFound->modTable->map[target->str] = val;
                         eFound->modTable->scopeVars[target->str] = val;
                         if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
@@ -2043,14 +2146,31 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 }
                 else if (eNs && eNs->nsTable)
                 {
-                    eNs->vars[target->str] = val;
-                    eNs->nsTable->map[target->str] = val;
-                    eNs->nsTable->scopeVars[target->str] = val;
-                    if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
-                        globals.vars[target->str] = val;
+                    if (eNs->bNsInst && eNs->bClassBody)
+                    {
+                        // In class body: member definition (e.g. `method = function() {}`)
+                        // writes to the instance table only, NOT as a lexical closure variable.
+                        // Otherwise instance methods mistakenly shadow outer namespace members.
+                        eNs->nsTable->map[target->str] = val;
+                    }
+                    else
+                    {
+                        eNs->vars[target->str] = val;
+                        eNs->nsTable->map[target->str] = val;
+                        eNs->nsTable->scopeVars[target->str] = val;
+                        if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
+                            globals.vars[target->str] = val;
+                    }
                 }
                 else if (eMod && eMod->modTable)
                 {
+                    if (val.t == Value::TableT && val.tab && !env->nsTable)
+                    {
+                        // If assigning a table to the module name itself before 'namespace ...'
+                        // (e.g. debug = global["(debug)"]), copy all members into the module
+                        for (auto& kv : val.tab->map)
+                            eMod->modTable->map[kv.first] = kv.second;
+                    }
                     eMod->vars[target->str] = val;
                     eMod->modTable->map[target->str] = val;
                     eMod->modTable->scopeVars[target->str] = val;
@@ -2059,7 +2179,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 }
                 else
                 {
-                    globals.vars[target->str] = val;   // aardio: default global
+                    globals.vars[target->str] = val;   // default global
                     // engine-provided root namespaces are pre-registered in
                     // `roots`, and NsPath/DoImport consult that map first.
                     // Leaving the two copies apart made `namespace process{}`
@@ -2333,6 +2453,8 @@ Value Interp::EvalClass(const PNode& n, Env* env)
             vClass.pdefaults = std::make_shared<vector<PNode>>(
                 n->b ? n->b->defaults : vector<PNode>());
             vClass.classBody = n->a;
+            if (env && env->self)
+                vClass.envUp = env->self;
             for (Env* e = env; e; e = e->parent.get())
                 if (e->nsTable && !e->bNsInst)
                 {
@@ -2344,6 +2466,7 @@ Value Interp::EvalClass(const PNode& n, Env* env)
             classEnv->parent = env ? env->self : globals.self;
             classEnv->nsTable = tb;
             classEnv->bNsBody = true;
+            classEnv->vars[L"self"] = vClass;
             for (auto& st : n->a->list)
             {
                 wstring prevErr = err ? *err : L"";
@@ -2539,7 +2662,7 @@ Value Interp::Exec(const PNode& n, Env* env)
             }
             case Node::VarDecl:
             {
-                // aardio: a var declared directly in a namespace or module
+                // a var declared directly in a namespace or module
                 // body is a namespace member. Mirror the slot into the
                 // namespace table's map so member access (ns.name) and
                 // code in other modules see it; the env slot keeps the
@@ -2606,7 +2729,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     BindVar(n->names[0], v);
                     return v;
                 }
-                // var a,b = f() — aardio multi-return unpack. A packed
+                // var a,b = f() — multi-return unpack. A packed
                 // `...` (bDots) carries ALL varargs in mrets and expands
                 // from index 0; a normal call result holds the FIRST
                 // return in v with mrets listing the extras.
@@ -2655,9 +2778,8 @@ Value Interp::Exec(const PNode& n, Env* env)
             case Node::With:
             {
                 // with(expr) body: bare names inside the body READ AND
-                // WRITE the with-target table live (bk.aardio's
-                // `with bk._metaProperty{ saveScale = d.saveScale }`
-                // must land back in the meta table) — bind the target
+                // WRITE the with-target table live (`with t{ k = v }`
+                // must land back in the table) — bind the target
                 // as this env's namespace instead of snapshotting
                 Value v = Eval(n->a, env);
                 auto local = std::make_shared<Env>();
@@ -2789,7 +2911,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 loopEnv->nsTable = env ? env->nsTable : nullptr;
                 loopEnv->modTable = env ? env->modTable : nullptr;
 
-                // Official aardio: loop variable is strictly local to the for loop.
+                // Loop variable is strictly local to the for loop.
                 // It does not mutate outer variables with the same name.
                 wstring loopVarName;
                 if (n->a && n->a->k == Node::Assign && n->a->a && n->a->a->k == Node::Ident)
@@ -2847,7 +2969,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     dStep = -BNum(Eval(n->c->a->a, loopEnv.get()));
                     if (dStep < 0) nDir = -1;
                 }
-                // When step is omitted, official aardio default step is ALWAYS 1 (forward).
+                // When step is omitted, default step is ALWAYS 1 (forward).
                 // Descending loops require an explicit negative step (e.g. `for(i=10;1;-1)`).
                 auto bContinue = [&]() -> bool {
                     if (!n->b)
@@ -2939,14 +3061,10 @@ Value Interp::Exec(const PNode& n, Env* env)
                 Value it = Eval(n->a, env);
                 // iterator function: official for-in calls it with no args
                 // until the primary return is null; extra returns bind to
-                // the second loop variable (aardio `return k, v`). popen's
-                // each/lines and table.eachArgs hand back exactly these
-                // closures.
+                // the second loop variable (`return k, v`). Iterator
+                // closures hand back exactly these multiple returns.
                 if (it.t == Value::Func)
                 {
-                    auto loopEnv = std::make_shared<Env>();
-                    loopEnv->self = loopEnv;
-                    loopEnv->parent = env ? env->self : globals.self;
                     vector<Value> iterArgs;
                     for (;;)
                     {
@@ -2957,19 +3075,21 @@ Value Interp::Exec(const PNode& n, Env* env)
                                             : CallVmFunc(it, iterArgs);
                         if (r.t == Value::Null)
                             return Value();
-                        loopEnv->vars.clear();
+                        auto iterEnv = std::make_shared<Env>();
+                        iterEnv->self = iterEnv;
+                        iterEnv->parent = env ? env->self : globals.self;
                         Value r0 = r;
                         r0.mrets = nullptr;
-                        loopEnv->vars[n->names[0]] = r0;
+                        iterEnv->vars[n->names[0]] = r0;
                         for (size_t ni = 1; ni < n->names.size(); ni++)
                         {
                             size_t mi = ni - 1;
                             Value rm = (r.mrets && mi < r.mrets->size())
                                     ? (*r.mrets)[mi] : Value();
                             rm.mrets = nullptr;
-                            loopEnv->vars[n->names[ni]] = rm;
+                            iterEnv->vars[n->names[ni]] = rm;
                         }
-                        Value rb = ExecBlock(n->b, loopEnv.get());
+                        Value rb = ExecBlock(n->b, iterEnv.get());
                         if (nBreak) { nBreak--; return Value(); }
                         if (nContinue) { nContinue--; }
                         if (nReturn) { ret = rb; return ret; }
@@ -2978,15 +3098,14 @@ Value Interp::Exec(const PNode& n, Env* env)
                 }
                 if (it.t != Value::TableT || !it.tab)
                     return Value();
-                auto loopEnv = std::make_shared<Env>();
-                loopEnv->self = loopEnv;
-                loopEnv->parent = env ? env->self : globals.self;
                 auto step = [&](const wstring& k, const Value& v) -> int {
-                    loopEnv->vars.clear();
-                    loopEnv->vars[n->names[0]] = Value::Str_(k);
+                    auto iterEnv = std::make_shared<Env>();
+                    iterEnv->self = iterEnv;
+                    iterEnv->parent = env ? env->self : globals.self;
+                    iterEnv->vars[n->names[0]] = Value::Str_(k);
                     if (n->names.size() > 1)
-                        loopEnv->vars[n->names[1]] = v;
-                    Value r = ExecBlock(n->b, loopEnv.get());
+                        iterEnv->vars[n->names[1]] = v;
+                    Value r = ExecBlock(n->b, iterEnv.get());
                     if (nBreak) { nBreak--; return 1; }
                     if (nContinue) { nContinue--; return 0; }
                     if (nReturn) { ret = r; return 2; }
@@ -3006,7 +3125,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     auto itv = it.tab->map.find(k);
                     Value v = itv != it.tab->map.end() ? itv->second : Value();
                     // a numeric-string key (form._ctrlHwnd[hwndNumber]) is a
-                    // NUMBER in aardio — iterating it as a string hands
+                    // NUMBER — iterating it as a string hands
                     // win.getStyle(string) a marshalled pointer and the
                     // WM_SIZE/enumControl chain then tears the control down
                     if (!k.empty() &&
@@ -3016,11 +3135,13 @@ Value Interp::Exec(const PNode& n, Env* env)
                         if (nK > 0)
                         {
                             Value vk = Value::Num_((double)nK);
-                            loopEnv->vars.clear();
-                            loopEnv->vars[n->names[0]] = vk;
+                            auto iterEnv = std::make_shared<Env>();
+                            iterEnv->self = iterEnv;
+                            iterEnv->parent = env ? env->self : globals.self;
+                            iterEnv->vars[n->names[0]] = vk;
                             if (n->names.size() > 1)
-                                loopEnv->vars[n->names[1]] = v;
-                            Value r = ExecBlock(n->b, loopEnv.get());
+                                iterEnv->vars[n->names[1]] = v;
+                            Value r = ExecBlock(n->b, iterEnv.get());
                             if (nBreak) { nBreak--; return Value(); }
                             if (nContinue) { nContinue--; continue; }
                             if (nReturn) { ret = r; return ret; }
@@ -3052,32 +3173,52 @@ Value Interp::Exec(const PNode& n, Env* env)
                 return Value();
             }
             case Node::Return:
-                ret = n->a ? Eval(n->a, env) : Value();
-                if (ret.bDots && ret.mrets)
+            {
+                vector<PNode> rawExprs;
+                if (n->a) rawExprs.push_back(n->a);
+                for (auto& e : n->list) rawExprs.push_back(e);
+
+                vector<Value> flatVals;
+                for (size_t i = 0; i < rawExprs.size(); i++)
                 {
-                    // `return ...` expands the varargs as the whole
-                    // return sequence: first value in ret, extras in mrets
-                    vector<Value> all = *ret.mrets;
-                    ret = all.empty() ? Value() : all[0];
-                    if (all.size() > 1)
+                    Value ev = Eval(rawExprs[i], env);
+                    if (ev.bDots && ev.mrets)
                     {
-                        auto extras = std::make_shared<vector<Value>>(
-                            all.begin() + 1, all.end());
-                        ret.mrets = extras;
+                        for (auto& mr : *ev.mrets)
+                            flatVals.push_back(mr);
                     }
                     else
-                        ret.mrets = nullptr;
+                    {
+                        flatVals.push_back(ev);
+                        if (i == rawExprs.size() - 1 && ev.mrets && !ev.mrets->empty())
+                        {
+                            for (auto& mr : *ev.mrets)
+                                flatVals.push_back(mr);
+                        }
+                    }
                 }
-                else if (!n->list.empty())
+
+                if (flatVals.empty())
                 {
-                    // aardio multi-return: extras ride on the Value
-                    auto extras = std::make_shared<vector<Value>>();
-                    for (auto& e : n->list)
-                        extras->push_back(Eval(e, env));
-                    ret.mrets = extras;
+                    ret = Value();
+                }
+                else
+                {
+                    ret = flatVals[0];
+                    ret.bDots = false;
+                    if (flatVals.size() > 1)
+                    {
+                        ret.mrets = std::make_shared<vector<Value>>(
+                            flatVals.begin() + 1, flatVals.end());
+                    }
+                    else
+                    {
+                        ret.mrets = nullptr;
+                    }
                 }
                 nReturn++;
                 return ret;
+            }
             case Node::Break:
                 nBreak++;
                 return Value();
@@ -3107,7 +3248,7 @@ Value Interp::GetRoot(const wstring& name)
             auto tb = std::make_shared<Table>();
             Value v = Value::Table_(tb);
             roots[name] = v;
-            globals.vars[name] = v;   // bare `string` resolves like aardio
+            globals.vars[name] = v;   // bare name resolves to root namespace
             return v;
         }
 
@@ -3157,6 +3298,17 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
                     auto ig = globals.vars.find(names[0]);
                     if (ig != globals.vars.end())
                         cand = ig->second;
+                }
+                if (!cand.tab && env)
+                {
+                    for (Env* e = env; e; e = e->parent.get())
+                    {
+                        if (e->modTable && (names.size() == 1 || names[0] == L"self"))
+                        {
+                            cand = Value::Table_(e->modTable);
+                            break;
+                        }
+                    }
                 }
                 if ((cand.t == Value::TableT || cand.t == Value::Class) &&
                     cand.tab)
@@ -3228,7 +3380,7 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
                     vargs->push_back(args[k]);
                     tbV->arr.push_back(args[k]);
                 }
-                // `arg` is aardio's spelling for the varargs table;
+                // `arg` is the alias for the varargs table;
                 // `...` expands it at call sites.
                 Value vDots = Value::Table_(tbV);
                 vDots.mrets = vargs;

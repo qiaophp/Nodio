@@ -18,9 +18,10 @@
 //
 // Binary safety: every file is stored as raw bytes; the entry script is
 // UTF-8 decoded only for execution. Embedded keys use lib-relative paths
-// ("win\\_.aardio", "res\\a.png") so the engine's embedded lookup works.
+// so the engine's embedded lookup works.
 
 #include <windows.h>
+#include "engine/common.h"
 #include "engine/NodioVM.h"
 #include "publish/publish.h"
 #include <string>
@@ -168,8 +169,8 @@ namespace NodioPublish
     // ---- import closure --------------------------------------------------
 
     // Scans source for `import a.b.c` / `import ..a.b` / `import a` and
-    // resolves each name to a lib file (aardio / nodio, folder layout
-    // preferred). Recursive with a visited set.
+    // resolves each name to a lib file (folder layout preferred).
+    // Recursive with a visited set.
     static void CollectClosure(const std::wstring& src,
                                const std::wstring& strLibDir,
                                std::map<std::wstring, std::wstring>& files,
@@ -213,13 +214,15 @@ namespace NodioPublish
             std::wstring visitKey = strLibDir + L"|" + rel;
             if (visited.count(visitKey)) continue;
 
-            const wchar_t* exts[] = { L"aardio", L"nodio" };
+            std::vector<std::wstring> exts = NodioVM::GetConfiguredExtensions();
             const bool alts[] = { true, false };
             std::wstring found;
             for (bool bAlt : alts)
             {
-                for (const wchar_t* ext : exts)
+                for (const auto& extWithDot : exts)
                 {
+                    std::wstring ext = extWithDot;
+                    if (!ext.empty() && ext[0] == L'.') ext = ext.substr(1);
                     std::wstring cand = JoinPath(strLibDir, rel) +
                         (bAlt ? (std::wstring(L"\\_.") + ext)
                               : (std::wstring(L".") + ext));
@@ -454,6 +457,16 @@ namespace NodioPublish
         return true;
     }
 
+    static std::string WToU8(const std::wstring& ws)
+    {
+        if (ws.empty()) return std::string();
+        int n = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
+        if (n <= 0) return std::string();
+        std::string s(n, 0);
+        WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], n, nullptr, nullptr);
+        return s;
+    }
+
     static std::string BuildManifestXml(const Options& opt)
     {
         // Same shape as the host's own dev-mode manifest (which is known
@@ -476,8 +489,7 @@ namespace NodioPublish
             xml += "<trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v2\">"
                    "<security><requestedPrivileges>"
                    "<requestedExecutionLevel level=\"" +
-                   std::string(opt.strUacLevel.begin(),
-                               opt.strUacLevel.end()) +
+                   WToU8(opt.strUacLevel) +
                    "\" uiAccess=\"false\"/>"
                    "</requestedPrivileges></security></trustInfo>";
         xml += "</assembly>";
@@ -675,8 +687,7 @@ namespace NodioPublish
         }
         if (!opt.strLibDir.empty())
             CollectClosure(srcMain, opt.strLibDir, colFiles, visited, 0);
-        // project-local lib: proj\lib\X.aardio == import X (official
-        // project layout), resolved after the global lib root
+        // project-local lib: proj\lib\X == import X, resolved after the global lib root
         {
             std::wstring strProjLib = JoinPath(strProjDir, L"lib");
             if (GetFileAttributesW(strProjLib.c_str()) != INVALID_FILE_ATTRIBUTES)

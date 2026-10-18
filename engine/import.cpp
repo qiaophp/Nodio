@@ -84,11 +84,7 @@ Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
                         if (vT.t == Value::Class || vT.t == Value::Func)
                         {
                             // The existing class/function binding wins:
-                            // the module body already built it (win.form
-                            // is "class win.form" inside win/ui/_.aardio,
-                            // and the delegator file win/form.aardio — one
-                            // `import win.ui;` line — caches the
-                            // delegatee's module table as its own value).
+                            // the module body already built it.
                             // Binding that table over the class dropped
                             // it. Merge the module's members in and keep.
                             for (auto& kv : mod.tab->map)
@@ -126,27 +122,15 @@ Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
 Value Interp::DoImport(const PNode& n, Env* env)
         {
             (void)env;
-            // M7: global lib root — the ORIGINAL aardio install's lib\
-            // (plaintext source), enabled via NODIO_LIBDIR; resolution
-            // order: project baseDir first, then the lib root
+            // global lib root — enabled via NODIO_LIBDIR or configuration;
+            // resolution order: project baseDir first, then the lib root
             static const wstring strLibDir = []
             {
                 wchar_t szLib[MAX_PATH] = L"";
-                GetEnvironmentVariableW(L"NODIO_LIBDIR", szLib, MAX_PATH);
-                return wstring(szLib);
+                if (GetEnvironmentVariableW(L"NODIO_LIBDIR", szLib, MAX_PATH) > 0)
+                    return wstring(szLib);
+                return GetNodioConfig().libDir;
             }();
-            // import resolution accepts both .aardio (official ecosystem)
-            // and .nodio (native) extensions; each root prefers the
-            // folder-module layout (rel\_.ext) over the flat file
-            // (rel.ext), and the aardio extension over nodio
-            auto LibCand = [&](const wstring& relX, bool bAlt,
-                               const wchar_t* ext) -> wstring
-            {
-                if (strLibDir.empty()) return L"";
-                return strLibDir + L"\\" + relX +
-                    (bAlt ? (wstring(L"\\_.") + ext)
-                          : (wstring(L".") + ext));
-            };
             auto Exists = [](const wstring& p) -> bool
             {
                 return !p.empty() && _waccess(p.c_str(), 0) == 0;
@@ -184,19 +168,22 @@ Value Interp::DoImport(const PNode& n, Env* env)
 
             // 1) pre-bound builtin namespaces resolve immediately —
             // but a matching lib FILE merges into the namespace first
-            // (aardio: import X loads lib source into namespace X)
+            // (import X loads lib source into namespace X)
             {
                 bool bLibFile = false;
                 if (!strLibDir.empty())
                 {
                     for (const auto& rc : relCands)
                     {
-                        if (Exists(strLibDir + L"\\" + rc + L".aardio") ||
-                            Exists(strLibDir + L"\\" + rc + L".nodio"))
+                        for (const auto& ext : GetConfiguredExtensions())
                         {
-                            bLibFile = true;
-                            break;
+                            if (Exists(strLibDir + L"\\" + rc + ext))
+                            {
+                                bLibFile = true;
+                                break;
+                            }
                         }
+                        if (bLibFile) break;
                     }
                 }
                 bool bAnyFile = bLibFile;
@@ -204,12 +191,16 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 {
                     for (const auto& rc : relCands)
                     {
-                        if (Exists(baseDir + L"\\" + rc + L".aardio") ||
-                            Exists(baseDir + L"\\" + rc + L".nodio"))
+                        for (const auto& ext : GetConfiguredExtensions())
                         {
-                            bAnyFile = true;
-                            break;
+                            if (Exists(baseDir + L"\\" + rc + ext) ||
+                                Exists(baseDir + L"\\lib\\" + rc + ext))
+                            {
+                                bAnyFile = true;
+                                break;
+                            }
                         }
+                        if (bAnyFile) break;
                     }
                 }
                 // 0) engine-provided modules with no backing file
@@ -217,7 +208,10 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 {
                     auto itN = namedModules.find(n->names[0]);
                     if (itN != namedModules.end())
+                    {
+                        BindModule(n->names, itN->second);
                         return itN->second;
+                    }
                 }
                 static bool bDbgI = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
                 if (bDbgI)
@@ -245,12 +239,15 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 bool bEmbedded = false;
                 for (const auto& rc : relCands)
                 {
-                    if (embedded.count(rc + L".aardio") ||
-                        embedded.count(rc + L".nodio"))
+                    for (const auto& ext : GetConfiguredExtensions())
                     {
-                        bEmbedded = true;
-                        break;
+                        if (embedded.count(rc + ext))
+                        {
+                            bEmbedded = true;
+                            break;
+                        }
                     }
+                    if (bEmbedded) break;
                 }
 
                 if (roots.count(n->names[0]) &&
@@ -258,63 +255,41 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     bSkipShadow)
                     return roots[n->names[0]];
             }
-            // 2) For multi-segment imports (e.g. `import win.ui.ctrl.thread`),
-            // Note: Official aardio does NOT automatically import parent package _.aardio
-            // files for dotted library paths; each sub-library explicitly imports its own
-            // dependencies. Unconditionally pre-loading parent _.aardio breaks versioned
-            // or alternative package variants such as System.Windows.Automation.3 which
-            // replaces System.Windows.Automation.
-#if 0
-            if (n->names.size() > 1)
-            {
-                wstring prefixRel;
-                vector<wstring> prefixNames;
-                for (size_t p = 0; p + 1 < n->names.size(); p++)
-                {
-                    if (p) prefixRel += L"\\";
-                    prefixRel += n->names[p];
-                    prefixNames.push_back(n->names[p]);
 
-                    wstring cand = LibCand(prefixRel, true, L"aardio");
-                    if (Exists(cand) && modules.find(cand) == modules.end())
-                    {
-                        PNode prefixNode = std::make_shared<Node>();
-                        prefixNode->k = Node::Import;
-                        prefixNode->names = prefixNames;
-                        DoImport(prefixNode, env);
-                    }
-                }
-            }
-#endif
-
-            // 3) file module: check lib root first, then baseDir
-            // candidates follow official hierarchical partition order (e.g. chrome\edge.history.aardio)
+            // file module: check lib root first, then baseDir
             wstring file;
             if (!strLibDir.empty())
             {
                 for (const auto& rc : relCands)
                 {
-                    wstring candA = strLibDir + L"\\" + rc + L".aardio";
-                    if (Exists(candA)) { file = candA; break; }
-                    wstring candN = strLibDir + L"\\" + rc + L".nodio";
-                    if (Exists(candN)) { file = candN; break; }
+                    for (const auto& ext : GetConfiguredExtensions())
+                    {
+                        wstring cand = strLibDir + L"\\" + rc + ext;
+                        if (Exists(cand)) { file = cand; break; }
+                    }
+                    if (!file.empty()) break;
                 }
             }
             if (file.empty() && !baseDir.empty())
             {
                 for (const auto& rc : relCands)
                 {
-                    wstring candA = baseDir + L"\\" + rc + L".aardio";
-                    if (Exists(candA)) { file = candA; break; }
-                    wstring candN = baseDir + L"\\" + rc + L".nodio";
-                    if (Exists(candN)) { file = candN; break; }
+                    for (const auto& ext : GetConfiguredExtensions())
+                    {
+                        wstring cand = baseDir + L"\\" + rc + ext;
+                        if (Exists(cand)) { file = cand; break; }
+                        wstring candLib = baseDir + L"\\lib\\" + rc + ext;
+                        if (Exists(candLib)) { file = candLib; break; }
+                    }
+                    if (!file.empty()) break;
                 }
             }
             if (file.empty())
             {
                 wstring defRel = relCands.empty() ? L"" : relCands.back();
-                file = baseDir.empty() ? (defRel + L".aardio")
-                                       : (baseDir + L"\\" + defRel + L".aardio");
+                wstring defExt = GetConfiguredExtensions().empty() ? L".nodio" : GetConfiguredExtensions().front();
+                file = baseDir.empty() ? (defRel + defExt)
+                                       : (baseDir + L"\\" + defRel + defExt);
             }
             static bool bDbg = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
             if (bDbg)
@@ -328,17 +303,17 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 BindModule(n->names, it->second);
                 return it->second;
             }
+
             // payload v2: embedded project files resolve before disk
-            // (published exe: libEmbed closure ships under lib-relative
-            // keys — "win\_.aardio" — so try both lib layouts, both
-            // extensions)
             auto itE = embedded.end();
             for (const auto& rc : relCands)
             {
-                auto itCand = embedded.find(rc + L".aardio");
-                if (itCand != embedded.end()) { itE = itCand; break; }
-                itCand = embedded.find(rc + L".nodio");
-                if (itCand != embedded.end()) { itE = itCand; break; }
+                for (const auto& ext : GetConfiguredExtensions())
+                {
+                    auto itCand = embedded.find(rc + ext);
+                    if (itCand != embedded.end()) { itE = itCand; break; }
+                }
+                if (itE != embedded.end()) break;
             }
             if (itE != embedded.end())
             {
@@ -417,10 +392,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     return Value();
                 // A module whose top level never executed `return` has no
                 // module value of its own: `ret` here is just the value of
-                // the LAST statement — for process/_.aardio that is
-                // `import process.job.limitKill;`, whose module table then
-                // got bound AS `process`, replacing the class the file
-                // declared. Without a top-level return, resolve the
+                // the LAST statement. Without a top-level return, resolve the
                 // namespace path instead.
                 if (!bTopReturn)
                     mod2 = Value();
@@ -458,24 +430,31 @@ Value Interp::DoImport(const PNode& n, Env* env)
                         mod2 = modPlaceholder2;
                     }
                 }
-                // lib convention: file a/b/C.aardio with 'namespace a.b;'
+                // lib convention: file a/b/C.<ext> with 'namespace a.b;'
                 // + 'class C { }' binds the CLASS, not the namespace
                 {
                     size_t sl = file.find_last_of(L"\\/");
                     wstring base = (sl == wstring::npos) ? file
                         : file.substr(sl + 1);
-                    if (base.size() > 7 &&
-                        base.substr(base.size() - 7) == L".aardio")
-                        base = base.substr(0, base.size() - 7);
-                    if (base.size() > 6 &&
-                        base.substr(base.size() - 6) == L".nodio")
-                        base = base.substr(0, base.size() - 6);
+                    base = StripScriptExtension(base);
+                    bool bIsFolderModule = false;
+                    if (base == L"_")
+                    {
+                        bIsFolderModule = true;
+                        size_t sl2 = file.find_last_of(L"\\/");
+                        if (sl2 != wstring::npos && sl2 > 0)
+                        {
+                            size_t sl3 = file.find_last_of(L"\\/", sl2 - 1);
+                            if (sl3 != wstring::npos)
+                                base = file.substr(sl3 + 1, sl2 - sl3 - 1);
+                        }
+                    }
                     if (mod2.t == Value::TableT && mod2.tab)
                     {
                         auto im = mod2.tab->map.find(base);
                         if (im != mod2.tab->map.end() &&
                             (im->second.t == Value::Class ||
-                             im->second.t == Value::Func))
+                             (im->second.t == Value::Func && !bIsFolderModule)))
                             mod2 = im->second;
                     }
                 }
@@ -490,8 +469,8 @@ Value Interp::DoImport(const PNode& n, Env* env)
             FILE* pf = nullptr;
             if (_wfopen_s(&pf, file.c_str(), L"rb") != 0 || !pf)
             {
-                // pure-namespace import: no <name>.aardio / _\_.aardio
-                // but a submodule folder exists (com/, util/...) in baseDir or strLibDir
+                // pure-namespace import: no backing file
+                // but a submodule folder exists in baseDir or strLibDir
                 wstring relDir;
                 for (size_t i = 0; i < n->names.size(); i++)
                 {
@@ -595,8 +574,8 @@ Value Interp::DoImport(const PNode& n, Env* env)
             placeholder->map[L"self"] = modPlaceholder;
             modules[file] = modPlaceholder;
             // Single-segment imports must NOT pre-bind the root global:
-            // official aardio leaves the module's own name unbound while
-            // the body runs, so golang's `assert(!golang)` self-guard
+            // the module's own name is left unbound while
+            // the body runs, so a module's `assert(!name)` self-guard
             // sees null. Re-entrant imports still resolve through the
             // modules[] cache above.
             // For dotted paths (e.g. `import a.b.c`), ensure parent namespace
@@ -652,9 +631,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             if (!err->empty())
                 return Value();
             // Without a top-level return the module has no value of its
-            // own — `ret` is just the last statement's value (for
-            // process/_.aardio, the process.job.limitKill module table,
-            // which then got bound AS `process`). Resolve the namespace
+            // own — `ret` is just the last statement's value. Resolve the namespace
             // path instead.
             if (!bTopReturn)
                 mod = Value();
@@ -697,16 +674,13 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 size_t sl = file.find_last_of(L"\\/");
                 wstring base = (sl == wstring::npos) ? file
                     : file.substr(sl + 1);
-                if (base.size() > 7 &&
-                    base.substr(base.size() - 7) == L".aardio")
-                    base = base.substr(0, base.size() - 7);
-                if (base.size() > 6 &&
-                    base.substr(base.size() - 6) == L".nodio")
-                    base = base.substr(0, base.size() - 6);
-                // folder-module convention: a/b/C/_.aardio binds C
+                base = StripScriptExtension(base);
+                // folder-module convention: a/b/C/_.<ext> binds C
                 // (the class declared inside), not '_'
+                bool bIsFolderModule = false;
                 if (base == L"_")
                 {
+                    bIsFolderModule = true;
                     size_t sl2 = file.find_last_of(L"\\/");
                     if (sl2 != wstring::npos && sl2 > 0)
                     {
@@ -721,7 +695,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     auto im = cand.tab->map.find(base);
                     if (im != cand.tab->map.end() &&
                         (im->second.t == Value::Class ||
-                         im->second.t == Value::Func))
+                         (im->second.t == Value::Func && !bIsFolderModule)))
                         mod = im->second;
                     else
                     {

@@ -1,4 +1,4 @@
-// regex.cpp — the aardio-pattern engine (compile + match).
+// regex.cpp — the pattern engine (compile + match).
 #include "engine/common.h"
 
 namespace NodioVM
@@ -6,18 +6,20 @@ namespace NodioVM
     bool REClass(unsigned cls, wchar_t c)
     {
         bool r = false;
-        if (cls & 1u) r = r || (iswdigit(c) != 0);
-        if (cls & 2u) r = r || !iswdigit(c);
-        if (cls & 4u) r = r || (iswalnum(c) || c == L'_');
-        if (cls & 8u) r = r || !(iswalnum(c) || c == L'_');
+        if (cls & 1u) r = r || (c >= L'0' && c <= L'9');
+        if (cls & 2u) r = r || !(c >= L'0' && c <= L'9');
+        if (cls & 4u) r = r || ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'_');
+        if (cls & 8u) r = r || !((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'_');
         if (cls & 16u) r = r || (iswspace(c) != 0);
         if (cls & 32u) r = r || !iswspace(c);
-        if (cls & 64u) r = r || (iswalpha(c) != 0);
-        if (cls & 128u) r = r || !iswalpha(c);
-        if (cls & 256u) r = r || (iswlower(c) != 0);
-        if (cls & 512u) r = r || (iswupper(c) != 0);
+        if (cls & 64u) r = r || ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z'));
+        if (cls & 128u) r = r || !((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z'));
+        if (cls & 256u) r = r || (c >= L'a' && c <= L'z');
+        if (cls & 512u) r = r || (c >= L'A' && c <= L'Z');
         if (cls & 1024u) r = r || (iswxdigit(c) != 0);
         if (cls & 2048u) r = r || (iswpunct(c) != 0);
+        if (cls & 4096u) r = r || ((unsigned)c < 0x80);
+        if (cls & 8192u) r = r || ((unsigned)c >= 0x80);
         return r;
     }
 
@@ -54,6 +56,8 @@ namespace NodioVM
             case L'u': return 512;
             case L'x': return 1024;
             case L'p': return 2048;
+            case L'i': return 4096;
+            case L'I': return 8192;
             default: return 0;
             }
         }
@@ -146,7 +150,7 @@ namespace NodioVM
             }
             else if (c == L'<')
             {
-                // Aardio non-capturing group
+                // Non-capturing group
                 if (pat.size() >= i + 3 && pat.substr(i, 3) == L"<@@")
                 {
                     size_t endAt = pat.find(L"@>", i + 3);
@@ -274,6 +278,30 @@ namespace NodioVM
                 el.k = 4;
                 return true;
             }
+            else if (c == L'!')
+            {
+                i++;
+                el.k = 9;
+                if (i >= pat.size() || pat[i] == L')' || pat[i] == L'>' || pat[i] == L'|')
+                {
+                    el.ch = L'$';
+                    return true;
+                }
+                if (i + 1 < pat.size() && pat[i] == L'\\' && pat[i + 1] == L'z')
+                {
+                    i += 2;
+                    el.ch = L'$';
+                    return true;
+                }
+                RE subEl;
+                if (ParseOne(subEl))
+                {
+                    el.sub.push_back(std::move(subEl));
+                    return true;
+                }
+                el.ch = L'$';
+                return true;
+            }
             else if (c == L'\\')
             {
                 i++;
@@ -298,7 +326,7 @@ namespace NodioVM
             }
             else if (c == L'%' && i + 1 < pat.size())
             {
-                // aardio balanced delimiter pattern %<begin><end>
+                // Balanced delimiter pattern %<begin><end>
                 // e.g. %(), %{}, %"", %'', %\[\], %\<\>
                 size_t pCur = i + 1;
                 wchar_t openC = 0, closeC = 0;
@@ -556,6 +584,7 @@ namespace NodioVM
                 return p;
             return RENPOS;
         }
+        case 9: return pos;
         default: return RENPOS;
         }
     }
@@ -571,6 +600,48 @@ namespace NodioVM
         if (el.k == 4)   // '$' — zero-width end anchor
         {
             if (pos != s.size()) return -1;
+            return REMatchSeq(els, idx + 1, s, pos, caps, groupStarts, anchored);
+        }
+        if (el.k == 9)   // '!' — zero-width boundary assertion
+        {
+            if (el.sub.empty() || el.ch == L'$')
+            {
+                if (pos != s.size()) return -1;
+            }
+            else
+            {
+                const RE& target = el.sub[0];
+                bool rightMatch = false;
+                if (pos < s.size())
+                {
+                    if (target.k == 1)
+                        rightMatch = REClassHit(target, s[pos]);
+                    else if (target.k == 0)
+                        rightMatch = (s[pos] == target.ch);
+                }
+                else
+                {
+                    if (target.k == 1 && (target.cls & (2u | 8u | 32u | 128u)))
+                        rightMatch = true; // \D, \W, \S, \A hit at end-of-string
+                }
+
+                bool leftMatch = false;
+                if (pos > 0)
+                {
+                    if (target.k == 1)
+                        leftMatch = REClassHit(target, s[pos - 1]);
+                    else if (target.k == 0)
+                        leftMatch = (s[pos - 1] == target.ch);
+                }
+                else
+                {
+                    if (target.k == 1 && (target.cls & (2u | 8u | 32u | 128u)))
+                        leftMatch = true; // start of string matches \D, \W, \S
+                }
+
+                if (!rightMatch || leftMatch)
+                    return -1;
+            }
             return REMatchSeq(els, idx + 1, s, pos, caps, groupStarts, anchored);
         }
         if (el.k == 5)   // GroupStart

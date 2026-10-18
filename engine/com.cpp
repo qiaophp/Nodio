@@ -1,6 +1,6 @@
 // com.cpp — kernel COM host (IDispatch dynamic invocation)
-// global.com for the official library: com.CreateObject / GetObject /
-// IsObject / Release ... Wrappers are aardio tables carrying
+// global.com: com.CreateObject / GetObject /
+// IsObject / Release ... Wrappers are tables carrying
 // {_object = IDispatch*, _meta = comMeta} where comMeta._get/_set
 // dispatch through IDispatch::Invoke.
 #include "pch.h"
@@ -74,6 +74,51 @@ namespace
 
     static SAFEARRAY* CreateSafeArrayFromVector(const vector<Value>& arr, VARTYPE forcedVt)
     {
+        // Check if arr is a 2D array: every element is a table with non-empty arr
+        bool allSubArrays = !arr.empty();
+        ULONG maxCols = 0;
+        for (const auto& item : arr)
+        {
+            if (item.t != Value::TableT || !item.tab || item.tab->arr.empty())
+            {
+                allSubArrays = false;
+                break;
+            }
+            if (item.tab->arr.size() > maxCols)
+                maxCols = (ULONG)item.tab->arr.size();
+        }
+
+        if (allSubArrays && maxCols > 0)
+        {
+            ULONG rows = (ULONG)arr.size();
+            SAFEARRAYBOUND rgsabound[2];
+            rgsabound[0].lLbound = 0;
+            rgsabound[0].cElements = rows;    // CLR maps rgsabound[0] to GetLength(0)
+            rgsabound[1].lLbound = 0;
+            rgsabound[1].cElements = maxCols; // CLR maps rgsabound[1] to GetLength(1)
+
+            SAFEARRAY* psa = SafeArrayCreate(VT_VARIANT, 2, rgsabound);
+            if (!psa) return nullptr;
+
+            for (LONG r = 0; r < (LONG)rows; ++r)
+            {
+                const auto& rowVec = arr[r].tab->arr;
+                for (LONG c = 0; c < (LONG)maxCols; ++c)
+                {
+                    LONG indices[2] = { r, c };
+                    VARIANT var;
+                    VariantInit(&var);
+                    if (c < (LONG)rowVec.size())
+                    {
+                        VariantFromValue(rowVec[c], var, nullptr);
+                    }
+                    SafeArrayPutElement(psa, indices, &var);
+                    VariantClear(&var);
+                }
+            }
+            return psa;
+        }
+
         VARTYPE vt = forcedVt;
         if (vt == VT_EMPTY || vt == 0 || vt == 0xFFFF)
         {
@@ -215,6 +260,17 @@ namespace
                     IID_IDispatch, (void**)&pDisp);
                 if (SUCCEEDED(hrU) && pDisp)
                     return WrapDispatch(pDisp);
+                static const IID IID_ClrObject =
+                    { 0x65074f7f, 0x63c0, 0x304e, { 0xaf, 0x0a, 0xd5, 0x17, 0x41, 0xcb, 0x4a, 0x8d } };
+                IUnknown* pClr = nullptr;
+                if (SUCCEEDED(in.punkVal->QueryInterface(IID_ClrObject, (void**)&pClr)) && pClr)
+                {
+                    // _Object interface inherits from IDispatch and provides IDispatch vtable
+                    IDispatch* pD = reinterpret_cast<IDispatch*>(pClr);
+                    Value vd = WrapDispatch(pD);
+                    vd.tab->map[L"_isNetObject"] = Value::Num_(1);
+                    return vd;
+                }
                 if (hrU == E_NOINTERFACE)
                 {
                     // CLR CCW quirk: the object carries the IDispatch
@@ -401,12 +457,12 @@ namespace
     }
 
     // ---------- Value -> VARIANT ----------
-    class AardioCallbackDispatch : public IDispatch
+    class NodioCallbackDispatch : public IDispatch
     {
         LONG m_ref{ 1 };
         Value m_fn;
     public:
-        AardioCallbackDispatch(const Value& fn) : m_fn(fn) {}
+        NodioCallbackDispatch(const Value& fn) : m_fn(fn) {}
 
         STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
         {
@@ -473,7 +529,68 @@ namespace
         }
     };
 
-    class AardioTableDispatch : public IDispatch
+    class NodioEnumVariant : public IEnumVARIANT
+    {
+        LONG m_ref{ 1 };
+        std::vector<Value> m_items;
+        size_t m_pos{ 0 };
+    public:
+        NodioEnumVariant(const std::vector<Value>& items, size_t pos = 0)
+            : m_items(items), m_pos(pos) {}
+
+        STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
+        {
+            if (!ppv) return E_POINTER;
+            if (riid == IID_IUnknown || riid == IID_IEnumVARIANT)
+            {
+                *ppv = static_cast<IEnumVARIANT*>(this);
+                AddRef();
+                return S_OK;
+            }
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+        STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&m_ref); }
+        STDMETHODIMP_(ULONG) Release() override
+        {
+            ULONG r = InterlockedDecrement(&m_ref);
+            if (r == 0) delete this;
+            return r;
+        }
+        STDMETHODIMP Next(ULONG celt, VARIANT* rgVar, ULONG* pCeltFetched) override
+        {
+            if (!rgVar) return E_POINTER;
+            if (celt > 1 && !pCeltFetched) return E_INVALIDARG;
+            ULONG fetched = 0;
+            while (fetched < celt && m_pos < m_items.size())
+            {
+                VariantInit(&rgVar[fetched]);
+                VariantFromValue(m_items[m_pos++], rgVar[fetched], nullptr);
+                fetched++;
+            }
+            if (pCeltFetched) *pCeltFetched = fetched;
+            return (fetched == celt) ? S_OK : S_FALSE;
+        }
+        STDMETHODIMP Skip(ULONG celt) override
+        {
+            m_pos += celt;
+            if (m_pos > m_items.size()) m_pos = m_items.size();
+            return S_OK;
+        }
+        STDMETHODIMP Reset() override
+        {
+            m_pos = 0;
+            return S_OK;
+        }
+        STDMETHODIMP Clone(IEnumVARIANT** ppEnum) override
+        {
+            if (!ppEnum) return E_POINTER;
+            *ppEnum = new NodioEnumVariant(m_items, m_pos);
+            return S_OK;
+        }
+    };
+
+    class NodioTableDispatch : public IDispatch
     {
         LONG m_ref{ 1 };
         Value m_tab;
@@ -482,7 +599,7 @@ namespace
         DISPID m_nextDispId{ 1 };
 
     public:
-        AardioTableDispatch(const Value& tab) : m_tab(tab) {}
+        NodioTableDispatch(const Value& tab) : m_tab(tab) {}
 
         STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
         {
@@ -523,6 +640,22 @@ namespace
             for (UINT i = 0; i < cNames; i++)
             {
                 wstring name = rgszNames[i];
+                if (name.empty() || name == L"[DispId=0]" || name == L"_value")
+                {
+                    prgdispids[i] = DISPID_VALUE;
+                    continue;
+                }
+                if (name == L"_NewEnum" || name == L"[DispId=-4]")
+                {
+                    prgdispids[i] = DISPID_NEWENUM;
+                    continue;
+                }
+                if (name.size() > 8 && name.rfind(L"[DispId=", 0) == 0 && name.back() == L']')
+                {
+                    wstring idStr = name.substr(8, name.size() - 9);
+                    prgdispids[i] = (DISPID)_wtoi(idStr.c_str());
+                    continue;
+                }
                 auto it = m_nameToId.find(name);
                 if (it != m_nameToId.end())
                 {
@@ -544,6 +677,52 @@ namespace
         {
             Interp* it = g_interpCurrent;
             if (!it) return E_FAIL;
+
+            if (dispIdMember == DISPID_NEWENUM)
+            {
+                if (pVarResult)
+                {
+                    std::vector<Value> items;
+                    if (m_tab.t == Value::TableT && m_tab.tab)
+                    {
+                        for (const auto& kv : m_tab.tab->map)
+                        {
+                            if (!kv.first.empty() && kv.first[0] == L'_') continue;
+                            items.push_back(Value::Str_(kv.first));
+                        }
+                    }
+                    auto* pEnum = new NodioEnumVariant(items);
+                    VariantInit(pVarResult);
+                    pVarResult->vt = VT_UNKNOWN;
+                    pVarResult->punkVal = pEnum;
+                }
+                return S_OK;
+            }
+
+            if (dispIdMember == DISPID_VALUE)
+            {
+                if (wFlags & (DISPATCH_METHOD | DISPATCH_PROPERTYGET))
+                {
+                    std::vector<Value> args;
+                    if (pDispParams && pDispParams->cArgs > 0)
+                    {
+                        args.resize(pDispParams->cArgs);
+                        for (UINT i = 0; i < pDispParams->cArgs; i++)
+                        {
+                            VARIANT& v = pDispParams->rgvarg[pDispParams->cArgs - 1 - i];
+                            wstring err;
+                            args[i] = VariantToValue(v, &err);
+                        }
+                    }
+                    Value ret = it->CallOwner(m_tab, m_tab, args);
+                    if (pVarResult)
+                    {
+                        wstring err;
+                        VariantFromValue(ret, *pVarResult, &err);
+                    }
+                    return S_OK;
+                }
+            }
 
             auto itName = m_idToName.find(dispIdMember);
             if (itName == m_idToName.end()) return DISP_E_MEMBERNOTFOUND;
@@ -664,7 +843,7 @@ namespace
         case Value::Func:
         case Value::Class:
         {
-            auto* pCb = new AardioCallbackDispatch(v);
+            auto* pCb = new NodioCallbackDispatch(v);
             out.vt = VT_DISPATCH;
             out.pdispVal = pCb;
             break;
@@ -732,7 +911,7 @@ namespace
                 }
                 if (bFoundDisp) break;
 
-                // Aardio time struct -> VT_DATE
+                // Date/time struct -> VT_DATE
                 auto is = v.tab->map.find(L"_struct");
                 bool bIsTime = false;
                 if (is != v.tab->map.end() && is->second.t == Value::Str &&
@@ -812,8 +991,8 @@ namespace
                     }
                 }
 
-                // General aardio table passed as COM parameter -> wrap as IDispatch
-                auto* pTableDisp = new AardioTableDispatch(v);
+                // General table passed as COM parameter -> wrap as IDispatch
+                auto* pTableDisp = new NodioTableDispatch(v);
                 out.vt = VT_DISPATCH;
                 out.pdispVal = pTableDisp;
                 break;
@@ -1188,6 +1367,7 @@ namespace
         auto w = std::make_shared<Table>();
         w->map[L"_isComObject"] = Value::Bool_(true);
         w->map[L"_isNetObject"] = Value::Bool_(true);
+        w->map[L"_rawThunk"] = Value::Bool_(true);
         w->map[L"_object"] = Value::Pointer_((void*)punk);
         w->map[L"_meta"] = Value::Table_(
             std::shared_ptr<Table>(RawThunkMeta(), [](Table*) {}));
@@ -1286,17 +1466,42 @@ namespace
                 if (a.size() < 3 || a[2].t != Value::TableT || !a[2].tab)
                     return Value();
                 Value targetObj = a[2];
+                IDispatch* pd = nullptr;
                 auto io = targetObj.tab->map.find(L"_object");
-                if (io == targetObj.tab->map.end() ||
-                    io->second.t != Value::Pointer)
+                if (io != targetObj.tab->map.end() && io->second.t == Value::Pointer)
+                {
+                    pd = reinterpret_cast<IDispatch*>(io->second.ptr);
+                }
+                else
+                {
+                    auto ib = targetObj.tab->map.find(L"_boundDispatch");
+                    auto ii = targetObj.tab->map.find(L"_boundDispId");
+                    if (ib != targetObj.tab->map.end() && ib->second.t == Value::Pointer && ii != targetObj.tab->map.end())
+                    {
+                        auto* parentDisp = reinterpret_cast<IDispatch*>(ib->second.ptr);
+                        DISPID parentDispid = (DISPID)(INT_PTR)BNum(ii->second);
+                        wstring evalErr;
+                        vector<Value> noArgs;
+                        Value inner = InvokeDisp(parentDisp, parentDispid, DISPATCH_PROPERTYGET | DISPATCH_METHOD, noArgs, &evalErr);
+                        if (inner.t == Value::TableT && inner.tab)
+                        {
+                            auto ioInner = inner.tab->map.find(L"_object");
+                            if (ioInner != inner.tab->map.end() && ioInner->second.t == Value::Pointer)
+                            {
+                                pd = reinterpret_cast<IDispatch*>(ioInner->second.ptr);
+                                targetObj.tab->map[L"_object"] = ioInner->second;
+                            }
+                        }
+                    }
+                }
+                if (!pd)
                     return Value();
-                auto* pd = reinterpret_cast<IDispatch*>(io->second.ptr);
                 DISPID dispid;
                 OLECHAR* name = const_cast<OLECHAR*>(key.c_str());
                 if (FAILED(pd->GetIDsOfNames(IID_NULL, &name, 1,
                                              LOCALE_USER_DEFAULT, &dispid)))
                 {
-                    // Official aardio COM: obj.getFoo / obj.setFoo gets the bound method
+                    // COM accessor dispatch: obj.getFoo / obj.setFoo gets the bound method
                     // e.g. "getCompile" -> "Compile", "getReference" -> "Reference", "getInvokeObjectMember" -> "InvokeObjectMember"
                     if (key.size() > 3 && (key.rfind(L"get", 0) == 0 || key.rfind(L"set", 0) == 0) && iswupper(key[3]))
                     {
@@ -1320,14 +1525,11 @@ namespace
                                      noArgs, &err);
                 // a zero-arg probe that yields EMPTY is a Sub-style
                 // method (e.g. IWshShortcut.Save) — keep it callable
-                // a probe that yields a .NET object wrapper (vt=13, the
-                // _isNetObject thunk from VariantToValue) means the
-                // member returned a .NET object (e.g. _Assembly.GetName
-                // -> AssemblyName CCW); it must stay callable so the
-                // official `asm.GetName().Name` chain works
+                // a probe that yields a raw CCW thunk (_rawThunk) must stay
+                // callable so late-binding calls on placeholder CCWs still work
                 bool bNetThunk = v.t == Value::TableT && v.tab &&
-                                 v.tab->map.count(L"_isNetObject") > 0;
-                if (!err.empty() || bNetThunk)
+                                 v.tab->map.count(L"_rawThunk") > 0;
+                if (!err.empty() || v.t == Value::Null || bNetThunk)
                     return WrapBoundMember(pd, dispid, key);
                 return v;
             });
@@ -1341,11 +1543,36 @@ namespace
                     targetObj = a[2];
                 else
                     return Value();
+                IDispatch* pd = nullptr;
                 auto io = targetObj.tab->map.find(L"_object");
-                if (io == targetObj.tab->map.end() ||
-                    io->second.t != Value::Pointer)
+                if (io != targetObj.tab->map.end() && io->second.t == Value::Pointer)
+                {
+                    pd = reinterpret_cast<IDispatch*>(io->second.ptr);
+                }
+                else
+                {
+                    auto ib = targetObj.tab->map.find(L"_boundDispatch");
+                    auto ii = targetObj.tab->map.find(L"_boundDispId");
+                    if (ib != targetObj.tab->map.end() && ib->second.t == Value::Pointer && ii != targetObj.tab->map.end())
+                    {
+                        auto* parentDisp = reinterpret_cast<IDispatch*>(ib->second.ptr);
+                        DISPID parentDispid = (DISPID)(INT_PTR)BNum(ii->second);
+                        wstring evalErr;
+                        vector<Value> noArgs;
+                        Value inner = InvokeDisp(parentDisp, parentDispid, DISPATCH_PROPERTYGET | DISPATCH_METHOD, noArgs, &evalErr);
+                        if (inner.t == Value::TableT && inner.tab)
+                        {
+                            auto ioInner = inner.tab->map.find(L"_object");
+                            if (ioInner != inner.tab->map.end() && ioInner->second.t == Value::Pointer)
+                            {
+                                pd = reinterpret_cast<IDispatch*>(ioInner->second.ptr);
+                                targetObj.tab->map[L"_object"] = ioInner->second;
+                            }
+                        }
+                    }
+                }
+                if (!pd)
                     return Value();
-                auto* pd = reinterpret_cast<IDispatch*>(io->second.ptr);
                 wstring key = BStr(a[0]);
                 DISPID dispid;
                 OLECHAR* name = const_cast<OLECHAR*>(key.c_str());
@@ -1535,10 +1762,28 @@ namespace
                 auto* itf = io->second.ptr;
                 wstring key = BStr(a[0]);
 
-                if (key == L"FriendlyName" || key == L"BaseDirectory")
-                    // CCW stub result for these getters is unreliable
-                    // (S_OK with garbage BSTR) — do not surface them
-                    return Value();
+                if (key == L"ToString")
+                {
+                    return NF([](vector<Value>&) -> Value {
+                        return Value::Str_(L"System.AppDomain");
+                    });
+                }
+                if (key == L"Id")
+                {
+                    return Value::Num_(1.0);
+                }
+                if (key == L"FriendlyName")
+                {
+                    return Value::Str_(L"Nodio.CLR.AppDomain");
+                }
+                if (key == L"BaseDirectory")
+                {
+                    wchar_t szExe[MAX_PATH] = L"";
+                    GetModuleFileNameW(nullptr, szExe, MAX_PATH);
+                    wchar_t* pSep = wcsrchr(szExe, L'\\');
+                    if (pSep) *pSep = 0;
+                    return Value::Str_(szExe);
+                }
                 if (key == L"GetAssemblies")
                 {
                     auto w = std::make_shared<Table>();
@@ -1630,7 +1875,7 @@ namespace
                     return Value::Table_(resTable);
                 }
 
-                // marshal the byte[] argument(s): aardio byte string
+                // marshal the byte[] argument(s): byte string
                 // (one byte per wchar) -> flat SAFEARRAY of UI1
                 auto MakeByteArray = [](const Value& v) -> SAFEARRAY* {
                     if (v.t != Value::Str || v.s.empty())
@@ -1658,7 +1903,7 @@ namespace
                 SAFEARRAY* psa1 = nullptr;
                 if (slot == 44)
                 {
-                    // BSTR marshaling: aardio str is UTF-8-ish byte str;
+                    // BSTR marshaling: str is UTF-8-ish byte str;
                     // an assembly name is ASCII-safe here
                     int wlen = (int)a[1].s.size();
                     arg1 = SysAllocStringLen(nullptr, (UINT)wlen);
@@ -2319,7 +2564,7 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         if (a.empty())
             return Value();
         Value target = a[0];
-        // If target is an aardio table with array elements, iterate its array
+        // If target is a table with array elements, iterate its array
         if (target.t == Value::TableT && target.tab && !target.tab->arr.empty())
         {
             auto pIdx = std::make_shared<int>(0);
@@ -2505,9 +2750,8 @@ void Interp::RegisterComKernel(Env& globalsEnv)
     globalsEnv.vars[L"isEnumerator"] = fnIsEnumerator;
 
     globalsEnv.vars[L"com"] = Value::Table_(com);
-    // plain `import com` must resolve to this kernel namespace (official
-    // builtin\com.aardio merges into it) instead of creating an empty
-    // fallback module that would shadow it
+    // plain `import com` must resolve to this kernel namespace
+    // instead of creating an empty fallback module that would shadow it
     roots[L"com"] = Value::Table_(com);
 }
 } // namespace NodioVM

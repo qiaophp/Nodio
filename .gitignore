@@ -18,3 +18,5 @@ thirdparty/
 # scratch/verification output
 r43*.txt
 trace*.txt
+__pycache__/
+*.pyc

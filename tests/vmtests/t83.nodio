@@ -1,0 +1,26 @@
+// t83: Class body scoping, self in constructor, and root DLL resolution
+namespace mytest {
+    var outerMember = "outer_val";
+
+    class myclass {
+        ctor() {
+            // self refers to class table
+            this.className = (self == myclass) ? "matched_class" : "mismatch";
+            this.staticProp = self.staticVal;
+        }
+
+        // Member defined in class body
+        testMethod = function() {
+            return "instance_method:" ++ outerMember;
+        };
+    }
+
+    namespace myclass {
+        staticVal = "static_data";
+    }
+}
+
+var obj = mytest.myclass();
+io.print("className=" ++ obj.className);
+io.print("staticProp=" ++ obj.staticProp);
+io.print("methodResult=" ++ obj.testMethod());

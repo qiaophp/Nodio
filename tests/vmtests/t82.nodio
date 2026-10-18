@@ -1,0 +1,5 @@
+var a = 1;
+for (i = 1; 5) {
+    a = a + i;
+}
+io.print("t82-sum=" ++ tostring(a));

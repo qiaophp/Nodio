@@ -1,0 +1,3 @@
+className=matched_class
+staticProp=static_data
+methodResult=instance_method:outer_val

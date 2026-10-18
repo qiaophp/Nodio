@@ -45,15 +45,11 @@ namespace NodioVM
         bool bUtf16 = false;
     };
 
-    // aardio compiled (bytecode) modules begin with the literal '=aardio'
-    // followed by a binary body — lib/ide/aifix.aardio ships this way. Such
-    // a file is not source text, so a source-syntax check does not apply;
-    // loading it as source must report a format error rather than a
-    // misleading syntax error.
-    inline bool IsCompiledModule(const wstring& src)
-    {
-        return src.size() >= 7 && src.compare(0, 7, L"=aardio") == 0;
-    }
+    // Compiled (bytecode) modules begin with a configured magic header
+    // followed by a binary body. Such a file is not source text, so a
+    // source-syntax check does not apply; loading it as source must
+    // report a format error rather than a misleading syntax error.
+    bool IsCompiledModule(const wstring& src);
 
     inline const wchar_t* const KEYWORDS[] = {
         L"var", L"function", L"if", L"else", L"elseif", L"while", L"for",
@@ -88,12 +84,13 @@ namespace NodioVM
         vector<wstring> params;
         wstring fname;                  // debug
         shared_ptr<Table> tab;
-        shared_ptr<Table> nsClosure;    // defining namespace (aardio upvalue)
+        shared_ptr<Table> nsClosure;    // defining namespace (lexical upvalue)
         shared_ptr<Env> envUp;          // defining frame chain (closure upvalues)
         shared_ptr<vector<PNode>> pdefaults;  // FuncLit param defaults
-        shared_ptr<vector<Value>> mrets;      // aardio extra return values
+        shared_ptr<vector<Value>> mrets;      // extra return values
         bool bDots = false;             // `...` packed value: mrets holds ALL varargs
         bool bUtf16 = false;            // UTF-16 (ustring) flag
+        bool bRawBytes = false;         // raw binary bytes (string& / raw buffer)
         shared_ptr<Value> thisVal;            // lexical this captured at function definition
         shared_ptr<Value> ownerVal;           // lexical owner captured at function definition
         // native builtin (round 19): C++-backed callable surfaced as a Func
@@ -115,6 +112,14 @@ namespace NodioVM
     // as string.crc32)
     inline std::string BUtf8(const Value& v)
     {
+        if (v.bRawBytes)
+        {
+            std::string out;
+            out.reserve(v.s.size());
+            for (wchar_t ch : v.s)
+                out.push_back((char)(unsigned char)ch);
+            return out;
+        }
         wstring w = v.ToString();
         if (w.empty()) return std::string();
         int cb = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
@@ -206,12 +211,12 @@ namespace NodioVM
     }
     inline Value NF(Value::NativeFn f) { return Value::Native_(std::move(f)); }
 
-    // x64 pointer-width API families: official aardio maps SetWindowLong /
+    // x64 pointer-width API families: the runtime maps SetWindowLong /
     // GetWindowLong / SetClassLong / GetClassLong to the *PtrW exports in
     // 64-bit builds — the 32-bit exports cannot carry a 64-bit window
-    // proc. win/api.aardio subclasses every form through SetWindowPointer
+    // proc. Forms subclass through SetWindowPointer
     // (declared as SetWindowLong with a ptr param); without this alias the
-    // subclass silently fails and NO window message ever reaches aardio.
+    // subclass silently fails and NO window message ever reaches the host.
     inline bool IsLongPtrFamily(const std::string& n)
     {
         return n.rfind("SetWindowLong", 0) == 0 ||
@@ -282,12 +287,12 @@ namespace NodioVM
         bool bCdecl = false;
         bool bRetFloat = false;   // declared "float" return (x64 XMM decode)
     };
-    // aardio root for compile-time embed paths ("~/...") — parent of
+    // root for compile-time embed paths ("~/...") — parent of
     // NODIO_LIBDIR; defined near RunSource, used by DoImport
     struct Interp;   // (fwd — real struct defined later)
     struct CbCtx
     {
-        Value fn;               // aardio function to invoke
+        Value fn;               // function to invoke
         Value owner;            // owner/this receiver for callback invocation
         ApiSig sig;             // declared signature
         Interp* interp = nullptr;
@@ -486,7 +491,7 @@ namespace NodioVM
     }
 
     // round 36: deep copy for thread boundaries — tables are duplicated so
-    // the worker and the main VM never share mutable state (aardio: threads
+    // the worker and the main VM never share mutable state (threads
     // receive value copies); functions/natives do not cross threads
     struct ThreadState
     {
@@ -501,7 +506,7 @@ namespace NodioVM
     extern std::map<HANDLE, std::shared_ptr<ThreadState>> g_threadStates;
     extern std::mutex g_threadStatesMutex;
     extern std::map<wstring, Value> g_threadSharedMap;
-    extern std::mutex g_threadSharedMutex;
+    extern std::recursive_mutex g_threadSharedMutex;
     struct RE
     {
         int k;                 // 0 char, 1 class, 2 dot, 3 group, 4 $ end, 7 balanced, 8 alt
@@ -695,7 +700,7 @@ namespace NodioVM
     {
         // Owning frame chain: call/block frames are heap objects so a
         // closure can keep its defining frames (and their locals —
-        // aardio upvalues) alive after the call returns. `self` is the
+        // lexical upvalues) alive after the call returns. `self` is the
         // owning handle set by the creator; children hold it via parent.
         // Machine-lifetime envs (globals) use a no-op deleter.
         std::shared_ptr<Env> parent;
@@ -704,7 +709,7 @@ namespace NodioVM
         shared_ptr<Table> nsTable;   // namespace scope: bare names land here
         shared_ptr<Table> modTable;  // file/module scope table: scopeVars
         // true while a namespace or module BODY executes directly in this
-        // env: a `var` declared here is a namespace member (aardio), so
+        // env: a `var` declared here is a namespace member, so
         // VarDecl mirrors it into the namespace table's map. Function-call
         // envs leave it false — their locals must stay local.
         bool bNsBody = false;
@@ -748,7 +753,7 @@ namespace NodioVM
             // 3. Namespace members in ambient namespace scopes
             for (Env* e = this; e; e = e->parent.get())
             {
-                if (e->nsTable && !isBuiltinPrimitive(k))
+                if (e->nsTable && !e->bNsInst && !isBuiltinPrimitive(k))
                 {
                     auto itS = e->nsTable->scopeVars.find(k);
                     if (itS != e->nsTable->scopeVars.end())
@@ -756,6 +761,16 @@ namespace NodioVM
                     auto it2 = e->nsTable->map.find(k);
                     if (it2 != e->nsTable->map.end())
                         return &it2->second;
+                    // In libraries where sub-namespaces share core declarations from sibling
+                    // `object` class (e.g. py3.dict calling PyObject_GetAttrString declared in py3.object),
+                    // fall back to looking up in parent namespace's `object` member table.
+                    auto itObj = e->nsTable->map.find(L"object");
+                    if (itObj != e->nsTable->map.end() && (itObj->second.t == Value::TableT || itObj->second.t == Value::Class) && itObj->second.tab)
+                    {
+                        auto itObjMem = itObj->second.tab->map.find(k);
+                        if (itObjMem != itObj->second.tab->map.end())
+                            return &itObjMem->second;
+                    }
                 }
                 if (e->modTable && !isBuiltinPrimitive(k))
                 {
@@ -840,6 +855,21 @@ namespace NodioVM
     vector<Tok> Lex(const wstring& src, wstring* strError);
 
     // util.cpp
+    struct NodioConfig
+    {
+        std::vector<std::wstring> extensions;
+        std::vector<std::wstring> magicHeaders;
+        std::wstring defaultTitle;
+        std::wstring windowClass;
+        std::wstring userAgent;
+        std::wstring libDir;
+    };
+    const NodioConfig& GetNodioConfig();
+    const std::vector<std::wstring>& GetConfiguredExtensions();
+    const std::vector<std::wstring>& GetConfiguredMagicHeaders();
+    bool HasScriptExtension(const std::wstring& filename);
+    std::wstring StripScriptExtension(const std::wstring& filename);
+
     Value DeepCopy(const Value& v);
     wstring HttpFetch(const wstring& strUrl, const wchar_t* szMethod,
                       const wstring& strBody, const wstring& strCType,
@@ -910,8 +940,8 @@ namespace NodioVM
                   const std::unordered_map<wstring, wstring>* pEmbedded,
                   bool bDebug, const wstring* pBreakLines);
 
-    // Resolve an aardio '~'-rooted path to a real disk path. '~' is the
-    // aardio install root: the parent of NODIO_LIBDIR when set (dev/F5),
+    // Resolve '~'-rooted path to a real disk path. '~' is the
+    // application install root: the parent of NODIO_LIBDIR when set (dev/F5),
     // otherwise the running exe's own directory (a published app). The
     // library loads bundled DLLs as raw.loadDll("~\lib\...") — resolving
     // '~' to the exe dir alone misses them.
