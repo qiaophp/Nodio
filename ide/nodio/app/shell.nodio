@@ -1,0 +1,44 @@
+// app/shell.nodio — the IDE main window.
+//
+// Owns the DSG layout (form + tree / editor / output / status controls) and
+// the menu + hotkeys. It exposes hooks (onOpen / onSave / onRun) that
+// main.nodio fills in, so this module knows nothing about the project model.
+//
+// Layout rule: declare controls with DSG (winform.add), never the direct
+// win.ui.ctrl.xxx(wf, …) constructor — that yields unrealized windows
+// (hwnd = null) whose .text silently no-ops.
+import win.ui;
+import win.ui.menu;
+
+/*DSG{{*/
+winform = win.form(text="Nodio IDE";right=960;bottom=640)
+winform.add(
+	tv={cls="treeview";left=8;top=8;right=228;bottom=590;z=1};
+	ed={cls="richedit";left=236;top=8;right=950;bottom=440;multiline=true;vscroll=true;hscroll=true;z=2};
+	out={cls="richedit";left=236;top=448;right=950;bottom=600;multiline=true;vscroll=true;readonly=true;z=3};
+	st={cls="static";text="就绪";left=236;top=606;right=950;bottom=626;z=4}
+)
+/*}}*/
+
+// hooks filled by main.nodio
+onOpen = null;
+onSave = null;
+onRun = null;
+
+setStatus = function(s){ winform.st.text = s }
+
+install = function(){
+	// F5 accelerator (WM_HOTKEY dispatch)
+	winform.reghotkey(function(id,mod,vk){ if(onRun) onRun() },0,0x74/*_VK_F5*/);
+
+	winform.menu = win.ui.menu(winform,{
+		{ "文件";{
+			{ "打开工程"; function(id){ if(onOpen) onOpen() } };
+			{ "保存"; function(id){ if(onSave) onSave() } };
+			{ "退出"; function(id){ winform.close() } };
+		} };
+		{ "运行";{
+			{ "运行脚本  F5"; function(id){ if(onRun) onRun() } };
+		} };
+	});
+}

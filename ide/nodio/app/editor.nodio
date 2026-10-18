@@ -1,0 +1,9 @@
+// app/editor.nodio — editor pane helpers.
+//
+// Thin wrapper over the richedit control today. Coloring (CHARFORMAT2 via
+// setSelCharformat) and LSP-driven diagnostics marks land here in M2; keeping
+// every editor touch behind this module stops that from leaking into the
+// shell/runner wiring.
+load = function(ctrl,text){ ctrl.text = text; }
+text = function(ctrl){ return ctrl.text; }
+setText = function(ctrl,s){ ctrl.text = s; }

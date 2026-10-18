@@ -1,0 +1,14 @@
+// app/lspClient.nodio — nodio-lsp client (milestone M2).
+//
+// The server binary speaks LSP over stdio (apps/nodio-lsp/main.cpp). Wiring
+// it up means: spawn it with process.popen, send initialize / didOpen /
+// didChange, and turn completion / hover / diagnostics responses into editor
+// UI. Not implemented yet — this module is the seam so the shell never grows
+// protocol code.
+
+exeName = "nodio-lsp.exe";
+
+// Returns a client handle, or null while the protocol layer is unimplemented.
+start = function(libDir){
+	return null;
+}

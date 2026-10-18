@@ -1,0 +1,17 @@
+// app/output.nodio — the output pane controller.
+//
+// Wraps a richedit control with an append-only buffer; the buffer is the
+// source of truth so callers can query it (the smoke test greps it) without
+// reading the control back.
+create = function(ctrl){
+	var buf = "";
+
+	return {
+		append = function(s){ buf = buf ++ s; ctrl.text = buf; };
+		clear  = function(){ buf = ""; ctrl.text = ""; };
+		getText = function(){ return buf; };
+		// truthy position of `s` in the buffer, or null — mirrors
+		// string.indexOf so callers can `if(outCtl.contains("x"))`
+		contains = function(s){ return ..string.indexOf(buf,s); };
+	};
+}

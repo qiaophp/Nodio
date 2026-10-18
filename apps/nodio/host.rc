@@ -1,4 +1,4 @@
-// host/host.rc — gives the host exe a resource section.
+// apps/nodio/host.rc — gives the host exe a resource section.
 //
 // The publisher rewrites the manifest and version resources in place
 // (UpdateResourceW corrupts the section when replacing entries), so each
@@ -10,7 +10,7 @@
 // CMakeLists so it cannot collide here.
 #include <windows.h>
 
-CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "host/host.manifest"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "apps/nodio/host.manifest"
 
 // Filler width the publisher's version strings must fit in (bytes).
 #define NODIO_VER_FIELD_PAD 64

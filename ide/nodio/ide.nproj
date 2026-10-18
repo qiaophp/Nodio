@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project start="main.nodio">
+	<file path="main.nodio" />
+	<file path="app\shell.nodio" />
+	<file path="app\editor.nodio" />
+	<file path="app\output.nodio" />
+	<file path="app\project.nodio" />
+	<file path="app\runner.nodio" />
+	<file path="app\lspClient.nodio" />
+	<file path="app\dapClient.nodio" />
+</project>

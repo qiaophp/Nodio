@@ -1,0 +1,13 @@
+// app/dapClient.nodio — nodio-dap client (milestone M3).
+//
+// The server binary speaks DAP over stdio (apps/nodio-dap/main.cpp). Wiring
+// it up means: spawn it with process.popen, drive the launch/initialize
+// handshake, push setBreakpoints, and surface stopped / stackTrace /
+// variables into the IDE. Not implemented yet — this module is the seam.
+
+exeName = "nodio-dap.exe";
+
+// Returns a session handle, or null while the protocol layer is unimplemented.
+start = function(libDir){
+	return null;
+}

@@ -1,0 +1,49 @@
+// app/runner.nodio — F5: run a script through process.popen and stream its
+// output into the output pane via a winform timer.
+import process.popen;
+
+// create(winform, exe, outCtl, setStatus) -> controller
+//   controller.isRunning()
+//   controller.run(filePath)   // filePath must be absolute (the child gets a
+//                              //   different working directory)
+create = function(winform, exe, outCtl, setStatus){
+	var proc = null;
+	var wid = null;
+
+	var stop = function(){
+		if(wid){ winform.clearInterval(wid); wid = null }
+	};
+
+	var poll = function(){
+		var p = proc;
+		if(!p) return;
+		var o,e = p.peek(0);
+		if(o !== null && o !== false && #o) outCtl.append(o);
+		if(e !== null && e !== false && #e) outCtl.append(e);
+		// done when the process exited and both pipes are drained
+		if(p.process && p.process.waitOne(0)){
+			var o2,e2 = proc.peek(0);
+			if(o2 && #o2) outCtl.append(o2);
+			if(e2 && #e2) outCtl.append(e2);
+			outCtl.append("\r\n[运行结束]\r\n");
+			proc.close();
+			proc = null;
+			stop();
+			setStatus("就绪");
+		}
+	};
+
+	return {
+		isRunning = function(){ return proc !== null };
+		run = function(filePath){
+			if(proc){ outCtl.append("\r\n[运行中——先等待当前脚本结束]\r\n"); return };
+			var cmd = """" ++ exe ++ """ """ ++ filePath ++ """";
+			proc = process.popen(cmd);
+			if(!proc){ outCtl.append("[启动失败: " ++ exe ++ "]\r\n"); return };
+			outCtl.clear();
+			outCtl.append("[运行] " ++ filePath ++ "\r\n");
+			setStatus("运行中...");
+			wid = winform.setInterval(poll,100);
+		};
+	};
+}

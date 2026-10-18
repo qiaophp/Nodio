@@ -2,68 +2,41 @@ cmake_minimum_required(VERSION 3.20)
 project(Nodio LANGUAGES CXX)
 
 # Nodio — clean-room rebuild of the aardio ecosystem on a pure x64-first
-# engine, with the retired MFC IDE shell replaced in later phases by a
-# WTL + Scintilla front end. This file builds ONLY the engine + console
-# host (zero MFC, zero managed dependencies).
+# engine with a self-hosted (aardio-on-the-VM) IDE.
+#
+# Module map (see docs/architecture.md):
+#   engine/          nodio_engine  — the VM (zero MFC, Win32 + CRT only)
+#   publish/         nodio_publish — payload embedder + PE stamping
+#   apps/nodio/      nodio.exe     — host: run / debug / check / publish
+#   apps/nodio-lsp/  nodio-lsp.exe — Language Server Protocol (stdio)
+#   apps/nodio-dap/  nodio-dap.exe — Debug Adapter Protocol (stdio)
+#   ide/nodio/       self-hosted IDE (aardio source, no C++ target)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(engine STATIC
-    engine/lexer.cpp
-    engine/parser.h
-    engine/value.cpp
-    engine/util.cpp
-    engine/ffi.cpp
-    engine/memdll.cpp
-    engine/regex.cpp
-    engine/json.cpp
-    engine/runtime.cpp
-    engine/import.cpp
-    engine/builtins.cpp
-    engine/debug.cpp
-    engine/gdi.cpp
-    engine/com.cpp
-    engine/entry.cpp
-    engine/common.h
-    engine/interp.h
-    engine/pch.h
-)
-target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_options(engine PRIVATE /utf-8)
-target_compile_definitions(engine PRIVATE
-    _UNICODE UNICODE _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(engine PUBLIC
-    user32 gdi32 kernel32 wininet ole32 oleaut32 uuid advapi32 shlwapi)
-set_target_properties(engine PROPERTIES
-    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+# one CRT flavor for every target
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
-add_executable(nodio
-    host/main.cpp
-    host/host.rc
-    publish/publish.cpp
-    publish/publish.h
-    publish/payload.h
-)
-target_compile_options(nodio PRIVATE /utf-8)
-target_compile_definitions(nodio PRIVATE
-    _UNICODE UNICODE _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(nodio PRIVATE engine)
-# host.rc embeds the manifest + version info as real PE resources at the
-# ids the Windows loader reads. The VS generator also emits its own default
-# manifest and merges it at link time (CVT1100 duplicate on RT_MANIFEST
-# id 1), so disable that merge with the linker switch.
-set_target_properties(nodio PROPERTIES
-    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+# Every executable lands in one directory (build-<arch>/<config>/) instead of
+# per-target generator subdirs, so the IDE and the test scripts find
+# nodio.exe / nodio-lsp.exe / nodio-dap.exe by a single known path.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")
+
+# Settings every target shares. The repo root is on the include path so that
+# `#include "engine/..."` / `#include "publish/..."` resolve from any source
+# directory (the component dirs keep their own name in the include, which is
+# why they are not nested under a src/ prefix).
+add_library(nodio_common INTERFACE)
+target_include_directories(nodio_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 if(MSVC)
-    target_link_options(nodio PRIVATE "/MANIFEST:NO")
+    target_compile_options(nodio_common INTERFACE /utf-8)
 endif()
-# 16 MB stack reserve: the tree-walking interpreter nests many C++ frames
-# per aardio call, so the default 1 MB reserve crashes a deep-but-legit
-# aardio recursion (~70 frames) before the engine's depth guard can fire.
-set_target_properties(nodio PROPERTIES LINK_FLAGS "/STACK:16777216")
+target_compile_definitions(nodio_common INTERFACE
+    _UNICODE UNICODE _CRT_SECURE_NO_WARNINGS)
 
-# ---- Nodio IDE is self-hosted: written in aardio, running on the Nodio ----
-# VM (ide/aardio/). The retired native Win32 + Scintilla C++ shell and its
-# thirdparty/scintilla tree were removed; the engine and host build no
-# longer reference Scintilla in any form.
+add_subdirectory(engine)
+add_subdirectory(publish)
+add_subdirectory(apps/nodio)
+add_subdirectory(apps/nodio-lsp)
+add_subdirectory(apps/nodio-dap)

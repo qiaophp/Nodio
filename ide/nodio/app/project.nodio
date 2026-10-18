@@ -1,0 +1,63 @@
+// app/project.nodio — the project model.
+//
+// One XML schema, two extensions: .nproj (Nodio-native) and .aproj (official
+// aardio). The IDE opens either, so aardio projects load without conversion.
+// See docs/architecture.md.
+//
+// The model is a plain table returned by load()/parse() — no module state —
+// so main.nodio owns the current project and threads it through.
+import fsys.dlg;
+
+// Parse project-file text. rootDir is the absolute project root (the dir
+// holding the project file, ending in a separator, as io.splitpath returns).
+// Returns: { root; path; start; files=array; count }.
+parse = function(text, rootDir){
+	var files = {};
+	var n = 0;
+	for(line in ..string.gmatch(text, '<file[^>]*>')){
+		var p = ..string.match(line, 'path="([^"]*)"');
+		if(p){
+			n = n + 1;
+			files[n] = {
+				path    = p;
+				embed   = ..string.match(line, 'embed="true"') !== null;
+				ignored = ..string.match(line, 'ignored="true"') !== null;
+			};
+		}
+	}
+	var s = ..string.match(text, 'start="([^"]*)"');
+	var model = {
+		root  = rootDir;
+		start = s ? rootDir ++ s : null;
+		files = files;
+		count = n;
+	};
+	return model;
+}
+
+// Read a .nproj/.aproj file into a model (null when unreadable).
+load = function(projFile){
+	var full = ..io.fullpath(projFile);
+	var text = ..io.readFile(full);
+	if(text === null) return null;
+	var dir = ..io.splitpath(full).dir;
+	var model = parse(text, dir);
+	model.path = full;
+	// default start file, matching the official template
+	if(!model.start) model.start = dir ++ "main.aardio";
+	return model;
+}
+
+// Pick a project file and load it (null when cancelled).
+open = function(){
+	var f = fsys.dlg.open("Nodio 工程|*.nproj;*.aproj|所有文件|*.*||","打开工程");
+	if(!f) return null;
+	return load(f);
+}
+
+// Fill the tree control with the project's file list.
+buildTree = function(tv, hRoot, model){
+	for(i=1;model.count;1){
+		tv.insertItem({ text = model.files[i].path }, hRoot);
+	}
+}

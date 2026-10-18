@@ -7,7 +7,7 @@ Decisions locked with the project owner:
    that shell in C++/MFC is the largest failure mode of the previous
    reconstruction: instead, the VM engine is extracted MFC-free (this
    repo). **The IDE is self-hosted: written in aardio, running on the
-   Nodio VM** (`ide/aardio/`). The interim native Win32 + Scintilla C++
+   Nodio VM** (`ide/nodio/`). The interim native Win32 + Scintilla C++
    shell and `thirdparty/scintilla` were removed once this decision
    landed — aardio-on-aardio gives a HWND-true form designer for free and
    makes the IDE itself the win.form/win.ui.ctrl compatibility suite.
@@ -37,7 +37,7 @@ Decisions locked with the project owner:
 
 ## Phase 1 — engine (this repo)
 - [x] Tree-walking interpreter, 57-test regression suite green (x86 + x64)
-- [x] MFC-free extraction (`engine/` + console `host/`)
+- [x] MFC-free extraction (`engine/` + console host `apps/nodio/`)
 - [x] x64 callback trampoline rewrite (shadow-slot spill + XMM save,
       RCX=ctx contract) — fixes the 0xC0000005 in EnumChildWindows-style
       callbacks
@@ -128,10 +128,10 @@ engine 40 / library 25 / publisher 15 / IDE 15 / designer 5.
 | engine (language + VM + FFI) | 40 | **96%** | parse 868/868 both arch; VM regression **78/78 both arch**; ns_sweep 45/54 (x64) / 52/54 (x86); Python3 全链路双向互操作通过; COM host + CLR host 加载通过; COM ActiveX 内嵌宿主 (com.CreateEmbed / _host / _form 反向绑定) 落地; CLR host 动态 C# 编译器 (dotNet.createCompiler) 与程序集 new/import 实例创建/静态调用全链路打通; AppDomain CCW 元数据分发 (ToString/Id/FriendlyName/BaseDirectory) 落地; 闭包词法 owner 捕获 (f.ownerVal) 打通 .NET 构造回调链 (System.DateTime / time.lunar); timeMeta 属性/方法重载分发修复; cdata/gcdata 元表解包与 _topointer 机制打通; math.dist/io.createDir 原语补齐; io.localpath file:/// 规范化修复 |
 | library (behaviour) | 25 | **46%** | dotNet / System 全家桶 (System.Collections.ArrayList / System.DateTime / System.IO.FileStream / System.Windows.Forms / System.Drawing) 真实运行通过; GUI 控件链 (LOGFONT、createIndirect、getFont/setFont、DSG 属性优先级、plus.skin) 实测通过; web.form / web.form.chat / web.form.simpleMarkdown 控件初始化与内嵌成功; time.lunar / time.ganzhi 完整格式化实测通过; DeepSeek OCR 等实机 GUI 窗体正常拉起进入消息循环; 嵌套命名空间作用域隔离修复 |
 | publisher (Phase 2) | 15 | **100%** | closed; fixtures green x64 + x86 |
-| IDE (Phase 3, self-hosted) | 15 | **0%** | the native Win32 + Scintilla v0 shell was **removed** once decision 1 landed (self-hosted in aardio); no IDE code yet — engine-side primitives for it are green (menu / timer / dlg / popen chain) |
+| IDE (Phase 3, self-hosted) | 15 | **20%** | DSG shell + modular `app/*` + project model (`.nproj`/`.aproj`) green (`tests/ide_smoke.ps1`); `nodio-lsp`/`nodio-dap` skeletons negotiate capabilities over stdio; IDE-side parser wiring, highlighting and the debug channel still open |
 | form designer (Phase 4) | 5 | **0%** | not started (will be aardio code inside the self-hosted IDE) |
 
-**Overall ≈ 65.5 / 100.** Per decision 5, the engine and the official library must reach 100% — the defect list below is that path:
+**Overall ≈ 67.9 / 100.** Per decision 5, the engine and the official library must reach 100% — the defect list below is that path:
 
 Fixed this session (pinned by t63–t80, sys_dt, lunar, and ideprobe):
 - **COM ActiveX In-Place Embedding** (`com.CreateEmbed`): ATL ActiveX hosting via `AtlAxAttachControl`, `_host` methods (`close`, `adjust`, `tranacc`), reverse `wb._form` binding;
@@ -177,18 +177,25 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 - [x] Publish fixtures (`tests/m7/proj`, t49) + memory-DLL-from-payload
       assertions (x64 + x86 green)
 
-## Phase 3 — self-hosted IDE (`ide/aardio/`, aardio on the Nodio VM)
+## Phase 3 — self-hosted IDE (`ide/nodio/`, aardio on the Nodio VM)
 - [x] VM introspection API for `(debug)` (`queryinfo`/`traceback`/
       `callcount`/`hook`/`open`/`close`, engine-provided named module) —
       `import debug` green; `getMainId` still missing and blocks `import ide`
 - [x] Engine primitives for the IDE probed green: win.ui.menu,
       winform.setInterval, fsys.dlg, and the full process.popen chain
       (F5 run pipeline unblocked; probe in the session log)
-- [ ] M0-3: main window skeleton in aardio (win.form + menu + project
-      tree + editor pane + output pane + F5 via process.popen)
-- [ ] M2: nodio-lsp (C; zan `lsp_main.c` skeleton + this parser) for
-      completion/IntelliSense
-- [ ] M3: nodio-dap onto `(debug)` for breakpoints/stepping
+- [x] M0-1: main window in aardio — DSG (`winform.add`) layout (tree /
+      richedit editor / richedit output / status), menu, F5 via
+      process.popen; modularized under `app/` (shell / editor / output /
+      project / runner / lspClient / dapClient); pinned by
+      `tests/ide_smoke.ps1`. Module map in `docs/architecture.md`.
+- [x] M4: project model — the IDE opens `.nproj` (Nodio-native) or `.aproj`
+      (official, same XML schema), builds the file tree and resolves the
+      start file; the IDE is its own project (`ide/nodio/ide.nproj`)
+- [x] M2 skeleton: `apps/nodio-lsp` — LSP over stdio, capabilities +
+      framing; wiring the parser to diagnostics/completion/symbols next
+- [x] M3 skeleton: `apps/nodio-dap` — DAP over stdio, capabilities +
+      handshake; wiring the debuggee control channel onto `(debug)` next
 
 ## Phase 4 — visual form designer (aardio code inside the IDE)
 - [ ] Native HWND design canvas + 8-handle resize tracker

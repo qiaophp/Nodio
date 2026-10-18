@@ -1,18 +1,24 @@
 # Nodio
 
 Clean-room rebuild of the aardio ecosystem: a pure engine-first, x64-first
-rewrite with the retired MFC IDE shell replaced by a modern WTL + Scintilla
-front end (Phase 3).
+rewrite whose IDE is **self-hosted** — written in aardio and running on the
+Nodio VM — replacing the retired MFC shell.
+
+Module map lives in `docs/architecture.md`; the compatibility ledger in
+`docs/roadmap.md`.
 
 ## Repository layout
 
-| Directory | Contents |
+| Path | Contents |
 |---|---|
-| `engine/` | `NodioVM.cpp/.h` — the self-contained tree-walking aardio interpreter (Win32 + CRT only, **zero MFC**), with: unified Microsoft x64 ABI call path (shadow space, XMM float/double marshalling), per-signature JIT call stubs, rewritten callback trampolines |
-| `host/` | tiny console host (`NODIO_RUN` / `NODIO_DEBUG` / `NODIO_BREAK` / `NODIO_LIBDIR` / `NODIO_PAUSE` env contract) that stands in for the F5 runtime and the regression harness |
-| `tests/vmtests/` | the 48-test language/stdlib regression suite (`run_vm_tests.ps1 -Exe <host>`) |
-| `tests/m7/` | GUI/plus-control acceptance scripts (run against the official `D:\aardio\lib` via `NODIO_LIBDIR`) |
-| `docs/` | roadmap and the reverse-engineering audit trail |
+| `engine/` | `nodio_engine` — the self-contained tree-walking aardio interpreter (Win32 + CRT only, **zero MFC**): unified x64 ABI call path, per-signature JIT call stubs, callback trampolines, FFI/GDI/COM/CLR hosts |
+| `publish/` | `nodio_publish` — binary-safe resource embedder, `.nproj`/`.aproj` rules, PE icon/version/manifest/UAC stamping |
+| `apps/nodio/` | `nodio.exe` — the standalone host (run / debug / check / publish) |
+| `apps/nodio-lsp/` | `nodio-lsp.exe` — Language Server Protocol over stdio |
+| `apps/nodio-dap/` | `nodio-dap.exe` — Debug Adapter Protocol over stdio |
+| `ide/nodio/` | the self-hosted IDE (aardio), modularized, with its own `ide.nproj` |
+| `tests/` | the VM regression suite, publish/m7 fixtures, sweeps, the IDE smoke |
+| `docs/` | architecture, roadmap, reverse-engineering audit trail |
 
 ## Build
 
@@ -24,14 +30,18 @@ cmake -S . -B build-x86 -A Win32      # retained for legacy DLL authors
 cmake --build build-x86 --config Release
 ```
 
+All executables are written to one directory: `build-x64/Release/`
+(`nodio.exe`, `nodio-lsp.exe`, `nodio-dap.exe`).
+
 ## Test
 
 ```
-powershell -File tests\run_vm_tests.ps1 `-Exe <full\path\to\host.exe>
+powershell -File tests\run_vm_tests.ps1 -Exe <full\path\to\nodio.exe>
+powershell -File tests\ide_smoke.ps1   -Exe <full\path\to\nodio.exe>
 ```
 
-Expects the official aardio library tree at `D:\aardio\lib` for the
-library-import cases (never redistributed here).
+The VM suite expects the official aardio library tree at `D:\aardio\lib` for
+the library-import cases (never redistributed here).
 
 ## Status
 
@@ -48,4 +58,5 @@ per search root (script directory first, then `NODIO_LIBDIR`):
 3. `rel\_.nodio`
 4. `rel.nodio`
 
-Scripts themselves may be `.aardio` or `.nodio` interchangeably.
+Scripts themselves may be `.aardio` or `.nodio` interchangeably. Projects are
+`.nproj` (Nodio-native) or `.aproj` (official aardio), same XML schema.
