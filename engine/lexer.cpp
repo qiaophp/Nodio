@@ -187,6 +187,7 @@ namespace NodioVM
                 wchar_t q = c;
                 i++;
                 wstring s;
+                bool bHasByteEscape = false;
                 while (i < n && src[i] != q)
                 {
                     if (src[i] == L'\\' && i + 1 < n)
@@ -200,6 +201,7 @@ namespace NodioVM
                         case L'0': case L'1': case L'2': case L'3': case L'4':
                         case L'5': case L'6': case L'7': case L'8': case L'9':
                         {
+                            bHasByteEscape = true;
                             // If \0 is immediately followed by a newline:
                             // "如果只想表示'\0'，并且后面有其他不相关的数字，可以在\0后面加一个换行"
                             if (e == L'0' && i + 1 < n && (src[i + 1] == L'\r' || src[i + 1] == L'\n'))
@@ -277,6 +279,7 @@ namespace NodioVM
                         default:
                             if (e == L'x')
                             {
+                                bHasByteEscape = true;
                                 int hexLen = 0;
                                 while (hexLen < 2 && i + 1 + hexLen < n && iswxdigit(src[i + 1 + hexLen]))
                                     hexLen++;
@@ -335,7 +338,7 @@ namespace NodioVM
                     i++;
                     bIsU = true;
                 }
-                Tok tokStr = { TStr, s, 0, line, false, bIsU };
+                Tok tokStr = { TStr, s, 0, line, false, bIsU, bHasByteEscape };
                 pushTok(tokStr);
                 continue;
             }

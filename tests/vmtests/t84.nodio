@@ -1,0 +1,20 @@
+import com.picture;
+var picdesc = {
+    INT cbSize = 20;
+    INT picType;
+    union desc = {
+        struct bmp = {pointer hbitmap; pointer hpal;} 
+        struct wmf = {pointer hmeta;int xExt;int yExt;} 
+        struct icon ={pointer hicon;} ;
+        struct emf = {int hemf;} 
+    };
+};
+var expectedSize = (raw.sizeof({pointer p}) == 8 ? 24 : 20);
+assert(raw.sizeof(picdesc) == expectedSize, "picdesc size should match pointer ABI");
+io.print("picdesc sizeof OK");
+
+var strBytes = '\x80\x09\xF8\x7B\x32\xBF\x1A\x10\x8B\xBB\x00\xAA\x00\x30\x0C\xAB';
+assert(#strBytes == 16, "raw byte string length should be 16");
+assert(strBytes[1] == 128, "first byte should be 128");
+assert(strBytes[16] == 171, "16th byte should be 171");
+io.print("raw byte escape OK");

@@ -681,7 +681,7 @@ namespace NodioVM
             {
                 a = (int)sizeof(void*);
             }
-            else if (t == L"struct" && vTab.tab)
+            else if ((t == L"struct" || t == L"union") && vTab.tab)
             {
                 auto itM = vTab.tab->map.find(f.name);
                 if (itM != vTab.tab->map.end() &&
@@ -689,7 +689,30 @@ namespace NodioVM
                      itM->second.t == Value::Class) &&
                     itM->second.tab)
                 {
-                    if (f.bIsArray)
+                    if (t == L"union")
+                    {
+                        int uMaxA = 1;
+                        auto uFields = ParseStructDef(itM->second);
+                        for (auto& uf : uFields)
+                        {
+                            wstring ut = uf.type;
+                            for (auto& c : ut) c = towlower(c);
+                            int a = 1;
+                            if ((ut == L"struct" || ut == L"union") && itM->second.tab)
+                            {
+                                auto itU = itM->second.tab->map.find(uf.name);
+                                if (itU != itM->second.tab->map.end() &&
+                                    (itU->second.t == Value::TableT || itU->second.t == Value::Class) &&
+                                    itU->second.tab)
+                                    a = CalcStructAlign(itU->second);
+                            }
+                            else
+                                a = GetStructFieldAlign(uf.type);
+                            if (a > uMaxA) uMaxA = a;
+                        }
+                        a = uMaxA;
+                    }
+                    else if (f.bIsArray)
                     {
                         Value elem = GetTableElement(itM->second, 0);
                         if (elem.t == Value::TableT || elem.t == Value::Class)
@@ -722,11 +745,45 @@ namespace NodioVM
         {
             wstring t = f.type;
             for (auto& c : t) c = towlower(c);
-            if (t == L"struct" && vTab.tab)
+            if ((t == L"struct" || t == L"union") && vTab.tab)
             {
                 auto itM = vTab.tab->map.find(f.name);
                 if (itM != vTab.tab->map.end() && (itM->second.t == Value::TableT || itM->second.t == Value::Class))
                 {
+                    if (t == L"union")
+                    {
+                        int uMaxSz = 0;
+                        int uMaxA = 1;
+                        auto uFields = ParseStructDef(itM->second);
+                        for (auto& uf : uFields)
+                        {
+                            wstring ut = uf.type;
+                            for (auto& c : ut) c = towlower(c);
+                            int subSz = 0;
+                            int subA = 1;
+                            if ((ut == L"struct" || ut == L"union") && itM->second.tab)
+                            {
+                                auto itU = itM->second.tab->map.find(uf.name);
+                                if (itU != itM->second.tab->map.end() && (itU->second.t == Value::TableT || itU->second.t == Value::Class))
+                                {
+                                    subSz = CalcStructTotalSize(itU->second);
+                                    subA = CalcStructAlign(itU->second);
+                                }
+                            }
+                            else
+                            {
+                                subSz = GetStructFieldSize(uf.type, uf.arrCount, uf.bIsArray, uf.bPtrArray);
+                                subA = GetStructFieldAlign(uf.type);
+                            }
+                            if (subSz > uMaxSz) uMaxSz = subSz;
+                            if (subA > uMaxA) uMaxA = subA;
+                        }
+                        total = AlignOffset(total, uMaxA);
+                        uMaxSz = AlignOffset(uMaxSz, uMaxA);
+                        total += uMaxSz;
+                        if (uMaxA > maxA) maxA = uMaxA;
+                        continue;
+                    }
                     if (f.bIsArray)
                     {
                         int count = f.arrCount > 0 ? f.arrCount : (int)GetTableLength(itM->second);
@@ -782,7 +839,7 @@ namespace NodioVM
                 int al;
                 if (f.bPtrArray)
                     al = (int)sizeof(void*);
-                else if (t == L"struct")
+                else if (t == L"struct" || t == L"union")
                 {
                     auto itM2 = vTab.tab->map.find(f.name);
                     if (itM2 != vTab.tab->map.end() &&
@@ -894,6 +951,56 @@ namespace NodioVM
                             HeapFree(GetProcessHeap(), 0, pSub);
                         }
                     }
+                }
+            }
+            else if (t == L"union")
+            {
+                if ((fv.t == Value::TableT || fv.t == Value::Class) && fv.tab)
+                {
+                    auto uFields = ParseStructDef(fv);
+                    int uMaxSz = 0;
+                    int uMaxA = 1;
+                    for (auto& uf : uFields)
+                    {
+                        wstring ut = uf.type;
+                        for (auto& c : ut) c = towlower(c);
+                        auto itU = fv.tab->map.find(uf.name);
+                        if (itU != fv.tab->map.end())
+                        {
+                            if ((ut == L"struct" || ut == L"union") && (itU->second.t == Value::TableT || itU->second.t == Value::Class) && itU->second.tab)
+                            {
+                                int subTotal = 0;
+                                void* pSub = StructSerialize(itU->second, &subTotal);
+                                if (pSub)
+                                {
+                                    memcpy(buf + off, pSub, subTotal);
+                                    HeapFree(GetProcessHeap(), 0, pSub);
+                                    if (subTotal > uMaxSz) uMaxSz = subTotal;
+                                }
+                                int subA = CalcStructAlign(itU->second);
+                                if (subA > uMaxA) uMaxA = subA;
+                            }
+                            else
+                            {
+                                int subSz = GetStructFieldSize(uf.type, uf.arrCount, uf.bIsArray, uf.bPtrArray);
+                                int subA = GetStructFieldAlign(uf.type);
+                                long long v64 = 0;
+                                if (subSz == 8 && IsSize64(itU->second))
+                                    v64 = (__int64)GetSize64Val(itU->second);
+                                else if (itU->second.t == Value::Pointer)
+                                    v64 = (long long)(INT_PTR)itU->second.ptr;
+                                else
+                                    v64 = (long long)BNum(itU->second);
+                                if (subSz == 8) *(__int64*)(buf + off) = (__int64)v64;
+                                else if (subSz == 2) *(unsigned short*)(buf + off) = (unsigned short)v64;
+                                else if (subSz == 1) *(unsigned char*)(buf + off) = (unsigned char)v64;
+                                else *(int*)(buf + off) = (int)v64;
+                                if (subSz > uMaxSz) uMaxSz = subSz;
+                                if (subA > uMaxA) uMaxA = subA;
+                            }
+                        }
+                    }
+                    sz = AlignOffset(uMaxSz, uMaxA);
                 }
             }
             else if (t == L"ustring" || t == L"ustr" || t == L"wstr" || t == L"bstr")
@@ -1129,7 +1236,7 @@ namespace NodioVM
                 int al;
                 if (f.bPtrArray)
                     al = (int)sizeof(void*);
-                else if (t == L"struct")
+                else if (t == L"struct" || t == L"union")
                 {
                     if (iv != vTab.tab->map.end() &&
                         (iv->second.t == Value::TableT ||
@@ -1213,6 +1320,48 @@ namespace NodioVM
                         sz = CalcStructTotalSize(iv->second);
                         StructDeserialize(iv->second, buf + off);
                     }
+                }
+            }
+            else if (t == L"union")
+            {
+                if (iv != vTab.tab->map.end() && (iv->second.t == Value::TableT || iv->second.t == Value::Class) && iv->second.tab)
+                {
+                    auto uFields = ParseStructDef(iv->second);
+                    int uMaxSz = 0;
+                    int uMaxA = 1;
+                    for (auto& uf : uFields)
+                    {
+                        wstring ut = uf.type;
+                        for (auto& c : ut) c = towlower(c);
+                        auto itU = iv->second.tab->map.find(uf.name);
+                        if (itU != iv->second.tab->map.end())
+                        {
+                            if ((ut == L"struct" || ut == L"union") && (itU->second.t == Value::TableT || itU->second.t == Value::Class) && itU->second.tab)
+                            {
+                                StructDeserialize(itU->second, buf + off);
+                                int subSz = CalcStructTotalSize(itU->second);
+                                int subA = CalcStructAlign(itU->second);
+                                if (subSz > uMaxSz) uMaxSz = subSz;
+                                if (subA > uMaxA) uMaxA = subA;
+                            }
+                            else
+                            {
+                                int subSz = GetStructFieldSize(uf.type, uf.arrCount, uf.bIsArray, uf.bPtrArray);
+                                int subA = GetStructFieldAlign(uf.type);
+                                long long ev = 0;
+                                if (subSz == 8) ev = *(__int64*)(buf + off);
+                                else if (subSz == 2) ev = *(unsigned short*)(buf + off);
+                                else if (subSz == 1) ev = *(unsigned char*)(buf + off);
+                                else ev = *(int*)(buf + off);
+                                if (subSz == 8) itU->second = CreateSize64((uint64_t)ev);
+                                else if (uf.type == L"pointer" || uf.type == L"ptr") itU->second = Value::Pointer_((void*)(INT_PTR)ev);
+                                else itU->second = Value::Num_((double)ev);
+                                if (subSz > uMaxSz) uMaxSz = subSz;
+                                if (subA > uMaxA) uMaxA = subA;
+                            }
+                        }
+                    }
+                    sz = AlignOffset(uMaxSz, uMaxA);
                 }
             }
             else if (t == L"ustring" || t == L"ustr" || t == L"wstr" || t == L"bstr")

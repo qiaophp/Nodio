@@ -581,7 +581,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             // For dotted paths (e.g. `import a.b.c`), ensure parent namespace
             // tables (`a`, `a.b`) exist mid-body, but do NOT pre-bind the leaf
             // name (`c`), so self-guards like `if(layout)` in `web.layout` see null.
-            if (n->names.size() > 2)
+            if (n->names.size() > 1)
             {
                 Value ns = GetRoot(n->names[0]);
                 for (size_t i = 1; i + 1 < n->names.size(); i++)

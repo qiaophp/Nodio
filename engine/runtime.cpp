@@ -34,7 +34,9 @@ Value Interp::Eval(const PNode& n, Env* env)
                     }
                     return Value::Str_(key);
                 }
-                return Value::Str_(s, n->bUtf16);
+                Value v = Value::Str_(s, n->bUtf16);
+                v.bRawBytes = n->bRawBytes;
+                return v;
             }
             case Node::Bool: return Value::Bool_(n->num != 0);
             case Node::NullK: return Value();

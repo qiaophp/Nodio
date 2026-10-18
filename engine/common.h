@@ -43,6 +43,7 @@ namespace NodioVM
         int line = 1;
         bool bLeadingSpace = false;
         bool bUtf16 = false;
+        bool bRawBytes = false;
     };
 
     // Compiled (bytecode) modules begin with a configured magic header
@@ -817,6 +818,7 @@ namespace NodioVM
         bool bDirect = false;        // Index: [["k"]] skips metatables
         bool bMeta = false;          // Postfix: 'tab@' metatable access
         bool bUtf16 = false;         // Str literal: '...'u UTF-16 string
+        bool bRawBytes = false;      // Str literal: raw binary bytes
         int line = 0;                // source line (round 30 error reporting)
     };
 

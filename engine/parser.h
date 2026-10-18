@@ -436,25 +436,20 @@ namespace NodioVM
                             p++;                       // 'union'
                             wstring strUName = Next().text;
                             structDesc += L"union " + strUName + L";";
-                            PNode keyU = New(Node::Str);
-                            keyU->str = strUName;
-                            n->a->list.push_back(keyU);
+                            PNode asgU = New(Node::Assign);
+                            asgU->str = L"=";
+                            PNode idxU = New(Node::Index);
+                            PNode thU = New(Node::Ident);
+                            thU->str = L"this";
+                            PNode kU = New(Node::Str);
+                            kU->str = strUName;
+                            idxU->a = thU;
+                            idxU->b = kU;
+                            asgU->a = idxU;
                             if (EatPunct(L"="))
                             {
-                                // keep the sub-struct table unevaluated:
-                                // build the value lazily via a function so
-                                // forward class references resolve at use
-                                PNode fnU = New(Node::FuncLit);
-                                PNode bodyU = New(Node::Block);
-                                PNode retU = New(Node::Return);
-                                retU->a = ParseExpr();
-                                bodyU->list.push_back(retU);
-                                fnU->a = bodyU;
-                                n->a->list.push_back(fnU);
-                            }
-                            else
-                            {
-                                n->a->list.push_back(New(Node::NullK));
+                                asgU->b = ParseExpr();
+                                n->a->list.push_back(asgU);
                             }
                             SkipNL();
                             EatPunct(L";");
@@ -1963,7 +1958,7 @@ namespace NodioVM
         // $"path" compile-time embed — resolve the path, read the file.
         // Text files embed their content; binary payloads embed the
         // resolved absolute path (raw.loadDll keeps loading by path).
-        wstring ResolveEmbedPath(const wstring& strPath)
+        wstring ResolveEmbedPath(const wstring& strPath, bool* pIsBinary = nullptr)
         {
             wstring rel = strPath;
             bool bOptional = false;
@@ -2039,6 +2034,7 @@ namespace NodioVM
                 if (raw[k] == 0) { bBinary = true; break; }
             if (bBinary)
             {
+                if (pIsBinary) *pIsBinary = true;
                 wstring w;
                 w.resize(rd);
                 for (size_t k = 0; k < rd; k++)
@@ -2084,10 +2080,12 @@ namespace NodioVM
                 wstring strPath = Peek(1).text;
                 p += 2;
                 PNode n = New(Node::Str);
-                n->str = ResolveEmbedPath(strPath);
+                bool bBinary = false;
+                n->str = ResolveEmbedPath(strPath, &bBinary);
+                n->bRawBytes = bBinary;
                 return n;
             }
-            if (t.t == TStr) { p++; PNode n = New(Node::Str); n->str = t.text; n->bUtf16 = t.bUtf16; return n; }
+            if (t.t == TStr) { p++; PNode n = New(Node::Str); n->str = t.text; n->bUtf16 = t.bUtf16; n->bRawBytes = t.bRawBytes; return n; }
             if (t.t == TIdent)
             {
                 p++;
@@ -2305,6 +2303,33 @@ namespace NodioVM
                         EatPunct(L";");
                         continue;
                     }
+                    if (Peek().t == TIdent && Peek().text == L"union" &&
+                        Peek(1).t == TIdent)
+                    {
+                        p++;                       // 'union'
+                        wstring strUName = Next().text;
+                        structDesc += L"union " + strUName + L";";
+                        PNode asgU = New(Node::Assign);
+                        asgU->str = L"=";
+                        PNode idxU = New(Node::Index);
+                        PNode thU = New(Node::Ident);
+                        thU->str = L"this";
+                        PNode kU = New(Node::Str);
+                        kU->str = strUName;
+                        idxU->a = thU;
+                        idxU->b = kU;
+                        asgU->a = idxU;
+                        if (EatPunct(L"="))
+                            asgU->b = ParseExpr();
+                        else
+                            asgU->b = New(Node::NullK);
+                        n->a->list.push_back(asgU);
+                        SkipNL();
+                        EatPunct(L";");
+                        EatPunct(L",");
+                        SkipNL();
+                        continue;
+                    }
                     if (Peek().t == TIdent && IsStructType(Peek().text) &&
                         Peek(1).t == TIdent)
                     {
@@ -2459,6 +2484,29 @@ namespace NodioVM
                         n->list.push_back(path);
                         SkipNL();
                         EatPunct(L";");
+                        continue;
+                    }
+                    if (Peek().t == TIdent && Peek().text == L"union" &&
+                        Peek(1).t == TIdent)
+                    {
+                        p++;                       // 'union'
+                        wstring strUName = Next().text;
+                        structDesc += L"union " + strUName + L";";
+                        PNode keyU = New(Node::Str);
+                        keyU->str = strUName;
+                        n->list.push_back(keyU);
+                        if (EatPunct(L"="))
+                        {
+                            n->list.push_back(ParseExpr());
+                        }
+                        else
+                        {
+                            n->list.push_back(New(Node::NullK));
+                        }
+                        SkipNL();
+                        EatPunct(L";");
+                        EatPunct(L",");
+                        SkipNL();
                         continue;
                     }
                     // round M2: struct member declaration —
