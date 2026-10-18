@@ -24,6 +24,8 @@ def test_file(nodio_exe, rel_path, timeout=2.5):
     cmd = [nodio_exe, "-e", f"import {mod};"]
     env = os.environ.copy()
     env["NODIO_LIBDIR"] = LIBDIR
+    env["NODIO_PAUSE"] = "0"
+    env["NODIO_CONSOLE"] = "1"
     try:
         res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace")
         if res.returncode == 0:
@@ -48,14 +50,27 @@ def run_sweep(nodio_exe, arch_name):
 
     print(f"=== Sweeping {len(files)} stdlib files on {arch_name} ({nodio_exe}) ===")
     results = {}
+    done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(test_file, nodio_exe, f): f for f in files}
         for fut in concurrent.futures.as_completed(futures):
             rel_path, status, code, msg = fut.result()
             results[rel_path] = (status, code, msg)
+            done += 1
+            if done % 100 == 0 or done == len(files):
+                print(f"[{arch_name}] Progress: {done}/{len(files)}...", flush=True)
 
     counts = Counter(status for status, _, _ in results.values())
-    print(f"[{arch_name}] Summary: Total={len(files)}, PASS={counts['PASS']}, FAIL={counts['FAIL']}, HANG={counts['HANG']}")
+    print(f"[{arch_name}] Summary: Total={len(files)}, PASS={counts['PASS']}, FAIL={counts['FAIL']}, HANG={counts['HANG']}", flush=True)
+
+    fails = {k: v for k, v in results.items() if v[0] == "FAIL"}
+    hangs = {k: v for k, v in results.items() if v[0] == "HANG"}
+    print(f"\n--- Top 15 Failures ({len(fails)} total) ---")
+    for k, v in list(fails.items())[:15]:
+        print(f"  FAIL: {k} -> {v[2][:100]}")
+    print(f"\n--- Hangs ({len(hangs)} total) ---")
+    for k in list(hangs.keys())[:15]:
+        print(f"  HANG: {k}")
     return results
 
 if __name__ == "__main__":
