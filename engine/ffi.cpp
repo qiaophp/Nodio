@@ -566,9 +566,36 @@ namespace NodioVM
                         if (vTab.t == Value::TableT && vTab.tab)
                         {
                             auto iv = vTab.tab->map.find(sname);
-                            if (iv != vTab.tab->map.end() && iv->second.t == Value::TableT && iv->second.tab)
+                            if (iv != vTab.tab->map.end())
                             {
-                                nArr = (int)GetTableLength(iv->second);
+                                if (iv->second.t == Value::TableT && iv->second.tab)
+                                {
+                                    nArr = (int)GetTableLength(iv->second);
+                                }
+                                else if (iv->second.t == Value::Str)
+                                {
+                                    // official contract: aardio strings are
+                                    // UTF-8 BYTE strings — #s is the byte
+                                    // length, so a BYTE[]/string[] array
+                                    // sized from a string value must use
+                                    // the UTF-8 byte count, not the wchar
+                                    // count ("你的密钥&" = 13 bytes, not 5)
+                                    if (iv->second.bRawBytes)
+                                        nArr = (int)iv->second.s.size();
+                                    else
+                                    {
+                                        int cb = WideCharToMultiByte(CP_UTF8, 0,
+                                            iv->second.s.c_str(),
+                                            (int)iv->second.s.size(),
+                                            nullptr, 0, nullptr, nullptr);
+                                        nArr = cb > 0 ? cb : 0;
+                                    }
+                                }
+                                else if (iv->second.t == Value::Pointer && iv->second.ptr)
+                                {
+                                    size_t bsz = GetBufferSize(iv->second.ptr);
+                                    if (bsz > 0) nArr = (int)bsz;
+                                }
                             }
                         }
                     }
@@ -1125,6 +1152,52 @@ namespace NodioVM
                     *(void**)(buf + off) = fv.ptr;
                 else if (fv.ptr != nullptr)
                     *(void**)(buf + off) = fv.ptr;
+                else if (fv.t == Value::Str)
+                {
+                    thread_local std::deque<std::string> s_ptrBytesKeep;
+                    thread_local std::deque<std::wstring> s_ptrWstrKeep;
+                    bool bIsBytes = true;
+                    for (wchar_t c : fv.s)
+                    {
+                        if ((unsigned short)c > 0xFF)
+                        {
+                            bIsBytes = false;
+                            break;
+                        }
+                    }
+                    if (bIsBytes)
+                    {
+                        s_ptrBytesKeep.push_back(BytesOf(fv.s));
+                        *(void**)(buf + off) = (void*)s_ptrBytesKeep.back().data();
+                    }
+                    else
+                    {
+                        s_ptrWstrKeep.push_back(fv.s);
+                        *(void**)(buf + off) = (void*)s_ptrWstrKeep.back().c_str();
+                    }
+                }
+                else if (fv.t == Value::TableT && fv.tab)
+                {
+                    auto iby = fv.tab->map.find(L"_bytes");
+                    if (iby != fv.tab->map.end() && iby->second.t == Value::Str)
+                    {
+                        thread_local std::deque<std::string> s_ptrBytesKeep;
+                        s_ptrBytesKeep.push_back(BytesOf(iby->second.s));
+                        *(void**)(buf + off) = (void*)s_ptrBytesKeep.back().data();
+                    }
+                    else
+                    {
+                        auto itp = fv.tab->map.find(L"_topointer");
+                        if (itp != fv.tab->map.end() && itp->second.t == Value::Pointer)
+                            *(void**)(buf + off) = itp->second.ptr;
+                        else
+                            *(void**)(buf + off) = (void*)(INT_PTR)(long long)BNum(fv);
+                    }
+                }
+                else if (fv.t == Value::Null)
+                {
+                    *(void**)(buf + off) = nullptr;
+                }
                 else
                     *(void**)(buf + off) = (void*)(INT_PTR)(long long)BNum(fv);
             }
@@ -1173,12 +1246,27 @@ namespace NodioVM
             }
             else if (f.bIsArray && t == L"byte" && fv.t == Value::Str)
             {
-                std::string sA((size_t)WideCharToMultiByte(CP_ACP, 0, fv.s.c_str(), (int)fv.s.size(), nullptr, 0, nullptr, nullptr), 0);
-                if (!sA.empty())
-                    WideCharToMultiByte(CP_ACP, 0, fv.s.c_str(), (int)fv.s.size(), &sA[0], (int)sA.size(), nullptr, nullptr);
                 char* pc = buf + off;
+                std::string sA;
+                if (fv.bRawBytes)
+                {
+                    for (wchar_t c : fv.s) sA.push_back((char)(unsigned char)c);
+                }
+                else
+                {
+                    sA.resize((size_t)WideCharToMultiByte(CP_UTF8, 0, fv.s.c_str(), (int)fv.s.size(), nullptr, 0, nullptr, nullptr));
+                    if (!sA.empty())
+                        WideCharToMultiByte(CP_UTF8, 0, fv.s.c_str(), (int)fv.s.size(), &sA[0], (int)sA.size(), nullptr, nullptr);
+                }
                 for (int k = 0; k < f.arrCount; k++)
                     pc[k] = (k < (int)sA.size()) ? sA[k] : 0;
+            }
+            else if (f.bIsArray && t == L"byte" && fv.t == Value::Pointer && fv.ptr)
+            {
+                char* pc = buf + off;
+                size_t srcSz = GetBufferSize(fv.ptr);
+                size_t cpy = (srcSz > 0 && (int)srcSz < f.arrCount) ? srcSz : (size_t)f.arrCount;
+                memcpy(pc, fv.ptr, cpy);
             }
             else if (f.bIsArray && (fv.t == Value::TableT) && fv.tab)
             {
@@ -1519,6 +1607,69 @@ namespace NodioVM
     CbDispatchFn g_cbDispatch = nullptr;
     std::wstring g_curModuleFile;
 
+    static BOOL WINAPI NodioWriteConsoleW(HANDLE hConsoleOutput, const VOID *lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
+    {
+        if (::WriteConsoleW(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved))
+            return TRUE;
+        DWORD err = ::GetLastError();
+        if (err == ERROR_INVALID_FUNCTION || err == ERROR_INVALID_HANDLE || err == ERROR_NOT_ENOUGH_MEMORY)
+        {
+            if (lpBuffer && nNumberOfCharsToWrite > 0)
+            {
+                const wchar_t* pw = (const wchar_t*)lpBuffer;
+                int nBytes = ::WideCharToMultiByte(CP_UTF8, 0, pw, (int)nNumberOfCharsToWrite, nullptr, 0, nullptr, nullptr);
+                if (nBytes > 0)
+                {
+                    std::string u8(nBytes, 0);
+                    ::WideCharToMultiByte(CP_UTF8, 0, pw, (int)nNumberOfCharsToWrite, &u8[0], nBytes, nullptr, nullptr);
+                    DWORD written = 0;
+                    BOOL ok = ::WriteFile(hConsoleOutput, u8.data(), (DWORD)u8.size(), &written, nullptr);
+                    if (ok)
+                    {
+                        if (lpNumberOfCharsWritten)
+                            *lpNumberOfCharsWritten = nNumberOfCharsToWrite;
+                        return TRUE;
+                    }
+                }
+            }
+            else if (nNumberOfCharsToWrite == 0)
+            {
+                if (lpNumberOfCharsWritten)
+                    *lpNumberOfCharsWritten = 0;
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+
+    static BOOL WINAPI NodioWriteConsoleA(HANDLE hConsoleOutput, const VOID *lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)
+    {
+        if (::WriteConsoleA(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved))
+            return TRUE;
+        DWORD err = ::GetLastError();
+        if (err == ERROR_INVALID_FUNCTION || err == ERROR_INVALID_HANDLE || err == ERROR_NOT_ENOUGH_MEMORY)
+        {
+            if (lpBuffer && nNumberOfCharsToWrite > 0)
+            {
+                DWORD written = 0;
+                BOOL ok = ::WriteFile(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, &written, nullptr);
+                if (ok)
+                {
+                    if (lpNumberOfCharsWritten)
+                        *lpNumberOfCharsWritten = nNumberOfCharsToWrite;
+                    return TRUE;
+                }
+            }
+            else if (nNumberOfCharsToWrite == 0)
+            {
+                if (lpNumberOfCharsWritten)
+                    *lpNumberOfCharsWritten = 0;
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+
 // ---- CreateDirectApiWrapper ----
 Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                                      bool bDllCdecl, bool bDllUnicode)
@@ -1608,6 +1759,20 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                 return Value(); // not found
 
             std::string checkName = suffix ? bareName : strNameA;
+            if (checkName == "WriteConsole")
+            {
+                if (suffix == 'A')
+                {
+                    fp = (FARPROC)NodioWriteConsoleA;
+                    bUnicode = false;
+                }
+                else
+                {
+                    fp = (FARPROC)NodioWriteConsoleW;
+                    bUnicode = true;
+                }
+                if (suffix == 'B') retType = ARBool;
+            }
             if (retType == ARInt && suffix == 0)
             {
                 if (checkName == "LoadCursor" || checkName == "LoadIcon" ||
@@ -1668,30 +1833,55 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     }
                     else if (v.t == Value::Str)
                     {
-                        bool bByteString = false;
-                        for (wchar_t c : v.s)
+                        if (v.bRawBytes)
                         {
-                            if (c == 0) { bByteString = true; break; }
-                        }
-                        if (bByteString)
-                        {
-                            tmpA.push_back(BytesOf(v.s));
-                            slots.push_back((SlotT)(INT_PTR)tmpA.back().data());
-                        }
-                        else if (bUnicode)
-                        {
-                            tmpW.push_back(v.s);
-                            slots.push_back((SlotT)(INT_PTR)tmpW.back().c_str());
+                            if (bUnicode)
+                            {
+                                // Re-pack raw UTF-16 LE bytes into real wchars
+                                wstring u16;
+                                u16.reserve(v.s.size() / 2 + 1);
+                                for (size_t k = 0; k + 1 < v.s.size(); k += 2)
+                                {
+                                    u16.push_back((wchar_t)(
+                                        (unsigned char)v.s[k] |
+                                        ((unsigned short)(unsigned char)v.s[k + 1] << 8)));
+                                }
+                                tmpW.push_back(std::move(u16));
+                                slots.push_back((SlotT)(INT_PTR)tmpW.back().c_str());
+                            }
+                            else
+                            {
+                                tmpA.push_back(BytesOf(v.s));
+                                slots.push_back((SlotT)(INT_PTR)tmpA.back().data());
+                            }
                         }
                         else
                         {
-                            std::string sA((size_t)WideCharToMultiByte(CP_ACP, 0, v.s.c_str(),
-                                (int)v.s.size(), nullptr, 0, nullptr, nullptr), 0);
-                            if (!sA.empty())
-                                WideCharToMultiByte(CP_ACP, 0, v.s.c_str(), (int)v.s.size(),
-                                                   &sA[0], (int)sA.size(), nullptr, nullptr);
-                            tmpA.push_back(std::move(sA));
-                            slots.push_back((SlotT)(INT_PTR)tmpA.back().c_str());
+                            bool bByteString = false;
+                            for (wchar_t c : v.s)
+                            {
+                                if (c == 0) { bByteString = true; break; }
+                            }
+                            if (bByteString)
+                            {
+                                tmpA.push_back(BytesOf(v.s));
+                                slots.push_back((SlotT)(INT_PTR)tmpA.back().data());
+                            }
+                            else if (bUnicode)
+                            {
+                                tmpW.push_back(v.s);
+                                slots.push_back((SlotT)(INT_PTR)tmpW.back().c_str());
+                            }
+                            else
+                            {
+                                std::string sA((size_t)WideCharToMultiByte(CP_ACP, 0, v.s.c_str(),
+                                    (int)v.s.size(), nullptr, 0, nullptr, nullptr), 0);
+                                if (!sA.empty())
+                                    WideCharToMultiByte(CP_ACP, 0, v.s.c_str(), (int)v.s.size(),
+                                                       &sA[0], (int)sA.size(), nullptr, nullptr);
+                                tmpA.push_back(std::move(sA));
+                                slots.push_back((SlotT)(INT_PTR)tmpA.back().c_str());
+                            }
                         }
                     }
                     else if (v.t == Value::TableT || v.t == Value::Class)

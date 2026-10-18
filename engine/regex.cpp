@@ -71,7 +71,28 @@ namespace NodioVM
             bool qLazy = false;
             if (q == L'*') { qMin = 0; qMax = -1; i++; hasQuant = true; }
             else if (q == L'+') { qMin = 1; qMax = -1; i++; hasQuant = true; }
-            else if (q == L'?') { qMin = 0; qMax = 1; i++; hasQuant = true; }
+            else if (q == L'?')
+            {
+                if (i + 1 < pat.size() && pat[i + 1] == L'!')
+                {
+                    i += 2;
+                    RE lookahead;
+                    lookahead.k = 11; // zero-width negative lookahead
+                    lookahead.sub.push_back(std::move(el));
+                    el = std::move(lookahead);
+                    return;
+                }
+                else if (i + 1 < pat.size() && pat[i + 1] == L'=')
+                {
+                    i += 2;
+                    RE lookahead;
+                    lookahead.k = 10; // zero-width positive lookahead
+                    lookahead.sub.push_back(std::move(el));
+                    el = std::move(lookahead);
+                    return;
+                }
+                qMin = 0; qMax = 1; i++; hasQuant = true;
+            }
             else if (q == L'{')
             {
                 size_t j = pat.find(L'}', i);
@@ -117,34 +138,14 @@ namespace NodioVM
                     i += 2;
                 else
                     gi = ++nGroups;
-                vector<vector<RE>> subBranches;
-                while (true)
-                {
-                    vector<RE> sub;
-                    if (!ParseSeq(sub, L')'))
-                        return false;
-                    subBranches.push_back(std::move(sub));
-                    if (i < pat.size() && pat[i] == L'|')
-                    {
-                        i++;
-                        continue;
-                    }
-                    break;
-                }
+                vector<RE> sub;
+                if (!ParseSeq(sub, L')'))
+                    return false;
                 if (i < pat.size() && pat[i] == L')')
                     i++;
-                if (subBranches.size() == 1)
-                {
-                    el.k = 3;
-                    el.gi = gi;
-                    el.sub = std::move(subBranches[0]);
-                }
-                else
-                {
-                    el.k = 8;
-                    el.gi = gi;
-                    el.alt = std::move(subBranches);
-                }
+                el.k = 3;
+                el.gi = gi;
+                el.sub = std::move(sub);
                 ParseQuantifier(el);
                 return true;
             }
@@ -194,34 +195,14 @@ namespace NodioVM
                     }
                 }
                 i++; // skip '<'
-                vector<vector<RE>> subBranches;
-                while (true)
-                {
-                    vector<RE> sub;
-                    if (!ParseSeq(sub, L'>'))
-                        return false;
-                    subBranches.push_back(std::move(sub));
-                    if (i < pat.size() && pat[i] == L'|')
-                    {
-                        i++;
-                        continue;
-                    }
-                    break;
-                }
+                vector<RE> sub;
+                if (!ParseSeq(sub, L'>'))
+                    return false;
                 if (i < pat.size() && pat[i] == L'>')
                     i++;
-                if (subBranches.size() == 1)
-                {
-                    el.k = 3;
-                    el.gi = -1;
-                    el.sub = std::move(subBranches[0]);
-                }
-                else
-                {
-                    el.k = 8;
-                    el.gi = -1;
-                    el.alt = std::move(subBranches);
-                }
+                el.k = 3;
+                el.gi = -1;
+                el.sub = std::move(sub);
                 ParseQuantifier(el);
                 return true;
             }
@@ -373,26 +354,6 @@ namespace NodioVM
             }
         }
 
-        bool ParseBranch(vector<RE>& branch)
-        {
-            if (i >= pat.size()) return false;
-            wchar_t c = pat[i];
-            if (iswalnum(c) || c == L'_')
-            {
-                while (i < pat.size() && (iswalnum(pat[i]) || pat[i] == L'_'))
-                {
-                    RE el;
-                    if (!ParseOne(el)) return false;
-                    branch.push_back(std::move(el));
-                }
-                return true;
-            }
-            RE el;
-            if (!ParseOne(el)) return false;
-            branch.push_back(std::move(el));
-            return true;
-        }
-
         bool ParseSeq(vector<RE>& out, wchar_t stopChar)
         {
             while (i < pat.size())
@@ -406,56 +367,77 @@ namespace NodioVM
                     break;
                 if (c == L'|')
                 {
-                    i++; // consume '|'
-                    vector<RE> nextBranch;
-                    if (!ParseBranch(nextBranch))
-                        return false;
-                    if (!out.empty() && out.back().k == 8)
+                    i++; // skip '|'
+                    if (out.empty())
+                        continue;
+                    RE left = std::move(out.back());
+                    out.pop_back();
+
+                    vector<RE> b2;
+                    if (i < pat.size() && pat[i] == L'<')
                     {
-                        out.back().alt.push_back(std::move(nextBranch));
-                    }
-                    else if (!out.empty())
-                    {
-                        vector<RE> leftBranch;
-                        if (out.back().k == 0 && (iswalnum(out.back().ch) || out.back().ch == L'_'))
-                        {
-                            vector<RE> words;
-                            while (!out.empty() && out.back().k == 0 && (iswalnum(out.back().ch) || out.back().ch == L'_'))
-                            {
-                                words.push_back(std::move(out.back()));
-                                out.pop_back();
-                            }
-                            for (auto it = words.rbegin(); it != words.rend(); ++it)
-                                leftBranch.push_back(std::move(*it));
-                        }
-                        else
-                        {
-                            leftBranch.push_back(std::move(out.back()));
-                            out.pop_back();
-                        }
-                        RE altEl;
-                        altEl.k = 8;
-                        altEl.alt.push_back(std::move(leftBranch));
-                        altEl.alt.push_back(std::move(nextBranch));
-                        out.push_back(std::move(altEl));
+                        RE right;
+                        if (!ParseOne(right))
+                            return false;
+                        b2.push_back(std::move(right));
                     }
                     else
                     {
-                        for (auto& nb : nextBranch)
-                            out.push_back(std::move(nb));
+                        while (i < pat.size())
+                        {
+                            wchar_t rc = pat[i];
+                            if (stopChar != 0 && rc == stopChar)
+                                break;
+                            if (rc == L')' && stopChar == L')')
+                                break;
+                            if (rc == L'>' && stopChar == L'>')
+                                break;
+                            if (rc == L'|')
+                                break;
+                            RE elRight;
+                            if (!ParseOne(elRight))
+                                return false;
+                            b2.push_back(std::move(elRight));
+                        }
                     }
+
+                    RE altEl;
+                    altEl.k = 8;
+                    altEl.gi = -1;
+                    if (left.k == 8 && left.min == 1 && left.max == 1 && left.gi < 0)
+                    {
+                        altEl.alt = std::move(left.alt);
+                    }
+                    else
+                    {
+                        vector<RE> b1;
+                        b1.push_back(std::move(left));
+                        altEl.alt.push_back(std::move(b1));
+                    }
+                    altEl.alt.push_back(std::move(b2));
+
+                    out.push_back(std::move(altEl));
                     continue;
                 }
                 RE el;
                 if (!ParseOne(el))
                     return false;
-                if (el.k == 3 && el.min == 1 && el.max == 1 && el.gi >= 0)
+                if ((el.k == 3 || el.k == 8) && el.min == 1 && el.max == 1 && el.gi >= 0)
                 {
-                    RE startEl; startEl.k = 5; startEl.gi = el.gi;
+                    int gi = el.gi;
+                    el.gi = -1;
+                    RE startEl; startEl.k = 5; startEl.gi = gi;
                     out.push_back(std::move(startEl));
-                    for (auto& s : el.sub)
-                        out.push_back(std::move(s));
-                    RE endEl; endEl.k = 6; endEl.gi = el.gi;
+                    if (el.k == 3)
+                    {
+                        for (auto& s : el.sub)
+                            out.push_back(std::move(s));
+                    }
+                    else
+                    {
+                        out.push_back(std::move(el));
+                    }
+                    RE endEl; endEl.k = 6; endEl.gi = gi;
                     out.push_back(std::move(endEl));
                 }
                 else
@@ -494,6 +476,12 @@ namespace NodioVM
                     long long e = REMatchSeq(branch, 0, s, pos, tmp, starts, false);
                     if (e >= 0)
                     {
+                        if (el.gi >= 0)
+                        {
+                            if ((size_t)el.gi >= tmp.size())
+                                tmp.resize((size_t)el.gi + 1);
+                            tmp[(size_t)el.gi] = L"";
+                        }
                         caps = tmp;
                         return (size_t)e;
                     }
@@ -508,9 +496,9 @@ namespace NodioVM
                 {
                     if (el.gi >= 0)
                     {
-                        if ((size_t)el.gi >= caps.size())
-                            caps.resize((size_t)el.gi + 1);
-                        caps[(size_t)el.gi] = L"";
+                        if ((size_t)el.gi >= tmp.size())
+                            tmp.resize((size_t)el.gi + 1);
+                        tmp[(size_t)el.gi] = L"";
                     }
                     caps = tmp;
                     return (size_t)e;
@@ -535,9 +523,9 @@ namespace NodioVM
                 return RENPOS;
             if (el.gi >= 0)
             {
-                if ((size_t)el.gi >= caps.size())
-                    caps.resize((size_t)el.gi + 1);
-                caps[(size_t)el.gi] = s.substr(pos, (size_t)e - pos);
+                if ((size_t)el.gi >= tmp.size())
+                    tmp.resize((size_t)el.gi + 1);
+                tmp[(size_t)el.gi] = s.substr(pos, (size_t)e - pos);
             }
             caps = tmp;
             return (size_t)e;
@@ -551,6 +539,12 @@ namespace NodioVM
                 long long e = REMatchSeq(branch, 0, s, pos, tmp, starts, false);
                 if (e >= 0)
                 {
+                    if (el.gi >= 0)
+                    {
+                        if ((size_t)el.gi >= tmp.size())
+                            tmp.resize((size_t)el.gi + 1);
+                        tmp[(size_t)el.gi] = s.substr(pos, (size_t)e - pos);
+                    }
                     caps = tmp;
                     return (size_t)e;
                 }
@@ -644,6 +638,28 @@ namespace NodioVM
             }
             return REMatchSeq(els, idx + 1, s, pos, caps, groupStarts, anchored);
         }
+        if (el.k == 10)   // '?=' — zero-width positive lookahead
+        {
+            if (!el.sub.empty())
+            {
+                vector<wstring> tryCaps = caps;
+                vector<size_t> tryStarts = groupStarts;
+                long long e = REMatchSeq(el.sub, 0, s, pos, tryCaps, tryStarts, false);
+                if (e < 0) return -1;
+            }
+            return REMatchSeq(els, idx + 1, s, pos, caps, groupStarts, anchored);
+        }
+        if (el.k == 11)   // '?!' — zero-width negative lookahead
+        {
+            if (!el.sub.empty())
+            {
+                vector<wstring> tryCaps = caps;
+                vector<size_t> tryStarts = groupStarts;
+                long long e = REMatchSeq(el.sub, 0, s, pos, tryCaps, tryStarts, false);
+                if (e >= 0) return -1;
+            }
+            return REMatchSeq(els, idx + 1, s, pos, caps, groupStarts, anchored);
+        }
         if (el.k == 5)   // GroupStart
         {
             vector<size_t> nextStarts = groupStarts;
@@ -670,6 +686,32 @@ namespace NodioVM
             {
                 caps = nextCaps;
                 return e;
+            }
+            return -1;
+        }
+        if (el.k == 8)   // Alternation
+        {
+            for (const auto& branch : el.alt)
+            {
+                vector<wstring> tryCaps = caps;
+                vector<size_t> tryStarts = groupStarts;
+                long long e = REMatchSeq(branch, 0, s, pos, tryCaps, tryStarts, false);
+                if (e >= 0)
+                {
+                    if (el.gi >= 0)
+                    {
+                        if ((size_t)el.gi >= tryCaps.size())
+                            tryCaps.resize((size_t)el.gi + 1);
+                        tryCaps[(size_t)el.gi] = s.substr(pos, (size_t)e - pos);
+                    }
+                    long long nextE = REMatchSeq(els, idx + 1, s, (size_t)e, tryCaps, tryStarts, anchored);
+                    if (nextE >= 0)
+                    {
+                        caps = tryCaps;
+                        groupStarts = tryStarts;
+                        return nextE;
+                    }
+                }
             }
             return -1;
         }

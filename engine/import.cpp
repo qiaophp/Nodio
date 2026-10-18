@@ -695,7 +695,8 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     auto im = cand.tab->map.find(base);
                     if (im != cand.tab->map.end() &&
                         (im->second.t == Value::Class ||
-                         (im->second.t == Value::Func && !bIsFolderModule)))
+                         (im->second.t == Value::Func && !bIsFolderModule &&
+                          !cand.tab->map.count(L"_meta") && cand.tab->map.size() <= 2)))
                         mod = im->second;
                     else
                     {
@@ -725,7 +726,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                             auto im2 = ns.tab->map.find(base);
                             if (im2 != ns.tab->map.end() &&
                                 (im2->second.t == Value::Class ||
-                                 im2->second.t == Value::Func))
+                                 (im2->second.t == Value::Func && !ns.tab->map.count(L"_meta") && ns.tab->map.size() <= 2)))
                                 mod = im2->second;
                         }
                     }

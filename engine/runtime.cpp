@@ -768,12 +768,14 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                 local->vars[L"this"] = ths;
             for (size_t i = 0; i < f.params.size(); i++)
             {
-                if (i < args.size())
+                if (i < args.size() && args[i].t != Value::Null)
                     local->vars[f.params[i]] = args[i];
                 else if (f.pdefaults && i < f.pdefaults->size() &&
                          (*f.pdefaults)[i])
                     local->vars[f.params[i]] =
                         Eval((*f.pdefaults)[i], local.get());
+                else if (i < args.size())
+                    local->vars[f.params[i]] = args[i];
                 else
                     local->vars[f.params[i]] = Value();
             }
@@ -1165,13 +1167,15 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 local->vars[L"this"] = vInst;
                 for (size_t i = 0; i < f.fn->names.size(); i++)
                 {
-                    if (i < args.size())
+                    if (i < args.size() && args[i].t != Value::Null)
                         local->vars[f.fn->names[i]] = args[i];
                     else if (f.pdefaults &&
                              i < f.pdefaults->size() &&
                              (*f.pdefaults)[i])
                         local->vars[f.fn->names[i]] =
                             Eval((*f.pdefaults)[i], local.get());
+                    else if (i < args.size())
+                        local->vars[f.fn->names[i]] = args[i];
                     else
                         local->vars[f.fn->names[i]] = Value();
                 }
@@ -1598,13 +1602,15 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             for (size_t i = 0; i < f.params.size(); i++)
             {
-                if (i < args.size())
+                if (i < args.size() && args[i].t != Value::Null)
                     local->vars[f.params[i]] = args[i];
                 else if (f.pdefaults &&
                          i < f.pdefaults->size() &&
                          (*f.pdefaults)[i])
                     local->vars[f.params[i]] =
                         Eval((*f.pdefaults)[i], local.get());
+                else if (i < args.size())
+                    local->vars[f.params[i]] = args[i];
                 else
                     local->vars[f.params[i]] = Value();
             }
@@ -2085,6 +2091,13 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 bool bFoundInOrBelowClass = false;
                 if (eNs && eNs->bClassBody && eNs->bNsInst && eNs->nsTable)
                 {
+                    if (env == eNs)
+                    {
+                        // Directly in class body: member definition (e.g. `bind = { ... }`, `method = function() {}`)
+                        // writes to the instance table only, and never overwrites ctor local variables or outer namespaces.
+                        eNs->nsTable->map[target->str] = val;
+                        return;
+                    }
                     for (Env* cur = env; cur; cur = cur->parent.get())
                     {
                         if (cur == eFound) { bFoundInOrBelowClass = true; break; }
@@ -2132,6 +2145,32 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                         // writes to the instance table only, NOT as a lexical closure variable.
                         // Otherwise instance methods mistakenly shadow outer namespace members.
                         eNs->nsTable->map[target->str] = val;
+                    }
+                    else if (eNs->bNsInst)
+                    {
+                        // Inside ctor: if already an instance property, update instance.
+                        // Otherwise, bare assignment targets the class namespace!
+                        if (eNs->nsTable->map.find(target->str) != eNs->nsTable->map.end())
+                        {
+                            eNs->nsTable->map[target->str] = val;
+                        }
+                        else
+                        {
+                            Env* eClass = eNs->parent.get();
+                            while (eClass && (!eClass->nsTable || eClass->bNsInst)) eClass = eClass->parent.get();
+                            if (eClass && eClass->nsTable)
+                            {
+                                eClass->vars[target->str] = val;
+                                eClass->nsTable->map[target->str] = val;
+                                eClass->nsTable->scopeVars[target->str] = val;
+                            }
+                            else
+                            {
+                                eNs->vars[target->str] = val;
+                                eNs->nsTable->map[target->str] = val;
+                                eNs->nsTable->scopeVars[target->str] = val;
+                            }
+                        }
                     }
                     else
                     {
@@ -2395,6 +2434,26 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
         }
 
 // ---- ExecBlock ----
+// Official aardio: locals declared with var inside a statement block
+// (if/while/do bodies, try) are BLOCK-scoped and disappear at block exit
+// (docs/language-reference/statements/blocks.md — 块级作用域). ExecBlock
+// therefore runs the body in a child frame; on exit the frame is dropped
+// and any var declared inside it goes out of scope. Assignments to outer
+// locals (bare `x = v` without var) still reach the outer frame through
+// DoAssign's eFound search.
+Value Interp::ExecBlockScoped(const PNode& blk, Env* env)
+{
+    if (!blk || blk->list.empty())
+        return ExecBlock(blk, env);
+    auto child = std::make_shared<Env>();
+    child->self = child;
+    child->parent = env ? env->self : globals.self;
+    // closure captures and namespace-member fallbacks must still see the
+    // enclosing scope's namespace/module tables through Find()'s parent walk,
+    // so they are intentionally NOT copied into the child frame.
+    return ExecBlock(blk, child.get());
+}
+
 Value Interp::ExecBlock(const PNode& blk, Env* env)
         {
             Value last;
@@ -2508,20 +2567,45 @@ Value Interp::EvalClass(const PNode& n, Env* env)
             else
             {
                 Value ns;
-                auto itG = globals.vars.find(n->names[0]);
-                if (itG != globals.vars.end() &&
-                    itG->second.t == Value::TableT)
-                    ns = itG->second;
-                else
+                // Dotted class name (class A.B): if not root-prefixed (..A.B),
+                // resolve A in ambient namespace or lexical scope first
+                if (!n->bRoot)
                 {
-                    auto tbN = std::make_shared<Table>();
-                    ns = Value::Table_(tbN);
-                    globals.vars[n->names[0]] = ns;
+                    Env* eNs = env;
+                    while (eNs && !eNs->nsTable) eNs = eNs->parent.get();
+                    if (eNs && eNs->nsTable)
+                    {
+                        auto it = eNs->nsTable->map.find(n->names[0]);
+                        if (it != eNs->nsTable->map.end() &&
+                            (it->second.t == Value::TableT || it->second.t == Value::Class))
+                            ns = it->second;
+                    }
+                    if (ns.t == Value::Null)
+                    {
+                        if (Value* pv = env->Find(n->names[0]))
+                        {
+                            if (pv->t == Value::TableT || pv->t == Value::Class)
+                                ns = *pv;
+                        }
+                    }
+                }
+                if (ns.t == Value::Null)
+                {
+                    auto itG = globals.vars.find(n->names[0]);
+                    if (itG != globals.vars.end() &&
+                        (itG->second.t == Value::TableT || itG->second.t == Value::Class))
+                        ns = itG->second;
+                    else
+                    {
+                        auto tbN = std::make_shared<Table>();
+                        ns = Value::Table_(tbN);
+                        globals.vars[n->names[0]] = ns;
+                    }
                 }
                 for (size_t k = 1; k + 1 < n->names.size(); k++)
                 {
                     Value nxt = GetMember(ns, n->names[k]);
-                    if (nxt.t != Value::TableT)
+                    if (nxt.t != Value::TableT && nxt.t != Value::Class)
                     {
                         auto tbN = std::make_shared<Table>();
                         nxt = Value::Table_(tbN);
@@ -2774,7 +2858,7 @@ Value Interp::Exec(const PNode& n, Env* env)
             {
                 while (true)
                 {
-                    ExecBlock(n->b, env);
+                    ExecBlockScoped(n->b, env);
                     if (nReturn) break;
                     if (nBreak) { nBreak--; break; }
                     if (nContinue) nContinue--;
@@ -2797,7 +2881,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                         if (!chain)
                         {
                             // else arm: runs when no case before it matched
-                            return ExecBlock(n->c->list[i + 1], env);
+                            return ExecBlockScoped(n->c->list[i + 1], env);
                         }
                         bool bHit = false;
                         for (PNode cur = chain; cur;)
@@ -2822,7 +2906,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                             cur = cur->c;
                         }
                         if (bHit)
-                            return ExecBlock(n->c->list[i + 1], env);
+                            return ExecBlockScoped(n->c->list[i + 1], env);
                     }
                     return Value();
                 }
@@ -2830,14 +2914,14 @@ Value Interp::Exec(const PNode& n, Env* env)
                 if (nReturn)
                     return vCond;   // inline return in cond: unwind now
                 if (vCond.Truthy())
-                    return ExecBlock(n->b, env);
+                    return ExecBlockScoped(n->b, env);
                 for (size_t i = 0; i + 1 < n->c->list.size(); i += 2)
                 {
                     if (Eval(n->c->list[i], env).Truthy())
-                        return ExecBlock(n->c->list[i + 1], env);
+                        return ExecBlockScoped(n->c->list[i + 1], env);
                 }
                 if (n->c->list.size() % 2 == 1)
-                    return ExecBlock(n->c->list.back(), env);
+                    return ExecBlockScoped(n->c->list.back(), env);
                 return Value();
             }
             case Node::While:
@@ -2852,7 +2936,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                         if (nReturn) return v;
                         if (!v.Truthy())
                             break;
-                        Value r = ExecBlock(n->b, env);
+                        Value r = ExecBlockScoped(n->b, env);
                         if (nBreak) { nBreak--; break; }
                         if (nContinue) { nContinue--; continue; }
                         if (nReturn) return r;
@@ -2863,11 +2947,11 @@ Value Interp::Exec(const PNode& n, Env* env)
                 {
                     while (true)
                     {
-                        Value v = ExecBlock(n->a, env);
+                        Value v = ExecBlockScoped(n->a, env);
                         if (nReturn) return v;
                         if (!v.Truthy())
                             break;
-                        Value r = ExecBlock(n->b, env);
+                        Value r = ExecBlockScoped(n->b, env);
                         if (nBreak) { nBreak--; break; }
                         if (nContinue) { nContinue--; continue; }
                         if (nReturn) return r;
@@ -2876,7 +2960,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 }
                 while (Exec(n->a, env).Truthy())
                 {
-                    Value r = ExecBlock(n->b, env);
+                    Value r = ExecBlockScoped(n->b, env);
                     if (nBreak) { nBreak--; break; }
                     if (nContinue) { nContinue--; continue; }
                     if (nReturn) return r;
@@ -3136,7 +3220,7 @@ Value Interp::Exec(const PNode& n, Env* env)
             }
             case Node::Try:
             {
-                ExecBlock(n->a, env);
+                ExecBlockScoped(n->a, env);
                 if (!err->empty())
                 {
                     wstring msg = *err;
@@ -3341,13 +3425,15 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             local->vars[L"owner"] = Value();   // native-side call: no owner
             for (size_t i = 0; i < f.params.size(); i++)
             {
-                if (i < args.size())
+                if (i < args.size() && args[i].t != Value::Null)
                     local->vars[f.params[i]] = args[i];
                 else if (f.pdefaults &&
                          i < f.pdefaults->size() &&
                          (*f.pdefaults)[i])
                     local->vars[f.params[i]] =
                         Eval((*f.pdefaults)[i], local.get());
+                else if (i < args.size())
+                    local->vars[f.params[i]] = args[i];
                 else
                     local->vars[f.params[i]] = Value();
             }

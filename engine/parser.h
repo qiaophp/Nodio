@@ -328,12 +328,12 @@ namespace NodioVM
                     n->names.push_back(ExpectIdent());
                     while (true)
                     {
-                        if (IsPunct(L".") && (Peek(1).t == TIdent || Peek(1).t == TKw || Peek(1).t == TNum))
+                        if (IsPunct(L".") && (Peek(1).t == TIdent || Peek(1).t == TKw))
                         {
                             p++;
                             n->names.push_back(Next().text);
                         }
-                        else if (IsPunct(L"[") && (Peek(1).t == TStr || Peek(1).t == TNum))
+                        else if (IsPunct(L"[") && Peek(1).t == TStr)
                         {
                             p++;
                             Tok tk = Next();
@@ -389,7 +389,7 @@ namespace NodioVM
                     }
                     n->names.push_back(ExpectIdent());
                     while (IsPunct(L".") &&
-                           (Peek(1).t == TIdent || Peek(1).t == TKw || Peek(1).t == TNum))
+                           (Peek(1).t == TIdent || Peek(1).t == TKw))
                     {
                         p++;
                         n->names.push_back(Next().text);

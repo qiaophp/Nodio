@@ -90,6 +90,7 @@ namespace NodioVM
         void DoAssign(const PNode& target, const Value& v, Env* env,
                       const wstring& op);
         Value ExecBlock(const PNode& blk, Env* env);
+        Value ExecBlockScoped(const PNode& blk, Env* env);
         Value EvalClass(const PNode& n, Env* env);
         Value InstantiateClass(const Value& f, vector<Value>& args,
                                const Value& vThis, bool bMethod = false);

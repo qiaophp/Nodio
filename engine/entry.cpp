@@ -177,7 +177,23 @@ namespace NodioVM
             wstring* pPrevErr = it.err;
             it.err = &strBootErr;
             vector<Tok> toksBoot = Lex(
-                L"import builtin; import builtin.struct; import builtin.com; import builtin.math; ::NMHDR = class { addr hwndFrom; ADDR idFrom; INT code; };", &strBootErr);
+                L"import builtin; import builtin.struct; import builtin.com; import builtin.math; ::NMHDR = class { addr hwndFrom; ADDR idFrom; INT code; }; "
+                L"table.get = function(k, t) { "
+                L"if (!t) { t = ..global; } "
+                L"var p, m, i = ..string.match(k, \"\\.*(.*)(%\\[\\])$\"); "
+                L"if (m) i = 1; "
+                L"else p, m = ..string.match(k, \"\\.*(.+)\\.([^.]+)$\"); "
+                L"if (m !== null) { "
+                L"if (#p) { var ok, nextT = call(table.get, null, p, t); if (!ok || !nextT) return null; t = nextT; } "
+                L"if (t) { "
+                L"if (i) m = #m > 2 ? eval(..string.slice(m, 2, -2)) : #t; "
+                L"if (t@ && t@._dotNetNamespace) return t[[m]], t; "
+                L"var ok, val = call(function() { return t[m]; }); if (!ok) return null; return val, t; "
+                L"} "
+                L"} else { "
+                L"if (t@ && t@._dotNetNamespace) return t[[k]], t; "
+                L"var ok, val = call(function() { return t[k]; }); if (!ok) return null; return val, t; "
+                L"}; };", &strBootErr);
             Parser psBoot{ toksBoot, 0, &strBootErr };
             psBoot.strEmbedBase = pBaseDir ? *pBaseDir : wstring();
             psBoot.strEmbedRoot = EmbedRoot();
