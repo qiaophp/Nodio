@@ -4157,7 +4157,26 @@ void Interp::InitBuiltins()
                             {
                                 fp = MemDllGetProc(memDll->pImage, strNameA.c_str());
                                 if (!fp && suffix)
+                                {
                                     fp = MemDllGetProc(memDll->pImage, bareName.c_str());
+                                    if (fp)
+                                    {
+                                        if (suffix == 'W') bNameW = true;
+                                        else if (suffix == 'A') bNameW = false;
+                                    }
+                                }
+                                if (!fp && strNameA.find('@') == std::string::npos)
+                                {
+                                    std::string w = (suffix ? bareName : strNameA) + "W";
+                                    fp = MemDllGetProc(memDll->pImage, w.c_str());
+                                    if (fp) bNameW = true;
+                                }
+                                if (!fp && strNameA.find('@') == std::string::npos)
+                                {
+                                    std::string an = (suffix ? bareName : strNameA) + "A";
+                                    fp = MemDllGetProc(memDll->pImage, an.c_str());
+                                    if (fp) bNameW = false;
+                                }
                             }
                             else
                             {
@@ -4891,8 +4910,7 @@ void Interp::InitBuiltins()
                                 last == L'F' || last == L'B' || last == L'W' || last == L'A')
                             {
                                 suffix = last;
-                                if (last != L'W' && last != L'A')
-                                    bareName = name.substr(0, name.size() - 1);
+                                bareName = name.substr(0, name.size() - 1);
                             }
                         }
 
@@ -4904,6 +4922,16 @@ void Interp::InitBuiltins()
                             fp = MemDllGetProc(memDll->pImage, nameA.c_str());
                             if (!fp && suffix)
                                 fp = MemDllGetProc(memDll->pImage, bareNameA.c_str());
+                            if (!fp && nameA.find('@') == std::string::npos)
+                            {
+                                std::string w = (suffix ? bareNameA : nameA) + "W";
+                                fp = MemDllGetProc(memDll->pImage, w.c_str());
+                            }
+                            if (!fp && nameA.find('@') == std::string::npos)
+                            {
+                                std::string an = (suffix ? bareNameA : nameA) + "A";
+                                fp = MemDllGetProc(memDll->pImage, an.c_str());
+                            }
                         }
                         else if (hMod)
                         {

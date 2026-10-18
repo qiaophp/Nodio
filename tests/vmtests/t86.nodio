@@ -1,0 +1,15 @@
+import com;
+
+var t = {
+    testProp = "hello";
+    add = function(a, b) {
+        return a + b;
+    };
+};
+
+var obj = com.ImplInterface(t);
+assert(com.IsObject(obj), "obj should be a COM object");
+assert(obj.testProp == "hello", "obj.testProp should return 'hello'");
+assert(obj.add(2, 3) == 5, "obj.add(2, 3) should return 5");
+
+io.print("com.ImplInterface test OK:", obj.testProp, obj.add(10, 20));

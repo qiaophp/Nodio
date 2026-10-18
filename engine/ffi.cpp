@@ -1028,16 +1028,20 @@ namespace NodioVM
                         src = &fv.s;
                     if (src)
                     {
-                        bool bByteStr = true;
+                        bool bAllByte = true;
+                        bool bHasNul = false;
                         for (wchar_t c : *src)
+                        {
                             if ((unsigned short)c > 0xFF)
                             {
-                                bByteStr = false;
+                                bAllByte = false;
                                 break;
                             }
-                        if (bByteStr)
+                            if (c == 0) bHasNul = true;
+                        }
+                        if (bAllByte && bHasNul && ((*src).size() % 2 == 0))
                         {
-                            // re-pack UTF-16 LE bytes into real wchars
+                            // re-pack UTF-16 LE bytes (e.g. from string.toUtf16) into real wchars
                             u16.reserve((*src).size() / 2 + 1);
                             for (size_t k = 0; k + 1 < (*src).size(); k += 2)
                                 u16.push_back((wchar_t)(
@@ -1045,9 +1049,6 @@ namespace NodioVM
                                     ((unsigned short)(unsigned char)
                                          (*src)[k + 1]
                                      << 8)));
-                            if ((*src).size() & 1)
-                                u16.push_back((wchar_t)(unsigned char)
-                                                  (*src)[(*src).size() - 1]);
                             sKeep.push_back(std::move(u16));
                             *(const wchar_t**)(buf + off) =
                                 sKeep.back().c_str();

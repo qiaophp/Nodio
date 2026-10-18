@@ -2523,6 +2523,32 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         return a[0];
     });
 
+    // com.ImplInterface(implObject) -> IDispatch COM wrapper table
+    com->map[L"ImplInterface"] = NF([](vector<Value>& a) -> Value {
+        if (a.empty()) return Value();
+        const Value& v = a[0];
+        if (v.t == Value::TableT && v.tab)
+        {
+            if (v.tab->map.count(L"_object") || v.tab->map.count(L"_boundDispatch"))
+                return v;
+        }
+        IDispatch* pDisp = nullptr;
+        if (v.t == Value::Func || v.native)
+            pDisp = new NodioCallbackDispatch(v);
+        else
+            pDisp = new NodioTableDispatch(v);
+        return WrapDispatch(pDisp);
+    });
+
+    // com.SetPreferredInvokeKind(comObject, preferredInvokeKind)
+    com->map[L"SetPreferredInvokeKind"] = NF([](vector<Value>& a) -> Value {
+        if (a.size() > 1 && a[0].t == Value::TableT && a[0].tab)
+        {
+            a[0].tab->map[L"_preferredInvokeKind"] = a[1];
+        }
+        return Value::Bool_(true);
+    });
+
     // com.Variant(val, vt, byRef)
     com->map[L"Variant"] = NF([](vector<Value>& a) -> Value {
         auto tb = std::make_shared<Table>();
