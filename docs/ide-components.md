@@ -503,6 +503,9 @@ opt = { left=0; top=0; right=600; bottom=400; background=0xF0F0F0 }
 | `ed.findNext(word, fromCaret)` / `ed.findPrev(word)` / `ed.replaceOnce(word, repl)` / `ed.replaceAll(word, repl)` | 查找替换（位置单位 = UTF-16 码元） |
 | `ed.showFind(withReplace)` / `ed.closeFind()` / `ed.findText()` / `ed.replaceText()` | 查找替换浮条 |
 | `ed.gotoLine(line)` / `ed.gotoPos(pos)` / `ed.updateCursor()` | 定位；返回 `line, col` |
+| `ed.setDiagnostics(list)` | 槽内诊断标记（波浪线 + 错误色）+ 行号栏诊断圆点。`list` 每项 `{line=1基; col=0基; endLine; endCol; msg; sev}`，`sev` 1=错误 2=警告 |
+| `ed.toggleFold(line)` / `ed.foldAll()` / `ed.unfoldAll()` | 代码折叠（见 §11.7） |
+| `ed.isFoldable(line)` / `ed.isFolded(line)` | 某行是不是折叠头 / 是不是已折叠 |
 | `ed.layout(l,t,r,b)` / `ed.gutterWidth()` / `ed.control()` | 布局与访问底层控件 |
 | 回调 | `onCursor(line,col)` / `onChange(text)` / `onDirty(dirty)` / `onGotoLine()` |
 
@@ -511,7 +514,8 @@ opt = { left=0; top=0; right=600; bottom=400; background=0xF0F0F0 }
 - richedit 的位置 = **UTF-16 码元**（1-based，CRLF 占 1 个码元）
 - `..string.len(s)` = **wchar 码元数**（与 richedit 同单位）
 - `#s` / `s[i]` / `string.sub` = **UTF-8 字节**
-- 行首位置用官方 `lineToChar(line)`（EM_LINEINDEX，精确）；
+- 行首位置**用组件自己的行首表** `__lineStart(line)`（不是官方 `lineToChar`）：
+  折叠后 `EM_LINEINDEX` 对隐藏行返回的位置是错的（见 §11.7）；
   行内偏移用 UTF-8 首字节推算的码元数
 
 ### 11.3 官方 richedit 的几个实测行为
