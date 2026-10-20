@@ -18,7 +18,9 @@
 //   0x0E STORE_UPVALUE / 0x0F LOAD_IF_SET / 0x29 TAILCALL / 0x2A CALL /
 //   0x2B CALL_NATIVE / 0x34 NEW_CLOSURE，以及第十七轮的**命名空间与导入**：
 //   0x15 NEW_NATIVE / 0x16 IMPORT_MEMBER，
-//   第十八轮的**拼接与循环**：0x21 CONCAT / 0x2D ADDEQ / 0x2E SUBEQ
+//   第十八轮的**拼接与循环**：0x21 CONCAT / 0x2D ADDEQ / 0x2E SUBEQ，
+//   第二十轮的**动态调用族**：0x2F CALL_MULTI / 0x30 CALL_VALUE /
+//   0x31 CALL_NS / 0x3C CALL_N（至此 61/61 全部落地）
 // 其余种类一律明确报错（种类 + 记录号），不静默跳过。
 #include "aardio_vm.h"
 
@@ -67,6 +69,12 @@ namespace NodioVM
             std::shared_ptr<Table> ns;
             // 返回值写回**调用方**帧的槽（官方 CALL 的 B 决定：返回槽 = A+B）
             int retSlot = -1;
+            // 被调方返回后，调用方还要做的事（官方 0x2F 的尾处理）：
+            //   把调用方帧的 postCopySrc 槽拷到 postCopyDst 槽，并把调用方 ip 设为 postJump。
+            // 官方 0x2F：调用返回后若槽 A+3 非空 → 槽 A-1 := 槽 A+3，并按下一条 0x22 跳转。
+            int postCopySrc = -1;
+            int postCopyDst = -1;
+            long long postJump = -1;
         };
 
         // 官方类型标签（实测自解释器 FUN_004C4BC0 的槽类型判定）
@@ -306,8 +314,10 @@ namespace NodioVM
         case 0x1E: case 0x1F: case 0x20: case 0x21:
         case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x28:
         case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E:
+        case 0x2F: case 0x30: case 0x31:
         case 0x32: case 0x33: case 0x34:
         case 0x35: case 0x36: case 0x37: case 0x38: case 0x39: case 0x3A: case 0x3B:
+        case 0x3C:
             return true;
         default:
             return false;
@@ -393,6 +403,60 @@ namespace NodioVM
             for (size_t i = 0; i < arena.size(); i++)
                 if (arena[i].get() == v.ptr) return arena[i];
             return nullptr;
+        };
+
+        // ---- 调用辅助（0x29 / 0x2A / 0x2B / 0x2F / 0x30 / 0x31 / 0x3C 共用）----
+        //
+        // 官方调用约定（实测自 FUN_004D3040 与 0x2A 装参块 0x004C5A44）：
+        //   · 被调值在「被调方槽」X
+        //   · 实参 = 调用方的槽 X+1 .. X+实参个数（官方原生路径把
+        //     [&slot[X], &slot[X+实参个数]) 整段复制）
+        //   · 被调帧的局部基址 = 被调方槽 + 1 —— 即**被调帧槽 0 = 第一个实参**
+        //     （官方：被调帧基址 = 被调方槽 + 0x10）
+        //   · 返回值写回调用方的返回槽
+        //
+        // 返回：0 = 已同步完成（结果已写回 retSlot）；1 = 已压入被调帧；
+        //       -1 = 出错（原因在 callErr）。
+        wstring callErr;
+        auto DoCall = [&](const RtSlot& fn, const std::vector<RtSlot>& args,
+                          int retSlot, int postCopySrc, int postCopyDst,
+                          long long postJump) -> int
+        {
+            if (fn.closure)
+            {
+                RtFrame nf;
+                nf.chunk = fn.closure->chunk;
+                if (!nf.chunk) { callErr = L"调用的闭包没有函数体"; return -1; }
+                int need = (int)args.size() + 1;      // 帧槽 0 = 第一个实参
+                int nSlots = (int)nf.chunk->flags[3];
+                if (nSlots < need) nSlots = need;
+                nf.slots.assign((size_t)nSlots, RtSlot());
+                for (size_t k = 0; k < args.size(); k++)
+                    nf.slots[k] = SlotGet(args[k]);   // 实参按值拷贝（官方：整段复制）
+                nf.upvalues = fn.closure->upvalues;
+                nf.ns = fn.closure->ownerNs ? fn.closure->ownerNs : frames.back().ns;
+                nf.parent = nullptr;                  // 帧栈会重排，不留悬挂父指针
+                nf.retSlot = retSlot;
+                nf.postCopySrc = postCopySrc;
+                nf.postCopyDst = postCopyDst;
+                nf.postJump = postJump;
+                nf.ip = 0;
+                frames.push_back(nf);
+                return 1;
+            }
+            if (fn.val.t == Value::Func && fn.val.native)
+            {
+                std::vector<Value> a;
+                a.reserve(args.size());
+                for (size_t k = 0; k < args.size(); k++)
+                    a.push_back(SlotGet(args[k]).val);
+                Value out = fn.val.native(a);
+                if (retSlot >= 0 && retSlot < (int)frames.back().slots.size())
+                    SlotPut(frames.back().slots[(size_t)retSlot], SlotOfValue(out));
+                return 0;
+            }
+            callErr = L"调用的对象不是函数";
+            return -1;
         };
 
         while (!frames.empty())
@@ -704,65 +768,197 @@ namespace NodioVM
             {   // TAILCALL / CALL / CALL_NATIVE
                 //
                 // 官方调用约定（实测自 FUN_004D3040 与 0x2A 装参块 0x004C5A44）：
-                //   · 被调值在 **A 槽**
-                //   · 实参窗口 = 槽 A+1 .. A+B-1（B-1 个值，第一个是 self/接收者）
-                //     —— 官方原生路径把 [&slot[A], &slot[A+B]) 整段复制，即 B-1 个值
-                //   · 返回槽 = **A+B**（B≠0 时官方写 vm->0x08 = &slot[A+B]）
-                //   · C 是官方传给被调方的「实参个数」（C-1；C=0 → 变参，C-1 = -1），
-                //     Nodio 只把它记进帧里当提示，不据此裁剪参数
-                int a = A;
-                int b = (int)(B & 0x1FF);
-                int argCount = (b >= 1) ? (b - 1) : 0;
+                //   · 0x2A：被调值在 **A 槽**；实参窗口 = 槽 A+1 .. A+C-1
+                //     （实参个数 = **C-1**，C = bits14..22）——
+                //     官方校验器 FUN_004D4450 的槽位检查
+                //     「nslots > A + C - 2」正好等价于「实参 = A+1..A+C-1」；
+                //     官方 0x2A 装参块把 (C-1) 压栈作为实参个数。
+                //   · 0x2B：官方压入 -1（变参）；C=0 时实参个数由被调方决定。
+                //   · 0x29：官方尾调用把当前帧换成「槽 A+B」处的被调值。
+                //   · 返回槽 = **A+B**（B = bits23..31；官方写 vm->0x08 = &slot[A+B]）
+                int calleeSlot = A;
+                int argCount = (C >= 1) ? (int)(C - 1) : 0;
+                int retSlot = (B != 0) ? (A + (int)B) : -1;
+                if (kind == 0x29)
+                {
+                    if (B != 0) calleeSlot = A + (int)B;
+                    retSlot = frame.retSlot;   // 尾调用：结果仍写回原调用方的返回槽
+                }
+                if (kind == 0x2B && C == 0) argCount = -1;   // 变参
 
+                RtSlot fn = LocalSlot((unsigned int)calleeSlot);
+                std::vector<RtSlot> args;
+                if (argCount >= 0)
+                {
+                    for (int k = 0; k < argCount; k++)
+                        args.push_back(LocalSlot((unsigned int)(calleeSlot + 1 + k)));
+                }
+                else
+                {
+                    // 变参（官方 0x2B 推 -1）：被调方按自己的形参个数取。
+                    // Nodio 的原生函数没有形参表，用「实参区最后一个非空槽」截断。
+                    int last = calleeSlot + 1;
+                    for (int i = (int)frame.slots.size() - 1; i > calleeSlot; i--)
+                    {
+                        if (LocalSlot((unsigned int)i).type != 0) { last = i; break; }
+                    }
+                    for (int i = calleeSlot + 1; i <= last; i++)
+                        args.push_back(LocalSlot((unsigned int)i));
+                }
+
+                int rc = DoCall(fn, args, retSlot, -1, -1, -1);
+                if (rc < 0)
+                    return Fail((int)pc, kind, L"调用的对象不是函数（槽 " +
+                        std::to_wstring(calleeSlot) + L"）");
+                if (rc == 1) continue;
+                break;
+            }
+            case 0x2F: case 0x31:
+            {   // CALL_MULTI / CALL_NS
+                //
+                // 官方 0x2F（0x004C5BA2 块）：
+                //   · 把 (A, A+1, A+2) 三个槽上移 3 位 → (A+3, A+4, A+5)
+                //     （官方只搬两个实参，故实参个数 = C-1 ≤ 2）
+                //   · 以 A+3（= 原 A）为被调值，实参 = 原 A+1 / A+2
+                //   · 返回值写回槽 A+6（官方写 vm->0x08 = &slot[A+6]）
+                //   · 调用后若槽 A+3 非空 → 槽 A-1 := 槽 A+3，
+                //     并按**下一条 0x22** 的位移跳转（官方 LAB_004C5C2D）
+                //
+                // 官方 0x31（0x004C5B40 块）：
+                //   · 槽 A 是**表** → 取表里第一个非空成员（官方 FUN_004C00C0：
+                //     先扫数组部分再扫哈希部分），键写进槽 A+3 再拷到槽 A+1，
+                //     成员值写进槽 A+4；找到则按下一条 0x22 的位移跳转。
+                //   · 槽 A 是**函数** → 走 0x2F 的调用路径。
+                //   · 其它类型 → 跳过 2 条记录（官方 puVar15 = local_148 + 2）。
+                if (kind == 0x31)
+                {
+                    RtSlot obj = LocalSlot(A);
+                    if (obj.type == 5)
+                    {
+                        Value key, val;
+                        bool found = false;
+                        if (obj.val.t == Value::TableT && obj.val.tab)
+                        {
+                            for (size_t i = 0; i < obj.val.tab->arr.size(); i++)
+                            {
+                                if (obj.val.tab->arr[i].t != Value::Null)
+                                {
+                                    key = Value::Num_((double)(i + 1));
+                                    val = obj.val.tab->arr[i];
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found)
+                            {
+                                for (auto it = obj.val.tab->map.begin();
+                                    it != obj.val.tab->map.end(); ++it)
+                                {
+                                    if (it->second.t != Value::Null)
+                                    {
+                                        key = Value::Str_(it->first);
+                                        val = it->second;
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (!found) break;       // 没找到 → 顺序执行（落回下一条 0x22）
+                        SetSlot(A + 3, SlotOfValue(key));
+                        SetSlot(A + 4, SlotOfValue(val));
+                        SetSlot(A + 1, SlotOfValue(key));   // 官方：槽 A+1 := 槽 A+3
+                        if (pc + 1 >= n)
+                            return Fail((int)pc, kind, L"CALL_NS 缺少后继的 JMP(0x22)");
+                        unsigned int nxtNs = code[pc + 1];
+                        if ((nxtNs & 0x3F) != 0x22)
+                            return Fail((int)pc, kind, L"CALL_NS 的后继不是 JMP(0x22)");
+                        int relNs = (int)((nxtNs >> 14) - 0x1FFFE);
+                        long long tNs = (long long)pc + relNs;
+                        if (tNs < 0 || tNs >= (long long)n)
+                            return Fail((int)pc, kind, L"CALL_NS 跳转落点越界");
+                        frame.ip = (size_t)tNs;
+                        break;
+                    }
+                    if (obj.type != 6) { frame.ip = pc + 2; break; }  // 跳过 2 条记录
+                }
+
+                int argc = (C >= 1) ? (int)(C - 1) : 0;
+                if (argc > 2) argc = 2;
+                RtSlot fn2 = LocalSlot(A);
+                std::vector<RtSlot> args2;
+                for (int k = 0; k < argc; k++)
+                    args2.push_back(LocalSlot((unsigned int)(A + 1 + k)));
+                SetSlot(A + 3, LocalSlot(A));
+                SetSlot(A + 4, LocalSlot(A + 1));
+                SetSlot(A + 5, LocalSlot(A + 2));
+
+                long long jump = -1;
+                if (LocalSlot((unsigned int)(A + 3)).type != 0)
+                {
+                    if (pc + 1 >= n)
+                        return Fail((int)pc, kind, L"CALL_MULTI 缺少后继的 JMP(0x22)");
+                    unsigned int nxt = code[pc + 1];
+                    if ((nxt & 0x3F) != 0x22)
+                        return Fail((int)pc, kind, L"CALL_MULTI 的后继不是 JMP(0x22)");
+                    int rel = (int)((nxt >> 14) - 0x1FFFE);
+                    long long t = (long long)pc + rel;
+                    if (t < 0 || t >= (long long)n)
+                        return Fail((int)pc, kind, L"CALL_MULTI 跳转落点越界");
+                    jump = t;
+                }
+                int rc2 = DoCall(fn2, args2, A + 6, A + 3, A - 1, jump);
+                if (rc2 < 0)
+                    return Fail((int)pc, kind, L"调用的对象不是函数（槽 " +
+                        std::to_wstring(A) + L"）");
+                if (rc2 == 1) continue;      // 闭包：尾处理在返回时执行
+                if (jump >= 0)
+                {
+                    // 同步路径（原生函数）：官方尾处理立即生效
+                    if (A - 1 >= 0 && A - 1 < (int)frame.slots.size() &&
+                        A + 3 < (int)frame.slots.size())
+                        SlotPut(frame.slots[(size_t)(A - 1)],
+                            SlotGet(frame.slots[(size_t)(A + 3)]));
+                    frame.ip = (size_t)jump;
+                }
+                break;
+            }
+            case 0x30:   // CALL_VALUE：官方 0x004C661C 块
+            {
+                // 官方：槽 A+1 的类型标签是 6（函数）→ 以 0 个实参调用它，
+                //       返回值写回槽 A+2（官方写 vm->0x08 = &slot[A+2]）；
+                //       类型不是 6 就什么都不做（顺序执行）。
+                RtSlot fn = LocalSlot((unsigned int)(A + 1));
+                if (fn.type != 6) break;
+                std::vector<RtSlot> noargs;
+                int rc = DoCall(fn, noargs, A + 2, -1, -1, -1);
+                if (rc < 0)
+                    return Fail((int)pc, kind, L"调用的对象不是函数（槽 " +
+                        std::to_wstring(A + 1) + L"）");
+                if (rc == 1) continue;
+                break;
+            }
+            case 0x3C:   // CALL_N：官方「显式帧」调用
+            {
+                // 官方 case 0x3c 不是「立即调用」，而是**准备被调帧**：
+                //   把当前帧顶端的槽复制到被调帧的槽区（N = B-1），
+                //   返回槽设成被调帧的第 0 槽。
+                // 官方校验器 FUN_004D4450 要求槽 A..A+B-2 在帧内。
+                // Nodio 用独立帧栈，没有「就地搭临时帧」这一步，
+                // 这里按等价语义实现：以实参个数 B-2 调用槽 A 的被调值，
+                // 返回值写回槽 A+B-1（官方被调帧的第 0 槽 = 调用方看到的返回槽）。
+                int argc = (B >= 2) ? (int)(B - 2) : 0;
                 RtSlot fn = LocalSlot(A);
-                if (!fn.closure && fn.val.t == Value::Func && !fn.val.native)
-                {
-                    // Value::Func 但没有 native → 不是可调用对象
-                }
-
-                if (fn.closure)
-                {
-                    // 解释执行：压入被调方的新帧
-                    RtFrame nf;
-                    nf.chunk = fn.closure->chunk;
-                    if (!nf.chunk)
-                        return Fail((int)pc, kind, L"调用的闭包没有函数体");
-                    int need = argCount + 1;          // 帧槽 0 = self，其余为显式参数
-                    int nSlots = (int)nf.chunk->flags[3];
-                    if (nSlots < need) nSlots = need;
-                    nf.slots.assign((size_t)nSlots, RtSlot());
-                    for (int k = 0; k < argCount; k++)
-                    {
-                        int src = a + 1 + k;
-                        if (src < (int)frame.slots.size())
-                            nf.slots[(size_t)k] = SlotGet(frame.slots[(size_t)src]);
-                    }
-                    nf.upvalues = fn.closure->upvalues;
-                    nf.ns = fn.closure->ownerNs ? fn.closure->ownerNs : frame.ns;
-                    nf.parent = nullptr;   // 帧栈会重排，不留悬挂父指针
-                    nf.retSlot = (b != 0) ? (a + b) : -1;
-                    nf.ip = 0;
-                    frames.push_back(nf);
-                    continue;
-                }
-
-                if (fn.val.t == Value::Func && fn.val.native)
-                {
-                    std::vector<Value> args;
-                    for (int k = 0; k < argCount; k++)
-                    {
-                        int src = a + 1 + k;
-                        if (src < (int)frame.slots.size())
-                            args.push_back(SlotGet(frame.slots[(size_t)src]).val);
-                    }
-                    Value out = fn.val.native(args);
-                    if (b != 0 && (a + b) < (int)frame.slots.size())
-                        SlotPut(frame.slots[(size_t)(a + b)], SlotOfValue(out));
-                    break;
-                }
-
-                return Fail((int)pc, kind, L"调用的对象不是函数（槽 " +
-                    std::to_wstring(a) + L"）");
+                std::vector<RtSlot> args;
+                for (int k = 0; k < argc; k++)
+                    args.push_back(LocalSlot((unsigned int)(A + 1 + k)));
+                int retSlot = (B >= 1) ? (A + (int)B - 1) : -1;
+                int rc = DoCall(fn, args, retSlot, -1, -1, -1);
+                if (rc < 0)
+                    return Fail((int)pc, kind, L"调用的对象不是函数（槽 " +
+                        std::to_wstring(A) + L"）");
+                if (rc == 1) continue;
+                break;
             }
             case 0x2C:   // RET：返回值 = 帧槽 A（B>1 时官方指向帧槽 A+B-1）
             {
@@ -776,9 +972,18 @@ namespace NodioVM
                     return res;
                 }
                 int ret = frame.retSlot;
+                int pcs = frame.postCopySrc, pcd = frame.postCopyDst;
+                long long pj = frame.postJump;
                 frames.pop_back();
                 if (ret >= 0 && ret < (int)frames.back().slots.size())
                     SlotPut(frames.back().slots[(size_t)ret], s);
+                // 官方 0x2F 的尾处理：返回后再拷槽、再跳转
+                if (pcs >= 0 && pcd >= 0 &&
+                    pcs < (int)frames.back().slots.size() &&
+                    pcd < (int)frames.back().slots.size())
+                    SlotPut(frames.back().slots[(size_t)pcd],
+                        SlotGet(frames.back().slots[(size_t)pcs]));
+                if (pj >= 0) frames.back().ip = (size_t)pj;
                 continue;
             }
             case 0x2D:   // ADDEQ：for 循环推进（计数器 += 步长，越界则落空）

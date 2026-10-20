@@ -157,16 +157,31 @@ foreach ($c in $loop) {
     Expect ($r.text -like "*结果: $($c.want)*") "concat/loop $($c.name) = $($c.want)" $r.text
 }
 
+# ---- 1g) 动态调用族（第二十轮）----
+$dyn = @(
+    @{ name = 'callmulti'; want = '12' },   # 0x2F：被调 = 槽 A，实参 = A+1/A+2，返回值 → 槽 A+6
+    @{ name = 'callvalue'; want = '42' },   # 0x30：槽 A+1 是函数 → 0 实参调用，返回值 → 槽 A+2
+    @{ name = 'callns';    want = 'v'  }    # 0x31：槽 A 是表 → 取第一个非空成员的键 → 槽 A+1
+)
+foreach ($c in $dyn) {
+    $f = Join-Path $tmp ($c.name + '.aardio')
+    if (-not (Test-Path $f)) { Expect $false "fixture $($c.name) generated" "missing"; continue }
+    $r = Run-Chunk $f
+    Expect ($r.code -eq 0) "run $($c.name) exits 0" $r.text
+    Expect ($r.text -like "*结果: $($c.want)*") "dynamic call $($c.name) = $($c.want)" $r.text
+}
+
 # ---- 2) 尚未实现的记录种类必须明确报错 ----
 $r = Run-Chunk (Join-Path $tmp 'unsupported.aardio')
 Expect ($r.code -ne 0) 'unsupported kind fails' $r.text
 Expect ($r.text -like '*尚未在记录 VM 中实现*') 'unsupported kind reported' $r.text
+Expect ($r.text -like '*0x3D*') 'unsupported kind is the illegal one' $r.text
 Expect ($r.text -like '*记录号 1*') 'unsupported kind locates pc' $r.text
 
 # ---- 3) 合成块必须能被官方等价校验器判为合法 ----
 $val = Join-Path $repo 'tools\aardio_validate.py'
 if (Test-Path $val) {
-    $all = @($cases + $order + $member + $call + $ns + $loop) | ForEach-Object { $_.name }
+    $all = @($cases + $order + $member + $call + $ns + $loop + $dyn) | ForEach-Object { $_.name }
     foreach ($n in $all) {
         $f = Join-Path $tmp ($n + '.aardio')
         $vout = & $py.Source $val $f 2>&1 | Out-String

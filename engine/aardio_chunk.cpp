@@ -255,14 +255,14 @@ namespace NodioVM
         {0x27, L"JTRUE",         L"A=真值槽 C=立即数(0/1) R18=位移(下一条u32)", L"真值(A) != C 时跳转", AardioImplemented},
         {0x28, L"JTRUE2",        L"A=目标槽 B=真值槽 C=立即数(0/1) R18=位移(下一条u32)", L"真值(B) != C 时跳转，并带上槽 B 的值", AardioImplemented},
         {0x29, L"TAILCALL",      L"B=被调槽", L"尾调用：把当前帧槽[0..B) 当实参调用槽 B 的函数", AardioImplemented},
-        {0x2A, L"CALL",          L"A=被调槽 B=返回槽偏移 C=实参个数提示", L"调用：实参窗口 = 槽 A+1..A+B-1，返回值写入槽 A+B", AardioImplemented},
-        {0x2B, L"CALL_NATIVE",   L"A=被调槽 B=返回槽偏移 C=实参个数提示", L"调用原生函数（实参窗口同上）", AardioImplemented},
+        {0x2A, L"CALL",          L"A=被调槽 C=实参个数+1 B=返回槽偏移", L"调用：实参窗口 = 槽 A+1..A+C-1（实参个数 = C-1），返回值写入槽 A+B", AardioImplemented},
+        {0x2B, L"CALL_NATIVE",   L"A=被调槽 C=实参个数+1 B=返回槽偏移", L"调用原生函数：C=0 时官方推 -1（变参，由被调方取）", AardioImplemented},
         {0x2C, L"RET",           L"A=返回值槽 B=返回值个数", L"返回：返回值 = 帧槽 A（B>1 时官方指向帧槽 A+B-1）", AardioImplemented},
         {0x2D, L"ADDEQ",         L"A=计数器槽 R18=位移", L"for 循环推进：cur = 槽[A+3]（是数值时）否则槽[A]；槽[A] = 槽[A+3] = cur + 槽[A+2]；越界则不赋值并顺序执行，否则跳转", AardioImplemented},
         {0x2E, L"SUBEQ",         L"A=计数器槽 R18=位移", L"槽[A] -= 槽[A+2]，槽[A+3] 清成 null，随后无条件跳转（for 循环的序言）", AardioImplemented},
-        {0x2F, L"CALL_MULTI",    L"A=基址槽 B=实参偏移", L"多值调用：搬运 4 个槽后调用"},
-        {0x30, L"CALL_VALUE",    L"A=基址槽 B=实参偏移", L"调用函数值"},
-        {0x31, L"CALL_NS",       L"A=基址槽 B=实参偏移", L"调用（命名空间/函数值）"},
+        {0x2F, L"CALL_MULTI",    L"A=被调槽 C=实参个数+1(≤3) R18=位移(下一条u32)", L"把 (A,A+1,A+2) 上移 3 位 → (A+3,A+4,A+5)，以 A+3 为被调值调用（实参 = 原 A+1/A+2），返回值写入槽 A+6；调用后若槽 A+3 非空则槽 A-1 := 槽 A+3 并按下一条 0x22 跳转", AardioImplemented},
+        {0x30, L"CALL_VALUE",    L"A=基址槽", L"槽 A+1 是函数（类型 6）时以 0 个实参调用它，返回值写入槽 A+2；否则顺序执行", AardioImplemented},
+        {0x31, L"CALL_NS",       L"A=对象槽 C=实参个数+1 R18=位移(下一条u32)", L"槽 A 是表 → 取第一个非空成员（键写回槽 A+1、值写进槽 A+4）并跳转；槽 A 是函数 → 走 0x2F 调用路径；其它类型 → 跳过 2 条记录", AardioImplemented},
         {0x32, L"BUILD_ARRAY",   L"A=目标表槽 B=源槽数 C=元素个数(C=0则下一条u32是个数)", L"把 A+1..A+B 各槽的元素追加进 A 槽的表", AardioImplemented},
         {0x33, L"GC",            L"—", L"垃圾回收", AardioImplemented},
         {0x34, L"NEW_CLOSURE",   L"A=目标槽 K=嵌套对象下标(18位)", L"建立闭包：捕获条数 = 嵌套对象 flags[0]，紧随其后的 N 条记录（kind 3=上值 / kind 4=局部槽）被消费", AardioImplemented},
@@ -273,7 +273,7 @@ namespace NodioVM
         {0x39, L"SHL",           L"A=目标 B=左 C=右", L"A ← B << C", AardioImplemented},
         {0x3A, L"SHR",           L"A=目标 B=左 C=右", L"A ← B >> C（算术右移）", AardioImplemented},
         {0x3B, L"USHR",          L"A=目标 B=左 C=右", L"A ← B >>> C（逻辑右移）", AardioImplemented},
-        {0x3C, L"CALL_N",        L"A=基址槽 B=实参个数-1", L"带显式实参个数的调用"},
+        {0x3C, L"CALL_N",        L"A=被调槽 B=实参个数+1", L"官方「显式帧」调用：准备被调帧（官方就地搭临时帧，Nodio 用独立帧栈等价实现为直接调用）", AardioImplemented},
     };
 
     const std::vector<AardioKindInfo>& AardioKindTable()

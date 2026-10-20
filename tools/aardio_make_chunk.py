@@ -193,12 +193,45 @@ class Chunk(object):
         return self.emit(rec(0x34, a=a, c=k))
 
     def call(self, a: int, b: int, c: int = 2) -> int:
-        """0x2A CALL：被调值在槽 A，实参窗口 = 槽 A+1..A+B-1，返回槽 = A+B。
+        """0x2A CALL：被调值在槽 A，实参窗口 = 槽 A+1..A+C-1，返回槽 = A+B。
 
-        B 是**返回槽的偏移**（官方 0x2A 装参块 0x004C5A44 写 vm->0x08 = &slot[A+B]）；
-        实参个数 = B-1（其中第一个是 self / 接收者）。
+        官方 0x2A 装参块 0x004C5A44：
+          · 把 (C-1) 压栈作为**实参个数**（C = bits14..22）；
+          · 写 vm->0x08 = &slot[A+B]（B = bits23..31）作为返回槽。
+        官方校验器 FUN_004D4450 的槽位检查「nslots > A + C - 2」
+        正好等价于「实参 = 槽 A+1 .. A+C-1」。
         """
         return self.emit(rec(0x2A, a=a, c=c, b=b))
+
+    # ---- 动态调用族（第二十轮）----
+
+    def call_multi(self, a: int, argc: int, target: int) -> int:
+        """0x2F CALL_MULTI：被调值 = 槽 A，实参个数 = argc（官方只搬两个实参）。
+
+        官方把 (A, A+1, A+2) 上移 3 位 → (A+3, A+4, A+5)，
+        以 A+3（= 原 A）为被调值调用，返回值写回槽 A+6；
+        调用后若槽 A+3 非空 → 槽 A-1 := 槽 A+3，并按**下一条 0x22** 的位移跳转。
+        这里紧跟一条 0x22，落点 = target。
+        """
+        pc = self.emit(rec(0x2F, a=a, c=argc + 1))
+        self.jmp(target)
+        return pc
+
+    def call_value(self, a: int) -> int:
+        """0x30 CALL_VALUE：槽 A+1 是函数（类型 6）时以 0 个实参调用它。
+
+        返回值写回槽 A+2；官方在类型不是 6 时什么都不做（顺序执行）。
+        """
+        return self.emit(rec(0x30, a=a))
+
+    def call_ns(self, a: int, target: int) -> int:
+        """0x31 CALL_NS：槽 A 是表 → 取第一个非空成员（键写回槽 A+1，值写进槽 A+4）。
+
+        官方紧跟一条 0x22（官方校验器要求 0x31/0x2F 的后继必须是 0x22）。
+        """
+        pc = self.emit(rec(0x31, a=a, c=2))
+        self.jmp(target)
+        return pc
 
     def load_upvalue(self, a: int, b: int) -> int:
         """0x03 LOAD_UPVALUE：目标槽 A，上值槽 B。"""
@@ -452,7 +485,7 @@ def build_call():
     c.load_int(1, 5)              # 槽1 = self
     c.load_int(2, 7)              # 槽2 = 参数1
     c.load_int(3, 3)              # 槽3 = 参数2
-    c.call(0, 4, 2)               # 实参 = 槽1..槽3；返回槽 = 槽4
+    c.call(0, 4, 4)               # 实参 = 槽1..槽3（3 个）；返回槽 = 槽4
     c.ret(4)
     return c
 
@@ -468,7 +501,7 @@ def build_params():
     c.new_closure(0, 0)
     c.load_int(1, 3)              # 槽1 = self
     c.load_int(2, 4)              # 槽2 = 参数1
-    c.call(0, 3, 2)               # 实参 = 槽1..槽2；返回槽 = 槽3
+    c.call(0, 3, 3)               # 实参 = 槽1..槽2（2 个）；返回槽 = 槽3
     c.ret(3)
     return c
 
@@ -491,7 +524,7 @@ def build_upvalue():
     c.load_int(0, 10)             # 槽0 = 10
     c.new_closure(1, 0)           # 槽1 = 闭包（1 个上值）
     c.local(0, 0)                 # 捕获项：装箱帧槽 0（kind 4 / LOAD_LOCAL）
-    c.call(1, 2, 1)               # 被调 = 槽1；实参 = 槽2；返回槽 = 槽3
+    c.call(1, 2, 2)               # 被调 = 槽1；实参 = 槽2（1 个）；返回槽 = 槽3
     c.local(4, 0)                 # 槽4 = 帧槽 0（应已被闭包改成 99）
     c.ret(4)
     return c
@@ -517,7 +550,7 @@ def build_recurse():
     body.load_int(5, 1)            # 槽5 = 1
     body.arith(0x19, 4, 4, 5)      # 槽4 = n - 1
     body.local(5, 1)               # 槽5 = n
-    body.call(2, 5, 2)             # f(...)：实参 = 槽3..槽6；返回槽 = 槽7
+    body.call(2, 5, 5)             # f(...)：实参 = 槽3..槽6（4 个）；返回槽 = 槽7
     body.local(6, 1)               # 槽6 = n
     body.arith(0x1A, 7, 7, 6)      # 槽7 = 槽7 * 槽6
     body.jmp(14)                   # → end
@@ -532,7 +565,7 @@ def build_recurse():
     c.get_member(2, ckey)           # 槽2 = ns.f
     c.load_int(3, 0)                # 槽3 = self
     c.load_int(4, 5)                # 槽4 = n = 5
-    c.call(2, 4, 2)                 # f(5)：实参 = 槽3..槽5；返回槽 = 槽6
+    c.call(2, 4, 4)                 # f(5)：实参 = 槽3..槽5（3 个）；返回槽 = 槽6
     c.ret(6)
     return c
 
@@ -631,15 +664,75 @@ def build_forloop():
     return c
 
 
-def build_unsupported():
-    """故意用一条尚未实现的记录（CALL_MULTI 0x2F）→ 记录 VM 必须明确报错
+def build_callmulti():
+    """0x2F CALL_MULTI：被调值在槽 A，实参 = 槽 A+1/A+2，返回值写回槽 A+6
 
-    0x2F 是多值调用（搬运 4 个槽后调用），第十八轮尚未落地；
-    这里用它验证「未实现的种类必须明确报错」。
+    官方 0x004C5BA2 块：把 (A, A+1, A+2) 上移 3 位 → (A+3, A+4, A+5)，
+    以 A+3（= 原 A）为被调值调用；调用后若槽 A+3 非空 → 槽 A-1 := 槽 A+3。
+    这里被调闭包返回 (self + 参数1) = 5 + 7 = 12。
+    """
+    body = Chunk(slots=4)
+    body.arith(0x18, 2, 0, 1)     # 帧槽2 = 帧槽0(self) + 帧槽1(参数1)
+    body.ret(2)
+
+    c = Chunk(slots=10)
+    c.children.append(body)
+    c.new_closure(2, 0)           # 槽2 = 闭包（体 = 子对象 0）
+    c.load_int(3, 5)              # 槽3 = self
+    c.load_int(4, 7)              # 槽4 = 参数1
+    # 0x2F：被调 = 槽2；实参 = 槽3、槽4（2 个）；返回值 → 槽8
+    #      搬运：槽5 = 槽2、槽6 = 槽3、槽7 = 槽4
+    #      调用后：槽1 (= A-1) := 槽5；并按下一条 0x22 跳转
+    c.call_multi(2, 2, 5)         # 0x2F + 紧跟的 0x22（落点 = 记录 5）
+    c.ret(8)
+    return c
+
+
+def build_callvalue():
+    """0x30 CALL_VALUE：槽 A+1 是函数 → 以 0 个实参调用，返回值写回槽 A+2 = 42
+
+    官方 0x004C661C 块：先判槽 A+1 的类型标签是不是 6（函数），
+    是则调用并把返回值写进槽 A+2。
+    """
+    body = Chunk(slots=2)
+    body.load_int(0, 42)          # 帧槽0 = 42
+    body.ret(0)
+
+    c = Chunk(slots=6)
+    c.children.append(body)
+    c.new_closure(1, 0)           # 槽1 = 闭包
+    c.call_value(0)               # 0x30：被调 = 槽1；返回值 → 槽2
+    c.ret(2)
+    return c
+
+
+def build_callns():
+    """0x31 CALL_NS：槽 A 是表 → 取第一个非空成员的键 = "v"
+
+    官方 0x004C5B40 块：槽 A 是表时调用 FUN_004C00C0（先扫数组部分再扫哈希部分），
+    第一个非空成员的键写进槽 A+3 再拷到槽 A+1，成员值写进槽 A+4；
+    找到就按下一条 0x22 的位移跳转。
+    """
+    c = Chunk(slots=8)
+    key = c.add_const("v")
+    c.new_native(0)                # 槽0 = 新命名空间表
+    c.load_int(1, 42)              # 槽1 = 42
+    c.set_member3(0, key, 1)       # ns.v = 42
+    c.call_ns(0, 5)                # 0x31 + 紧跟的 0x22（落点 = 记录 5）
+    c.ret(1)                       # 槽1 = 第一个非空成员的键 = "v"
+    return c
+
+
+def build_unsupported():
+    """故意用一条**非法**记录种类（0x3D，官方只有 0x00..0x3C）→ 必须明确报错
+
+    第二十轮之后 61 种记录全部落地，「未实现的种类」这条路已经走不到；
+    这里改用越界种类验证「非法种类必须明确报错」，而不是静默跳过。
+    记录字的种类字段只有 6 位（0..0x3F），官方只定义了 0x00..0x3C 共 61 种。
     """
     c = Chunk(slots=4)
     c.load_int(0, 1)
-    c.emit(rec(0x2F, a=1, c=0, b=0))   # CALL_MULTI：记录 VM 尚未实现
+    c.emit(rec(0x3D, a=1, c=0, b=0))   # 0x3D：超出官方 61 种记录的范围
     c.ret(1)
     return c
 
@@ -667,6 +760,9 @@ BUILDERS = {
     "import": build_import,
     "import_new": build_import_new,
     "concat": build_concat,
+    "callmulti": build_callmulti,
+    "callvalue": build_callvalue,
+    "callns": build_callns,
     "forloop": build_forloop,
     "unsupported": build_unsupported,
 }

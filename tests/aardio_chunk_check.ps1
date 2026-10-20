@@ -106,8 +106,8 @@ if (-not (Test-Path (Join-Path $LibDir 'ide\aifix.aardio'))) {
     # ---- S-6：「未实现记录种类」一节（把「Nodio 还缺什么」量化到记录种类）----
     Expect ($dis -like '*== 未实现记录种类 ==*')        'disasm has unimplemented section' $dis
     Expect ($dis -like '*可执行 */61*')                 'disasm reports implemented count' $dis
-    # 第十八轮：0x21 已落地 → 改用仍未实现的 0x2F 校验「操作数角色」这一行
-    Expect ($dis -like '*0x2F CALL_MULTI*A=基址槽*') 'disasm shows operand roles' $dis
+    # 第二十轮：61 种记录全部落地 → 「未实现记录种类」一节为空
+    Expect ($dis -like '*可执行 61/61*')              'disasm reports 61/61 executable' $dis
     # 第十四轮：0x00 / 0x18 已在记录 VM 里落地 → 不再出现在「未实现」一节
     Expect ($dis -notlike '*0x00 LOAD_OUTER*')          'disasm omits implemented kind 0x00' $dis
     Expect ($dis -notlike '*0x18 ADD*')                 'disasm omits implemented kind 0x18' $dis
@@ -133,11 +133,18 @@ if (-not (Test-Path (Join-Path $LibDir 'ide\aifix.aardio'))) {
     Expect ($dis -notlike '*0x2D ADDEQ*')               'disasm omits implemented kind 0x2D' $dis
     Expect ($dis -notlike '*0x2E SUBEQ*')               'disasm omits implemented kind 0x2E' $dis
     $unimpl = @($dis -split "`n" | Where-Object { $_ -match '^\s+0x[0-9A-F]{2}\s' })
-    # 第十八轮：记录 VM 已落地 57 种，剩 4 种未实现（多值与命名空间调用）
-    Expect ($unimpl.Count -eq 4)                        'disasm lists the 4 remaining kinds' $unimpl.Count
-    Expect ($dis -like '*可执行 57/61*')                'disasm reports 57/61 executable' $dis
+    # 第二十轮：记录 VM 已落地 61 种，「未实现记录种类」一节为空
+    Expect ($unimpl.Count -eq 0)                        'disasm lists no remaining kinds' $unimpl.Count
+    Expect ($dis -like '*可执行 61/61*')                'disasm reports 61/61 executable' $dis
+    # 第二十轮：动态调用族（0x2F / 0x30 / 0x31 / 0x3C）也不再出现在「未实现」一节
+    Expect ($dis -notlike '*0x2F CALL_MULTI*A=*')       'disasm omits implemented kind 0x2F' $dis
+    Expect ($dis -notlike '*0x30 CALL_VALUE*A=*')       'disasm omits implemented kind 0x30' $dis
+    Expect ($dis -notlike '*0x31 CALL_NS*A=*')          'disasm omits implemented kind 0x31' $dis
+    Expect ($dis -notlike '*0x3C CALL_N*A=*')           'disasm omits implemented kind 0x3C' $dis
     # 第十六轮：调用约定（实参窗口 / 返回槽）按官方反汇编写进种类表
-    Expect ($dis -like '*0x2F CALL_MULTI*')             'disasm keeps call_multi entry' $dis
+    Expect ($dis -like '*CALL_MULTI=13*')               'disasm keeps call_multi histogram entry' $dis
+    Expect ($dis -like '*CALL_VALUE=13*')               'disasm keeps call_value histogram entry' $dis
+    Expect ($dis -like '*CALL_NS=12*')                  'disasm keeps call_ns histogram entry' $dis
     # ---- S-1b：「结构校验」一节（官方校验器 FUN_004D4450 的等价实现）----
     Expect ($dis -like '*== 结构校验 ==*')             'disasm has validate section' $dis
     Expect ($dis -like '*对象 97  记录 8734  违规 0*') 'disasm validate counts' $dis
