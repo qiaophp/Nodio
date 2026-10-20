@@ -23,6 +23,9 @@
 #   6) 官方真实样本（lib/ide/aifix.aardio）在记录 VM 上**优雅失败**
 #      （报「尚未实现」而不是崩溃）。
 #
+# 第十七轮新增：命名空间与导入（0x15 NEW_NATIVE / 0x16 IMPORT_MEMBER）——
+#   新建命名空间表、导入模块名（含全局里没有的名字）、导入后模块命名空间切换。
+#
 # 用法: powershell -File aardio_run_check.ps1 [-Exe <nodio.exe>]
 param($Exe = 'D:\Nodio\build-x64\Release\nodio.exe',
       [string]$LibDir = 'D:\aardio\lib')
@@ -125,6 +128,20 @@ foreach ($c in $call) {
     Expect ($r.text -like "*结果: $($c.want)*") "call frame $($c.name) = $($c.want)" $r.text
 }
 
+# ---- 1e) 命名空间与导入（第十七轮）----
+$ns = @(
+    @{ name = 'new_native'; want = '42' },   # 0x15 新建命名空间 → 写成员 → 读回
+    @{ name = 'import';     want = '42' },   # 0x16 import "mod" → 模块命名空间切换
+    @{ name = 'import_new'; want = '7'  }    # 0x16 导入不存在的名字 → 就地建空命名空间
+)
+foreach ($c in $ns) {
+    $f = Join-Path $tmp ($c.name + '.aardio')
+    if (-not (Test-Path $f)) { Expect $false "fixture $($c.name) generated" "missing"; continue }
+    $r = Run-Chunk $f
+    Expect ($r.code -eq 0) "run $($c.name) exits 0" $r.text
+    Expect ($r.text -like "*结果: $($c.want)*") "namespace $($c.name) = $($c.want)" $r.text
+}
+
 # ---- 2) 尚未实现的记录种类必须明确报错 ----
 $r = Run-Chunk (Join-Path $tmp 'unsupported.aardio')
 Expect ($r.code -ne 0) 'unsupported kind fails' $r.text
@@ -134,7 +151,7 @@ Expect ($r.text -like '*记录号 1*') 'unsupported kind locates pc' $r.text
 # ---- 3) 合成块必须能被官方等价校验器判为合法 ----
 $val = Join-Path $repo 'tools\aardio_validate.py'
 if (Test-Path $val) {
-    $all = @($cases + $order + $member + $call) | ForEach-Object { $_.name }
+    $all = @($cases + $order + $member + $call + $ns) | ForEach-Object { $_.name }
     foreach ($n in $all) {
         $f = Join-Path $tmp ($n + '.aardio')
         $vout = & $py.Source $val $f 2>&1 | Out-String

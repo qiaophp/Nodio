@@ -16,7 +16,8 @@
 // （0x05/0x06/0x07/0x08/0x09/0x0A/0x0B/0x0C/0x0D/0x10/0x11/0x12/0x13/0x14/0x17、
 //  0x32），以及第十六轮的**调用帧与闭包**：
 //   0x0E STORE_UPVALUE / 0x0F LOAD_IF_SET / 0x29 TAILCALL / 0x2A CALL /
-//   0x2B CALL_NATIVE / 0x34 NEW_CLOSURE
+//   0x2B CALL_NATIVE / 0x34 NEW_CLOSURE，以及第十七轮的**命名空间与导入**：
+//   0x15 NEW_NATIVE / 0x16 IMPORT_MEMBER
 // 其余种类一律明确报错（种类 + 记录号），不静默跳过。
 #include "aardio_vm.h"
 
@@ -270,7 +271,8 @@ namespace NodioVM
         case 0x00: case 0x01: case 0x02: case 0x03: case 0x04:
         case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0A:
         case 0x0B: case 0x0C: case 0x0D: case 0x0E: case 0x0F:
-        case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x17:
+        case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
+        case 0x16: case 0x17:
         case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D:
         case 0x1E: case 0x1F: case 0x20:
         case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x28:
@@ -301,6 +303,14 @@ namespace NodioVM
         // VM 暂存槽（官方 vm+0x40）：0x07/0x0D 的对象
         RtSlot scratch;
 
+        // 全局命名空间（官方 DAT_007C89B0 的运行期表）：
+        //   · VM 暂存槽 vm+0x40 指向它 —— 0x07 GET_MEMBER2 / 0x0D SET_MEMBER2
+        //     的对象就是它（实测：官方样本根 chunk 的第一条 GET_MEMBER2
+        //     从 vm+0x40 取到的是全局函数）；
+        //   · 模块命名空间与 0x15 建出的命名空间，父表都指向它
+        //     （官方 FUN_004C0810 建表时写死 puVar3[4] = &DAT_007C89B0）。
+        std::shared_ptr<Table> globalNs = std::make_shared<Table>();
+
         {
             RtFrame f;
             f.chunk = &root;
@@ -308,9 +318,10 @@ namespace NodioVM
             if (nSlots < 0) nSlots = 0;
             f.slots.assign((size_t)nSlots, RtSlot());
             f.ns = std::make_shared<Table>();
+            f.ns->parent = globalNs;
             frames.push_back(f);
         }
-        scratch = SlotOf(Value::Table_(frames[0].ns));
+        scratch = SlotOf(Value::Table_(globalNs));
 
         auto Cur = [&]() -> RtFrame& { return frames.back(); };
 
@@ -343,6 +354,15 @@ namespace NodioVM
                 }
             }
             return SlotOf(v);
+        };
+
+        // Value::Pointer（闭包）→ 闭包对象；不是闭包则返回空
+        auto ClosureOfValue = [&](const Value& v) -> std::shared_ptr<RtClosure>
+        {
+            if (v.t != Value::Pointer) return nullptr;
+            for (size_t i = 0; i < arena.size(); i++)
+                if (arena[i].get() == v.ptr) return arena[i];
+            return nullptr;
         };
 
         while (!frames.empty())
@@ -816,6 +836,99 @@ namespace NodioVM
                             *member = val.val;
                     }
                 }
+                break;
+            }
+            case 0x15:   // NEW_NATIVE：新建命名空间表（父表 = 全局命名空间）
+            {
+                // 官方 FUN_004C0810：分配一张 type 5 的**空表**，父表写死全局内建表
+                // （puVar3[4] = &DAT_007C89B0），表内容由随后的 SET_MEMBER3 填。
+                // B / C 是两个打包的小整数位域（((x & 7) + 8) << (x >> 3 - 1)），
+                // 官方只把它落到表标志位上，确切含义尚未查明（见 docs §7.8）。
+                std::shared_ptr<Table> ns = std::make_shared<Table>();
+                ns->parent = globalNs;
+                SetSlot(A, SlotOf(Value::Table_(ns)));
+                break;
+            }
+            case 0x16:   // IMPORT_MEMBER：名字 = B 操作数（bit8=1 → 常量），目标 = 槽 C
+            {
+                // 官方 FUN_004C3B80：
+                //   · 目标槽若已是表 → 以它为查找起点；否则目标槽 ← 原模块命名空间；
+                //   · 名字是字符串时按 '.' 逐段查表；名字以 '.' 开头则从
+                //     VM 暂存槽（= 全局命名空间）开始查；
+                //   · 查不到的段**就地建一个空命名空间**并登记在当前表里；
+                //   · 最后模块命名空间 ← 解析出来的命名空间。
+                RtSlot name = Operand9(B);
+                int dest = (int)(C & 0x1FF);
+                std::shared_ptr<Table> ctx;
+                RtSlot destSlot = (dest >= 0 && dest < (int)frame.slots.size())
+                    ? SlotGet(frame.slots[(size_t)dest]) : RtSlot();
+                if (destSlot.val.t == Value::TableT && destSlot.val.tab)
+                {
+                    ctx = destSlot.val.tab;       // 目标槽已是表 → 以它为起点
+                }
+                else
+                {
+                    if (!frame.ns)
+                        return Fail((int)pc, kind, L"IMPORT_MEMBER：当前没有模块命名空间");
+                    ctx = frame.ns;
+                    SetSlot(dest, SlotOf(Value::Table_(ctx)));
+                }
+
+                if (name.val.t == Value::Str)
+                {
+                    const wstring& path = name.val.s;
+                    size_t pos = 0;
+                    if (!path.empty() && path[0] == L'.')
+                    {
+                        ctx = globalNs;            // 绝对路径：从全局命名空间开始
+                        pos = 1;
+                    }
+                    while (pos <= path.size())
+                    {
+                        size_t dot = path.find(L'.', pos);
+                        size_t end = (dot == wstring::npos) ? path.size() : dot;
+                        wstring seg = path.substr(pos, end - pos);
+                        if (!seg.empty())
+                        {
+                            Value found;
+                            if (ctx && RtTableFind(ctx, KeyOfValue(Value::Str_(seg)), &found))
+                            {
+                                if (found.t == Value::TableT && found.tab)
+                                {
+                                    ctx = found.tab;
+                                }
+                                else
+                                {
+                                    // 闭包 → 取它的属主命名空间（官方 FUN_004C3B80 的 type 6 分支）
+                                    std::shared_ptr<RtClosure> cl = ClosureOfValue(found);
+                                    if (cl && cl->ownerNs) ctx = cl->ownerNs;
+                                    else
+                                        return Fail((int)pc, kind,
+                                            L"IMPORT_MEMBER：导入的成员不是命名空间：" + seg);
+                                }
+                            }
+                            else
+                            {
+                                std::shared_ptr<Table> sub = std::make_shared<Table>();
+                                sub->parent = globalNs;
+                                if (ctx)
+                                    RtTableSet(ctx, KeyOfValue(Value::Str_(seg)), Value::Table_(sub));
+                                ctx = sub;
+                            }
+                        }
+                        if (dot == wstring::npos) break;
+                        pos = dot + 1;
+                    }
+                }
+                else if (name.val.t == Value::TableT && name.val.tab)
+                {
+                    ctx = name.val.tab;           // 名字本身就是一张表 → 直接用它
+                }
+                else
+                {
+                    return Fail((int)pc, kind, L"IMPORT_MEMBER：名字既不是字符串也不是表");
+                }
+                frame.ns = ctx;
                 break;
             }
             case 0x17:   // METHOD_PREP：结果 = A 槽，A+1 = B 槽副本，键 = C 槽

@@ -208,6 +208,23 @@ class Chunk(object):
         """0x0E STORE_UPVALUE：源槽 A，上值槽 B（按引用写入）。"""
         return self.emit(rec(0x0E, a=a, b=b))
 
+    # ---- 命名空间与导入（第十七轮）----
+
+    def new_native(self, a: int, b: int = 0, c: int = 0) -> int:
+        """0x15 NEW_NATIVE：目标槽 A ← 新建的命名空间表（父表 = 全局命名空间）。
+
+        B / C 是官方打包的两个小整数位域（((x & 7) + 8) << (x >> 3 - 1)），
+        官方只把它落到表标志位上，语义尚未查明（docs §7.8）。
+        """
+        return self.emit(rec(0x15, a=a, c=c, b=b))
+
+    def import_member(self, dest: int, name_operand: int) -> int:
+        """0x16 IMPORT_MEMBER：名字 = B 操作数（bit8=1 → 常量下标），目标 = 槽 C。
+
+        官方描述符：0x16 的 C 段寻址类别 = 局部槽下标，B 段 = 常量或局部槽。
+        """
+        return self.emit(rec(0x16, a=0, c=dest, b=name_operand))
+
     # ---- 序列化 ----
 
     def body(self) -> bytes:
@@ -497,15 +514,68 @@ def build_recurse():
     return c
 
 
-def build_unsupported():
-    """故意用一条尚未实现的记录（NEW_NATIVE 0x15）→ 记录 VM 必须明确报错
+def build_new_native():
+    """0x15 NEW_NATIVE：新建命名空间表 → 写成员 → 读回来 = 42
 
-    0x15 是官方「内建函数序号」记录（依赖内建表 DAT_007C89B0），
-    第十六轮尚未落地；这里用它验证「未实现的种类必须明确报错」。
+    官方 FUN_004C0810 建的是一张**空的 type 5 表**（父表 = 全局内建表），
+    表里的成员由随后的 SET_MEMBER3 填 —— 这正是官方样本 aifix.aardio 的写法。
+    """
+    c = Chunk(slots=6)
+    key = c.add_const("v")
+    c.new_native(1)                # 槽1 = 新命名空间
+    c.load_int(2, 42)              # 槽2 = 42
+    c.set_member3(1, key, 2)       # 0x11：ns.v = 槽2
+    c.get_member3(3, 1, key)       # 0x09：槽3 = ns.v
+    c.ret(3)
+    return c
+
+
+def build_import():
+    """0x16 IMPORT_MEMBER：全局.mod ← 命名空间；import "mod" 后读回成员 = 42
+
+    0x0D SET_MEMBER2 写的对象是 VM 暂存槽（vm+0x40）= **全局命名空间**，
+    所以这里先把模块挂到全局，再 import 它。
+    """
+    c = Chunk(slots=8)
+    gkey = c.add_const("mod")
+    mkey = c.add_const("v")
+    c.new_native(1)                # 槽1 = 模块命名空间
+    c.load_int(2, 42)
+    c.set_member3(1, mkey, 2)      # 模块.v = 42
+    c.set_member2(1, gkey)         # 0x0D：全局.mod = 模块
+    c.import_member(3, gkey | 0x100)   # 名字 = 常量 "mod"；目标 = 槽3
+    c.get_member(4, mkey)          # 0x05：模块命名空间已切到 mod → 槽4 = mod.v
+    c.ret(4)
+    return c
+
+
+def build_import_new():
+    """0x16 IMPORT_MEMBER：导入一个**全局里没有**的名字 = 7
+
+    官方 FUN_004C3B80：查不到的段会就地建一张空命名空间并登记在当前表里，
+    然后模块命名空间切到这张新表。
+    """
+    c = Chunk(slots=8)
+    nkey = c.add_const("newmod")
+    vkey = c.add_const("v")
+    c.import_member(2, nkey | 0x100)   # 名字 = "newmod"（全局里没有）→ 目标 = 槽2
+    c.get_member3(1, 2, nkey)          # 槽1 = 槽2["newmod"]（原模块命名空间里新建的那张表）
+    c.load_int(3, 7)
+    c.set_member3(1, vkey, 3)          # newmod.v = 7
+    c.get_member(4, vkey)              # 模块命名空间（已切到 newmod）.v = 7
+    c.ret(4)
+    return c
+
+
+def build_unsupported():
+    """故意用一条尚未实现的记录（CONCAT 0x21）→ 记录 VM 必须明确报错
+
+    0x21 的实参窗口证据仍有歧义（见 docs §7.8），第十七轮尚未落地；
+    这里用它验证「未实现的种类必须明确报错」。
     """
     c = Chunk(slots=4)
     c.load_int(0, 1)
-    c.emit(rec(0x15, a=1))      # NEW_NATIVE：记录 VM 尚未实现内建函数序号
+    c.emit(rec(0x21, a=1, c=0, b=0))   # CONCAT：记录 VM 尚未实现
     c.ret(1)
     return c
 
@@ -529,6 +599,9 @@ BUILDERS = {
     "params": build_params,
     "upvalue": build_upvalue,
     "recurse": build_recurse,
+    "new_native": build_new_native,
+    "import": build_import,
+    "import_new": build_import_new,
     "unsupported": build_unsupported,
 }
 
