@@ -53,26 +53,24 @@ function Expect([bool]$cond, [string]$label, [string]$got) {
     else { $script:fail++; Write-Host "FAIL $label got=[$got]" }
 }
 
-# ---- 1) 官方唯一样本：结构化诊断 ----
+# ---- 1) 官方唯一样本：现在**可以执行**（第二十一轮 / S-1b 阶段 F）----
+#
+#   早期版本这里断言 `import ide.aifix;` 会打印「官方预编译模块 (=aardio) …
+#   暂不可执行 …」的结构化诊断。第二十一轮起，Nodio 的记录 VM 已经能把
+#   官方预编译块**真正跑起来**，所以 import 不再走诊断分支；
+#   结构化诊断（对象数 / 记录数 / 常量数 / 记录流解码 / 结构校验）仍然保留在
+#   `-disasm` 里（见 1b），并且现在多了一条**可执行性**断言。
 if (-not (Test-Path (Join-Path $LibDir 'ide\aifix.aardio'))) {
     Write-Host "SKIP official sample not found under $LibDir"
 } else {
-    $out = Run-Script 'import ide.aifix;' $LibDir
-    Expect ($out -like '*官方预编译模块 (=aardio)*') 'official sample diagnosed' $out
-    Expect ($out -like '*暂不可执行*')              'states not executable'      $out
-    Expect ($out -like '*97 个对象*')                'object count 97'            $out
-    Expect ($out -like '*8734 条指令*')              'code word count 8734'       $out
-    Expect ($out -like '*2173 个常量*')              'constant count 2173'        $out
-    Expect ($out -like '*最大嵌套 4 层*')            'max depth 4'                $out
-    Expect ($out -like '*尚未实现该字节码的解释器*') 'explains the missing part'  $out
-    # 第十一轮新增：记录流按官方运行期布局解码后的结论（官方 aardio 给不出）
-    Expect ($out -like '*记录流已按官方运行期布局解码*') 'record stream decoded'  $out
-    Expect ($out -like '*8734 条记录*')                'record count 8734'        $out
-    Expect ($out -like '*用到 43/61 种记录种类*')       '43 of 61 kinds used'      $out
-    Expect ($out -like '*非法种类 0 条*')               'no illegal kinds'         $out
-    Expect ($out -like '*631 个跳转目标中 631 个落在指令边界上*') 'all jumps resolve' $out
-    # 第十三轮新增：官方校验器 FUN_004D4450 等价实现的结论
-    Expect ($out -like '*结构校验：97 个对象 / 8734 条记录 / 0 处违规*') 'validate result reported' $out
+    $out = Run-Script "import ide.aifix; io.print('AIFIX_IMPORTED');" $LibDir
+    Expect ($out -like '*AIFIX_IMPORTED*')               'official sample imports for real' $out
+    Expect ($out -notlike '*暂不可执行*')                  'official sample no longer unexecutable' $out
+    Expect ($out -notlike '*官方预编译模块 (=aardio)*')    'official sample no longer diagnosed' $out
+    # 块里的函数也要能真正执行到底
+    $out = Run-Script "import ide.aifix; io.print('AIFIX_CALL:', ide.aifix('var a = 1;'));" $LibDir
+    Expect ($out -like '*AIFIX_CALL:*')                   'official precompiled function executes' $out
+    Expect ($out -notlike '*执行失败*')                    'official precompiled function succeeds' $out
 }
 
 # ---- 1b) `-disasm` CLI：反汇编官方预编译块（官方 aardio 完全没有这个能力）----

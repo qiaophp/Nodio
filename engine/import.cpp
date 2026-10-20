@@ -2,6 +2,7 @@
 #include "engine/parser.h"
 #include "engine/compiler.h"
 #include "engine/aardio_chunk.h"
+#include "engine/aardio_vm.h"
 #include <windows.h>
 
 namespace NodioVM
@@ -175,6 +176,235 @@ Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
             }
             return mod;
         }
+
+// ---- RunAardioChunkModule（阶段 F）----
+//
+// 官方预编译块不是一段孤立的字节码：它在运行期要靠**全局命名空间**找
+// `import` 与已导入的标准库模块，靠**模块命名空间**承接自己的成员。
+// 因此这里做三件事：
+//
+//   1) 把 Nodio 的全局根（roots）搬进记录 VM 的全局命名空间，并补上官方块
+//      需要的全局内建：`import`（加载标准库模块）与 `global`
+//      （官方里 global 就是全局命名空间本身）；
+//   2) 按模块的点号路径建好**模块命名空间**（父表 = 全局命名空间）——
+//      这正是官方加载器交给块的那张表（块的 0x06 LOAD_SELF_NS / 0x05
+//      GET_MEMBER 用的就是它）；
+//   3) 记录 VM 执行块。块里的 `import` 调用回到 Nodio 的导入机制，导入结果
+//      同时登记进记录 VM 的全局命名空间（官方语义：导入的模块名全局可见）。
+Value Interp::RunAardioChunkModule(const std::string& raw,
+    const vector<wstring>& names, const wstring& fileKey, wstring* modErr)
+{
+    auto root = std::make_shared<AardioChunkNode>();
+    AardioChunkStats st;
+    wstring perr;
+    if (!ParseAardioChunkTree(raw, root.get(), &st, &perr))
+    {
+        if (modErr) *modErr = L"官方预编译模块 (=aardio) 结构不完整 (" + perr + L")";
+        return Value();
+    }
+
+    // ---- 模块命名空间（官方加载器交给块的那张表）----
+    auto modNs = std::make_shared<Table>();
+    modNs->map[L"self"] = Value::Table_(modNs);
+
+    // 按模块的点号路径**先**绑定（与普通源码模块一致）：
+    // 官方加载器也是先把模块的命名空间挂到路径上再执行块，
+    // 块里的 `import ide` / `import aifix` 才能在全局命名空间里找到它们。
+    vector<wstring> vBind = names;
+    if (vBind.empty()) vBind.push_back(L"module");
+    BindModule(vBind, Value::Table_(modNs));
+
+    // 先登记进模块缓存：官方块可能**自导入**（官方样本 ide/aifix 的块体里
+    // 就有 `global.import("ide.aifix")`），没有缓存就会无限递归。
+    if (!fileKey.empty()) modules[fileKey] = Value::Table_(modNs);
+
+    // ---- 全局命名空间（官方 DAT_007C89B0）----
+    // 必须在绑定之后建：官方块要能从全局命名空间里看到自己这条路径
+    // （例如 ide.aifix 的块里 `import ide` 找的就是全局里的 ide）。
+    auto gns = std::make_shared<Table>();
+    for (auto& kv : roots) gns->map[kv.first] = kv.second;
+
+    // ---- 全局 import 内建 ----
+    //
+    // 官方调用约定：调用区的第 1 个槽是 owner（隐含首参数），实参从第 2 个槽起。
+    // 官方块的 `import x` 语句编译成 `import(owner=模块命名空间, "x")`，
+    // 记录 VM 把 owner 交给被调方语义之外的部分 —— 这里默认导入到
+    // **本块自己的模块命名空间**（官方语义：导入到当前模块）。
+    Interp* self = this;
+    gns->map[L"import"] = NF([self, gns, modNs](vector<Value>& a) -> Value {
+        if (a.empty()) return Value();
+        wstring path;
+        if (a[0].t == Value::Str) path = a[0].s;
+        else if (a.size() >= 2 && a[1].t == Value::Str) path = a[1].s;
+        else return Value();
+        // 点号路径 → 模块名序列
+        vector<wstring> segs;
+        size_t pos = 0;
+        while (pos <= path.size())
+        {
+            size_t dot = path.find(L'.', pos);
+            size_t end = (dot == wstring::npos) ? path.size() : dot;
+            if (end > pos) segs.push_back(path.substr(pos, end - pos));
+            if (dot == wstring::npos) break;
+            pos = dot + 1;
+        }
+        if (segs.empty()) return Value();
+        // 目标命名空间：调用方给的就用它，否则默认本块的模块命名空间
+        shared_ptr<Table> target = modNs;
+        for (size_t i = 0; i < a.size(); i++)
+            if (a[i].t == Value::TableT && a[i].tab) { target = a[i].tab; break; }
+        // 交给 Nodio 的导入机制（走标准库解析 / 命名空间绑定）
+        PNode imp = std::make_shared<Node>();
+        imp->k = Node::Import;
+        imp->names = segs;
+        Value mod = self->DoImport(imp, self->globals.self.get());
+        if (mod.t != Value::TableT || !mod.tab) return mod;
+        // 官方：导入的模块在全局命名空间里可见 —— 同步全局根的顶层条目
+        // （顶层命名空间是同一张表，所以点号路径的后续段自动可见）。
+        for (auto& kv : self->roots) gns->map[kv.first] = kv.second;
+        // 官方：`import a.b.c` 把 a 命名空间挂到调用方的命名空间下
+        // （单段时挂模块自己）。
+        if (target)
+        {
+            Value parentNs = mod;
+            if (segs.size() > 1)
+            {
+                auto itR = self->roots.find(segs[0]);
+                if (itR != self->roots.end()) parentNs = itR->second;
+            }
+            if (parentNs.t == Value::TableT && parentNs.tab)
+                target->map[segs[0]] = parentNs;
+        }
+        return mod;
+    });
+    // 官方里 global 就是全局命名空间本身
+    gns->map[L"global"] = Value::Table_(gns);
+
+    AardioHost host;
+    host.globalNs = gns;
+    host.moduleNs = modNs;
+    host.importModule = [self](const wstring& name, std::shared_ptr<Table>* out) -> bool
+    {
+        if (!out) return false;
+        vector<wstring> segs;
+        size_t pos = 0;
+        while (pos <= name.size())
+        {
+            size_t dot = name.find(L'.', pos);
+            size_t end = (dot == wstring::npos) ? name.size() : dot;
+            if (end > pos) segs.push_back(name.substr(pos, end - pos));
+            if (dot == wstring::npos) break;
+            pos = dot + 1;
+        }
+        if (segs.empty()) return false;
+        PNode imp = std::make_shared<Node>();
+        imp->k = Node::Import;
+        imp->names = segs;
+        Value mod = self->DoImport(imp, self->globals.self.get());
+        if (mod.t != Value::TableT || !mod.tab) return false;
+        *out = mod.tab;
+        return true;
+    };
+    // 官方块会调用官方库里的 .aardio **源函数**（如 string.reduceReplace）：
+    // 记录 VM 不认识源码函数，必须回调宿主解释器执行。
+    host.callHostFunc = [self](const Value& fn, vector<Value>& args,
+        Value* ret, wstring* err) -> bool
+    {
+        bool bErr = false;
+        Value r = self->CallVmFuncStatic(Value(), fn, args, &bErr, err);
+        if (bErr) return false;
+        if (ret) *ret = r;
+        return true;
+    };
+
+    AardioChunkModule mod;
+    mod.root = root;
+    mod.globalNs = gns;
+    mod.moduleNs = modNs;
+
+    AardioRunResult r = RunAardioChunk(*root, &host, &mod);
+    if (!r.ok)
+    {
+        wchar_t hex[8];
+        swprintf_s(hex, L"%02X", r.kind < 0 ? 0 : r.kind);
+        if (modErr)
+            *modErr = L"官方预编译模块 (=aardio) 执行失败: " + r.err +
+                L"（记录号 " + std::to_wstring(r.pc) + L" / 种类 0x" + hex + L"）";
+        return Value();
+    }
+
+    // 块执行期间可能切换过模块命名空间（0x16 IMPORT_MEMBER 会切），
+    // 最终的模块命名空间以根帧的 ns 为准。
+    std::shared_ptr<Table> finalNs = r.ns ? r.ns : modNs;
+    if (finalNs != modNs)
+    {
+        for (auto& kv : modNs->map)
+            if (!finalNs->map.count(kv.first)) finalNs->map[kv.first] = kv.second;
+    }
+    finalNs->map[L"self"] = Value::Table_(finalNs);
+
+    // ---- 块里定义的函数（闭包）→ 宿主可调用的原生函数 ----
+    //
+    // 官方块里的 `aifix` / `markdown` 这类成员在运行期是「闭包对象」
+    // （记录 VM 的 Value::Pointer）。宿主（Nodio 源码、其它官方块）要能
+    // 直接调用它们，所以这里把闭包包装成 Value::Func(native)：
+    // 调用时重新进入记录 VM 执行闭包体。
+    //
+    // 包装范围是**全局命名空间**（官方 DAT_007C89B0 的运行期表）：
+    // 官方块把成员写进的是它 import 到的那个命名空间（官方样本
+    // ide/aifix 写进的是全局的 `ide` 命名空间），不是块自己的命名空间。
+    mod.moduleNs = finalNs;
+    mod.importModule = host.importModule;
+    mod.callHostFunc = host.callHostFunc;
+    {
+        std::set<Table*> seen;
+        std::function<void(std::shared_ptr<Table>&)> wrap =
+            [&](std::shared_ptr<Table>& t)
+        {
+            if (!t || seen.count(t.get())) return;
+            seen.insert(t.get());
+            for (auto& kv : t->map)
+            {
+                if (AardioIsClosure(mod, kv.second))
+                    kv.second = MakeAardioClosureFn(mod, kv.second);
+                else if (kv.second.t == Value::TableT && kv.second.tab)
+                    wrap(kv.second.tab);
+            }
+            for (auto& kv : t->scopeVars)
+            {
+                if (AardioIsClosure(mod, kv.second))
+                    kv.second = MakeAardioClosureFn(mod, kv.second);
+                else if (kv.second.t == Value::TableT && kv.second.tab)
+                    wrap(kv.second.tab);
+            }
+        };
+        wrap(gns);
+        wrap(finalNs);
+    }
+
+    // 模块的值 = **路径上的最终绑定**。
+    // 官方加载器先把模块的命名空间挂到路径上再执行块，块体随后可以把它换掉
+    // （官方样本 ide/aifix 就是把 ide.aifix 换成了 aifix 函数本身，
+    //  __clsAlias__ / __invalidLibs__ 等表也落在 ide 命名空间里）。
+    Value pathVal;
+    {
+        auto itR = roots.find(vBind[0]);
+        if (itR != roots.end())
+        {
+            pathVal = itR->second;
+            for (size_t i = 1; i < vBind.size(); i++)
+            {
+                if (pathVal.t != Value::TableT || !pathVal.tab) { pathVal = Value(); break; }
+                auto itS = pathVal.tab->map.find(vBind[i]);
+                if (itS == pathVal.tab->map.end()) { pathVal = Value(); break; }
+                pathVal = itS->second;
+            }
+        }
+    }
+    if (pathVal.t == Value::Null || !pathVal.tab)
+        pathVal = Value::Table_(finalNs);
+    return pathVal;
+}
 
 // ---- DoImport ----
 Value Interp::DoImport(const PNode& n, Env* env)
@@ -485,9 +715,32 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     if (src.compare(0, 7, L"=aardio") == 0)
                     {
                         // 官方预编译块（aardio.exe 内部称 precompiled chunk）。
-                        // 容器层已经能读，但字节码解释器尚未实现。
-                        modErr = L"格式错误: 官方预编译模块 (=aardio) 暂不可执行 — "
-                                 L"Nodio 尚未实现该字节码的解释器";
+                        // 阶段 F：记录 VM 直接执行它。
+                        // 内嵌载荷是文本形态（UTF-16），先还原成字节再解析。
+                        std::string rawEmbed;
+                        {
+                            int n = WideCharToMultiByte(CP_UTF8, 0, src.data(),
+                                (int)src.size(), nullptr, 0, nullptr, nullptr);
+                            if (n > 0)
+                            {
+                                rawEmbed.resize((size_t)n);
+                                WideCharToMultiByte(CP_UTF8, 0, src.data(),
+                                    (int)src.size(), &rawEmbed[0], n, nullptr, nullptr);
+                            }
+                        }
+                        wstring runErr;
+                        Value modVal = RunAardioChunkModule(rawEmbed, vBind, file, &runErr);
+                        if (modVal.t == Value::Null || !modVal.tab)
+                        {
+                            modErr = runErr.empty()
+                                ? (L"格式错误: 官方预编译模块 (=aardio) 执行失败")
+                                : runErr;
+                        }
+                        else
+                        {
+                            modules[file] = modVal;
+                            return modVal;
+                        }
                     }
                     else
                     {
@@ -714,25 +967,19 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 // error instead of a misleading syntax error.
                 if (IsAardioChunk(raw))
                 {
-                    // 官方预编译块：容器层可以完整解析，给出结构化的诊断，
-                    // 而不是笼统的「不支持的字节码格式」。
-                    AardioChunkNode root;
-                    AardioChunkStats st;
-                    wstring perr;
-                    if (ParseAardioChunkTree(raw, &root, &st, &perr))
+                    // 阶段 F：官方预编译块由记录 VM 直接执行。
+                    wstring runErr;
+                    Value modVal = RunAardioChunkModule(raw, vBind, file, &runErr);
+                    if (modVal.t == Value::Null || !modVal.tab)
                     {
-                        modErr = AardioChunkDiagnostic(st);
-                        // S-1b：再跑一遍官方校验器 FUN_004D4450 的等价实现，
-                        // 把「结构是否合规」也写进诊断（官方给不出这份结论）。
-                        AardioValidateResult vres;
-                        ValidateAardioChunkTree(root, &vres, nullptr);
-                        modErr += L"；结构校验：" + std::to_wstring(vres.objects) +
-                            L" 个对象 / " + std::to_wstring(vres.records) +
-                            L" 条记录 / " + std::to_wstring(vres.errors) + L" 处违规";
+                        modErr = runErr.empty()
+                            ? (L"格式错误: 官方预编译模块 (=aardio) 执行失败")
+                            : runErr;
                     }
                     else
                     {
-                        modErr = L"格式错误: 官方预编译模块 (=aardio) 结构不完整 (" + perr + L")";
+                        modules[file] = modVal;
+                        return modVal;
                     }
                 }
                 else

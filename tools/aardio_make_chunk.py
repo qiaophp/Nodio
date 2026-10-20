@@ -193,24 +193,35 @@ class Chunk(object):
         return self.emit(rec(0x34, a=a, c=k))
 
     def call(self, a: int, b: int, c: int = 2) -> int:
-        """0x2A CALL：被调值在槽 A，实参窗口 = 槽 A+1..A+C-1，返回槽 = A+B。
+        """0x2A CALL：被调值在槽 A，调用区 = 槽 A+1..A+B-1，返回值写回槽 A。
 
-        官方 0x2A 装参块 0x004C5A44：
-          · 把 (C-1) 压栈作为**实参个数**（C = bits14..22）；
-          · 写 vm->0x08 = &slot[A+B]（B = bits23..31）作为返回槽。
-        官方校验器 FUN_004D4450 的槽位检查「nslots > A + C - 2」
-        正好等价于「实参 = 槽 A+1 .. A+C-1」。
+        官方调用约定（owner 模型，四路实测）：
+          · **调用区 = 槽 A+1 .. A+B-1**（B-1 个槽）
+          · **A+1 是 owner**（隐含首参数，对应 aardio 的 `owner`）：
+            0x17 METHOD_PREP 把接收者复制到 A+1；普通调用由编译器显式放入。
+          · **实参 = 槽 A+2 .. A+B-1**（B-2 个）
+          · 被调帧：**槽 0 = owner，槽 1.. = 实参**
+          · **返回值写回调用方槽 A .. A+C-2**（C-1 个）
+            官方 0x2A 装参块 0x004C5A44 压栈的正是 `C-1`（建帧时登记的返回值个数）。
+
+        所以：owner + 2 个实参 → B = 4；返回 1 个值 → C = 2。
         """
         return self.emit(rec(0x2A, a=a, c=c, b=b))
 
     # ---- 动态调用族（第二十轮）----
 
     def call_multi(self, a: int, argc: int, target: int) -> int:
-        """0x2F CALL_MULTI：被调值 = 槽 A，实参个数 = argc（官方只搬两个实参）。
+        """0x2F CALL_MULTI：被调值 = 槽 A，先上移 3 位再调用。
 
-        官方把 (A, A+1, A+2) 上移 3 位 → (A+3, A+4, A+5)，
-        以 A+3（= 原 A）为被调值调用，返回值写回槽 A+6；
-        调用后若槽 A+3 非空 → 槽 A-1 := 槽 A+3，并按**下一条 0x22** 的位移跳转。
+        官方 0x004C5BA2 块：
+          · 把 (A, A+1, A+2) 上移 3 位 → (A+3, A+4, A+5)：
+            A+3 = 被调值、A+4 = owner、A+5 = 实参。
+          · 以 A+3 为被调值调用（官方 `PUSH EAX`，EAX = &slot[A+3]），
+            登记的返回值个数 = **C**（官方 `PUSH ESI`，ESI = bits14..22）。
+          · **返回值写回被调槽 A+3**（与 0x2A 写回被调槽 A 同理）。
+          · 调用后若返回值（槽 A+3）非空 → 槽 A+2 := 槽 A+3，
+            并按下一条 0x22 的位移跳转（官方 0x004C5C2D）；
+            **为空则跳过那条 0x22**（官方 0x004C5C41，循环结束）。
         这里紧跟一条 0x22，落点 = target。
         """
         pc = self.emit(rec(0x2F, a=a, c=argc + 1))
@@ -469,40 +480,39 @@ def build_array():
 def build_call():
     """0x34 NEW_CLOSURE + 0x2A CALL：闭包返回 (参数1 + 参数2) = 10
 
-    官方调用约定：被调值在槽 A，实参窗口 = 槽 A+1..A+B-1（第一个是 self），
-    返回值写入槽 A+B。
-    被调帧的槽布局：**槽 0 = self，槽 1.. = 显式参数**，
-    函数体的局部变量与参数共用同一片槽（官方编译器把局部排在参数之后），
-    所以这里的局部从槽 2 开始。
+    官方调用约定（owner 模型）：
+      调用区 = 槽 A+1..A+B-1，A+1 = owner，实参 = 槽 A+2..A+B-1；
+      被调帧槽 0 = owner、槽 1.. = 实参；返回值写回调用方槽 A。
+    这里 owner + 2 个实参 → B = 4；返回 1 个值 → C = 2。
     """
     body = Chunk(slots=4)
-    body.arith(0x18, 2, 1, 2)     # 槽2 = 帧槽1 + 帧槽2 = 7 + 3
+    body.arith(0x18, 2, 1, 2)     # 帧槽2 = 帧槽1(参数1) + 帧槽2(参数2)
     body.ret(2)
 
     c = Chunk(slots=6)
     c.children.append(body)
-    c.new_closure(0, 0)           # 槽0 = 闭包（体 = 子对象 0）
-    c.load_int(1, 5)              # 槽1 = self
-    c.load_int(2, 7)              # 槽2 = 参数1
-    c.load_int(3, 3)              # 槽3 = 参数2
-    c.call(0, 4, 4)               # 实参 = 槽1..槽3（3 个）；返回槽 = 槽4
-    c.ret(4)
+    c.new_closure(0, 0)           # 槽0 = 闭包（被调值）
+    c.load_int(1, 5)              # 槽1 = owner（A+1）
+    c.load_int(2, 7)              # 槽2 = 参数1（A+2）
+    c.load_int(3, 3)              # 槽3 = 参数2（A+3）
+    c.call(0, 4, 2)               # 调用区 = 槽1..槽3；返回值 → 槽0
+    c.ret(0)
     return c
 
 
 def build_params():
-    """调用带参数的闭包：self + 参数1 = 3 + 4 = 7"""
+    """调用带参数的闭包：owner + 参数1 = 3 + 4 = 7"""
     body = Chunk(slots=4)
-    body.arith(0x18, 2, 0, 1)     # 槽2 = 帧槽0(self) + 帧槽1(参数1)
+    body.arith(0x18, 2, 0, 1)     # 帧槽2 = 帧槽0(owner) + 帧槽1(参数1)
     body.ret(2)
 
     c = Chunk(slots=6)
     c.children.append(body)
     c.new_closure(0, 0)
-    c.load_int(1, 3)              # 槽1 = self
+    c.load_int(1, 3)              # 槽1 = owner
     c.load_int(2, 4)              # 槽2 = 参数1
-    c.call(0, 3, 3)               # 实参 = 槽1..槽2（2 个）；返回槽 = 槽3
-    c.ret(3)
+    c.call(0, 3, 2)               # 调用区 = 槽1..槽2（owner + 1 实参）；返回值 → 槽0
+    c.ret(0)
     return c
 
 
@@ -536,37 +546,37 @@ def build_recurse():
     闭包先存进**模块命名空间**（0x0C SET_MEMBER），函数体再用 0x05 GET_MEMBER
     把「自己」取回来调用 —— 这条路径同时验证：
       闭包能进表 / 能从表取回 / 闭包的属主命名空间对帧可见 / 嵌套帧。
+    调用约定同 build_call：被调 = 槽2、owner = 槽3、实参 = 槽4；
+    返回值写回被调槽（槽2）。
     """
     body = Chunk(slots=8)
     key = body.add_const("f")
-    # 被调帧：槽 0 = self，槽 1 = 参数 n，**局部变量从槽 2 起**
+    # 被调帧：槽 0 = owner，槽 1 = 参数 n，**局部变量从槽 2 起**
     body.get_member(2, key)        # 槽2 = ns.f（自己）
-    body.local(3, 1)               # 槽3 = 帧槽1（参数 n）
-    body.load_int(4, 1)            # 槽4 = 1
-    # 注意：cond() 会连发**两条**记录（条件记录 + 一条 0x22），所以后面的
-    # 记录号要 +1：base = 13、end = 14。
-    body.cond(0x26, 1, 3, 4, 13)   # if (n <= 1) → base
-    body.local(4, 1)               # 槽4 = n
-    body.load_int(5, 1)            # 槽5 = 1
-    body.arith(0x19, 4, 4, 5)      # 槽4 = n - 1
-    body.local(5, 1)               # 槽5 = n
-    body.call(2, 5, 5)             # f(...)：实参 = 槽3..槽6（4 个）；返回槽 = 槽7
-    body.local(6, 1)               # 槽6 = n
-    body.arith(0x1A, 7, 7, 6)      # 槽7 = 槽7 * 槽6
-    body.jmp(14)                   # → end
-    body.load_int(7, 1)            # base：槽7 = 1
-    body.ret(7)                    # end：返回槽7
+    body.local(3, 0)               # 槽3 = 帧槽0（owner）
+    body.local(4, 1)               # 槽4 = 帧槽1（参数 n）
+    body.local(6, 1)               # 槽6 = n（留作乘数）
+    body.load_int(7, 1)            # 槽7 = 1
+    # 注意：cond() 会连发**两条**记录（条件记录 + 一条 0x22），所以下面的
+    # 记录号要 +1：base = 11、end = 12。
+    body.cond(0x26, 1, 4, 7, 11)   # if (n <= 1) → base
+    body.arith(0x19, 4, 4, 7)      # 槽4 = n - 1（实参）
+    body.call(2, 4, 2)             # f(n-1)：被调 = 槽2、owner = 槽3、实参 = 槽4；返回值 → 槽2
+    body.arith(0x1A, 2, 2, 6)      # 槽2 = 槽2(返回值) * 槽6(n)
+    body.jmp(12)                   # → end
+    body.load_int(2, 1)            # base：槽2 = 1
+    body.ret(2)                    # end：返回槽2
 
     c = Chunk(slots=8)
     c.children.append(body)
     ckey = c.add_const("f")
     c.new_closure(0, 0)             # 槽0 = 闭包
     c.set_member(0, ckey)           # ns.f = 闭包
-    c.get_member(2, ckey)           # 槽2 = ns.f
-    c.load_int(3, 0)                # 槽3 = self
+    c.get_member(2, ckey)           # 槽2 = ns.f（被调值）
+    c.load_int(3, 0)                # 槽3 = owner
     c.load_int(4, 5)                # 槽4 = n = 5
-    c.call(2, 4, 4)                 # f(5)：实参 = 槽3..槽5（3 个）；返回槽 = 槽6
-    c.ret(6)
+    c.call(2, 4, 2)                 # f(5)：返回值 → 槽2
+    c.ret(2)
     return c
 
 
@@ -665,26 +675,26 @@ def build_forloop():
 
 
 def build_callmulti():
-    """0x2F CALL_MULTI：被调值在槽 A，实参 = 槽 A+1/A+2，返回值写回槽 A+6
+    """0x2F CALL_MULTI：被调值在槽 A，先上移 3 位再调用，返回值写回槽 A+3
 
     官方 0x004C5BA2 块：把 (A, A+1, A+2) 上移 3 位 → (A+3, A+4, A+5)，
-    以 A+3（= 原 A）为被调值调用；调用后若槽 A+3 非空 → 槽 A-1 := 槽 A+3。
-    这里被调闭包返回 (self + 参数1) = 5 + 7 = 12。
+    以 A+3（= 原 A）为被调值调用；返回值写回**被调槽 A+3**；
+    调用后若返回值非空 → 槽 A+2 := 槽 A+3，并按下一条 0x22 跳转。
+    这里被调闭包返回 (owner + 参数1) = 5 + 7 = 12。
     """
     body = Chunk(slots=4)
-    body.arith(0x18, 2, 0, 1)     # 帧槽2 = 帧槽0(self) + 帧槽1(参数1)
+    body.arith(0x18, 2, 0, 1)     # 帧槽2 = 帧槽0(owner) + 帧槽1(参数1)
     body.ret(2)
 
     c = Chunk(slots=10)
     c.children.append(body)
     c.new_closure(2, 0)           # 槽2 = 闭包（体 = 子对象 0）
-    c.load_int(3, 5)              # 槽3 = self
+    c.load_int(3, 5)              # 槽3 = owner
     c.load_int(4, 7)              # 槽4 = 参数1
-    # 0x2F：被调 = 槽2；实参 = 槽3、槽4（2 个）；返回值 → 槽8
-    #      搬运：槽5 = 槽2、槽6 = 槽3、槽7 = 槽4
-    #      调用后：槽1 (= A-1) := 槽5；并按下一条 0x22 跳转
-    c.call_multi(2, 2, 5)         # 0x2F + 紧跟的 0x22（落点 = 记录 5）
-    c.ret(8)
+    # 0x2F：被调 = 槽2 → 移位到槽5；owner = 槽3 → 槽6；实参 = 槽4 → 槽7
+    #      返回值 → 槽5（A+3）；非空 → 槽4 := 槽5，并按下一条 0x22 跳转
+    c.call_multi(2, 1, 5)         # 0x2F + 紧跟的 0x22（落点 = 记录 5）
+    c.ret(5)                      # 返回槽5 = 12
     return c
 
 

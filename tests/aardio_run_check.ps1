@@ -61,6 +61,22 @@ function Run-Chunk([string]$path) {
     return @{ code = $p.ExitCode; text = (($o.Result + $e.Result) -replace "`r", '').Trim() }
 }
 
+function Run-Code([string]$code) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = "-e `"$code`""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $o = $p.StandardOutput.ReadToEndAsync()
+    $e = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(60000)) { $p.Kill(); $p.WaitForExit(3000) }
+    return @{ code = $p.ExitCode; text = (($o.Result + $e.Result) -replace "`r", '').Trim() }
+}
+
 # ---- 0) 合成夹具（用官方格式文法写出）----
 $gen = Join-Path $repo 'tools\aardio_make_chunk.py'
 if (-not (Test-Path $gen)) { "SKIP generator missing: $gen"; exit 0 }
@@ -169,6 +185,29 @@ foreach ($c in $dyn) {
     $r = Run-Chunk $f
     Expect ($r.code -eq 0) "run $($c.name) exits 0" $r.text
     Expect ($r.text -like "*结果: $($c.want)*") "dynamic call $($c.name) = $($c.want)" $r.text
+}
+
+# ---- 1h) 官方预编译块经宿主导入并**真正执行**（第二十一轮）----
+#   官方 ide/aifix.aardio 是「=aardio」预编译块（根 524 记录 + 4 个嵌套对象，
+#   其中子对象 0 是 5153 记录的函数体）。这里让宿主 import 它再调用块里的函数，
+#   验证「记录 VM 能把官方块跑到底」——这是 S-1b 阶段 F 的验收点。
+$officialSample = Join-Path $LibDir 'ide\aifix.aardio'
+if (Test-Path $officialSample) {
+    $env:NODIO_LIBDIR = $LibDir
+    $r = Run-Code "import ide.aifix; io.print('AIFIX_TYPE:', type(ide.aifix));"
+    Expect ($r.code -eq 0) 'official precompiled module imports' $r.text
+    Expect ($r.text -like '*AIFIX_TYPE:*') 'official precompiled module exposes function' $r.text
+
+    $r = Run-Code "import ide.aifix; io.print('AIFIX_OUT:', ide.aifix('var a = 1;'));"
+    Expect ($r.code -eq 0) 'official precompiled function runs to completion' $r.text
+    Expect ($r.text -like '*AIFIX_OUT:*') 'official precompiled function returns a value' $r.text
+    Expect ($r.text -notlike '*执行失败*') 'official precompiled function does not fail' $r.text
+
+    $r = Run-Code "import autos.tools.handlers; io.print('HANDLERS_OK');"
+    Expect ($r.code -eq 0) 'module depending on precompiled block imports' $r.text
+    Expect ($r.text -like '*HANDLERS_OK*') 'module depending on precompiled block works' $r.text
+} else {
+    Write-Host "SKIP official precompiled sample not found under $LibDir"
 }
 
 # ---- 2) 尚未实现的记录种类必须明确报错 ----

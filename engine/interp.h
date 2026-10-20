@@ -165,6 +165,11 @@ namespace NodioVM
                                const Value& vThis, bool bMethod = false);
         Value Exec(const PNode& n, Env* env);
         Value GetRoot(const wstring& name);
+        // 阶段 F：执行官方 "=aardio" 预编译块，返回模块命名空间
+        // （失败时返回空值并把原因写进 modErr）
+        // fileKey = 该块在模块缓存里的键（官方块可能自导入，必须先入缓存）
+        Value RunAardioChunkModule(const std::string& raw,
+            const vector<wstring>& names, const wstring& fileKey, wstring* modErr);
         Value NsPath(const vector<wstring>& names, Env* env = nullptr,
                      bool bRoot = false);
         Value CallVmFunc(const Value& f, vector<Value>& args);

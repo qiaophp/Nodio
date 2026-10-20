@@ -32,6 +32,35 @@
 
 namespace NodioVM
 {
+    // ------------------------------------------------------------------
+    // 阶段 F：宿主接线
+    //
+    // 官方预编译块不是孤立的字节码：它在运行期要访问**全局命名空间**
+    // （官方 DAT_007C89B0，解释器里的 vm+0x40），并且会调用全局内建
+    // （`import` 等）与官方标准库模块。Nodio 要执行官方块，就得把这三样
+    // 交给记录 VM：
+    //
+    //   · globalNs     全局命名空间（0x07 GET_MEMBER2 / 0x0D SET_MEMBER2
+    //                   的对象就是它；所有 `import` 进来的模块也登记在这里）
+    //   · moduleNs     模块自己的命名空间（官方 0x15 建的表、父表 = globalNs；
+    //                   官方里模块的命名空间是「加载器建好后交给块」的）
+    //   · importModule 0x16 IMPORT_MEMBER / 全局 import 内建要用的模块加载器
+    // ------------------------------------------------------------------
+    struct AardioHost
+    {
+        // 全局命名空间：为 null 时 VM 自建一张空表（离线反汇编/自测用）
+        std::shared_ptr<Table> globalNs;
+        // 模块命名空间：为 null 时 VM 自建一张空表（父表 = globalNs）
+        std::shared_ptr<Table> moduleNs;
+        // 按点号路径加载官方模块（如 L"ide.aifix"）；成功返回命名空间
+        std::function<bool(const wstring& name, std::shared_ptr<Table>* out)> importModule;
+        // 调用宿主（普通 aardio 源码）里的函数。官方块会调用官方库里的
+        // .aardio 源函数（如 string.reduceReplace），记录 VM 必须能回调
+        // 宿主解释器执行它们。
+        std::function<bool(const Value& fn, std::vector<Value>& args,
+            Value* ret, wstring* err)> callHostFunc;
+    };
+
     // 一次执行的结论
     struct AardioRunResult
     {
@@ -41,13 +70,47 @@ namespace NodioVM
         int pc = -1;          // 失败时的记录号（chunk 内）
         int kind = -1;        // 失败时的记录种类
         int steps = 0;        // 实际执行的记录条数
+        std::shared_ptr<Table> ns;   // 模块命名空间（执行后的根帧 ns）
+    };
+
+    // ------------------------------------------------------------------
+    // 官方块模块的**运行期句柄**
+    //
+    // 官方块执行完之后并不就此结束：块里定义的函数（闭包）要能被宿主
+    // （Nodio 源码、其它官方块）继续调用。为此需要三样东西活得比执行过程久：
+    //
+    //   · chunk 树      —— 闭包体是指向 chunk 节点的裸指针，树必须一直在
+    //   · 运行期状态    —— 闭包池（闭包对象本体）+ 全局/模块命名空间
+    //   · 导入回调      —— 块里的 `import` 要继续能加载官方库模块
+    // ------------------------------------------------------------------
+    struct AardioChunkModule
+    {
+        std::shared_ptr<AardioChunkNode> root;       // chunk 树（闭包体的有效性靠它）
+        std::shared_ptr<Table> globalNs;             // 全局命名空间（官方 DAT_007C89B0）
+        std::shared_ptr<Table> moduleNs;             // 模块命名空间
+        std::shared_ptr<void> runtime;               // 记录 VM 的闭包池（内部类型）
+        std::function<bool(const wstring&, std::shared_ptr<Table>*)> importModule;
+        std::function<bool(const Value&, std::vector<Value>&, Value*, wstring*)> callHostFunc;
     };
 
     // 执行一个官方预编译块的记录流。
     // 目前支持：取值 / 算术 / 位运算 / 比较 / 分支 / 返回 / 成员访问 / 数组构造 /
     // 闭包与调用帧 / 命名空间与导入；字符串拼接、复合赋值、多值调用等
     // 仍会明确报「尚未实现」。
-    AardioRunResult RunAardioChunk(const AardioChunkNode& root);
+    // host 可为 null（离线执行：全局命名空间为空、模块加载不可用）。
+    // mod 非空时，执行状态（闭包池等）会写进 mod，供后续宿主调用块内函数。
+    AardioRunResult RunAardioChunk(const AardioChunkNode& root,
+        const AardioHost* host = nullptr, AardioChunkModule* mod = nullptr);
+
+    // 调用官方块里定义的函数（闭包）。callee 是 Value::Pointer（闭包对象）。
+    bool CallAardioClosure(AardioChunkModule& mod, const Value& callee,
+        std::vector<Value>& args, Value* ret, wstring* err);
+
+    // 把官方块里定义的函数包装成宿主可调用的原生函数（Value::Func）。
+    Value MakeAardioClosureFn(AardioChunkModule& mod, const Value& callee);
+
+    // 该值是否是本模块闭包池里的函数（Value::Pointer）。
+    bool AardioIsClosure(const AardioChunkModule& mod, const Value& v);
 
     // 记录 VM 已能执行的记录种类数（0..61），与 -disasm 的「可执行 N/61」一致
     int AardioVmImplementedKindCount();
