@@ -365,6 +365,29 @@
 >    以及 `member`/`member2`/`member3`/`index`/`method`/`array` 六个
 >    成员访问族夹具；所有夹具都必须能被官方等价校验器判为合法。
 >    `tests/aardio_chunk_check.ps1` 同步到 46 项（x64/x86 双绿）。
+> **第十六轮（S-1b 第四阶段：调用帧与闭包落地）**。
+> ① **调用约定定案**（`docs/aardio-bytecode.md` §7.5.5）：
+>    被调值 = 槽 `A`；**实参窗口 = 槽 `A+1`..`A+B-1`**（第一个是 self）；
+>    **返回槽 = 槽 `A+B`**（官方 0x2A 装参块 `0x004C5A44` 写
+>    `vm->0x08 = &slot[A+B]`）；帧槽 0 = self、槽 1.. = 显式参数，
+>    函数体的局部变量与参数共用同一片槽。
+> ② **闭包语义定案**：捕获条数 = 嵌套对象的 `flags[0]`（运行时 +0x48），
+>    紧随的 N 条 kind 3/4 记录是捕获项并被**消费**；上值**按引用**
+>    （`FUN_004D5210` 的 cell 指向定义帧的局部槽）。
+> ③ **官方样本全量自证**：`aifix.aardio` 的 96 个 `0x34` 记录逐个校验
+>    「捕获条数 + 后继记录种类」→ **0 违规**；顺带纠正第十五轮把根的
+>    `/1` 误记成 `/0/1` 造成的「捕获条数矛盾」假冲突。
+> ④ 记录 VM 改为**帧栈**（闭包 = `RtClosure`、上值 = `RtCell` 盒），
+>    落地 `0x0E` / `0x0F` / `0x29` / `0x2A` / `0x2B` / `0x34`，
+>    `-disasm` 进度从 `可执行 46/61` 变成 **`可执行 52/61`**（剩 9 种：
+>    原生函数 / 导入成员 / 字符串拼接 / 复合赋值 / 多值调用）。
+> ⑤ 回归：`tests/aardio_run_check.ps1` 扩到 **55 项**（x64/x86 双绿）——
+>    新增 `call`(10)、`params`(7)、`upvalue`(99) 三个调用与闭包夹具；
+>    `tests/aardio_chunk_check.ps1` 同步到 52 项（x64/x86 双绿）。
+> **下一步（S-1b 第四阶段续）**：原生函数（`0x15`）、导入成员（`0x16`）、
+>    字符串拼接（`0x21`）、复合赋值（`0x2D`/`0x2E`）、
+>    多值调用（`0x2F`–`0x31`、`0x3C`），
+>    补齐剩下 9 种 → 官方 `lib/ide/aifix.aardio` 真正跑起来。
 > **下一步（S-1b 第四阶段）**：调用帧与闭包（`0x29`–`0x2B`、`0x2F`–`0x31`、
 >    `0x3C`、`0x34`）、原生函数（`0x15`）、导入成员（`0x16`），
 >    补齐剩下 15 种 → 官方 `lib/ide/aifix.aardio` 真正跑起来。
@@ -756,7 +779,21 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
       **Ctrl+S / Ctrl+N / Ctrl+O / Ctrl+W / Ctrl+F9 一个都没注册上**；
       已全部改正并补上 Ctrl+F / Ctrl+H / Ctrl+G / Ctrl+Shift+F。
       详见 `docs/ide-components.md` §4 / §14、`docs/capability-gap.md` §1.13
-- [ ] 语法着色 / 代码折叠 / 槽内错误标记 / 双栏对比（编辑器仍是纯 richedit）
+- [x] **LSP 诊断真正接进 IDE**（2026-10-20 第九轮）— 槽内**波浪线** + 错误色 +
+      行号栏**诊断圆点** + 底部问题列表 + 双击跳转。
+      根因级发现两条：① 官方 `richedit.setCharformat` **从不加
+      `CFM_UNDERLINETYPE` 掩码位** → 控件忽略 `underlineType` → 只画单线，
+      出不来波浪线；② **`LSP_EXE`/`DAP_EXE` 拼成了 `nodio.exe-lsp`**（不存在）
+      → **LSP 与调试器从来没起来过**（问题列表一直是空的）。
+      详见 `docs/capability-gap.md` §1.14
+- [x] **代码折叠**（2026-10-20 第十轮）— 行号栏折叠标记（▸/▾，点即折叠）、
+      菜单「格式 → 折叠/展开 / 全部折叠 / 全部展开」、快捷键 `Ctrl+Shift+[`。
+      折叠靠 CHARFORMAT2 的 **`CFE_HIDDEN`**：隐藏的段落**连行高一起收起**
+      （不用自绘覆盖层），文本本身不丢。
+      ⚠ 折叠后官方 `lineToChar/lineFromChar/lineRange` **返回错的位置**
+      → 组件自维护 `lineStarts`/`visLines`，行号栏按可见文档行画。
+      详见 `docs/capability-gap.md` §1.15、`docs/ide-components.md` §11.7
+- [ ] 双栏对比（编辑器仍是纯 richedit）
 - [ ] 属性格分组带（基本/位置/外观/样式，折叠箭头）
 - [ ] 网格 / 边界线 / 对齐 / 缩放 / 改窗体设置（官方字符串表 32984-32991 的命令）
 - [ ] 事件代码生成

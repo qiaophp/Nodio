@@ -563,6 +563,46 @@ opt = { left=0; top=0; right=600; bottom=400; background=0xF0F0F0 }
    另外官方 ctrl 没有可用的 `redraw` 成员（调用抛「非函数值」），
    整块重绘用引擎 sysapi：`::InvalidateRect(hwnd,0,1)` + `::UpdateWindow(hwnd)`。
 
+### 11.7 诊断标记与代码折叠（都靠 CHARFORMAT2 的原始位）
+
+两个功能都**不用**官方 `richedit.setCharformat`，而是组件自己构造
+`CHARFORMAT2` 结构体、直接发 `EM_SETCHARFORMAT`（0x444）。
+两个原因（都实测）：
+
+1. 官方 `setCharformat` 的 `mask` **只加 `CFM_UNDERLINE`，从不加
+   `CFM_UNDERLINETYPE(0x800000)`** → 控件按规范忽略 `underlineType`
+   → **永远只画单线，出不来波浪线**；
+2. 官方用 `if(textColor)` 判断要不要设颜色，而 **aardio 里 0 是真值**
+   （只有 null/false 为假）→ 只传 `underline` 也会把选区文字色刷成 0（黑）。
+
+原生 RICHEDIT50W 的 `CHARFORMAT2W` 真实布局 == aardio 官方 `CHARFORMAT2` 类
+（`textColor@20 / bUnderlineType@112`，含 `pad` WORD，total = 116），
+组件在 `lib/nodio/ui/editor.aardio` 里自己定义了一份。
+
+**诊断标记**（`setDiagnostics`）：
+
+- 波浪线：`mask = CFM_UNDERLINE|CFM_UNDERLINETYPE|CFM_COLOR`，
+  `effects = CFE_UNDERLINE`，`underlineType = 8`（`CFU_UNDERLINEWAVE`）；
+- 清标记：`mask` 只带 `CFM_UNDERLINE|CFM_UNDERLINETYPE`（**不带 CFM_COLOR**）
+  → 只清下划线，不碰文字色；
+- 行号栏：错误行画圆点 + 行号染成诊断色；
+- 诊断集合带**指纹判重**：IDE 心跳每 300ms 喂一次诊断，
+  不判重的话编辑器每 0.3 秒全文重刷一次。
+
+**代码折叠**：
+
+- 折叠靠 `dwEffects` 的 **`CFE_HIDDEN(0x100)`**：给正文区打 hidden 格式，
+  控件就把这些段落**整个收起（连行高都没有）**；隐藏的只是显示属性，
+  文本本身不丢，保存出去永远是完整文本；
+- 隐藏区间要**连最后一行行尾的 CRLF 一起盖住**，否则折叠后留一条空行；
+- ⚠ **折叠后官方 `lineToChar` / `lineFromChar` / `lineRange` 返回错的位置**
+  （`EM_LINEINDEX` 对隐藏行返回隐藏行自己的起点）→ 组件自己维护
+  `lineStarts` / `lineLens`（文档行 → 字符位置）和 `visLines`（可见文档行），
+  行号栏按 `visLines` 画；
+- 行号栏宽 64 逻辑像素：左诊断圆点、中行号、右折叠标记（▸ 已折叠 / ▾ 展开，
+  自己用矩形拼的实心小三角，不依赖字体字形）；点标记即折叠/展开；
+- 折叠区按 aardio 花括号配对识别（字符串/注释里的花括号不算）。
+
 ## 12. `nodio.ui.filedlg` — 系统文件对话框（打开/另存为）
 
 | API | 说明 |

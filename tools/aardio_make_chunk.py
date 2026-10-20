@@ -73,6 +73,7 @@ class Chunk(object):
         self.consts = []       # (type, payload)
         self.slots = slots
         self.upvalues = upvalues
+        self.children = []     # 嵌套对象（闭包体）—— NEW_CLOSURE 的 K 指向它
 
     # ---- 发射 ----
     def emit(self, word: int) -> int:
@@ -174,12 +175,41 @@ class Chunk(object):
         """0x32 BUILD_ARRAY：目标表 = 槽 A，元素取自 A+1..A+count。"""
         return self.emit(rec(0x32, a=a, c=cap, b=count))
 
+    # ---- 调用帧与闭包（第十六轮）----
+
+    def new_closure(self, a: int, k: int) -> int:
+        """0x34 NEW_CLOSURE：目标槽 A，K = 嵌套对象下标（18 位）。
+
+        捕获条数 = 嵌套对象的 flags[0]（官方运行时 +0x48）；
+        紧随其后的 N 条记录是捕获项（kind 3 = 上值 / kind 4 = 局部槽），
+        会被**消费**（ip 前进 N 条）。
+        """
+        return self.emit(rec(0x34, a=a, c=k))
+
+    def call(self, a: int, b: int, c: int = 2) -> int:
+        """0x2A CALL：被调值在槽 A，实参窗口 = 槽 A+1..A+B-1，返回槽 = A+B。
+
+        B 是**返回槽的偏移**（官方 0x2A 装参块 0x004C5A44 写 vm->0x08 = &slot[A+B]）；
+        实参个数 = B-1（其中第一个是 self / 接收者）。
+        """
+        return self.emit(rec(0x2A, a=a, c=c, b=b))
+
+    def load_upvalue(self, a: int, b: int) -> int:
+        """0x03 LOAD_UPVALUE：目标槽 A，上值槽 B。"""
+        return self.emit(rec(0x03, a=a, b=b))
+
+    def store_upvalue(self, a: int, b: int) -> int:
+        """0x0E STORE_UPVALUE：源槽 A，上值槽 B（按引用写入）。"""
+        return self.emit(rec(0x0E, a=a, b=b))
+
     # ---- 序列化 ----
-    def bytes(self) -> bytes:
-        out = bytearray(HEADER)
+
+    def body(self) -> bytes:
+        out = bytearray()
         out += struct.pack("<I", 0)          # name = null
         out += struct.pack("<i", 0)          # attr1 = 首行
         out += struct.pack("<i", 0)          # attr2 = 末行
+        # flags[0] = 上值个数（运行时 +0x48）/ flags[3] = 局部槽数（+0x4B）
         out += bytes((self.upvalues & 0xFF, 0, 0, self.slots & 0xFF, 0))
         out += struct.pack("<I", len(self.code))
         for w in self.code:
@@ -187,11 +217,16 @@ class Chunk(object):
         out += struct.pack("<I", len(self.consts))
         for t, payload in self.consts:
             out += bytes((t,)) + payload
-        out += struct.pack("<I", 0)          # objects
+        out += struct.pack("<I", len(self.children))
+        for ch in self.children:
+            out += ch.body()
         out += struct.pack("<I", 0)          # tableA
         out += struct.pack("<I", 0)          # tableB
         out += struct.pack("<I", 0)          # tableC
         return bytes(out)
+
+    def bytes(self) -> bytes:
+        return bytes(HEADER) + self.body()
 
 
 def build_add():
@@ -352,11 +387,79 @@ def build_array():
     return c
 
 
+def build_call():
+    """0x34 NEW_CLOSURE + 0x2A CALL：闭包返回 (参数1 + 参数2) = 10
+
+    官方调用约定：被调值在槽 A，实参窗口 = 槽 A+1..A+B-1（第一个是 self），
+    返回值写入槽 A+B。
+    被调帧的槽布局：**槽 0 = self，槽 1.. = 显式参数**，
+    函数体的局部变量与参数共用同一片槽（官方编译器把局部排在参数之后），
+    所以这里的局部从槽 2 开始。
+    """
+    body = Chunk(slots=4)
+    body.arith(0x18, 2, 1, 2)     # 槽2 = 帧槽1 + 帧槽2 = 7 + 3
+    body.ret(2)
+
+    c = Chunk(slots=6)
+    c.children.append(body)
+    c.new_closure(0, 0)           # 槽0 = 闭包（体 = 子对象 0）
+    c.load_int(1, 5)              # 槽1 = self
+    c.load_int(2, 7)              # 槽2 = 参数1
+    c.load_int(3, 3)              # 槽3 = 参数2
+    c.call(0, 4, 2)               # 实参 = 槽1..槽3；返回槽 = 槽4
+    c.ret(4)
+    return c
+
+
+def build_params():
+    """调用带参数的闭包：self + 参数1 = 3 + 4 = 7"""
+    body = Chunk(slots=4)
+    body.arith(0x18, 2, 0, 1)     # 槽2 = 帧槽0(self) + 帧槽1(参数1)
+    body.ret(2)
+
+    c = Chunk(slots=6)
+    c.children.append(body)
+    c.new_closure(0, 0)
+    c.load_int(1, 3)              # 槽1 = self
+    c.load_int(2, 4)              # 槽2 = 参数1
+    c.call(0, 3, 2)               # 实参 = 槽1..槽2；返回槽 = 槽3
+    c.ret(3)
+    return c
+
+
+def build_upvalue():
+    """闭包按引用改写外层局部：10 → 99
+
+    0x34 之后的捕获项（kind 4 = LOAD_LOCAL）把外层帧槽 0 **装箱**，
+    闭包里的 0x0E STORE_UPVALUE 写的就是同一个 cell（官方 FUN_004D5210）。
+    """
+    body = Chunk(slots=4, upvalues=1)
+    body.load_upvalue(1, 0)       # 槽1 = 上值0
+    body.load_int(2, 99)          # 槽2 = 99
+    body.store_upvalue(2, 0)      # 上值0 ← 槽2（按引用写回外层帧槽 0）
+    body.load_upvalue(3, 0)       # 槽3 = 上值0（此时 = 99）
+    body.ret(3)
+
+    c = Chunk(slots=6)
+    c.children.append(body)
+    c.load_int(0, 10)             # 槽0 = 10
+    c.new_closure(1, 0)           # 槽1 = 闭包（1 个上值）
+    c.local(0, 0)                 # 捕获项：装箱帧槽 0（kind 4 / LOAD_LOCAL）
+    c.call(1, 2, 1)               # 被调 = 槽1；实参 = 槽2；返回槽 = 槽3
+    c.local(4, 0)                 # 槽4 = 帧槽 0（应已被闭包改成 99）
+    c.ret(4)
+    return c
+
+
 def build_unsupported():
-    """故意用一条尚未实现的记录（CALL 0x2A）→ 记录 VM 必须明确报错"""
+    """故意用一条尚未实现的记录（NEW_NATIVE 0x15）→ 记录 VM 必须明确报错
+
+    0x15 是官方「内建函数序号」记录（依赖内建表 DAT_007C89B0），
+    第十六轮尚未落地；这里用它验证「未实现的种类必须明确报错」。
+    """
     c = Chunk(slots=4)
     c.load_int(0, 1)
-    c.emit(rec(0x2A, a=1))      # CALL：记录 VM 尚未实现调用帧
+    c.emit(rec(0x15, a=1))      # NEW_NATIVE：记录 VM 尚未实现内建函数序号
     c.ret(1)
     return c
 
@@ -376,6 +479,9 @@ BUILDERS = {
     "index": build_index,
     "method": build_method,
     "array": build_array,
+    "call": build_call,
+    "params": build_params,
+    "upvalue": build_upvalue,
     "unsupported": build_unsupported,
 }
 

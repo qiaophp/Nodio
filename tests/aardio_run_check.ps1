@@ -110,6 +110,20 @@ foreach ($c in $member) {
     Expect ($r.text -like "*结果: $($c.want)*") "run $($c.name) = $($c.want)" $r.text
 }
 
+# ---- 1d) 调用帧与闭包（第十六轮）----
+$call = @(
+    @{ name = 'call';    want = '10' },   # NEW_CLOSURE + CALL：参数1 + 参数2
+    @{ name = 'params';  want = '7'  },   # 被调帧槽 0 = self，槽 1.. = 显式参数
+    @{ name = 'upvalue'; want = '99' }    # 上值按引用：闭包改写外层局部 10 → 99
+)
+foreach ($c in $call) {
+    $f = Join-Path $tmp ($c.name + '.aardio')
+    if (-not (Test-Path $f)) { Expect $false "fixture $($c.name) generated" "missing"; continue }
+    $r = Run-Chunk $f
+    Expect ($r.code -eq 0) "run $($c.name) exits 0" $r.text
+    Expect ($r.text -like "*结果: $($c.want)*") "call frame $($c.name) = $($c.want)" $r.text
+}
+
 # ---- 2) 尚未实现的记录种类必须明确报错 ----
 $r = Run-Chunk (Join-Path $tmp 'unsupported.aardio')
 Expect ($r.code -ne 0) 'unsupported kind fails' $r.text
@@ -119,7 +133,7 @@ Expect ($r.text -like '*记录号 1*') 'unsupported kind locates pc' $r.text
 # ---- 3) 合成块必须能被官方等价校验器判为合法 ----
 $val = Join-Path $repo 'tools\aardio_validate.py'
 if (Test-Path $val) {
-    $all = @($cases + $order + $member) | ForEach-Object { $_.name }
+    $all = @($cases + $order + $member + $call) | ForEach-Object { $_.name }
     foreach ($n in $all) {
         $f = Join-Path $tmp ($n + '.aardio')
         $vout = & $py.Source $val $f 2>&1 | Out-String
@@ -134,7 +148,10 @@ $sample = Join-Path $LibDir 'ide\aifix.aardio'
 if (Test-Path $sample) {
     $r = Run-Chunk $sample
     Expect ($r.code -ne 0) 'official sample does not pretend to succeed' $r.text
-    Expect ($r.text -like '*尚未在记录 VM 中实现*') 'official sample fails with clear reason' $r.text
+    # 第十六轮：调用族落地后，官方样本的失败点前移到「调用的对象不是函数」
+    #（记录 3 处调用的是官方内建函数，Nodio 还没有内建表）—— 仍须是**明确原因**。
+    Expect ($r.text -like '*执行失败*') 'official sample fails with clear reason' $r.text
+    Expect ($r.text -like '*位置: 记录号*') 'official sample reports the record position' $r.text
     Expect ($r.text -notlike '*访问冲突*' -and $r.text -notlike '*异常*') 'official sample no crash' $r.text
 } else {
     Write-Host "SKIP official sample not found under $LibDir"

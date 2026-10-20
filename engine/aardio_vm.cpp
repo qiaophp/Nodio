@@ -7,13 +7,16 @@
 //   · 61 种记录语义            §7.5
 //   · 操作数寻址（描述符表）   §7.5.2
 //   · 操作数角色（A/B/C）      §7.5.4
+//   · 调用帧与闭包            §7.5.5
 //
-// 本文件实现「不依赖调用帧 / 闭包 / 原生函数」的一组记录：
+// 本文件实现「不依赖原生函数 / 导入成员」的一组记录：
 // 取值（LOAD_* / CLEAR_LOCALS）、算术（0x18-0x1D）、一元负号、真值、长度、
 // 位运算（0x35-0x3B）、跳转与条件跳转（0x22-0x28）、返回（0x2C）、GC（0x33），
-// 以及第十五轮新增的**成员访问族**与**数组构造**：
-//   0x05/0x06/0x07/0x08/0x09/0x0A/0x0B/0x0C/0x0D/0x10/0x11/0x12/0x13/0x14/0x17
-//   0x32 BUILD_ARRAY
+// 第十五轮新增的**成员访问族**与**数组构造**
+// （0x05/0x06/0x07/0x08/0x09/0x0A/0x0B/0x0C/0x0D/0x10/0x11/0x12/0x13/0x14/0x17、
+//  0x32），以及第十六轮的**调用帧与闭包**：
+//   0x0E STORE_UPVALUE / 0x0F LOAD_IF_SET / 0x29 TAILCALL / 0x2A CALL /
+//   0x2B CALL_NATIVE / 0x34 NEW_CLOSURE
 // 其余种类一律明确报错（种类 + 记录号），不静默跳过。
 #include "aardio_vm.h"
 
@@ -21,28 +24,51 @@ namespace NodioVM
 {
     namespace
     {
+        struct RtCell;      // 上值盒（官方 FUN_004D5210 的 cell，按引用）
+        struct RtClosure;   // 闭包对象（官方 type 6）
+
         // 官方 16 字节槽：值 8 字节 @+0 + 类型标签 4 字节 @+8
         struct RtSlot
         {
-            int type = 0;       // 0 null / 1 bool / 3 number / 4 string / 6 func / 7 table
+            int type = 0;       // 0 null / 1 bool / 3 number / 4 string / 5 table / 6 func / 7 class
             Value val;
+            // type 6（闭包）：闭包体 + 上值数组
+            std::shared_ptr<RtClosure> closure;
+            // 上值别名：真实值存放在 box->value（官方 cell 指向定义帧的局部槽）
+            std::shared_ptr<RtCell> box;
+        };
+
+        // 上值盒：官方 FUN_004D5210 —— 指向定义帧的局部槽，**按引用**
+        struct RtCell
+        {
+            RtSlot value;
+        };
+
+        // 闭包对象（官方 FUN_004D50A0，type 6）
+        //   +0x07 上值个数 / +0x10 属主命名空间 / +0x14 闭包体 chunk / +0x18 上值数组
+        struct RtClosure
+        {
+            const AardioChunkNode* chunk = nullptr;              // 闭包体（嵌套对象）
+            std::vector<std::shared_ptr<RtCell>> upvalues;        // 上值数组
+            std::shared_ptr<Table> ownerNs;                       // 属主命名空间
         };
 
         struct RtFrame
         {
             std::vector<RtSlot> slots;
             const AardioChunkNode* chunk = nullptr;
-            std::vector<RtSlot> upvalues;
+            // 本作用域的上值数组（官方 iVar11+0x18）
+            std::vector<std::shared_ptr<RtCell>> upvalues;
             RtFrame* parent = nullptr;
             size_t ip = 0;
             // 模块命名空间（官方 iVar11+0x10）：0x05/0x0C 的对象，0x06 的取值
             std::shared_ptr<Table> ns;
-            // VM 暂存槽（官方 vm+0x40）：0x07/0x0D 的对象
-            RtSlot scratch;
+            // 返回值写回**调用方**帧的槽（官方 CALL 的 B 决定：返回槽 = A+B）
+            int retSlot = -1;
         };
 
         // 官方类型标签（实测自解释器 FUN_004C4BC0 的槽类型判定）
-        //   0 null / 1 bool / 3 number / 4 string / 5 table / 6 func / 7 array
+        //   0 null / 1 bool / 3 number / 4 string / 5 table / 6 func / 7 class
         int TagOfValue(const Value& v)
         {
             switch (v.t)
@@ -64,6 +90,18 @@ namespace NodioVM
             s.type = TagOfValue(v);
             s.val = v;
             return s;
+        }
+
+        // 上值别名：读穿透 box，写也穿透 box（官方 cell 按引用）
+        RtSlot SlotGet(const RtSlot& s)
+        {
+            return s.box ? s.box->value : s;
+        }
+
+        void SlotPut(RtSlot& s, const RtSlot& v)
+        {
+            if (s.box) s.box->value = v;
+            else s = v;
         }
 
         bool TruthyOf(const Value& v)
@@ -113,14 +151,8 @@ namespace NodioVM
                 wstring y = (b.t == Value::Str) ? b.s : NumText(NumOf(b));
                 return x.compare(y) < 0 ? -1 : (x == y ? 0 : 1);
             }
-            double x = NumOf(a), y = NumOf(b);
-            return x < y ? -1 : (x == y ? 0 : 1);
-        }
-
-        // 官方类型标签 → 值的类型
-        Value ValueOfSlot(const RtSlot& s)
-        {
-            return s.val;
+            double x = NumOf(a), b2 = NumOf(b);
+            return x < b2 ? -1 : (x == b2 ? 0 : 1);
         }
 
         // ---- 官方表（table）语义 ----
@@ -227,14 +259,6 @@ namespace NodioVM
             return false;
         }
 
-        // 记录 VM 的错误出口
-        struct VmFail
-        {
-            wstring msg;
-            int pc = -1;
-            int kind = -1;
-        };
-
         const int kMaxSteps = 20000000;   // 防止死循环（官方有 200 层调用限制）
     }
 
@@ -245,12 +269,12 @@ namespace NodioVM
         {
         case 0x00: case 0x01: case 0x02: case 0x03: case 0x04:
         case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0A:
-        case 0x0B: case 0x0C: case 0x0D: case 0x10: case 0x11: case 0x12:
-        case 0x13: case 0x14: case 0x17:
+        case 0x0B: case 0x0C: case 0x0D: case 0x0E: case 0x0F:
+        case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x17:
         case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D:
         case 0x1E: case 0x1F: case 0x20:
         case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x28:
-        case 0x2C: case 0x32: case 0x33:
+        case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x32: case 0x33: case 0x34:
         case 0x35: case 0x36: case 0x37: case 0x38: case 0x39: case 0x3A: case 0x3B:
             return true;
         default:
@@ -269,62 +293,26 @@ namespace NodioVM
     AardioRunResult RunAardioChunk(const AardioChunkNode& root)
     {
         AardioRunResult res;
-        RtFrame frame;
-        frame.chunk = &root;
 
-        // 局部槽表：官方 chunk 帧 +0x4B（槽位数）
-        int nSlots = (int)root.flags[3];
-        if (nSlots < 0) nSlots = 0;
-        frame.slots.assign((size_t)nSlots, RtSlot());
+        // ---- 帧栈（官方是「就地压栈」，Nodio 用每帧独立槽数组，语义等价）----
+        std::vector<RtFrame> frames;
+        // 闭包保活区：闭包以 Value::Pointer 存进表 / 槽，指针由这里兜底
+        std::vector<std::shared_ptr<RtClosure>> arena;
+        // VM 暂存槽（官方 vm+0x40）：0x07/0x0D 的对象
+        RtSlot scratch;
 
-        // 模块命名空间（官方 iVar11+0x10）与 VM 暂存槽（官方 vm+0x40）
-        frame.ns = std::make_shared<Table>();
-        frame.scratch = SlotOf(Value::Table_(frame.ns));
-
-        const std::vector<unsigned int>& code = root.code;
-        const size_t n = code.size();
-
-        // 常量表（chunk 帧 +0x08）—— 9 位操作数 bit8=1 与 18 位操作数都指向它
-        const std::vector<AardioConstValue>& consts = root.consts;
-
-        auto ConstSlot = [&](int idx) -> RtSlot
         {
-            RtSlot s;
-            if (idx < 0 || idx >= (int)consts.size()) return s;
-            const AardioConstValue& c = consts[(size_t)idx];
-            s.type = c.type;
-            switch (c.type)
-            {
-            case 1: s.val = Value::Bool_(c.b); break;
-            case 3: s.val = Value::Num_(c.num); break;
-            case 4: s.val = Value::Str_(c.str); break;
-            default: s.val = Value(); break;
-            }
-            return s;
-        };
+            RtFrame f;
+            f.chunk = &root;
+            int nSlots = (int)root.flags[3];
+            if (nSlots < 0) nSlots = 0;
+            f.slots.assign((size_t)nSlots, RtSlot());
+            f.ns = std::make_shared<Table>();
+            frames.push_back(f);
+        }
+        scratch = SlotOf(Value::Table_(frames[0].ns));
 
-        // 9 位操作数：bit8=1 → 常量表；否则 → 当前帧局部槽表
-        auto Operand9 = [&](unsigned int v) -> RtSlot
-        {
-            if (v & 0x100) return ConstSlot((int)(v & 0xFF));
-            int idx = (int)v;
-            if (idx < 0 || idx >= (int)frame.slots.size()) return RtSlot();
-            return frame.slots[(size_t)idx];
-        };
-
-        // 只按局部槽下标取（官方在「对象槽」位置一律直取局部槽，不看 bit8）
-        auto LocalSlot = [&](unsigned int v) -> RtSlot
-        {
-            int idx = (int)(v & 0xFF);
-            if (idx < 0 || idx >= (int)frame.slots.size()) return RtSlot();
-            return frame.slots[(size_t)idx];
-        };
-
-        auto SetSlot = [&](int idx, const RtSlot& s)
-        {
-            if (idx < 0 || idx >= (int)frame.slots.size()) return;
-            frame.slots[(size_t)idx] = s;
-        };
+        auto Cur = [&]() -> RtFrame& { return frames.back(); };
 
         auto Fail = [&](int pc, int kind, const wstring& msg) -> AardioRunResult
         {
@@ -337,8 +325,50 @@ namespace NodioVM
             return r;
         };
 
-        while (frame.ip < n)
+        // 值 → 槽：闭包以 Value::Pointer 存放，这里还原成 type 6
+        auto SlotOfValue = [&](const Value& v) -> RtSlot
         {
+            if (v.t == Value::Pointer)
+            {
+                for (size_t i = 0; i < arena.size(); i++)
+                {
+                    if (arena[i].get() == v.ptr)
+                    {
+                        RtSlot s;
+                        s.type = 6;
+                        s.val = v;
+                        s.closure = arena[i];
+                        return s;
+                    }
+                }
+            }
+            return SlotOf(v);
+        };
+
+        while (!frames.empty())
+        {
+            RtFrame& frame = Cur();
+            const AardioChunkNode* chunk = frame.chunk;
+            const std::vector<unsigned int>& code = chunk->code;
+            const size_t n = code.size();
+            const std::vector<AardioConstValue>& consts = chunk->consts;
+
+            if (frame.ip >= n)
+            {
+                // 记录流跑完但没有 RET —— 视为返回 null
+                if (frames.size() <= 1)
+                {
+                    res.ok = true;
+                    res.value = Value();
+                    return res;
+                }
+                int ret = frame.retSlot;
+                frames.pop_back();
+                if (ret >= 0 && ret < (int)frames.back().slots.size())
+                    frames.back().slots[(size_t)ret] = RtSlot();
+                continue;
+            }
+
             if (res.steps >= kMaxSteps)
                 return Fail((int)frame.ip, -1, L"执行步数超过上限（疑似死循环）");
 
@@ -359,6 +389,45 @@ namespace NodioVM
                 return Fail((int)pc, kind,
                     L"记录种类 0x" + wstring(hex) + L" 尚未在记录 VM 中实现");
             }
+
+            // 局部槽存取（穿透上值别名）
+            auto LocalSlot = [&](unsigned int v) -> RtSlot
+            {
+                int idx = (int)(v & 0xFF);
+                if (idx < 0 || idx >= (int)frame.slots.size()) return RtSlot();
+                return SlotGet(frame.slots[(size_t)idx]);
+            };
+
+            auto ConstSlot = [&](int idx) -> RtSlot
+            {
+                RtSlot s;
+                if (idx < 0 || idx >= (int)consts.size()) return s;
+                const AardioConstValue& c = consts[(size_t)idx];
+                s.type = c.type;
+                switch (c.type)
+                {
+                case 1: s.val = Value::Bool_(c.b); break;
+                case 3: s.val = Value::Num_(c.num); break;
+                case 4: s.val = Value::Str_(c.str); break;
+                default: s.val = Value(); break;
+                }
+                return s;
+            };
+
+            // 9 位操作数：bit8=1 → 常量表；否则 → 当前帧局部槽表
+            auto Operand9 = [&](unsigned int v) -> RtSlot
+            {
+                if (v & 0x100) return ConstSlot((int)(v & 0xFF));
+                int idx = (int)v;
+                if (idx < 0 || idx >= (int)frame.slots.size()) return RtSlot();
+                return SlotGet(frame.slots[(size_t)idx]);
+            };
+
+            auto SetSlot = [&](int idx, const RtSlot& s)
+            {
+                if (idx < 0 || idx >= (int)frame.slots.size()) return;
+                SlotPut(frame.slots[(size_t)idx], s);
+            };
 
             switch (kind)
             {
@@ -386,10 +455,7 @@ namespace NodioVM
                 int hi = (int)B, lo = A;
                 if (hi < lo) std::swap(hi, lo);
                 for (int i = lo; i <= hi && i < (int)frame.slots.size(); i++)
-                {
-                    frame.slots[(size_t)i].type = 0;
-                    frame.slots[(size_t)i].val = Value();
-                }
+                    SlotPut(frame.slots[(size_t)i], RtSlot());
                 break;
             }
             case 0x03:   // LOAD_UPVALUE：B 是上值槽
@@ -397,17 +463,37 @@ namespace NodioVM
                 int idx = (int)(B & 0xFF);
                 RtSlot s;
                 if (idx >= 0 && idx < (int)frame.upvalues.size())
-                    s = frame.upvalues[(size_t)idx];
+                {
+                    const std::shared_ptr<RtCell>& cell = frame.upvalues[(size_t)idx];
+                    if (cell) s = SlotGet(cell->value);
+                }
                 SetSlot(A, s);
                 break;
             }
             case 0x04:   // LOAD_LOCAL：B 是局部槽
             {
+                SetSlot(A, LocalSlot(B));
+                break;
+            }
+            case 0x0E:   // STORE_UPVALUE：A 是源槽，B 是上值槽（按引用写入）
+            {
                 int idx = (int)(B & 0xFF);
-                RtSlot s;
+                RtSlot s = LocalSlot(A);
+                if (idx >= 0 && idx < (int)frame.upvalues.size())
+                {
+                    const std::shared_ptr<RtCell>& cell = frame.upvalues[(size_t)idx];
+                    if (cell) cell->value = s;
+                }
+                break;
+            }
+            case 0x0F:   // LOAD_IF_SET：目标槽为空（null）时写入 A 槽的值
+            {
+                int idx = (int)(B & 0x1FF);
                 if (idx >= 0 && idx < (int)frame.slots.size())
-                    s = frame.slots[(size_t)idx];
-                SetSlot(A, s);
+                {
+                    if (frame.slots[(size_t)idx].type == 0)
+                        SlotPut(frame.slots[(size_t)idx], LocalSlot(A));
+                }
                 break;
             }
             case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D:
@@ -508,7 +594,7 @@ namespace NodioVM
                 case 0x27:   // JTRUE：真值槽 A 的真值 != C（立即数 0/1）则跳转
                 {
                     RtSlot l = (A >= 0 && A < (int)frame.slots.size())
-                        ? frame.slots[(size_t)A] : RtSlot();
+                        ? SlotGet(frame.slots[(size_t)A]) : RtSlot();
                     int t1 = TruthyOf(l.val) ? 1 : 0;
                     jump = (t1 != (int)(C & 0x1FF));
                     break;
@@ -534,14 +620,86 @@ namespace NodioVM
                 }
                 break;
             }
-            case 0x2C:   // RET：A 是返回值槽
+            case 0x29: case 0x2A: case 0x2B:
+            {   // TAILCALL / CALL / CALL_NATIVE
+                //
+                // 官方调用约定（实测自 FUN_004D3040 与 0x2A 装参块 0x004C5A44）：
+                //   · 被调值在 **A 槽**
+                //   · 实参窗口 = 槽 A+1 .. A+B-1（B-1 个值，第一个是 self/接收者）
+                //     —— 官方原生路径把 [&slot[A], &slot[A+B]) 整段复制，即 B-1 个值
+                //   · 返回槽 = **A+B**（B≠0 时官方写 vm->0x08 = &slot[A+B]）
+                //   · C 是官方传给被调方的「实参个数」（C-1；C=0 → 变参，C-1 = -1），
+                //     Nodio 只把它记进帧里当提示，不据此裁剪参数
+                int a = A;
+                int b = (int)(B & 0x1FF);
+                int argCount = (b >= 1) ? (b - 1) : 0;
+
+                RtSlot fn = LocalSlot(A);
+                if (!fn.closure && fn.val.t == Value::Func && !fn.val.native)
+                {
+                    // Value::Func 但没有 native → 不是可调用对象
+                }
+
+                if (fn.closure)
+                {
+                    // 解释执行：压入被调方的新帧
+                    RtFrame nf;
+                    nf.chunk = fn.closure->chunk;
+                    if (!nf.chunk)
+                        return Fail((int)pc, kind, L"调用的闭包没有函数体");
+                    int need = argCount + 1;          // 帧槽 0 = self，其余为显式参数
+                    int nSlots = (int)nf.chunk->flags[3];
+                    if (nSlots < need) nSlots = need;
+                    nf.slots.assign((size_t)nSlots, RtSlot());
+                    for (int k = 0; k < argCount; k++)
+                    {
+                        int src = a + 1 + k;
+                        if (src < (int)frame.slots.size())
+                            nf.slots[(size_t)k] = SlotGet(frame.slots[(size_t)src]);
+                    }
+                    nf.upvalues = fn.closure->upvalues;
+                    nf.ns = fn.closure->ownerNs ? fn.closure->ownerNs : frame.ns;
+                    nf.parent = nullptr;   // 帧栈会重排，不留悬挂父指针
+                    nf.retSlot = (b != 0) ? (a + b) : -1;
+                    nf.ip = 0;
+                    frames.push_back(nf);
+                    continue;
+                }
+
+                if (fn.val.t == Value::Func && fn.val.native)
+                {
+                    std::vector<Value> args;
+                    for (int k = 0; k < argCount; k++)
+                    {
+                        int src = a + 1 + k;
+                        if (src < (int)frame.slots.size())
+                            args.push_back(SlotGet(frame.slots[(size_t)src]).val);
+                    }
+                    Value out = fn.val.native(args);
+                    if (b != 0 && (a + b) < (int)frame.slots.size())
+                        SlotPut(frame.slots[(size_t)(a + b)], SlotOfValue(out));
+                    break;
+                }
+
+                return Fail((int)pc, kind, L"调用的对象不是函数（槽 " +
+                    std::to_wstring(a) + L"）");
+            }
+            case 0x2C:   // RET：返回值 = 帧槽 A（B>1 时官方指向帧槽 A+B-1）
             {
                 RtSlot s;
                 if (A >= 0 && A < (int)frame.slots.size())
-                    s = frame.slots[(size_t)A];
-                res.ok = true;
-                res.value = ValueOfSlot(s);
-                return res;
+                    s = SlotGet(frame.slots[(size_t)A]);
+                if (frames.size() <= 1)
+                {
+                    res.ok = true;
+                    res.value = s.val;
+                    return res;
+                }
+                int ret = frame.retSlot;
+                frames.pop_back();
+                if (ret >= 0 && ret < (int)frames.back().slots.size())
+                    SlotPut(frames.back().slots[(size_t)ret], s);
+                continue;
             }
             case 0x33:   // GC：记录 VM 不做回收
                 break;
@@ -567,7 +725,7 @@ namespace NodioVM
                 RtSlot key = ConstSlot((int)K);
                 Value out;
                 bool ok = frame.ns && RtTableFind(frame.ns, KeyOfValue(key.val), &out);
-                SetSlot(A, ok ? SlotOf(out) : RtSlot());
+                SetSlot(A, ok ? SlotOfValue(out) : RtSlot());
                 break;
             }
             case 0x06:   // LOAD_SELF_NS：A ← 当前模块命名空间
@@ -579,8 +737,8 @@ namespace NodioVM
             {
                 RtSlot key = ConstSlot((int)K);
                 Value out;
-                bool ok = RtGetMember(frame.scratch.val, key.val, &out);
-                SetSlot(A, ok ? SlotOf(out) : RtSlot());
+                bool ok = RtGetMember(scratch.val, key.val, &out);
+                SetSlot(A, ok ? SlotOfValue(out) : RtSlot());
                 break;
             }
             case 0x08:   // GET_GLOBAL：A ← B 槽对象所属的父命名空间表
@@ -598,30 +756,27 @@ namespace NodioVM
                 RtSlot key = Operand9(C);
                 Value out;
                 bool ok = RtGetMember(obj.val, key.val, &out);
-                SetSlot(A, ok ? SlotOf(out) : RtSlot());
+                SetSlot(A, ok ? SlotOfValue(out) : RtSlot());
                 break;
             }
             case 0x0C:   // SET_MEMBER：对象 = 模块命名空间，键 = 常量表[K]，值 = A 槽
             {
                 RtSlot key = ConstSlot((int)K);
-                RtSlot val = (A >= 0 && A < (int)frame.slots.size())
-                    ? frame.slots[(size_t)A] : RtSlot();
+                RtSlot val = LocalSlot(A);
                 if (frame.ns) RtTableSet(frame.ns, KeyOfValue(key.val), val.val);
                 break;
             }
             case 0x0D:   // SET_MEMBER2：对象 = VM 暂存槽(vm+0x40)，键 = 常量表[K]，值 = A 槽
             {
                 RtSlot key = ConstSlot((int)K);
-                RtSlot val = (A >= 0 && A < (int)frame.slots.size())
-                    ? frame.slots[(size_t)A] : RtSlot();
-                if (frame.scratch.val.t == Value::TableT && frame.scratch.val.tab)
-                    RtTableSet(frame.scratch.val.tab, KeyOfValue(key.val), val.val);
+                RtSlot val = LocalSlot(A);
+                if (scratch.val.t == Value::TableT && scratch.val.tab)
+                    RtTableSet(scratch.val.tab, KeyOfValue(key.val), val.val);
                 break;
             }
             case 0x10:   // SET_METATABLE：对象 = A 槽，元表 = B 槽
             {
-                RtSlot obj = (A >= 0 && A < (int)frame.slots.size())
-                    ? frame.slots[(size_t)A] : RtSlot();
+                RtSlot obj = LocalSlot(A);
                 RtSlot meta = Operand9(B);
                 if (obj.val.t == Value::TableT && obj.val.tab)
                 {
@@ -632,8 +787,7 @@ namespace NodioVM
             }
             case 0x11: case 0x13: case 0x14:
             {   // SET_MEMBER3 / RAWSET / SET_MEMBER4：对象 = A 槽，键 = B 槽，值 = C 槽
-                RtSlot obj = (A >= 0 && A < (int)frame.slots.size())
-                    ? frame.slots[(size_t)A] : RtSlot();
+                RtSlot obj = LocalSlot(A);
                 RtSlot key = Operand9(B);
                 RtSlot val = Operand9(C);
                 if (obj.val.t == Value::TableT && obj.val.tab)
@@ -642,8 +796,7 @@ namespace NodioVM
             }
             case 0x12:   // CONCAT_MEMBER：表 = A 槽，键 = B 槽，待追加值 = C 槽
             {
-                RtSlot tbl = (A >= 0 && A < (int)frame.slots.size())
-                    ? frame.slots[(size_t)A] : RtSlot();
+                RtSlot tbl = LocalSlot(A);
                 RtSlot key = Operand9(B);
                 RtSlot val = Operand9(C);
                 if (tbl.val.t == Value::TableT && tbl.val.tab)
@@ -672,7 +825,7 @@ namespace NodioVM
                 SetSlot(A + 1, obj);
                 Value out;
                 bool ok = RtGetMember(obj.val, key.val, &out);
-                SetSlot(A, ok ? SlotOf(out) : RtSlot());
+                SetSlot(A, ok ? SlotOfValue(out) : RtSlot());
                 break;
             }
             case 0x32:   // BUILD_ARRAY：目标表 = A 槽，元素取自 A+1..A+B
@@ -688,17 +841,82 @@ namespace NodioVM
                 if (count == 0)
                     return Fail((int)pc, kind,
                         L"BUILD_ARRAY 的基址依赖调用帧返回槽，记录 VM 尚未实现调用帧");
-                RtSlot dest = (A >= 0 && A < (int)frame.slots.size())
-                    ? frame.slots[(size_t)A] : RtSlot();
+                RtSlot dest = LocalSlot(A);
                 if (dest.val.t == Value::TableT && dest.val.tab)
                 {
                     for (int i = 1; i <= count; i++)
                     {
                         int idx = A + i;
                         if (idx < 0 || idx >= (int)frame.slots.size()) break;
-                        dest.val.tab->arr.push_back(frame.slots[(size_t)idx].val);
+                        dest.val.tab->arr.push_back(SlotGet(frame.slots[(size_t)idx]).val);
                     }
                 }
+                break;
+            }
+            case 0x34:   // NEW_CLOSURE：K = 嵌套对象下标，捕获条数 = 嵌套对象 flags[0]
+            {
+                int k = (int)K;
+                const std::vector<AardioChunkNode>& kids = chunk->children;
+                if (k < 0 || k >= (int)kids.size())
+                    return Fail((int)pc, kind, L"NEW_CLOSURE 的嵌套对象下标越界：" +
+                        std::to_wstring(k));
+                const AardioChunkNode* body = &kids[(size_t)k];
+                int nu = (int)body->flags[0];      // 官方运行时 +0x48 = 上值个数
+
+                std::vector<std::shared_ptr<RtCell>> ups;
+                ups.reserve((size_t)nu);
+                for (int i = 0; i < nu; i++)
+                {
+                    size_t cpc = pc + 1 + (size_t)i;
+                    if (cpc >= n)
+                        return Fail((int)pc, kind, L"NEW_CLOSURE 的捕获记录越界");
+                    unsigned int cw = code[cpc];
+                    int ck = (int)(cw & 0x3F);
+                    int cb = (int)((cw >> 23) & 0x1FF);
+                    if (ck == 0x03)
+                    {
+                        // 捕获当前作用域的上值（共享同一个 cell）
+                        std::shared_ptr<RtCell> cell;
+                        if (cb < (int)frame.upvalues.size())
+                            cell = frame.upvalues[(size_t)cb];
+                        if (!cell) cell = std::make_shared<RtCell>();
+                        ups.push_back(cell);
+                    }
+                    else
+                    {
+                        // 捕获局部槽：把该槽**装箱**，之后写局部即写上值（按引用）
+                        int idx = cb & 0xFF;
+                        if (idx >= 0 && idx < (int)frame.slots.size())
+                        {
+                            RtSlot& s = frame.slots[(size_t)idx];
+                            if (!s.box)
+                            {
+                                std::shared_ptr<RtCell> cell = std::make_shared<RtCell>();
+                                cell->value = SlotGet(s);
+                                s.box = cell;
+                            }
+                            ups.push_back(s.box);
+                        }
+                        else
+                        {
+                            ups.push_back(std::make_shared<RtCell>());
+                        }
+                    }
+                }
+                if (nu > 0)
+                    frame.ip = pc + 1 + (size_t)nu;   // 捕获记录被消费
+
+                std::shared_ptr<RtClosure> cl = std::make_shared<RtClosure>();
+                cl->chunk = body;
+                cl->upvalues = ups;
+                cl->ownerNs = frame.ns;
+                arena.push_back(cl);
+
+                RtSlot s;
+                s.type = 6;
+                s.val = Value::Pointer_(cl.get());
+                s.closure = cl;
+                SetSlot(A, s);
                 break;
             }
             default:
