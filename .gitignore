@@ -20,3 +20,13 @@ r43*.txt
 trace*.txt
 __pycache__/
 *.pyc
+
+# updater residue (aardio renames the locked old file to "<name>.<n>.old")
+*.old
+
+# IDE 会话的一次性探针脚本（scratch，不是回归用例）
+tests/probe_*.aardio
+tests/editor_*.aardio
+tests/ide_diag_sample.nodio
+tests/m7/proj/probe2.aardio
+pelican-bike.html

@@ -15,6 +15,7 @@
 #include <set>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -65,12 +66,37 @@ namespace NodioVM
 
     struct Env;
     struct Value;
-    struct Table
+    struct ComCacheEntry;
+
+    // Identity key for non-string Value keys (tables/functions/classes).
+    // ToString() flattens every table to "table", so the official-library
+    // cycle guard (objreferences[t]) and any t[t]=... map collapsed distinct
+    // objects into one slot. Object identity keys keep them distinct.
+    wstring ObjectKeyOf(const Value& v);
+
+    struct Table : public std::enable_shared_from_this<Table>
     {
         std::unordered_map<wstring, Value> map;
         vector<Value> arr;
         std::unordered_map<wstring, Value> scopeVars; // private namespace/module scope variables (var x)
+        // 官方表对象 +0x08 处的指针：既是父命名空间（成员查找的回退目标），
+        // 也可被 setmetatable 覆盖（官方 0x10 SET_METATABLE 写的就是这一格）。
+        std::shared_ptr<Table> parent;
         bool bExplicitMeta = false;
+        std::shared_ptr<std::unordered_map<wstring, ComCacheEntry>> comCache;
+        // statement epoch this object was born in (gc.cpp): the collector
+        // never touches objects that belong to the statement currently
+        // being evaluated — a value may still live in a C++ temporary
+        // across the collection point.
+        long nEpoch = 0;
+        // GC registry: every live table is tracked (gc.cpp) so the
+        // collector can find reference cycles. The VM's shared_ptr graph
+        // IS cyclic by construction — a closure captures its defining
+        // frame and the frame holds the closure — so plain refcounting
+        // can never reclaim those; only a reachability sweep can.
+        Table();
+        Table(const Table& rhs);
+        ~Table();
     };
 
     struct Value
@@ -107,6 +133,12 @@ namespace NodioVM
         wstring ToString() const;
     };
 
+    struct ComCacheEntry
+    {
+        long dispid = -1;
+        Value boundMethod;
+    };
+
     // builtin-writing helpers (round 19)
     inline wstring BStr(const Value& v) { return v.ToString(); }
     // UTF-8 byte view of a string value (for byte-level primitives such
@@ -130,6 +162,48 @@ namespace NodioVM
             WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &out[0],
                                 cb, nullptr, nullptr);
         return out;
+    }
+    // UTF-8 encoding of a wide string.
+    inline std::string Utf8Bytes(const wstring& w)
+    {
+        if (w.empty()) return std::string();
+        int cb = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                                     nullptr, 0, nullptr, nullptr);
+        std::string out((size_t)max(cb, 0), 0);
+        if (cb > 0)
+            WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &out[0],
+                                cb, nullptr, nullptr);
+        return out;
+    }
+    // Canonical content form of a string value. Official aardio strings ARE
+    // byte arrays, so every string has exactly one content:
+    //   - raw byte strings (bRawBytes): one byte per wchar, as stored
+    //   - UTF-16 strings (bUtf16):     the same text, encoded as UTF-8
+    //   - text strings:                UTF-8 encoding
+    // Comparison / concatenation / console output all go through this
+    // form, so a source literal and the same bytes read back from a file
+    // are the same string.
+    inline std::string StrByteForm(const Value& v)
+    {
+        if (v.bRawBytes)
+        {
+            std::string out;
+            out.reserve(v.s.size());
+            for (wchar_t ch : v.s)
+                out.push_back((char)(unsigned char)ch);
+            return out;
+        }
+        // A UTF-16 (ustring) value holds UTF-16 code units; encoding it as
+        // UTF-8 yields the same text a plain string literal would hold, so
+        // the two compare equal (official code always converts ustrings with
+        // string.fromUtf16 before comparing them).
+        return Utf8Bytes(v.s);
+    }
+    // Byte form of any value, for console output.
+    inline std::string ValueByteForm(const Value& v)
+    {
+        if (v.t == Value::Str) return StrByteForm(v);
+        return Utf8Bytes(v.ToString());
     }
     bool IsSize64(const Value& v);
     uint64_t GetSize64Val(const Value& v);
@@ -211,6 +285,16 @@ namespace NodioVM
         return defCp;
     }
     inline Value NF(Value::NativeFn f) { return Value::Native_(std::move(f)); }
+
+    // Environment flag helper. getenv() does not see every variable the
+    // desktop runtime injects into the process, so the diagnostics read
+    // the process environment directly. The buffer form is used on
+    // purpose: GetEnvironmentVariableW(name, NULL, 0) reports 0 here.
+    inline bool EnvFlag(const wchar_t* name)
+    {
+        wchar_t sz[8] = L"";
+        return GetEnvironmentVariableW(name, sz, 8) > 0;
+    }
 
     // x64 pointer-width API families: the runtime maps SetWindowLong /
     // GetWindowLong / SetClassLong / GetClassLong to the *PtrW exports in
@@ -299,8 +383,20 @@ namespace NodioVM
         Interp* interp = nullptr;
         void* code = nullptr;   // executable trampoline
         size_t codeSize = 0;
+        // Official contract (docs/library-guide/builtin/raw/callback.md VI):
+        // a native callback is a GC managed "cdata" object - once the last
+        // script reference to it is gone the collector releases the native
+        // trampoline and the script closure behind it. "rooted" marks the
+        // callbacks that have no script visible owner yet (a bare function
+        // handed to a dynamic FFI call): those stay GC roots.
+        bool rooted = true;
+        bool released = false;  // script side already detached
+        int popBytes = 0;       // stdcall stack cleanup of the trampoline
     };
     extern std::vector<CbCtx*> g_cbs;
+    // Release a native callback: detach the script closure, neutralize the
+    // trampoline and give its slot back to the trampoline pool.
+    void ReleaseCallback(CbCtx* ctx);
 
     // C++ shim shared by all trampolines. x86 __fastcall(ctx, stack):
     // caller args begin at stack+4 (after return address). x64
@@ -697,18 +793,46 @@ namespace NodioVM
         bool bPtrArray = false;
     };
 
+    struct Env;
+
+    struct EnvWeakRef
+    {
+        std::weak_ptr<Env> wp;
+        EnvWeakRef() = default;
+        inline EnvWeakRef(const std::shared_ptr<Env>& sp);
+        inline EnvWeakRef& operator=(const std::shared_ptr<Env>& sp);
+        inline operator std::shared_ptr<Env>() const;
+        inline explicit operator bool() const;
+        inline std::shared_ptr<Env> lock() const;
+        inline Env* get() const;
+    };
+
     struct Env
     {
         // Owning frame chain: call/block frames are heap objects so a
         // closure can keep its defining frames (and their locals —
-        // lexical upvalues) alive after the call returns. `self` is the
-        // owning handle set by the creator; children hold it via parent.
+        // lexical upvalues) alive after the call returns. `self` is a
+        // weak handle to break the self-referencing cycle: closures and
+        // child frames promote it to shared_ptr on capture.
         // Machine-lifetime envs (globals) use a no-op deleter.
         std::shared_ptr<Env> parent;
-        std::shared_ptr<Env> self;
+        EnvWeakRef self;
         std::unordered_map<wstring, Value> vars;
         shared_ptr<Table> nsTable;   // namespace scope: bare names land here
         shared_ptr<Table> modTable;  // file/module scope table: scopeVars
+        // S-2: the source file that owns the code running in this frame.
+        // Module frames carry their own path; a call frame inherits it from
+        // the DEFINING frame chain (a function of module A called from
+        // module B still belongs to A).  Runtime errors use this to report
+        // the file the line number actually comes from — a bare line number
+        // is ambiguous once a library has been imported.
+        wstring srcFile;
+        // GC registry (gc.cpp): live frames are tracked so the collector
+        // can reclaim frame cycles (a frame holding a closure that
+        // captured that same frame).
+        long nEpoch = 0;
+        Env();
+        ~Env();
         // true while a namespace or module BODY executes directly in this
         // env: a `var` declared here is a namespace member, so
         // VarDecl mirrors it into the namespace table's map. Function-call
@@ -727,6 +851,14 @@ namespace NodioVM
         // semantic — gdip.family's ctor assigns `this.name` while the
         // metaProperty declares name as a read-only _get property)
         bool bInstInit = false;
+        // the instance table being constructed by this ctor frame (identity
+        // only, no ownership — the instance stays alive through the frame's
+        // `this` variable). A ctor's `this.x = v` is member initialization
+        // ONLY when the write lands on THIS instance: after `this = other`
+        // (official instance replacement, as win.ui.tracker does) the write
+        // targets `other` and must go through the metatable's _set — that is
+        // how the official tracker installs its wndproc message table.
+        Table* instTable = nullptr;
         Value* Find(const wstring& k)
         {
             // 1. Local frames (frames that have a parent)
@@ -738,12 +870,18 @@ namespace NodioVM
             }
             // 2. Built-in primitives like `type`, `call`, `loadcode` etc. are never shadowed by namespace members
             static auto isBuiltinPrimitive = [](const wstring& name) {
-                return name == L"type" || name == L"call" || name == L"loadcode" ||
-                       name == L"loadcodex" || name == L"eval" || name == L"error" ||
-                       name == L"assert" || name == L"invoke" || name == L"callex" ||
-                       name == L"rget";
+                switch (name.size())
+                {
+                case 4: return name == L"type" || name == L"call" || name == L"eval" || name == L"rget";
+                case 5: return name == L"error";
+                case 6: return name == L"assert" || name == L"invoke" || name == L"callex";
+                case 8: return name == L"loadcode";
+                case 9: return name == L"loadcodex";
+                default: return false;
+                }
             };
-            if (isBuiltinPrimitive(k))
+            bool bIsBuiltin = isBuiltinPrimitive(k);
+            if (bIsBuiltin)
             {
                 Env* root = this;
                 while (root->parent) root = root->parent.get();
@@ -754,7 +892,7 @@ namespace NodioVM
             // 3. Namespace members in ambient namespace scopes
             for (Env* e = this; e; e = e->parent.get())
             {
-                if (e->nsTable && !e->bNsInst && !isBuiltinPrimitive(k))
+                if (e->nsTable && !e->bNsInst && !bIsBuiltin)
                 {
                     auto itS = e->nsTable->scopeVars.find(k);
                     if (itS != e->nsTable->scopeVars.end())
@@ -790,6 +928,37 @@ namespace NodioVM
             return nullptr;
         }
     };
+
+    inline EnvWeakRef::EnvWeakRef(const std::shared_ptr<Env>& sp) : wp(sp) {}
+    inline EnvWeakRef& EnvWeakRef::operator=(const std::shared_ptr<Env>& sp) { wp = sp; return *this; }
+    inline EnvWeakRef::operator std::shared_ptr<Env>() const { return wp.lock(); }
+    inline EnvWeakRef::operator bool() const { return !wp.expired(); }
+    inline std::shared_ptr<Env> EnvWeakRef::lock() const { return wp.lock(); }
+    inline Env* EnvWeakRef::get() const { auto sp = wp.lock(); return sp.get(); }
+
+    inline void CleanDeadEnv(std::shared_ptr<Env>& env)
+    {
+        return;
+    }
+
+    // Invariant guard for the GC frame stack. The stack is popped with
+    // pop_back(), so a missing push or an extra pop silently removes
+    // ANOTHER frame's env from the root set - that env then looks
+    // unreachable while its C++ frame is still running, and the collector
+    // frees it under the VM's feet. Every push/pop site pairs its own
+    // frame, so a mismatch here is always a bug.
+    inline void GcFrameCheck(std::vector<std::shared_ptr<Env>>& frames,
+                              Env* self, const char* where)
+    {
+        if (frames.empty() || frames.back().get() != self)
+        {
+            fwprintf(stderr, L"[GCFRAME] %s: popping %p but top is %p (size=%zu)\n",
+                     where, (void*)self,
+                     frames.empty() ? nullptr : (void*)frames.back().get(),
+                     frames.size());
+            fflush(stderr);
+        }
+    }
 
     struct Interp;
     extern thread_local Interp* g_interpCurrent;   // M2: active interp for meta hooks
@@ -850,8 +1019,111 @@ namespace NodioVM
     extern std::map<HWND, FormState*> g_forms;
     LRESULT CALLBACK FormWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
+    // ---------------- GC (gc.cpp) ----------------
+    // Live heap-object counters (every Table/Env registers itself).
+    // Atomics: a worker thread allocates objects concurrently with the
+    // main thread, so these counters are touched from several threads.
+    extern std::atomic<long> g_liveTables;
+    extern std::atomic<long> g_liveEnvs;
+    // Total objects ever created — used to pace automatic collection.
+    extern std::atomic<long> g_gcAllocTick;
+    void GcDumpLive();
+    // permanent GC roots: metatables kept alive by static members
+    void GcAddRootTable(const std::shared_ptr<Table>& tb);
+    // The live-object registry is shared by EVERY thread. Two threads
+    // inserting into the same unordered_set without a lock corrupts the
+    // heap (observed as STATUS_HEAP_CORRUPTION / 0xC0000374 with a
+    // drifting access-violation site). Recursive: a collector that
+    // holds the lock may run a finalizer, which allocates objects.
+    extern std::recursive_mutex g_gcRegistryMutex;
+    // Serializes collectors: the mark phase uses a shared scratch set.
+    extern std::mutex g_gcCollectMutex;
+    // Number of interpreters currently running script code. The
+    // collector's mark phase only sees the roots of the interpreter that
+    // runs it, so collecting while another interpreter runs on another
+    // thread would free objects that thread still holds.
+    extern std::atomic<int> g_activeVmThreads;
+    // Statement epoch: bumped at every statement boundary. Heap objects
+    // remember the epoch they were born in, so the collector can spare
+    // the statement currently being evaluated.
+    extern std::atomic<long> g_gcEpoch;
+    // Epoch / root stacks are per-thread: their push/pop discipline is
+    // stack-structured, so one thread's restore must never truncate
+    // another thread's entries.
+    extern thread_local std::vector<long> g_gcEpochStack;
+    inline long GcProtectEpoch()
+    {
+        return g_gcEpochStack.empty() ? g_gcEpoch.load() : g_gcEpochStack.back();
+    }
+    // Explicit root stack: values that live in native C++ frames across a
+    // possible collection point (call arguments, evaluation temporaries).
+    extern thread_local std::vector<Value> g_gcRoots;
+    struct GcRootScope
+    {
+        size_t base;
+        GcRootScope() : base(g_gcRoots.size()) {}
+        ~GcRootScope() { g_gcRoots.resize(base); }
+        void add(const Value& v) { g_gcRoots.push_back(v); }
+        void addAll(const std::vector<Value>& vs)
+        {
+            for (const auto& v : vs) g_gcRoots.push_back(v);
+        }
+    };
+
+    // ---------------- fiber execution contexts ----------------
+    // A fiber runs on its OWN C++ stack (Win32 fiber), so the VM's
+    // stack-structured bookkeeping must travel with the fiber that pushed
+    // it: the GC frame stack, the explicit root stack, the epoch stack and
+    // the control-flow flags (return / break / continue) plus the pending
+    // return value.
+    //
+    // Without this, a fiber that yields in the middle of a call leaves its
+    // frame on top of the resumer's frame stack. The resumer's pop_back()
+    // then removes the WRONG frame, so the collector loses live frames
+    // (the same failure mode as "a running frame got collected"), and the
+    // two execution streams' control-flow flags get mixed - a `return`
+    // inside a fiber can abort the resumer's loop, and vice versa.
+    struct VMFiber;
+    struct FiberCtx
+    {
+        std::vector<std::shared_ptr<Env>> gcFrames;
+        std::vector<Value> roots;
+        std::vector<long> epochStack;
+        int nReturn = 0, nBreak = 0, nContinue = 0;
+        Value ret;
+        Value fn;                     // the fiber's entry function (a GC root)
+        void* osFiber = nullptr;      // the OS fiber this context runs on
+        Value owner;                  // the meta-dispatch owner
+        int metaDepth = 0;            // metaProperty dispatch depth
+        std::unordered_set<Table*> metaActive;
+        // The fiber's script value. WEAK on purpose: a strong reference here
+        // would keep the table alive forever, and the table's reachability
+        // is exactly what tells the collector that the fiber was abandoned.
+        std::weak_ptr<Table> fiberVal;
+        void* fiber = nullptr;             // the owning VMFiber
+        VMFiber* runningFiber = nullptr;   // the fiber this context runs
+    };
+
+    // A fiber (纤程) runs on its own C++ stack. The state below belongs to
+    // the fiber, not to the thread: the script value is the only handle the
+    // VM has on it, and the execution context travels with the fiber.
+    struct VMFiber
+    {
+        void* hFiber = nullptr;
+        std::shared_ptr<FiberCtx> ctx;
+        wstring status = L"suspended";   // suspended | running | dead
+        std::vector<Value> inArgs;      // arguments for the next resume
+        std::vector<Value> outVals;     // values yielded or returned
+        void* resumeFiber = nullptr;    // OS fiber to switch back to
+        FiberCtx* resumeCtx = nullptr;  // execution context to switch back to
+    };
+
 
     // ---------------- module surface ----------------
+    // sysapi.cpp — bare `::` system API resolution (::SetWindowPointer ...)
+    struct Interp;
+    Value ResolveSysApi(Interp* it, const wstring& name);
+
     // lexer.cpp
     bool IsIdentChar(wchar_t c);
     vector<Tok> Lex(const wstring& src, wstring* strError);
@@ -937,10 +1209,28 @@ namespace NodioVM
     // entry.cpp
     wstring EmbedRoot();
     int CheckSyntax(const wstring& src, wstring* strError);
-    int RunSource(const wstring& src, wstring* strError,
-                  const wstring* pBaseDir,
-                  const std::unordered_map<wstring, wstring>* pEmbedded,
-                  bool bDebug, const wstring* pBreakLines);
+    // S-2: the source file that owns the code running in `env` — walks the
+    // defining-frame chain and returns the first frame that carries one
+    // (a module frame carries its own path; a call frame inherits it from
+    // the frame its function was DEFINED in, so a function of module A
+    // called from module B is still attributed to A).
+    const wstring* SourceFilePtrOfEnv(Env* env);
+    // S-2: does the message already carry a location marker? The two
+    // report points (the try/catch handler and the top-level report) must
+    // not append a second one, so this is checked before appending.
+    bool HasErrorLocation(const wstring& msg);
+    // S-2: append the location of a runtime error to a message:
+    //   "@ <file>:<line>"  when the owning file is known,
+    //   "@ 行 <line>"      when it is not (a bare line number).
+    // Official aardio keeps 文件 / 错误行号 in a structured error report
+    // (see the field table in aardio.exe) and drops them entirely when the
+    // project is published with debugging disabled; Nodio keeps them in the
+    // message itself, so console output, the LSP and CI logs can all
+    // attribute a failure to a file.
+    void AppendErrorLocation(wstring* msg, const wstring& file, int line);
+    // RunSource is declared in NodioVM.h (the public entry point) — it
+    // must not be declared twice: two overloads with different arities
+    // would make every 6-argument call ambiguous.
 
     // Resolve '~'-rooted path to a real disk path. '~' is the
     // application install root: the parent of NODIO_LIBDIR when set (dev/F5),
@@ -953,6 +1243,25 @@ namespace NodioVM
         wstring rel = strPath.substr(1);
         while (!rel.empty() && (rel[0] == L'\\' || rel[0] == L'/'))
             rel = rel.substr(1);
+
+        // Check 64-bit overlay first (e.g. D:\Nodio\lib\...)
+        if (rel.rfind(L"lib\\", 0) == 0 || rel.rfind(L"lib/", 0) == 0)
+        {
+            wstring sub = rel.substr(4);
+            wchar_t szOverlay[MAX_PATH] = L"";
+            if (GetEnvironmentVariableW(L"NODIO_OVERLAY_LIBDIR", szOverlay, MAX_PATH) > 0)
+            {
+                wstring cand = wstring(szOverlay) + L"\\" + sub;
+                if (_waccess(cand.c_str(), 0) == 0) return cand;
+            }
+#if defined(_WIN64) || defined(__x86_64__)
+            if (_waccess((L"D:\\Nodio\\lib\\" + sub).c_str(), 0) == 0)
+                return L"D:\\Nodio\\lib\\" + sub;
+#endif
+            if (_waccess((L"D:\\aardio\\lib\\" + sub).c_str(), 0) == 0)
+                return L"D:\\aardio\\lib\\" + sub;
+        }
+
         wstring root = EmbedRoot();
         if (root.empty())
         {
