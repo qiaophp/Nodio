@@ -26,6 +26,8 @@
 # 第十七轮新增：命名空间与导入（0x15 NEW_NATIVE / 0x16 IMPORT_MEMBER）——
 #   新建命名空间表、导入模块名（含全局里没有的名字）、导入后模块命名空间切换。
 #
+# 第十八轮新增：字符串拼接（0x21 CONCAT）与 for 循环（0x2E SUBEQ + 0x2D ADDEQ）。
+#
 # 用法: powershell -File aardio_run_check.ps1 [-Exe <nodio.exe>]
 param($Exe = 'D:\Nodio\build-x64\Release\nodio.exe',
       [string]$LibDir = 'D:\aardio\lib')
@@ -142,6 +144,19 @@ foreach ($c in $ns) {
     Expect ($r.text -like "*结果: $($c.want)*") "namespace $($c.name) = $($c.want)" $r.text
 }
 
+# ---- 1f) 拼接与循环（第十八轮）----
+$loop = @(
+    @{ name = 'concat';  want = 'a12b' },  # 0x21：槽 B..C 升序拼接
+    @{ name = 'forloop'; want = '60'   }   # 0x2E + 0x2D：for 循环 10+20+30
+)
+foreach ($c in $loop) {
+    $f = Join-Path $tmp ($c.name + '.aardio')
+    if (-not (Test-Path $f)) { Expect $false "fixture $($c.name) generated" "missing"; continue }
+    $r = Run-Chunk $f
+    Expect ($r.code -eq 0) "run $($c.name) exits 0" $r.text
+    Expect ($r.text -like "*结果: $($c.want)*") "concat/loop $($c.name) = $($c.want)" $r.text
+}
+
 # ---- 2) 尚未实现的记录种类必须明确报错 ----
 $r = Run-Chunk (Join-Path $tmp 'unsupported.aardio')
 Expect ($r.code -ne 0) 'unsupported kind fails' $r.text
@@ -151,7 +166,7 @@ Expect ($r.text -like '*记录号 1*') 'unsupported kind locates pc' $r.text
 # ---- 3) 合成块必须能被官方等价校验器判为合法 ----
 $val = Join-Path $repo 'tools\aardio_validate.py'
 if (Test-Path $val) {
-    $all = @($cases + $order + $member + $call + $ns) | ForEach-Object { $_.name }
+    $all = @($cases + $order + $member + $call + $ns + $loop) | ForEach-Object { $_.name }
     foreach ($n in $all) {
         $f = Join-Path $tmp ($n + '.aardio')
         $vout = & $py.Source $val $f 2>&1 | Out-String

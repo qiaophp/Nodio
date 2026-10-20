@@ -225,6 +225,29 @@ class Chunk(object):
         """
         return self.emit(rec(0x16, a=0, c=dest, b=name_operand))
 
+    # ---- 拼接与循环（第十八轮）----
+
+    def concat(self, a: int, b: int, c: int) -> int:
+        """0x21 CONCAT：把槽 B..C 的值拼成一个字符串，写回槽 B 再拷进槽 A。
+
+        官方：count = C - B + 1，FUN_004C4410 按**升序**拼接槽 B..C。
+        """
+        return self.emit(rec(0x21, a=a, c=c, b=b))
+
+    def addeq(self, a: int, target: int) -> int:
+        """0x2D ADDEQ：for 循环推进（A = 计数器槽），位移取自本条（偏置 0x1FFFE）。"""
+        return self.emit(self._jump_like(0x2D, a, target))
+
+    def subeq(self, a: int, target: int) -> int:
+        """0x2E SUBEQ：槽[A] -= 槽[A+2] 后无条件跳转（位移取自本条，偏置 0x1FFFE）。"""
+        return self.emit(self._jump_like(0x2E, a, target))
+
+    def _jump_like(self, kind: int, a: int, target: int) -> int:
+        """跳转类记录（0x22/0x2D/0x2E）：位移取自本条 18 位，偏置 0x1FFFE。"""
+        pc = len(self.code)
+        raw = ((target - pc) + 0x1FFFE) & 0x3FFFF
+        return (kind & 0x3F) | ((a & 0xFF) << 6) | (raw << 14)
+
     # ---- 序列化 ----
 
     def body(self) -> bytes:
@@ -567,15 +590,56 @@ def build_import_new():
     return c
 
 
-def build_unsupported():
-    """故意用一条尚未实现的记录（CONCAT 0x21）→ 记录 VM 必须明确报错
+def build_concat():
+    """0x21 CONCAT：把槽 B..C 的值按升序拼起来 = "a12b"
 
-    0x21 的实参窗口证据仍有歧义（见 docs §7.8），第十七轮尚未落地；
+    官方样本 aifix.aardio 的 /0 pc=401 就是
+    「LOAD_OUTER 槽16 / LOAD_LOCAL 槽17 / LOAD_OUTER 槽18 → CONCAT A=16 B=16 C=18」。
+    """
+    c = Chunk(slots=6)
+    k1 = c.add_const("a")
+    k2 = c.add_const("b")
+    c.load_const(1, k1)            # 槽1 = "a"
+    c.load_int(2, 12)              # 槽2 = 12
+    c.load_const(3, k2)            # 槽3 = "b"
+    c.concat(1, 1, 3)              # 槽1 = "a" + "12" + "b"
+    c.ret(1)
+    return c
+
+
+def build_forloop():
+    """0x2E SUBEQ + 0x2D ADDEQ：for 循环 = 60
+
+    照官方样本 aifix.aardio 的 /0 pc=262-277 的形状拼：
+      SUBEQ A=1  → 槽1 = 槽1 - 槽3（序言），跳到 ADDEQ
+      ADDEQ A=1  → 槽1 += 槽3；越界就落空，否则跳回循环体
+    循环体：槽5 = 槽1 * 10，累加进槽0。
+    计数器 1、2、3 → 10 + 20 + 30 = 60。
+    """
+    c = Chunk(slots=8)
+    c.load_int(0, 0)               # 槽0 = 累加和
+    c.load_int(1, 1)               # 槽1 = 计数器（= 1）
+    c.load_int(2, 3)               # 槽2 = 上限（= 3）
+    c.load_int(3, 1)               # 槽3 = 步长（= 1）
+    c.subeq(1, 8)                  # 槽1 = 1 - 1 = 0；跳到 ADDEQ（记录 8）
+    # 记录 5..7：循环体
+    c.load_int(6, 10)              # 槽6 = 10
+    c.arith(0x1A, 5, 1, 6)         # 槽5 = 槽1 * 10
+    c.arith(0x18, 0, 0, 5)         # 槽0 = 槽0 + 槽5
+    c.addeq(1, 5)                  # 槽1 += 1；越界则落空，否则跳回记录 5
+    c.ret(0)
+    return c
+
+
+def build_unsupported():
+    """故意用一条尚未实现的记录（CALL_MULTI 0x2F）→ 记录 VM 必须明确报错
+
+    0x2F 是多值调用（搬运 4 个槽后调用），第十八轮尚未落地；
     这里用它验证「未实现的种类必须明确报错」。
     """
     c = Chunk(slots=4)
     c.load_int(0, 1)
-    c.emit(rec(0x21, a=1, c=0, b=0))   # CONCAT：记录 VM 尚未实现
+    c.emit(rec(0x2F, a=1, c=0, b=0))   # CALL_MULTI：记录 VM 尚未实现
     c.ret(1)
     return c
 
@@ -602,6 +666,8 @@ BUILDERS = {
     "new_native": build_new_native,
     "import": build_import,
     "import_new": build_import_new,
+    "concat": build_concat,
+    "forloop": build_forloop,
     "unsupported": build_unsupported,
 }
 

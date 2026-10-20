@@ -17,7 +17,8 @@
 //  0x32），以及第十六轮的**调用帧与闭包**：
 //   0x0E STORE_UPVALUE / 0x0F LOAD_IF_SET / 0x29 TAILCALL / 0x2A CALL /
 //   0x2B CALL_NATIVE / 0x34 NEW_CLOSURE，以及第十七轮的**命名空间与导入**：
-//   0x15 NEW_NATIVE / 0x16 IMPORT_MEMBER
+//   0x15 NEW_NATIVE / 0x16 IMPORT_MEMBER，
+//   第十八轮的**拼接与循环**：0x21 CONCAT / 0x2D ADDEQ / 0x2E SUBEQ
 // 其余种类一律明确报错（种类 + 记录号），不静默跳过。
 #include "aardio_vm.h"
 
@@ -142,6 +143,34 @@ namespace NodioVM
             wchar_t buf[64];
             swprintf_s(buf, L"%.15g", v);
             return buf;
+        }
+
+        // 官方 FUN_004C4410（变参串拼接）把数值按 "%.14g" 转成文本
+        wstring NumText14(double v)
+        {
+            wchar_t buf[64];
+            swprintf_s(buf, L"%.14g", v);
+            return buf;
+        }
+
+        // 槽 → 数值：官方要求「数值或可转数值的字符串」，否则报错
+        bool AsNumber(const RtSlot& s, double* out)
+        {
+            switch (s.val.t)
+            {
+            case Value::Num:  *out = s.val.n; return true;
+            case Value::Bool: *out = s.val.b ? 1 : 0; return true;
+            case Value::Str:
+            {
+                wchar_t* end = nullptr;
+                double d = wcstod(s.val.s.c_str(), &end);
+                if (end == s.val.s.c_str()) return false;
+                *out = d;
+                return true;
+            }
+            default:
+                return false;
+            }
         }
 
         int CompareOf(const Value& a, const Value& b)
@@ -274,9 +303,10 @@ namespace NodioVM
         case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
         case 0x16: case 0x17:
         case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D:
-        case 0x1E: case 0x1F: case 0x20:
+        case 0x1E: case 0x1F: case 0x20: case 0x21:
         case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x28:
-        case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x32: case 0x33: case 0x34:
+        case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E:
+        case 0x32: case 0x33: case 0x34:
         case 0x35: case 0x36: case 0x37: case 0x38: case 0x39: case 0x3A: case 0x3B:
             return true;
         default:
@@ -567,6 +597,36 @@ namespace NodioVM
                 SetSlot(A, SlotOf(Value::Num_(len)));
                 break;
             }
+            case 0x21:   // CONCAT：把槽 B..C 的值拼成一个字符串
+            {
+                // 官方 case 0x21（0x004C592F）：
+                //   count = C - B + 1；FUN_004C4410(vm, count, C) 把槽 B..C
+                //   的字符串**按升序**拼起来写回槽 B；随后解释器再把槽 B
+                //   拷进槽 A。
+                int b = (int)(B & 0x1FF);
+                int c = (int)(C & 0x1FF);
+                if (c < b)
+                    return Fail((int)pc, kind, L"CONCAT 的操作数区间非法（C < B）");
+                wstring out;
+                for (int i = b; i <= c; i++)
+                {
+                    RtSlot s = LocalSlot((unsigned int)i);
+                    switch (s.val.t)
+                    {
+                    case Value::Str:  out += s.val.s; break;
+                    case Value::Num:  out += NumText14(s.val.n); break;
+                    case Value::Bool: out += (s.val.b ? L"true" : L"false"); break;
+                    case Value::Null: break;                       // 空串
+                    default:
+                        return Fail((int)pc, kind,
+                            L"CONCAT 的参数既不是字符串也不是数值（槽 " +
+                            std::to_wstring(i) + L"）");
+                    }
+                }
+                SetSlot(b, SlotOf(Value::Str_(out)));   // 官方：结果先写回槽 B
+                SetSlot(A, SlotOf(Value::Str_(out)));   // 再拷进槽 A
+                break;
+            }
             case 0x22:   // JMP：位移取自本条
             {
                 int rel = (int)(K - 0x1FFFE);
@@ -720,6 +780,59 @@ namespace NodioVM
                 if (ret >= 0 && ret < (int)frames.back().slots.size())
                     SlotPut(frames.back().slots[(size_t)ret], s);
                 continue;
+            }
+            case 0x2D:   // ADDEQ：for 循环推进（计数器 += 步长，越界则落空）
+            {
+                // 官方 case 0x2d：
+                //   cur  = (槽[A+3] 是数值) ? 槽[A+3] : 槽[A]
+                //   newv = cur + 槽[A+2]（步长）
+                //   lim  = 槽[A+1]
+                //   步长 <= 0 时 newv <  lim → 跳过赋值（顺序执行，循环结束）
+                //   步长 >  0 时 newv >  lim → 跳过赋值
+                //   否则：槽[A] = 槽[A+3] = newv，并跳到 pc + (K - 0x1FFFE)
+                RtSlot sA = LocalSlot(A), sLim = LocalSlot(A + 1);
+                RtSlot sStep = LocalSlot(A + 2), sCnt = LocalSlot(A + 3);
+                double cur = 0, step = 0, lim = 0;
+                if (!AsNumber(sA, &cur) || !AsNumber(sLim, &lim) ||
+                    !AsNumber(sStep, &step))
+                    return Fail((int)pc, kind, L"ADDEQ 的操作数不是数值");
+                if (sCnt.type == 3) cur = NumOf(sCnt.val);
+                double newv = cur + step;
+                bool skip = (step <= 0) ? (newv < lim) : (newv > lim);
+                if (!skip)
+                {
+                    SetSlot(A, SlotOf(Value::Num_(newv)));
+                    SetSlot(A + 3, SlotOf(Value::Num_(newv)));
+                    int rel = (int)(K - 0x1FFFE);
+                    long long t = (long long)pc + rel;
+                    if (t < 0 || t >= (long long)n)
+                        return Fail((int)pc, kind, L"ADDEQ 跳转落点越界");
+                    frame.ip = (size_t)t;
+                }
+                break;
+            }
+            case 0x2E:   // SUBEQ：槽[A] -= 槽[A+2]，随后**无条件**跳转
+            {
+                // 官方 case 0x2e：槽[A]、槽[A+1]、槽[A+2] 都必须是数值
+                // （字符串会尝试转数值），然后
+                //   槽[A] = 槽[A] - 槽[A+2]；槽[A+3] 的类型标签清成 null；
+                //   ip = pc + (K - 0x1FFFE)（**总是**跳）。
+                // 官方样本里它是 for 循环的「序言」：把计数器先减去步长，
+                // 让随后的 ADDEQ 正好加回步长、得到循环的第一个值。
+                RtSlot sA = LocalSlot(A), sLim = LocalSlot(A + 1);
+                RtSlot sStep = LocalSlot(A + 2);
+                double v = 0, step = 0, dummy = 0;
+                if (!AsNumber(sA, &v) || !AsNumber(sLim, &dummy) ||
+                    !AsNumber(sStep, &step))
+                    return Fail((int)pc, kind, L"SUBEQ 的操作数不是数值");
+                SetSlot(A, SlotOf(Value::Num_(v - step)));
+                SetSlot(A + 3, RtSlot());        // 官方：槽[A+3] 清成 null
+                int rel = (int)(K - 0x1FFFE);
+                long long t = (long long)pc + rel;
+                if (t < 0 || t >= (long long)n)
+                    return Fail((int)pc, kind, L"SUBEQ 跳转落点越界");
+                frame.ip = (size_t)t;
+                break;
             }
             case 0x33:   // GC：记录 VM 不做回收
                 break;

@@ -3,8 +3,9 @@
 > 状态：**容器层已完全还原并通过字节级回归验证**；**运行期解释器本体已定位，
 > 61 种记录的语义已逐条读出**（第十一轮），**操作数角色已定案**（第十五轮），
 > **调用帧与闭包语义已定案**（第十六轮），
-> **命名空间与导入语义已定案**（第十七轮）。
-> Nodio 侧的记录 VM 已能执行 **54/61** 种记录（第十七轮）。
+> **命名空间与导入语义已定案**（第十七轮），
+> **字符串拼接与 for 循环语义已定案**（第十八轮）。
+> Nodio 侧的记录 VM 已能执行 **57/61** 种记录（第十八轮）。
 > 方法：REA（`rea-agents@6.4.0`）+ Ghidra 12.1.4 headless 反编译 `aardio.exe`，
 > 配合对官方唯一样本的字节级差分/穷举分析。
 > 工具：`tools/aardio_bytecode.py`、`tools/aardio_opcodes.py`、`tools/aardio_stats.py`、
@@ -31,9 +32,10 @@
 | VM 状态对象与调用帧布局 | **完全还原（第十一轮）** | `FUN_004c4bc0` / `FUN_004d3040` 实测 |
 | 61 种记录的运行期语义 | **已逐条读出（第十一轮）** | 解释器 61 个 case 逐条反编译；算术组 / 位运算组有 helper 分派参数佐证；剩余 8 个变体差异见 §7.8 |
 | **操作数角色（A/B/C 各是什么）** | **已定案（第十五轮）** | 官方解释器调用点的压栈次序 + 官方校验器 `FUN_004D4450` 的取位次序 + 官方样本 `aifix.aardio` 交叉验证；见 §7.5.4 |
-| **Nodio 记录 VM 已能执行的记录种类** | **54/61（第十七轮）** | `engine/aardio_vm.cpp`；`-disasm` 的「未实现记录种类」一节实时统计；回归 `tests/aardio_run_check.ps1` |
+| **Nodio 记录 VM 已能执行的记录种类** | **57/61（第十八轮）** | `engine/aardio_vm.cpp`；`-disasm` 的「未实现记录种类」一节实时统计；回归 `tests/aardio_run_check.ps1` |
 | **调用约定与闭包语义** | **已定案（第十六轮）** | 被调槽 = A；实参窗口 = 槽 A+1..A+B-1；返回槽 = A+B；闭包捕获条数 = 嵌套对象 `flags[0]`；见 §7.5.5 |
 | **命名空间与导入语义** | **已定案（第十七轮）** | `0x15` = 新建空命名空间表（父表 = 全局内建表）；`0x16` = 名字在 B、目标槽在 C，导入后模块命名空间切到被导入的命名空间；见 §7.5.6 |
+| **字符串拼接与 for 循环语义** | **已定案（第十八轮）** | `0x21` = 把槽 B..C 升序拼成字符串（写回槽 B 再拷进槽 A）；`0x2D` = for 循环推进（越界则落空）；`0x2E` = 槽 A -= 槽 A+2 后无条件跳转；见 §7.5.7 |
 | 官方校验器对各记录种类的结构约束 | **部分还原（21/61）** | 官方 chunk 校验器 `FUN_004d4450`；**与解释器对 kind 0x22 的解读不一致**（见 §7.7） |
 | 「64 路分派表」 | **确认不存在** | 描述符表的 5 个引用点全在编译/校验侧；运行期是 61 个 case 直接分派，无跳转表（第十轮） |
 
@@ -736,7 +738,7 @@ bits 23..31 : B        (9 bit)   操作数②（bit31=1 时指常量表）
 | 0x1E | NEG | A, B | A ← -B（一元负号） |
 | 0x1F | TRUTHY | A, B | A ← (B 是否为真) |
 | 0x20 | LENGTH | A, B | A ← 长度（字符串长度 / 表元素数） |
-| 0x21 | CONCAT | A, B | 变参串拼接，结果写回槽 |
+| 0x21 | CONCAT | A, B, C | 把槽 **B..C** 的值按**升序**拼成一个字符串（count = C-B+1），先写回槽 B，再拷进槽 A |
 | 0x22 | JMP | R18 | 无条件跳转：IP ← 本条 + R18 |
 | 0x23 | JZ | A, C | 相等比较为假则跳过；真则跳到下一条 u32 的 R18 |
 | 0x24 | JE | A, B, C | 比较 B 与 C，相等则跳到下一条 u32 的 R18 |
@@ -748,8 +750,8 @@ bits 23..31 : B        (9 bit)   操作数②（bit31=1 时指常量表）
 | 0x2A | CALL | A, B, C | 调用：被调值 = 槽 A，实参窗口 = 槽 A+1..A+B-1，返回值写入槽 A+B |
 | 0x2B | CALL_NATIVE | A, B, C | 调用原生函数（实参窗口同上；`FUN_004D3040` 的原生分支） |
 | 0x2C | RET | A, C | 返回 |
-| 0x2D | ADDEQ | A, R18 | A ← A + delta（复合赋值） |
-| 0x2E | SUBEQ | A, R18 | A ← A - delta（复合赋值） |
+| 0x2D | ADDEQ | A, R18 | for 循环推进：cur = 槽[A+3]（是数值时）否则槽[A]；槽[A] = 槽[A+3] = cur + 槽[A+2]；越界则不赋值并顺序执行，否则跳到本条 + R18 |
+| 0x2E | SUBEQ | A, R18 | 槽[A] -= 槽[A+2]，槽[A+3] 清成 null，随后**无条件**跳到本条 + R18（for 循环的序言） |
 | 0x2F | CALL_MULTI | A, C | 多值调用：搬运 4 个槽后调用 |
 | 0x30 | CALL_VALUE | A, C | 调用函数值（槽类型 6） |
 | 0x31 | CALL_NS | A, C | 调用（槽类型 5/6） |
@@ -1177,6 +1179,92 @@ B 段 = 3（常量或局部槽），与反汇编一致。
 > Nodio 的记录 VM 挂在**帧**上；闭包帧沿用「属主命名空间」，
 > 因此在闭包体里执行 `0x16` 只切换该帧、不影响定义者 —— 这一点待补齐。
 
+### 7.5.7 字符串拼接与 for 循环（第十八轮定案）
+
+第十八轮把 `0x21` / `0x2D` / `0x2E` 三条记录的角色与行为定案，
+Nodio 的记录 VM 据此落地 **57/61** 种记录。
+
+#### 7.5.7.1 0x21 CONCAT：槽 B..C 升序拼接
+
+反汇编（`0x004C592F` 起）：
+
+```asm
+004c5935  SHR ESI,0xe
+004c5938  AND ESI,0x1ff        ; ESI = C
+004c593e  PUSH ESI              ; 第三个实参 = C（末参槽）
+004c593f  SHR EDI,0x17         ; EDI = B
+004c5942  SUB ESI,EDI
+004c5944  INC ESI              ; count = C - B + 1
+004c5945  PUSH ESI              ; 第二个实参 = count
+004c5946  PUSH EBX              ; 第一个实参 = vm
+004c594a  CALL 0x004c4410       ; FUN_004C4410(vm, count, C)
+...
+004c596f  MOV EDX,[EAX + EDI*0x8]   ; 槽[B].value
+004c5972  MOV [ECX + EAX],EDX       ; 槽[A].value ← 槽[B].value
+```
+
+* `FUN_004C4410(vm, count, C)` 把槽 `C-count+1 .. C`（= 槽 B..C）里的
+  **字符串**按**升序**（先 B 后 C）拼起来，结果写回**槽 B**
+  （`puVar8 = iVar7 + local_7c * -0x10`，而 `iVar7 = &slot[C+1]`）；
+* 数值按 `"%.14g"` 转文本；既不是字符串又不是数值 → 报 `FUN_004D4F30`；
+* 随后解释器把槽 B 的 12 字节拷进槽 A。
+
+官方描述符 `DAT_007C80A0[0x21] = 0x68` → C、B 两段的寻址类别都是
+**局部槽下标**（不是常量），与上面「B/C 是槽号」一致。
+
+官方样本佐证：`aifix.aardio` 的 `/0 pc=401`：
+
+```
+398 LOAD_OUTER  A=16 C=96     → 槽16 = 常量
+399 LOAD_LOCAL  A=17 B=12    → 槽17 = 槽12
+400 LOAD_OUTER  A=18 C=97     → 槽18 = 常量
+401 CONCAT      A=16 B=16 C=18 → 槽16 = 槽16 + 槽17 + 槽18
+402 CALL        A=13 B=4 C=2
+```
+
+#### 7.5.7.2 0x2D / 0x2E：for 循环的「序言 + 推进」
+
+官方样本 `/0 pc=259-277` 是一段完整的 for 循环：
+
+```
+259 LOAD_OUTER A=9  C=66      → 槽9  = 1      （计数器）
+260 LOAD_OUTER A=10 C=67      → 槽10 = 3      （上限）
+261 LOAD_OUTER A=11 C=66      → 槽11 = 1      （步长）
+262 SUBEQ     A=9  rel=+15    → 槽9 = 槽9 - 槽11 = 0；跳到 277
+263..276                     ← 循环体
+277 ADDEQ     A=9  rel=-14    → 槽9 += 槽11；越界则落空，否则跳回 263
+278 ...                       ← 循环之后
+```
+
+* **0x2E SUBEQ**（序言）：`槽[A] = 槽[A] - 槽[A+2]`（步长），
+  槽[A+3] 的类型标签清成 null，**总是**跳转。
+  于是 `1 - 1 = 0`，随后的 ADDEQ 正好加回步长、得到循环的第一个值 1。
+* **0x2D ADDEQ**（推进）：
+
+  ```
+  cur  = (槽[A+3] 是数值) ? 槽[A+3] : 槽[A]
+  newv = cur + 槽[A+2]
+  lim  = 槽[A+1]
+  步长 <= 0 时 newv <  lim → 跳过赋值（顺序执行 → 循环结束）
+  步长 >  0 时 newv >  lim → 跳过赋值
+  否则：槽[A] = 槽[A+3] = newv，并跳到 本条 + R18（回到循环体）
+  ```
+
+  步长 > 0 时用 `newv > lim`（**不是** `>=`）判越界 → **上限本身会被计入循环**，
+  与 `for i = 1 to 3` 跑 3 圈一致。
+
+> 两条记录的位移都在**本条**记录里（偏置 `0x1FFFE`，与 `0x22 JMP` 同源）；
+> 官方描述符 `DAT_007C80A0[0x2D] = DAT_007C80A0[0x2E] = 0x62` → 类别 2
+> （单 18 位有符号 = 跳转类），校验器也按跳转落点检查它们。
+
+#### 7.5.7.3 Nodio 的落地与回归
+
+* `engine/aardio_vm.cpp`：新增 `0x21` / `0x2D` / `0x2E` 三个 case；
+  数值转文本用 `"%.14g"`（官方 `FUN_004C4410` 的格式）；
+* 新增合成夹具 `concat`("a12b")、`forloop`(60)；
+* 回归 `tests/aardio_run_check.ps1` 67 → **73 项**；
+* `-disasm` 的进度：54/61 → **57/61**（剩 4 种：`0x2F` / `0x30` / `0x31` / `0x3C`）。
+
 ### 7.6 解释器 helper 地图
 | 地址 | 作用 |
 | --- | --- |
@@ -1246,7 +1334,8 @@ B 段 = 3（常量或局部槽），与反汇编一致。
 | 0x15 NEW_NATIVE 的 B/C 位域 | ⏳ **第十七轮部分解开**：B、C 各打包一个 3 位小整数（`((x & 7) + 8) << (x >> 3 - 1)`，`x >> 3 == 0` 表示该字段缺省）；官方只把其中一个值的符号位落到表标志位（`puVar3[8] = (param_2 < 0)`），两个小整数的**确切含义**仍未查明（§7.5.6.1） |
 | 0x16 IMPORT_MEMBER 的操作数角色 | ✅ **第十七轮已解**：名字 = **B** 操作数（bit8=1 → 常量），目标 = **槽 C**，A 不参与；官方描述符 `DAT_007C80A0[0x16] = 0x38`（C = 局部槽、B = 常量或局部槽）与反汇编一致（§7.5.6.2） |
 | VM 暂存槽 `vm+0x40` 的语义 | ✅ **第十七轮已解**（修正第十六轮的偏差）：= **全局命名空间**；模块命名空间与 `0x15` 建出的命名空间，父表都是它（§7.5.6.4） |
-| 0x21 CONCAT 的实参窗口 | ⏳ **仍未定案**：反汇编给出 count = `C - B + 1`、base = `C`、参数取帧槽 `B..C`，结果写回槽 `B`；但与官方样本 `/0/0` 的用法对不上，落地风险高，暂不实现 |
+| 0x21 CONCAT 的实参窗口 | ✅ **第十八轮已解**：**名字 = 槽 B..C**（count = C-B+1，升序拼接），结果先写回槽 B 再拷进槽 A；官方描述符 `DAT_007C80A0[0x21] = 0x68`（B/C 都是局部槽下标）与反汇编一致（§7.5.7.1） |
+| 0x2D / 0x2E 的操作数角色 | ✅ **第十八轮已解**：`0x2D` = for 循环推进（槽 A..A+3：计数器/上限/步长/内部计数器，越界则落空）；`0x2E` = 槽 A -= 槽 A+2 后无条件跳转（循环序言）；位移都在本条记录、偏置 0x1FFFE（§7.5.7.2） |
 | 记录流 → **AST** 的结构编码 | ✅ **第十三轮撤销该问题**：官方运行期没有 AST，解释器 `FUN_004C4BC0` 直接执行扁平记录流；因此**不需要**反推树，路线改为「照官方做记录 VM」（见 §7.5.2） |
 | 常量池（2173 个常量）在记录流里的索引约定 | ✅ **第十三轮已解**：常量表在 chunk 帧 `+0x08`（16 字节/项）；下标有两种载体——9 位操作数 + bit8=1，或 **18 位操作数 K**（§7.5.2） |
 
@@ -1448,7 +1537,19 @@ Nodio 现在能**读出**官方预编译块的结构，并在 import 阶段给�
    > 官方样本 `aifix.aardio` 仍在**记录号 3** 停下：根 chunk 第 3 条 `CALL`
    > 调的是**全局函数 `import`**，而 Nodio 还没有「aardio 标准库 → Nodio 标准库」
    > 的映射层 —— 这是下一件独立的工程，不在本轮范围内。
-8. **大**：完整支持 `.aau` / 预编译模块的加载、缓存与调试信息（行号表）。
+8. **第十八轮新增：字符串拼接与 for 循环落地（S-1b 第四阶段再续）**。
+   把 `0x21` / `0x2D` / `0x2E` 的操作数角色与行为定案（§7.5.7）：
+   * `0x21 CONCAT` = 把**槽 B..C** 的值按**升序**拼成一个字符串
+     （count = C-B+1），先写回槽 B 再拷进槽 A；
+   * `0x2D ADDEQ` = for 循环推进：计数器 += 步长，越界就落空（顺序执行），
+     否则跳回循环体；上限用 `>` 判越界 → **上限本身计入循环**；
+   * `0x2E SUBEQ` = 槽 A -= 槽 A+2 后**无条件**跳转，是 for 循环的「序言」。
+   记录 VM 随之从 `可执行 54/61` 变成 **`可执行 57/61`**
+   （剩 4 种：多值调用 `0x2F` / 函数值调用 `0x30` / 命名空间调用 `0x31` /
+   带实参个数的调用 `0x3C`）。
+   回归 `tests/aardio_run_check.ps1` 扩到 **73 项断言**：新增 `concat`("a12b")
+   与 `forloop`(60) 两个夹具。
+9. **大**：完整支持 `.aau` / 预编译模块的加载、缓存与调试信息（行号表）。
    注：官方预编译块**自带源码行号区间**（chunk 头的两个 i32 = 首行/末行），
    这是官方给预编译模块做运行期行号定位的基础，Nodio 可以照做。
 
@@ -1572,6 +1673,21 @@ python tools\aardio_ctx.py D:\aardio\lib\ide\aifix.aardio 0x15,0x16
 python tools\aardio_make_chunk.py tests\aardio_vm
 python tools\aardio_validate.py tests\aardio_vm\import.aardio
 D:\Nodio\build-x64\Release\nodio.exe -runchunk tests\aardio_vm\import.aardio
+pwsh -File tests\aardio_run_check.ps1 -Exe D:\Nodio\build-x64\Release\nodio.exe
+pwsh -File tests\aardio_chunk_check.ps1 -Exe D:\Nodio\build-x64\Release\nodio.exe
+
+# 12) 第十八轮：字符串拼接与 for 循环（0x21 / 0x2D / 0x2E）
+#    a) 官方语义取证：拼接 helper + 解释器里的三个 case
+& $gh D:\ghidra_proj aardio -process aardio.exe -noanalysis `
+    -scriptPath D:\Nodio\tools\ghidra `
+    -postScript DumpDecomp.java D:\ghidra_out '0x4c4410' `
+    -postScript DumpDisasm.java D:\ghidra_out '0x4c4bc0'
+#    b) 官方样本里定位 0x21 / 0x2D / 0x2E，打印上下文与常量
+python tools\aardio_ctx.py D:\aardio\lib\ide\aifix.aardio 0x21,0x2D,0x2E
+#    c) 合成夹具（拼接 / 循环）→ 官方等价校验器 → 记录 VM 执行
+python tools\aardio_make_chunk.py tests\aardio_vm
+python tools\aardio_validate.py tests\aardio_vm\forloop.aardio
+D:\Nodio\build-x64\Release\nodio.exe -runchunk tests\aardio_vm\forloop.aardio
 pwsh -File tests\aardio_run_check.ps1 -Exe D:\Nodio\build-x64\Release\nodio.exe
 pwsh -File tests\aardio_chunk_check.ps1 -Exe D:\Nodio\build-x64\Release\nodio.exe
 ```
