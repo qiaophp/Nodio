@@ -1,0 +1,57 @@
+// t91: 官方 raw.tostdcall 的 cdata 契约（引擎缺口 E-11）
+//
+// 官方契约来源（不是自造 API）：
+//   D:\aardio\docs\library-guide\builtin\raw\callback.md
+//     §2 "使用 raw.tostdcall 函数将普通 aardio 函数转换为支持 stdcall
+//          调用约定的可回调函数"
+//     §2 "回调函数也可以在 aardio 中被调用执行，例如： func_c(1,2,3)"
+//     §2 "回调函数是一个 cdata 对象，回调函数声明了 _topointer 元方法"
+//     §2 "可以附加一个参数以显式指定 owner 指针的值"
+//     §6 "如果所有引用原生回调函数对象的变量被赋值为 null 或者超出作用域
+//          不再有效，将会自动回收并删除"
+//
+// 修复前：raw.tostdcall 返回一个裸数字，CbCtx 永远留在引擎的 g_cbs 里，
+// 回调闭包连同它捕获的一切被当成 GC 根永久钉住（官方 win.subclass 用
+// __wndproc_gc__ 表持有回调，win.form 把回调存进 this._wndproc_c ——
+// 这些持有关系在修复后才有意义）。
+import raw;
+
+namespace probe {
+    var released = 0;
+}
+
+// ---- 1) 类型：官方 cdata（带 _topointer 元方法）
+var c = raw.tostdcall(function (a, b, c) {
+    return a + b + c;
+}, "int(int,int,int)");
+io.print("CDATA-TYPE " + type(c));
+
+// ---- 2) 回调可以从 aardio 直接调用（官方 §2）
+io.print("CDATA-CALL " + c(1, 2, 3));
+
+// ---- 3) 第 3 个参数指定 owner（官方 §2）
+var c2 = raw.tostdcall(function () {
+    return owner.tag;
+}, "int()", { tag = "OWNED" });
+io.print("CDATA-OWNER " + c2());
+
+// ---- 4) 释放：回调是 GC 管理的对象 —— 丢掉最后一个脚本引用后，
+//         回调捕获的表随之回收，它的 table.gc finalizer 就会执行。
+//         （finalizer 闭包只捕获命名空间，不反向捕获 payload，避免官方
+//          文档警告的「成员 + 闭包循环引用导致无法释放」。）
+//         payload 必须活在**函数作用域**里：脚本顶层的局部变量由正在
+//         运行的脚本帧持有，函数返回后仍然可达，永远不会被回收。
+var makeCallback = function () {
+    var payload = { tag = "P" };
+    payload.fin = function () {
+        probe.released = 1;
+    };
+    table.gc(payload, "fin");
+    return raw.tostdcall(function () {
+        return payload.tag;
+    }, "int()");
+};
+var c3 = makeCallback();
+c3 = null;
+collectgarbage("collect");
+io.print("CDATA-RELEASED " + probe.released);

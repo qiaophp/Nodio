@@ -1,0 +1,134 @@
+// nodio.gui.input — 输入框。
+//
+// 移植自 Zan.Gui 的 Gui/Widget/Input.zan：
+//   带边框的圆角盒 + 居中文字 + 聚焦光标 + 占位文字（placeholder）。
+//   状态：normal / hover / pressed / focused / disabled。
+//
+// 键盘输入：宿主把 WM_CHAR / WM_KEYDOWN 交给当前获得焦点的控件
+// （见 nodio.gui.host 的 focus 机制），输入框据此插入/删除字符。
+namespace nodio.gui{
+import nodio.gui.widget;
+import nodio.gui.style;
+import nodio.gui.theme;
+import nodio.gui.ctx;
+
+input = function(opt){
+	opt = opt : {};
+	var self = ..nodio.gui.widget({
+		text = opt.text;
+		style = opt.style : ..nodio.gui.styleInput(opt.size : "medium");
+	});
+	self.placeholder = opt.placeholder : "";
+	self.caret = 0;              // 光标位置（字符序号）
+	self.focused = false;
+	self.onChange = opt.onChange;   // function(widget, text)
+	self.onEnter = opt.onEnter;
+
+	// 文本
+	self.getText = function(){
+		return self.text : "";
+	}
+	self.setText = function(t, caret){
+		self.text = t : "";
+		if(caret === null || caret === undefined){
+			self.caret = #self.text;
+		}
+		else{
+			self.caret = caret;
+		}
+		self.invalidate();
+		if(self.onChange) self.onChange(self, self.text);
+	}
+	// 插入一段文字（键盘输入）
+	self.insert = function(t){
+		if(!self.enabled) return;
+		var s = self.text : "";
+		var c = self.caret;
+		if(c < 0) c = 0;
+		if(c > #s) c = #s;
+		self.text = ..string.left(s, c) ++ t ++ ..string.right(s, #s - c);
+		self.caret = c + #t;
+		self.invalidate();
+		if(self.onChange) self.onChange(self, self.text);
+	}
+	// 退格
+	self.backspace = function(){
+		if(!self.enabled) return;
+		var s = self.text : "";
+		if(self.caret <= 0) return;
+		self.text = ..string.left(s, self.caret - 1) ++ ..string.right(s, #s - (self.caret - 1));
+		self.caret = self.caret - 1;
+		self.invalidate();
+		if(self.onChange) self.onChange(self, self.text);
+	}
+	// 删除键
+	self.del = function(){
+		if(!self.enabled) return;
+		var s = self.text : "";
+		if(self.caret >= #s) return;
+		self.text = ..string.left(s, self.caret) ++ ..string.right(s, #s - self.caret - 1);
+		self.invalidate();
+		if(self.onChange) self.onChange(self, self.text);
+	}
+	// 字符位置 → 像素 x（按当前字体量）
+	self.__caretX = function(g, sb, tx, tw){
+		var s = self.text : "";
+		var c = self.caret;
+		if(c < 0) c = 0;
+		if(c > #s) c = #s;
+		if(c == 0) return tx;
+		return tx + g.measure(..string.left(s, c), sb.fontPx);
+	}
+
+	self.onMouseDown = function(x,y){
+		self.focused = true;
+		// 光标落到最近字符（按横向比例估算）
+		var s = self.text : "";
+		if(#s == 0){ self.caret = 0; self.invalidate(); return }
+		var w = self.rect.right - self.rect.left;
+		var ratio = (x - self.rect.left) / w;
+		if(ratio < 0) ratio = 0;
+		if(ratio > 1) ratio = 1;
+		self.caret = math.floor(ratio * #s + 0.5);
+		self.invalidate();
+	}
+	// 供外部注入
+	self.onKeyChar = function(ch){ self.insert(ch) }
+	self.onKeyBackspace = function(){ self.backspace() }
+	self.onKeyDelete = function(){ self.del() }
+
+	self.paint = function(g, rc){
+		var th = g.theme;
+		var sb = self.box(th);
+		var x = rc.left;
+		var y = rc.top;
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var r = g.s(sb.radius);
+		g.round(sb.bg, x, y, w, h, r);
+		var bw = g.s(sb.borderW);
+		if(bw > 0) g.roundLine(sb.borderColor, x, y, w, h, r, bw);
+		var padL = g.s(sb.padL);
+		var padR = g.s(sb.padR);
+		var tx = x + padL;
+		var tw = w - padL - padR;
+		var s = self.text : "";
+		if(s == "" && self.placeholder){
+			g.text(self.placeholder, th.textTertiary, sb.fontPx, tx, y, tw, h,
+				{align=0; valign=1; ellipsis=1});
+		}
+		else{
+			g.text(s, sb.fg, sb.fontPx, tx, y, tw, h,
+				{align=0; valign=1; ellipsis=1});
+		}
+		// 光标
+		if(self.focused && self.enabled){
+			var cx = self.__caretX(g, sb, tx, tw);
+			g.line(sb.accent >= 0 ? sb.accent : th.primary, cx, y + g.s(6),
+				cx, y + h - g.s(6), g.s(1));
+		}
+	}
+	return self;
+}
+
+}

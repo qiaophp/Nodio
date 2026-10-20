@@ -1,0 +1,9 @@
+namespace s2mod;
+
+boom = function() {
+	error("s2 module boom");
+}
+
+callBack = function(f) {
+	f();
+}

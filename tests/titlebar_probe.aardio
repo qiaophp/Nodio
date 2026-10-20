@@ -1,0 +1,70 @@
+// tests/titlebar_probe.aardio — 自绘标题栏的行为回归（进程内直接发鼠标消息）。
+//
+// 为什么不用「真鼠标」自动化：合成鼠标事件（mouse_event / SendInput）
+// 在本机的桌面会话里送不进目标进程（点页签、点标题栏都收不到），
+// 测出来的结果不可信。进程内直接给画板发 WM_LBUTTONDOWN / WM_MOUSEMOVE /
+// WM_LBUTTONUP 走的是**同一条消息链**（窗口子类化 → onMouseDown → 拖动/菜单），
+// 结果确定可复现。
+//
+// 用法：
+//   NODIO_RUN=tests\titlebar_probe.aardio nodio.exe
+//   期望输出： DRAG-OK / MENU-OPEN / MENU-FIRED / PROBE-OK
+import win.ui;
+import nodio.ui.titlebar;
+import raw;
+
+var f = win.form(text="titlebar probe";right=1000;bottom=600);
+var fired = "";
+var tb = nodio.ui.titlebar(f, {
+	menus = {
+		{ "文件";{
+			{ "新建"; function(id){ fired = "NEW" } };
+			{ "-"; null };
+			{ "退出"; function(id){ fired = "EXIT" } };
+		} };
+	};
+});
+f.show();
+// 让画板先画一遍（菜单标题的矩形是绘制时算出来的）
+..win.delay(600);
+
+var u32 = ..raw.loadDll("user32.dll");
+var setCursor = u32.api("SetCursorPos", "bool(int x,int y)");
+var wr = ..win.getRect(f.hwnd, true);
+var bh = tb.board.ctrl.hwnd;
+
+// ---- 1) 拖动窗口：光标从 (500,20) 移到 (560,70)，即 (+60,+50)，
+//         窗口应当跟着移动同样的量 ----
+setCursor(wr.left + 500, wr.top + 20);
+::SendMessage(bh, 0x201/*_WM_LBUTTONDOWN*/, 1, (20<<16)|500);
+setCursor(wr.left + 560, wr.top + 70);
+::SendMessage(bh, 0x200/*_WM_MOUSEMOVE*/, 0, (70<<16)|560);
+::SendMessage(bh, 0x202/*_WM_LBUTTONUP*/, 0, (70<<16)|560);
+var wr2 = ..win.getRect(f.hwnd, true);
+var dx = wr2.left - wr.left;
+var dy = wr2.top - wr.top;
+if(dx == 60 && dy == 50) io.print("DRAG-OK");
+else io.print("DRAG-FAIL dx=" ++ dx ++ " dy=" ++ dy);
+
+// ---- 2) 点菜单标题 → 弹出下拉菜单 ----
+setCursor(wr2.left + 60, wr2.top + 20);
+::SendMessage(bh, 0x201, 1, (20<<16)|60);
+..win.delay(200);
+if(tb.openMenu == 1 && tb.popup) io.print("MENU-OPEN");
+else io.print("MENU-FAIL open=" ++ tostring(tb.openMenu));
+
+// ---- 3) 点第一项 → 触发命令 + 菜单关闭 ----
+var ph = tb.popup ? tb.popup.ctrl.hwnd : 0;
+if(ph){
+	var pr = tb.popRects[1];
+	::SendMessage(ph, 0x201, 1, ((pr.top+pr.bottom)/2<<16)|((pr.left+pr.right)/2));
+	..win.delay(200);
+	if(fired == "NEW" && tb.openMenu == 0) io.print("MENU-FIRED");
+	else io.print("MENU-FIRE-FAIL fired=" ++ fired ++ " open=" ++ tostring(tb.openMenu));
+}
+else{
+	io.print("MENU-FIRE-FAIL no-popup");
+}
+
+f.close();
+if(dx == 60 && dy == 50 && tb.openMenu == 0) io.print("PROBE-OK");

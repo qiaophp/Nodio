@@ -1,14 +1,253 @@
-// app/lspClient.nodio — nodio-lsp client (milestone M2).
+// app/lspClient.nodio — nodio-lsp client.
 //
-// The server binary speaks LSP over stdio (apps/nodio-lsp/main.cpp). Wiring
-// it up means: spawn it with process.popen, send initialize / didOpen /
-// didChange, and turn completion / hover / diagnostics responses into editor
-// UI. Not implemented yet — this module is the seam so the shell never grows
-// protocol code.
+// Speaks Content-Length framed JSON-RPC over stdio to apps/nodio-lsp.exe
+// (spawned with process.popen). Transport facts that took real debugging
+// to establish, keep them:
+//   * aardio DOUBLE-quoted strings do NOT escape \r\n — frame separators
+//     must be built with single-quoted '\r\n' literals;
+//   * popen's stdIn (io.file "w+") keeps the last written bytes in its CRT
+//     buffer; appending one '\n' after each framed message flushes the
+//     whole thing to the pipe (the server tolerates the stray blank line);
+//   * every request read must go through poll() — never a blocking read,
+//     the IDE cannot afford to freeze on a silent server.
+import process.popen;
+import JSON;
 
 exeName = "nodio-lsp.exe";
 
-// Returns a client handle, or null while the protocol layer is unimplemented.
-start = function(libDir){
+var p = null;          // popen process
+var nextId = 1;        // JSON-RPC request id
+var uri = "";          // current document uri (file:/// url)
+var text = "";         // current document text (mirrors the editor)
+var version = 0;       // document version counter
+var diags = {};        // latest diagnostics: { {line,col,msg,sev}; ... }
+var pending = {};      // responses we can't serve synchronously
+
+// ---------- framing ----------
+var sendRaw = function(body){
+	if(!p) return;
+	p.writeUtf8("Content-Length: " ++ #body ++ '\r\n\r\n' ++ body);
+	p.writeUtf8('\n');
+};
+
+var request = function(method, params){
+	if(!p) return null;
+	var id = nextId;
+	nextId = nextId + 1;
+	var body = JSON.stringify({ jsonrpc = "2.0"; id = id; method = method; params = params });
+	sendRaw(body);
+	return id;
+};
+
+var notify = function(method, params){
+	if(!p) return;
+	sendRaw(JSON.stringify({ jsonrpc = "2.0"; method = method; params = params }));
+};
+
+// ---------- helpers ----------
+var toFileUri = function(path){
+	// file:///C:/dir/file.nodio — forward slashes, percent-free is fine
+	// for the paths this IDE produces (ASCII project dirs)
+	var s = ..string.replace(path, '\\', '/');
+	if(..string.indexOf(s, "file:///") !== null) return s;
+	return "file:///" ++ s;
+};
+
+// Read every complete frame currently available and process it. Frames are
+// accumulated in `inbox` across calls: peek() removes bytes from the pipe,
+// so a frame split over two pipe reads is only safe when the leftover is
+// kept. Returns the response body whose id == wantId, or null.
+//
+// Byte-offset facts (probed, keep them):
+//   * string.indexOf returns the 1-based index of the FIRST byte of the
+//     match: for "AB\r\n\r\nCDEF" indexOf('\r\n\r\n') == 3;
+//   * string.mid(s, k, n) is a CLOSED 1-based slice starting at byte k, so
+//     the body starts at hEnd + 4 (hEnd points at the first '\r');
+//   * string.slice(s, k) keeps bytes k..#s (also closed), so the consumed
+//     frame is removed with slice(inbox, hEnd + 4 + cl);
+//   * a TRUNCATED json body makes JSON.parse hang forever (it never
+//     returns an error), so the length check below is load-bearing: never
+//     hand json.parse a body shorter than Content-Length.
+var inbox = "";
+
+var poll = function(wantId){
+	if(!p) return null;
+	var found = null;
+	var o = p.peek(0);
+	if(o !== null && o !== false && #o > 0) inbox = inbox ++ o;
+	while(true){
+		var hEnd = ..string.indexOf(inbox, '\r\n\r\n');
+		if(hEnd === null) break;
+		var head = ..string.left(inbox, hEnd - 1);
+		var cl = ..string.match(head, "Content-Length:\s*(\d+)");
+		if(cl === null){
+			// corrupt header: drop one byte and resync
+			inbox = ..string.slice(inbox, 2);
+			continue;
+		}
+		var nLen = tonumber(cl);
+		var bodyStart = hEnd + 4;              // 1-based index of body[1]
+		if((#inbox - bodyStart + 1) < nLen) break;   // frame incomplete
+		var body = ..string.mid(inbox, bodyStart, nLen);
+		inbox = ..string.slice(inbox, bodyStart + nLen);
+		var msg = JSON.parse(body);
+		if(!msg) continue;
+		if(msg.id !== null && wantId !== null && tonumber(msg.id) === tonumber(wantId)){
+			found = msg;
+		}
+		elseif(msg.method === "textDocument/publishDiagnostics"){
+			var ds = msg.params ? msg.params.diagnostics : null;
+			diags = {};
+			if(ds){
+				for(k,v in ds){
+					var end = v.range ? v.range.end : null;
+					..table.push(diags, {
+						line = tonumber(v.range.start.line);
+						col = tonumber(v.range.start.character);
+						// 结束位置：编辑器要用它画「槽内波浪线」的准确范围
+						endLine = end ? tonumber(end.line) : tonumber(v.range.start.line);
+						endCol = end ? tonumber(end.character) : tonumber(v.range.start.character);
+						msg = tostring(v.message);
+						sev = v.severity === null ? 1 : tonumber(v.severity);
+					});
+				}
+			}
+		}
+	}
+	return found;
+};
+
+// ---------- public API ----------
+start = function(exePath, filePath, docText){
+	if(p) return "busy";
+	p = process.popen(exePath);
+	if(!p) return "spawn-failed";
+	// ACP on CJK Windows is 936 — popen would then re-encode the server's
+	// UTF-8 output as GBK->UTF-8 and corrupt every frame. The LSP wire is
+	// byte-oriented; keep it raw.
+	p.codepage = 65001;
+	uri = toFileUri(filePath);
+	text = docText;
+	version = 0;
+	nextId = 1;
+	diags = {};
+	var id = request("initialize", { capabilities = {} });
+	// wait briefly for the initialize reply so didOpen lands after it
+	for(i = 1; 20; 1){
+		sleep(20);
+		if(poll(id) !== null) break;
+	}
+	didChange(docText);
+	return "ok";
+};
+
+didChange = function(docText){
+	if(!p) return;
+	text = docText;
+	version = version + 1;
+	notify("textDocument/didChange", {
+		textDocument = { uri = uri; version = version };
+		contentChanges = { { text = docText } };
+	});
+};
+
+// completion -> array of { label; kind; detail } or null
+completion = function(line, character){
+	if(!p) return null;
+	var id = request("textDocument/completion", {
+		textDocument = { uri = uri };
+		position = { line = line; character = character };
+	});
+	for(i = 1; 50; 1){
+		sleep(20);
+		var r = poll(id);
+		if(r !== null){
+			var res = r.result;
+			var items = null;
+			if(res){
+				// server may return [ CompletionList ] — unwrap
+				if(#res > 0 && type(res[1]) === type.table && res[1].items !== null){
+					res = res[1];
+				}
+				// CompletionList wrapper or plain array
+				items = res.items ? res.items : res;
+			}
+			var out = {};
+			if(items){
+				for(k,v in items){
+					..table.push(out, {
+						label = tostring(v.label);
+						kind = v.kind === null ? 0 : tonumber(v.kind);
+						detail = v.detail === null ? "" : tostring(v.detail);
+					});
+				}
+			}
+			return out;
+		}
+	}
 	return null;
-}
+};
+
+// hover -> string or ""
+hover = function(line, character){
+	if(!p) return "";
+	var id = request("textDocument/hover", {
+		textDocument = { uri = uri };
+		position = { line = line; character = character };
+	});
+	for(i = 1; 50; 1){
+		sleep(20);
+		var r = poll(id);
+		if(r !== null){
+			if(r.result === null || r.result === undefined) return "";
+			var c = r.result.contents;
+			if(type(c) === type.table){
+				if(c.value !== null) return tostring(c.value);
+				return tostring(c);
+			}
+			return tostring(c);
+		}
+	}
+	return "";
+};
+
+symbols = function(){
+	if(!p) return {};
+	var id = request("textDocument/documentSymbol", { textDocument = { uri = uri } });
+	for(i = 1; 50; 1){
+		sleep(20);
+		var r = poll(id);
+		if(r !== null){
+			var out = {};
+			if(r.result){
+				for(k,v in r.result){
+					..table.push(out, {
+						name = tostring(v.name);
+						kind = v.kind === null ? 0 : tonumber(v.kind);
+						line = v.location ? tonumber(v.location.range.start.line) : 0;
+					});
+				}
+			}
+			return out;
+		}
+	}
+	return {};
+};
+
+getDiags = function(){
+	poll(null); // drain; publishDiagnostics updates diags
+	return diags;
+};
+
+stop = function(){
+	if(!p) return;
+	notify("shutdown", {});
+	notify("exit", {});
+	p.writeClose();
+	p.close();
+	p = null;
+};
+
+isRunning = function(){
+	return p !== null;
+};

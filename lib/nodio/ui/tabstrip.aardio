@@ -1,0 +1,285 @@
+// nodio.ui.tabstrip — 自绘标签条（画板 + 命中测试）。
+//
+// 官方 IDE 的右栏（控件/语法/标准库/范例/工具/AI）与底栏
+// （问题/输出/调试/终端）用的就是这种自绘标签条——原生选项卡控件
+// 做不出截图里的样子，所以这里用 nodio.ui.board 自己画：
+//
+//   · 标签条背景 + 底部 1px 分隔线
+//   · 选中项：反白底 + 2px 强调色下划线
+//   · 悬停项：浅色底
+//   · 文字用 GDI+ 实测宽度排布（graphics.measureString）
+//
+// 坐标：物理像素（见 nodio.ui.board 的说明）。
+// 尺寸常量按逻辑像素写，用 nodio.ui.px() 换算 —— 系统 150% 时
+// 标签条高度、图标大小、内边距跟着放大，和原生控件保持一致。
+//
+// 用法：
+//   strip = nodio.ui.tabstrip(winform, {left=0;top=0;right=300;bottom=26})
+//   strip.addTab("控件"); strip.addTab("语法","thLarge")
+//   strip.selIndex = 2
+//   strip.onSelect = function(idx){ ... }
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.theme;
+import nodio.ui.icons;
+import nodio.ui.dpi;
+import gdip;
+
+var __tpSeq = 0;
+
+tabstrip = function(winform, opt){
+	opt = opt : {};
+	// 配色默认取当前主题（nodio.ui.theme）——换主题不用改组件
+	var th = ..nodio.ui.theme();
+	// 设计常量（逻辑像素）
+	var PAD_L   = 10;   // 标签左侧留白
+	var PAD_R   = 10;   // 标签右侧留白
+	var ICON    = 12;   // 图标边长
+	var ICON_GAP= 6;    // 图标与文字的间距
+	var CLOSE_W = 14;   // 关闭标记占位
+	var CLOSE_S = 6;    // 关闭标记（×）边长
+	var ACCENT  = 2;    // 顶部强调线粗细
+	var self = {
+		winform = winform;
+		board = null;
+		rect = opt.rect;
+		height = ..nodio.ui.px(opt.height : 26);
+		tabs = {};        // 标题
+		icons = {};       // 每个标签的图标名（nodio.ui.icons 的名字）
+		rects = {};       // 每个标签的 {left;right}（绘制时算出）
+		selIndex = 1;
+		hoverIndex = 0;
+		onSelect = null;
+		onClick = null;         // function(idx, closeHit) — 总是触发（点已选中的页签也触发）
+		closable = opt.closable : false;   // 标签右侧带 × 关闭标记
+		closeHit = 0;           // 当前鼠标悬停的关闭标记（0=无）
+		// 配色
+		bgColor      = opt.bgColor : th.tabBg;
+		textColor    = opt.textColor : th.tabText;
+		selTextColor = opt.selTextColor : th.tabTextSel;
+		selBgColor   = opt.selBgColor : th.panel;
+		hoverBgColor = opt.hoverBgColor : th.tabHover;
+		lineColor    = opt.lineColor : th.border;
+		accentColor  = opt.accentColor : th.accent;
+	};
+
+	__tpSeq = __tpSeq + 1;
+	var r = opt.rect : {left=0; top=0; right=300; bottom=self.height};
+
+	self.board = nodio.ui.board(winform, {
+		left = r.left; top = r.top; right = r.right; bottom = r.bottom;
+		fontSize = opt.fontSize : 12;
+	});
+	self.board.onDraw = function(graphics, rc, bd){
+		self.__draw(graphics, rc, bd);
+	}
+	self.board.onMouseDown = function(x, y, bd){
+		self.__hit(x);
+	}
+	self.board.onMouseMove = function(x, y, bd){
+		var h = self.__hitIndex(x);
+		var c = self.__closeIndex(x);
+		if(h != self.hoverIndex || c != self.closeHit){
+			self.hoverIndex = h;
+			self.closeHit = c;
+			self.board.invalidate();
+		}
+	}
+	self.board.onMouseUp = function(x, y, bd){
+		self.hoverIndex = 0;
+		self.closeHit = 0;
+		self.board.invalidate();
+	}
+
+	// 绘制
+	// 扁平风格（对齐 aar.chengxu.online/thread-903.htm 的现代 IDE）：
+	//   · 整条标签条一个底色，**没有**底部分隔线
+	//   · 选中项：稍亮的底 + **顶部 2px 强调色描边**（不是底部下划线）
+	//   · 悬停项：极弱的底色
+	self.__draw = function(graphics, rc, bd){
+		var h = rc.bottom - rc.top;
+		var font = bd.font;
+		var fmt = bd.format;
+		// 物理尺寸
+		var pPAD_L = ..nodio.ui.px(PAD_L);
+		var pPAD_R = ..nodio.ui.px(PAD_R);
+		var pICON = ..nodio.ui.px(ICON);
+		var pICON_GAP = ..nodio.ui.px(ICON_GAP);
+		var pCLOSE_W = ..nodio.ui.px(CLOSE_W);
+		var pCLOSE_S = ..nodio.ui.px(CLOSE_S);
+		var pACCENT = ..nodio.ui.px(ACCENT);
+		// 背景
+		var bg = ..gdip.solidBrush(self.bgColor);
+		graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, h);
+		bg.delete();
+		// 标签
+		var x = rc.left + ..nodio.ui.px(2);
+		for(i=1;#self.tabs;1){
+			var text = self.tabs[i];
+			// 量文字宽度：布局框给足高度，避免字体变大后被裁剪/折行
+			var m = graphics.measureString(text, font, ::RECTF(0,0,4000,4000), fmt);
+			var w = m ? m.width : ..nodio.ui.px(60);
+			var icon = self.icons[i];
+			if(icon && #icon) icon = icon; else icon = null;
+			var tw = pPAD_L + w + pPAD_R;
+			if(icon) tw = tw + pICON + pICON_GAP;
+			if(self.closable) tw = tw + pCLOSE_W;
+			self.rects[i] = {left=x; right=x + tw; closeLeft = x + tw - pCLOSE_W};
+			var sel = (i == self.selIndex);
+			var hov = (i == self.hoverIndex) && !sel;
+			if(sel){
+				var sb = ..gdip.solidBrush(self.selBgColor);
+				graphics.fillRect(sb, x, rc.top, tw, h);
+				sb.delete();
+			}
+			elseif(hov){
+				var hb = ..gdip.solidBrush(self.hoverBgColor);
+				graphics.fillRect(hb, x, rc.top, tw, h);
+				hb.delete();
+			}
+			// 图标
+			var tx = x + pPAD_L;
+			if(icon){
+				..nodio.ui.drawIcon(graphics, icon, tx, rc.top + (h - pICON) / 2, ICON,
+					sel ? self.selTextColor : self.textColor);
+				tx = tx + pICON + pICON_GAP;
+			}
+			// 文字
+			var brush = ..gdip.solidBrush(sel ? self.selTextColor : self.textColor);
+			graphics.drawString(text, font,
+				::RECTF(tx, rc.top, w + 2, h), fmt, brush);
+			brush.delete();
+			// 关闭标记
+			if(self.closable){
+				var cx = x + tw - pCLOSE_W / 2 - pCLOSE_S / 2;
+				var cy = rc.top + h / 2 - pCLOSE_S / 2;
+				var cpen = ..gdip.pen(self.closeHit == i ? 0xFFD03030 : self.textColor, 1);
+				graphics.drawLine(cpen, cx, cy, cx + pCLOSE_S, cy + pCLOSE_S);
+				graphics.drawLine(cpen, cx + pCLOSE_S, cy, cx, cy + pCLOSE_S);
+				cpen.delete();
+			}
+			// 选中项：顶部强调色描边
+			if(sel){
+				var ap = ..gdip.pen(self.accentColor, pACCENT);
+				graphics.drawLine(ap, x, rc.top + pACCENT/2, x + tw, rc.top + pACCENT/2);
+				ap.delete();
+			}
+			x = x + tw;
+		}
+	}
+
+	// 命中测试
+	self.__hitIndex = function(x){
+		for(i=1;#self.rects;1){
+			if(x >= self.rects[i].left && x < self.rects[i].right) return i;
+		}
+		return 0;
+	}
+
+	// 命中测试：x 是否落在某个标签的关闭标记上
+	self.__closeIndex = function(x){
+		if(!self.closable) return 0;
+		for(i=1;#self.rects;1){
+			if(x >= self.rects[i].closeLeft && x < self.rects[i].right) return i;
+		}
+		return 0;
+	}
+
+	self.__hit = function(x){
+		var i = self.__hitIndex(x);
+		if(!i) return;
+		var isClose = (self.__closeIndex(x) == i);
+		if(self.onClick) self.onClick(i, isClose);
+		if(isClose) return;
+		if(i != self.selIndex){
+			self.selIndex = i;
+			self.board.invalidate();
+			if(self.onSelect) self.onSelect(i);
+		}
+	}
+
+	// 增加标签
+	// 图标名存成**字符串**（没有图标就是空串）——
+	// aardio 里给表赋 null 会删掉这个键，icons 表的下标就和 tabs 对不上了。
+	self.addTab = function(caption, icon){
+		..table.push(self.tabs, caption);
+		self.icons[#self.tabs] = icon : "";
+		self.rects[#self.tabs] = {left=0; right=0};
+		self.board.invalidate();
+		return #self.tabs;
+	}
+
+	// 改某个标签的图标
+	self.setIcon = function(i, icon){
+		if(i < 1 || i > #self.tabs) return;
+		self.icons[i] = icon : "";
+		self.board.invalidate();
+	}
+
+	// 标签数
+	self.count = function(){
+		return #self.tabs;
+	}
+
+	// 清空
+	self.clear = function(){
+		self.tabs = {};
+		self.icons = {};
+		self.rects = {};
+		self.selIndex = 0;
+		self.hoverIndex = 0;
+		self.board.invalidate();
+	}
+
+	// 删掉第 i 个标签（后面的标签前移）
+	self.removeTab = function(i){
+		if(i < 1 || i > #self.tabs) return;
+		..table.remove(self.tabs, i);
+		..table.remove(self.icons, i);
+		..table.remove(self.rects, i);
+		if(self.selIndex > #self.tabs) self.selIndex = #self.tabs;
+		if(self.selIndex == i) self.selIndex = i > 1 ? i - 1 : 1;
+		self.board.invalidate();
+		return i;
+	}
+
+	// 改标题
+	self.setCaption = function(i, text){
+		if(i < 1 || i > #self.tabs) return;
+		self.tabs[i] = text;
+		self.board.invalidate();
+	}
+
+	// 切换
+	self.setSelIndex = function(i){
+		if(i < 1 || i > #self.tabs) return;
+		self.selIndex = i;
+		self.board.invalidate();
+	}
+
+	// 重新摆放
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		self.board.layout(l, t, r, b);
+	}
+
+	// 显示/隐藏
+	self.show = function(flag){
+		self.board.show(flag);
+	}
+
+	// 初始标签
+	var titles = opt.tabs : {};
+	for(i=1;#titles;1){
+		self.addTab(titles[i]);
+	}
+	self.layout();
+	return self;
+}
+
+}

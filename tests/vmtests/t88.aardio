@@ -1,0 +1,22 @@
+// round 44: time() text parsing contract (official time.md).
+//
+// Official contract this pins (D:\aardio\docs\library-guide\builtin\time\time.md):
+//   - text that does not satisfy the format -> null
+//   - the date part is always required, the time part may be omitted
+//   - @lax only applies when @format is given explicitly
+//   - the text left after the last parsed value lands in .endstr
+//   - %b / %B parse a month name ("06 Nov 1994")
+//   - ISO8601: the date may be written without separators
+io.print("garbage=" + (time("garbage") === null));
+io.print("date8=" + tostring(time("20170822")));
+io.print("dateSep=" + tostring(time("2017-08-22 12:36:23")));
+io.print("dateTime14=" + tostring(time("20170822123623")));
+io.print("hourOnly=" + tostring(time("20170822 12")));
+io.print("partDate=" + (time("2017-05", "%Y-%m-%d") === null));
+io.print("fullDate=" + tostring(time("2017-05-02", "%Y-%m-%d")));
+io.print("noSec=" + (time("16:56", "%H:%M:%S") === null));
+io.print("lax=" + tostring(time("16:56", "%H:%M:%S", null, true)));
+io.print("namedMonth=" + tostring(time("06 Nov 1994", "%d %b %Y")));
+io.print("endstr=" + tostring(time("20170822 123623 +0700").endstr));
+io.print("gmt=" + tostring(time.gmt("Sun, 06 Nov 1994 08:49:37 GMT")));
+io.print("gmtOffset=" + tostring(time.gmt("Sun, 06 Nov 1994 08:49:37 +0700")));

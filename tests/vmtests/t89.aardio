@@ -1,0 +1,74 @@
+// t89: fiber execution context (纤程 + GC)
+// A fiber runs on its own C++ stack, so the VM's stack-structured state has
+// to travel with it: the GC frame stack, the explicit root stack, the epoch
+// stack and the control-flow flags. This test pins three properties:
+//   1. a parked fiber keeps its live locals across a collection
+//      (its frames are GC roots while it is suspended)
+//   2. the two execution flows do not share one frame stack / control flow
+//      (a `return` inside a fiber must not abort the resumer's loop)
+//   3. an abandoned fiber releases its parked locals instead of pinning
+//      them for the rest of the process
+var log = "";
+
+// 1) a fiber parks a table in a local and reads it back after the main
+//    flow forced several collections
+var co = create(function(){
+    var payload = { tag = "alive", n = 42 };
+    for (i = 1; 100; 1) var junk = { i = i, s = "garbage" ++ i };
+    yield("y1");
+    log ++= "payload:" ++ payload.tag ++ ":" ++ tostring(payload.n) ++ ";";
+    return "end";
+});
+
+var ok1, v1 = resume(co);
+for (i = 1; 4000; 1) var junk = { i = i, s = "garbage" ++ i };
+collectgarbage();
+collectgarbage();
+var ok2, v2 = resume(co);
+io.print("r1:" ++ tostring(ok1) ++ "/" ++ tostring(v1));
+io.print("r2:" ++ tostring(ok2) ++ "/" ++ tostring(v2));
+io.print("log:" ++ log);
+
+// 2) a fiber that returns from inside a loop must not abort the resumer's
+//    loop: the control-flow flags belong to the running flow
+var co2 = create(function(){
+    for (i = 1; 10; 1) {
+        yield(i);
+    }
+    return "stop";
+});
+var n = 0;
+while (true) {
+    var ok, v = resume(co2);
+    n ++;
+    if (v === "stop" || n > 50) break;
+}
+io.print("iter:" ++ tostring(n));
+
+// 3) nested resume: a fiber that resumes another fiber
+var inner = create(function(){
+    yield("inner1");
+    return "inner2";
+});
+var outer = create(function(){
+    var ok, v = resume(inner);
+    yield("outer:" ++ tostring(v));
+    return "outer-done";
+});
+var ok3, v3 = resume(outer);
+var ok4, v4 = resume(outer);
+io.print("nested1:" ++ tostring(v3));
+io.print("nested2:" ++ tostring(v4));
+io.print("innerstatus:" ++ tostring(..fiber.status(inner)));
+
+// 4) an abandoned fiber releases its parked locals
+var freed = 0;
+var drop = create(function(){
+    var cap = { _gc = function(){ freed ++; } };
+    yield("y");
+});
+resume(drop);
+drop = null;
+collectgarbage();
+collectgarbage();
+io.print("freed:" ++ tostring(freed));

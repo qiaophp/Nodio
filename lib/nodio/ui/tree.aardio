@@ -1,0 +1,447 @@
+// nodio.ui.tree — 自绘树（层级 + 折叠箭头 + 缩进 + 图标 + 滚动）。
+//
+// 为什么不用原生 treeview：
+//   ① 原生 treeview 的配色消息（TVM_SETTEXTCOLOR 等）在本机 comctl32 里
+//      会把 lParam 当指针解引用 → **进程崩 0xC0000005**
+//      （见 docs/capability-gap.md §1.11.4），深色主题做不了；
+//   ② 引擎原生控件表没有 treeview 的 insertItem/setItemData/expand，
+//      能力面本来就缺；
+//   ③ 参考 IDE（aar.chengxu.online/thread-903.htm）的树是**纯色自绘**，
+//      没有系统 treeview 的虚线、3D 边框。
+//
+// 坐标：物理像素（见 nodio.ui.board 的说明）。
+// 尺寸常量按逻辑像素写，用 nodio.ui.px() 换算。
+//
+// 用法：
+//   tr = nodio.ui.tree(winform, {left=0;top=0;right=240;bottom=600})
+//   var root = tr.addNode("工程", null, null)
+//   tr.addNode("main.nodio", "D:\\x\\main.nodio", root)
+//   tr.expand(root)
+//   tr.onSelect  = function(node){ ... }
+//   tr.onOpen    = function(node){ ... }        // 双击
+//   tr.onContextMenu = function(x, y){ ... }    // 屏幕坐标
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.theme;
+import nodio.ui.icons;
+import nodio.ui.dpi;
+
+var __treeSeq = 0;
+
+tree = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	// 设计常量（逻辑像素）
+	var ROW_H   = 22;    // 行高
+	var INDENT  = 16;    // 每层缩进
+	var ARROW   = 9;     // 折叠箭头占位
+	var ICON    = 14;    // 节点图标边长
+	var PAD     = 4;     // 文字左留白
+	var SB_W    = 10;    // 滚动条宽
+	var self = {
+		winform = winform;
+		board = null;
+		rect = opt.rect;
+		nodes = {};          // 根节点数组
+		selNode = null;      // 选中的节点
+		hoverNode = null;
+		scroll = 0;          // 垂直滚动偏移（物理像素）
+		onSelect = null;     // function(node)
+		onOpen = null;       // function(node)  —— 双击
+		onContextMenu = null;// function(x, y)   —— 屏幕坐标
+		// 配色
+		bgColor     = opt.bgColor : th.panel;
+		textColor   = opt.textColor : th.text;
+		dimColor    = opt.dimColor : th.textDim;
+		selColor    = opt.selColor : th.selBg;
+		hoverColor  = opt.hoverColor : th.hoverBg;
+		lineColor   = opt.lineColor : th.border;
+		scrollColor = opt.scrollColor : th.border;
+		scrollThumb = opt.scrollThumb : th.textDim;
+	};
+
+	__treeSeq = __treeSeq + 1;
+	var r = opt.rect : {left=0; top=0; right=240; bottom=400};
+
+	self.board = nodio.ui.board(winform, {
+		left = r.left; top = r.top; right = r.right; bottom = r.bottom;
+		fontSize = opt.fontSize : 12;
+	});
+	self.ctrl = self.board.ctrl;
+	self.board.onDraw = function(graphics, rc, bd){
+		self.__draw(graphics, rc, bd);
+	}
+	// 右键：board 的 WM_CONTEXTMENU(0x7B) → 屏幕坐标
+	// （与官方 win.ui.tracker 的 onContextMenu(x,y) 语义一致，见
+	//  D:\aardio\lib\win\ui\tracker.aardio:150-166）。
+	// 不接这一条，onContextMenu 只是个没人读的属性，右键完全无效。
+	self.board.onContextMenu = function(x, y, bd){
+		if(self.onContextMenu) self.onContextMenu(x, y);
+	}
+
+	// ---------- 数据 ----------
+	self.clear = function(){
+		self.nodes = {};
+		self.selNode = null;
+		self.scroll = 0;
+		self.__invalidateRows();
+		self.board.invalidate();
+	}
+
+	// 加节点：text 显示，path 存路径，parent 是父节点（null=根）
+	// iconOpen：展开时用的图标（目录的 folderOpen），没有就用 icon
+	self.addNode = function(text, path, parent){
+		var node = {
+			text = text;
+			path = path;
+			icon = null;
+			iconOpen = null;
+			children = {};
+			expanded = true;
+			parent = null;
+		};
+		if(parent){
+			node.parent = parent;
+			..table.push(parent.children, node);
+		}
+		else{
+			..table.push(self.nodes, node);
+		}
+		self.__invalidateRows();
+		self.board.invalidate();
+		return node;
+	}
+
+	// 节点路径
+	self.pathOf = function(node){
+		if(!node) return null;
+		if(type(node.path) == "string") return node.path;
+		return null;
+	}
+
+	self.setText = function(node, text){
+		if(!node) return;
+		node.text = text;
+		self.board.invalidate();
+	}
+
+	self.setIcon = function(node, icon){
+		if(!node) return;
+		node.icon = icon;
+		self.board.invalidate();
+	}
+
+	self.expand = function(node){
+		if(!node) return;
+		node.expanded = true;
+		self.__invalidateRows();
+		self.board.invalidate();
+	}
+
+	self.collapse = function(node){
+		if(!node) return;
+		node.expanded = false;
+		self.__invalidateRows();
+		self.board.invalidate();
+	}
+
+	self.toggle = function(node){
+		if(!node) return;
+		node.expanded = !node.expanded;
+		self.__invalidateRows();
+		self.board.invalidate();
+	}
+
+	self.selectedNode = function(){
+		return self.selNode;
+	}
+
+	// ---------- 可见行（把树摊平成行数组） ----------
+	var __rows = null;
+	var __rowsDirty = true;
+	self.__invalidateRows = function(){ __rowsDirty = true; }
+
+	var __build = function(node, level, out){
+		..table.push(out, {node=node; level=level; hasChild=(#node.children > 0)});
+		if(node.expanded){
+			for(i=1;#node.children;1){
+				__build(node.children[i], level + 1, out);
+			}
+		}
+	}
+
+	self.__visibleRows = function(){
+		if(__rowsDirty || !__rows){
+			__rows = {};
+			for(i=1;#self.nodes;1){
+				__build(self.nodes[i], 0, __rows);
+			}
+			__rowsDirty = false;
+		}
+		return __rows;
+	}
+
+	// ---------- 几何 ----------
+	var __rowH = function(){ return ..nodio.ui.px(ROW_H) };
+	var __sbW = function(){ return ..nodio.ui.px(SB_W) };
+	var __contentH = function(){
+		return #self.__visibleRows() * __rowH();
+	}
+	var __maxScroll = function(rc){
+		var m = __contentH() - (rc.bottom - rc.top);
+		if(m < 0) m = 0;
+		return m;
+	}
+
+	self.__clientRect = function(){
+		try{
+			var r2 = self.board.ctrl.getClientRect();
+			if(r2){
+				// 官方 rect 的 width/height 是**方法**
+				var w = r2.width ? r2.width() : 0;
+				var h = r2.height ? r2.height() : 0;
+				if(w && h) return {left=0; top=0; right=w; bottom=h};
+			}
+		}catch(e){}
+		return {left=0; top=0; right=200; bottom=100};
+	}
+
+	// 客户区 y → 行号（0=没命中）
+	self.__hitIndex = function(y, rc){
+		var rh = __rowH();
+		if(rh <= 0) return 0;
+		if(y < rc.top) return 0;
+		var idx = math.floor((y - rc.top + self.scroll) / rh) + 1;
+		var rows = self.__visibleRows();
+		if(idx < 1 || idx > #rows) return 0;
+		return idx;
+	}
+
+	// 客户区坐标 → 节点
+	self.nodeAt = function(x, y){
+		var rc = self.__clientRect();
+		var i = self.__hitIndex(y, rc);
+		if(!i) return null;
+		return self.__visibleRows()[i].node;
+	}
+
+	// 屏幕坐标 → 节点（官方 hitTest 的语义：屏幕坐标）
+	self.nodeAtScreen = function(x, y){
+		var rc = self.__clientRect();
+		// 屏幕→客户区换算必须用**屏幕**矩形：ctrl.getRect() 给的是客户区
+		// （原点恒为 0,0），用它换算会让屏幕坐标命中恒为 miss。
+		var br = ..win.getRect(self.board.ctrl.hwnd, true);
+		if(!br) return null;
+		return self.nodeAt(x - br.left, y - br.top);
+	}
+
+	// ---------- 交互 ----------
+	self.board.onMouseMove = function(x, y, bd){
+		if(self.__dragScroll){
+			var rc = self.__clientRect();
+			var maxS = __maxScroll(rc);
+			var viewH = rc.bottom - rc.top;
+			var contentH = __contentH();
+			var thumbH = math.max(..nodio.ui.px(24), viewH * viewH / contentH);
+			if(thumbH > viewH) thumbH = viewH;
+			var t = (y - self.__dragScroll - rc.top) - thumbH/2;
+			if(t < 0) t = 0;
+			var s = t * maxS / (viewH - thumbH);
+			if(s < 0) s = 0;
+			if(s > maxS) s = maxS;
+			self.scroll = s;
+			self.board.invalidate();
+			return;
+		}
+		var n = self.nodeAt(x, y);
+		if(n != self.hoverNode){
+			self.hoverNode = n;
+			self.board.invalidate();
+		}
+	}
+
+	// 点在折叠箭头上 → 展开/折叠
+	self.__toggleAt = function(x, y, rc){
+		var i = self.__hitIndex(y, rc);
+		if(!i) return false;
+		var row = self.__visibleRows()[i];
+		if(!row.hasChild) return false;
+		var pIndent = ..nodio.ui.px(INDENT);
+		var pArrow = ..nodio.ui.px(ARROW);
+		var ax = rc.left + row.level * pIndent;
+		if(x >= ax && x <= ax + pArrow){
+			self.toggle(row.node);
+			return true;
+		}
+		return false;
+	}
+
+	self.board.onMouseDown = function(x, y, bd){
+		var rc = self.__clientRect();
+		if(x >= rc.right - __sbW()){
+			var tr = self.__thumbRect(rc);
+			if(tr && y >= tr.y && y <= tr.y + tr.h){
+				self.__dragScroll = y;
+			}
+			else{
+				var rh = __rowH();
+				self.scroll = self.scroll + (y < (tr ? tr.y : rc.top) ? -rh*3 : rh*3);
+				if(self.scroll < 0) self.scroll = 0;
+				var ms = __maxScroll(rc);
+				if(self.scroll > ms) self.scroll = ms;
+				self.board.invalidate();
+			}
+			return;
+		}
+	}
+
+	self.board.onMouseUp = function(x, y, bd){
+		self.__dragScroll = null;
+	}
+
+	self.board.onMouseClick = function(x, y, bd){
+		var rc = self.__clientRect();
+		if(self.__toggleAt(x, y, rc)) return;
+		var i = self.__hitIndex(y, rc);
+		if(!i) return;
+		var node = self.__visibleRows()[i].node;
+		if(self.selNode != node){
+			self.selNode = node;
+			self.board.invalidate();
+			if(self.onSelect) self.onSelect(node);
+		}
+	}
+
+	self.board.onDoubleClick = function(x, y, bd){
+		var rc = self.__clientRect();
+		var i = self.__hitIndex(y, rc);
+		if(!i) return;
+		var node = self.__visibleRows()[i].node;
+		if(self.onOpen) self.onOpen(node);
+	}
+
+	self.board.onMouseWheel = function(delta, x, y, bd){
+		var rc = self.__clientRect();
+		var rh = __rowH();
+		self.scroll = self.scroll - (delta / 120) * rh * 3;
+		if(self.scroll < 0) self.scroll = 0;
+		var ms = __maxScroll(rc);
+		if(self.scroll > ms) self.scroll = ms;
+		self.board.invalidate();
+	}
+
+	// ---------- 绘制 ----------
+	self.__thumbRect = function(rc){
+		var sbW = __sbW();
+		var viewH = rc.bottom - rc.top;
+		var maxS = __maxScroll(rc);
+		if(maxS <= 0) return null;
+		var contentH = __contentH();
+		var thumbH = math.max(..nodio.ui.px(24), viewH * viewH / contentH);
+		if(thumbH > viewH) thumbH = viewH;
+		var t = viewH * self.scroll / maxS;
+		return {x = rc.right - sbW; y = rc.top + t; w = sbW; h = thumbH};
+	}
+
+	self.__draw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var rh = __rowH();
+		var sbW = __sbW();
+		var pIndent = ..nodio.ui.px(INDENT);
+		var pArrow = ..nodio.ui.px(ARROW);
+		var pIcon = ..nodio.ui.px(ICON);
+		var pPad = ..nodio.ui.px(PAD);
+		// 背景
+		var bg = ..gdip.solidBrush(self.bgColor);
+		graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+		bg.delete();
+		// 行
+		var rows = self.__visibleRows();
+		var first = math.floor(self.scroll / rh) + 1;
+		if(first < 1) first = 1;
+		for(i=first;#rows;1){
+			var row = rows[i];
+			var y = rc.top + (i - 1) * rh - self.scroll;
+			if(y >= rc.bottom) break;
+			var node = row.node;
+			var sel = (node == self.selNode);
+			if(sel){
+				var sb = ..gdip.solidBrush(self.selColor);
+				graphics.fillRect(sb, rc.left, y, rc.right - rc.left - sbW, rh);
+				sb.delete();
+			}
+			elseif(node == self.hoverNode){
+				var hvb = ..gdip.solidBrush(self.hoverColor);
+				graphics.fillRect(hvb, rc.left, y, rc.right - rc.left - sbW, rh);
+				hvb.delete();
+			}
+			var x = rc.left + row.level * pIndent;
+			// 折叠箭头（尺寸按 DPI 缩放）
+			if(row.hasChild){
+				var cx = x + pArrow/2;
+				var cy = y + rh/2;
+				var a1 = ..nodio.ui.px(3);
+				var a2 = ..nodio.ui.px(2);
+				var a3 = ..nodio.ui.px(1);
+				var ap = ..gdip.pen(self.textColor, ..nodio.ui.px(1.4));
+				if(node.expanded){
+					graphics.drawLine(ap, cx - a1, cy - a2, cx, cy + a3);
+					graphics.drawLine(ap, cx, cy + a3, cx + a1, cy - a2);
+				}
+				else{
+					graphics.drawLine(ap, cx - a2, cy - a1, cx + a3, cy);
+					graphics.drawLine(ap, cx + a3, cy, cx - a2, cy + a1);
+				}
+				ap.delete();
+				x = x + pArrow;
+			}
+			else{
+				x = x + pArrow;
+			}
+			// 节点图标
+			var icon = node.icon;
+			if(node.expanded && node.iconOpen) icon = node.iconOpen;
+			if(icon){
+				..nodio.ui.drawIcon(graphics, icon, x, y + (rh - pIcon)/2, ICON,
+					sel ? self.textColor : self.dimColor);
+				x = x + pIcon + 2;
+			}
+			// 文字
+			var brush = ..gdip.solidBrush(self.textColor);
+			graphics.drawString(tostring(node.text : ""), font,
+				::RECTF(x + pPad, y, rc.right - sbW - x - pPad, rh), fmt, brush);
+			brush.delete();
+		}
+		// 滚动条
+		var tr = self.__thumbRect(rc);
+		if(tr){
+			var tb = ..gdip.solidBrush(self.scrollColor);
+			graphics.fillRect(tb, rc.right - sbW, rc.top, sbW, rc.bottom - rc.top);
+			tb.delete();
+			var kb = ..gdip.solidBrush(self.scrollThumb);
+			graphics.fillRect(kb, tr.x, tr.y, tr.w, tr.h);
+			kb.delete();
+		}
+	}
+
+	// 重新摆放
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		self.board.layout(l, t, r, b);
+	}
+
+	self.show = function(flag){
+		self.board.show(flag);
+	}
+
+	self.layout();
+	return self;
+}
+
+}

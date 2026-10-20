@@ -1,9 +1,77 @@
-// app/editor.nodio — editor pane helpers.
+// app/editor.nodio — 编辑器命令门面。
 //
-// Thin wrapper over the richedit control today. Coloring (CHARFORMAT2 via
-// setSelCharformat) and LSP-driven diagnostics marks land here in M2; keeping
-// every editor touch behind this module stops that from leaking into the
-// shell/runner wiring.
-load = function(ctrl,text){ ctrl.text = text; }
-text = function(ctrl){ return ctrl.text; }
-setText = function(ctrl,s){ ctrl.text = s; }
+// 真正的实现都在标准库组件里（nodio.ui.editor）：
+// 行号栏、语法着色、当前行高亮、缩进/注释、查找替换、撤销/脏标记。
+// 本模块只做两件事：
+//   1. 把「命令」收敛到一个门面，shell/main 不用到处直接摸组件成员；
+//   2. 放编辑器的右键菜单（官方 win.ui.tracker + win.ui.popmenu）。
+import win.ui.tracker;
+import win.ui.menu;
+
+// 门面：ed 是 nodio.ui.editor 组件实例
+load = function(ed,text){ ed.setText(text) }
+text = function(ed){ return ed.getText() }
+setText = function(ed,s){ ed.setText(s) }
+
+// ---------- 编辑命令 ----------
+cut = function(ed){ ed.cut() }
+copy = function(ed){ ed.copy() }
+paste = function(ed){ ed.paste() }
+selectAll = function(ed){ ed.selectAll() }
+undo = function(ed){ ed.undo() }
+redo = function(ed){ ed.redo() }
+indent = function(ed){ ed.indent() }
+unindent = function(ed){ ed.unindent() }
+toggleComment = function(ed){ ed.toggleComment() }
+find = function(ed){ ed.showFind(false) }
+replace = function(ed){ ed.showFind(true) }
+findNext = function(ed){ return ed.findNext(ed.findText(), true) }
+findPrev = function(ed){ return ed.findPrev(ed.findText()) }
+replaceAll = function(ed){ return ed.replaceAll(ed.findText(), ed.replaceText()) }
+
+// 跳到第 n 行（1-based）
+gotoLine = function(ed, line){
+	if(!ed) return false;
+	return ed.gotoLine(line);
+}
+
+// ---------- 右键菜单 ----------
+// 编辑器右键菜单。全部走官方契约，没有自造 API：
+//   · 官方 win.ui.tracker 派发 0x7B → onContextMenu(x,y)（x,y 是屏幕坐标）
+//   · 官方 win.ui.popmenu 负责弹出；popId 带 TPM_RETURNCMD，同步返回命令 id
+// 菜单对象只建一次并复用：命令 id 固定，弹出时按 id 分发，
+// 不会每次右键都新建 HMENU。
+contextMenu = function(winform, ed){
+	if(!ed) return null;
+	var ctrl = ed.control();
+	win.ui.tracker(ctrl);
+	var pm = win.ui.popmenu(winform);
+	var idCut   = pm.add("剪切", null);
+	var idCopy  = pm.add("复制", null);
+	var idPaste = pm.add("粘贴", null);
+	pm.addSeparator();
+	var idFind  = pm.add("查找", null);
+	var idRep   = pm.add("替换", null);
+	pm.addSeparator();
+	var idIndent= pm.add("增加缩进", null);
+	var idUnind = pm.add("减少缩进", null);
+	var idComm  = pm.add("注释/取消注释", null);
+	pm.addSeparator();
+	var idAll   = pm.add("全选", null);
+
+	ctrl.onContextMenu = function(x,y){
+		// 不带坐标调用：官方取光标的屏幕坐标弹出（正是右键菜单的语义）
+		var id = pm.popId();
+		if(!id) return;          // 用户取消
+		if(id == idCut) cut(ed);
+		elseif(id == idCopy) copy(ed);
+		elseif(id == idPaste) paste(ed);
+		elseif(id == idFind) find(ed);
+		elseif(id == idRep) replace(ed);
+		elseif(id == idIndent) indent(ed);
+		elseif(id == idUnind) unindent(ed);
+		elseif(id == idComm) toggleComment(ed);
+		elseif(id == idAll) selectAll(ed);
+	}
+	return ctrl;
+}

@@ -1,0 +1,10 @@
+// probe: which path form resolves against the published payload's embedded FS?
+import raw;
+io.print("--- embedded lookup forms ---");
+io.print("A ~\\res\\hello.txt :", tostring(..io.readFile("~\res\hello.txt")));
+io.print("B res\\hello.txt    :", tostring(..io.readFile("res\hello.txt")));
+io.print("C ~/res/hello.txt  :", tostring(..io.readFile("~/res/hello.txt")));
+io.print("D \\res\\hello.txt  :", tostring(..io.readFile("\res\hello.txt")));
+io.print("--- disk forms ---");
+io.print("E fullpath(~)      :", tostring(..io.fullpath("~\res\hello.txt")));
+io.print("F exist            :", tostring(..io.exist("~\res\hello.txt")));

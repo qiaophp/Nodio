@@ -1,0 +1,325 @@
+// nodio.gui.style — 样式盒（StyleBox）与样式（Style）解析。
+//
+// 移植自 Zan.Gui 的 Styling/StyleBox.zan 与 Styling/Style.zan。
+//
+// Zan.Gui 的核心主张：
+//   「这是 GUI 唯一知道如何 **paint** 一个带样式 box 的地方，
+//     控件无需再携带按皮肤分叉的绘制代码，它只解析一次然后绘制。」
+// 本文件照搬这个分层：
+//
+//   规格(spec)  →  样式盒(stylebox)  →  解析(resolve)  →  绘制(paint)
+//
+// 规格里颜色可以写**语义角色名**（"primary" / "bgHover" …），
+// 解析时按当前主题换成实际色值 —— 所以换主题不用改控件代码。
+//
+// 未设置约定：所有数值字段用 **-1 表示未设置**（走回退），
+// 0 是有效值（bg=0 就是全透明＝不填充，borderW=0 就是不描边）。
+namespace nodio.gui{
+
+// ---------- 样式盒字段表 ----------
+// 顺序即「解析优先级」：后面的覆盖前面的。
+var boxFields = {
+	// 填充
+	"bg"; "bgTo"; "opacity";
+	// 文字
+	"fg"; "accent"; "fontPx"; "fontWeight"; "lineHeight";
+	"align"; "valign"; "ellipsis"; "nowrap";
+	// 描边 / 圆角
+	"borderColor"; "borderW";
+	"borderTopW"; "borderRightW"; "borderBottomW"; "borderLeftW";
+	"borderTopColor"; "borderRightColor"; "borderBottomColor"; "borderLeftColor";
+	"radius"; "radiusTL"; "radiusTR"; "radiusBR"; "radiusBL";
+	// 阴影
+	"shadowColor"; "shadowDx"; "shadowDy"; "shadowBlur";
+	// 度量
+	"padL"; "padT"; "padR"; "padB";
+	"width"; "height"; "minW"; "minH"; "maxW"; "maxH";
+	"gap";
+};
+
+// 新建一个样式盒：所有字段先置 -1（未设置）
+stylebox = function(spec){
+	var sb = {};
+	for(i=1;#boxFields;1){
+		sb[boxFields[i]] = -1;
+	}
+	if(spec){
+		for(i=1;#boxFields;1){
+			var k = boxFields[i];
+			if(spec[k] !== null && spec[k] !== undefined){
+				sb[k] = spec[k];
+			}
+		}
+	}
+	return sb;
+}
+
+// 取值：未设置（-1 / 不存在）时退回 fallback
+styleboxOr = function(sb, key, fallback){
+	if(!sb) return fallback;
+	var v = sb[key];
+	if(v === null || v === undefined) return fallback;
+	if(v == -1) return fallback;
+	return v;
+}
+
+// 合并：over 里设置了（!=-1）的字段覆盖 base
+styleboxMerge = function(base, over){
+	var out = stylebox();
+	if(base){
+		for(i=1;#boxFields;1){
+			var k = boxFields[i];
+			var v = base[k];
+			if(v !== null && v !== undefined && v != -1) out[k] = v;
+		}
+	}
+	if(over){
+		for(i=1;#boxFields;1){
+			var k2 = boxFields[i];
+			var v2 = over[k2];
+			if(v2 !== null && v2 !== undefined && v2 != -1) out[k2] = v2;
+		}
+	}
+	return out;
+}
+
+// 解析：把语义角色名换成主题色值，再补上主题默认值。
+// 返回的盒子里所有度量都是**逻辑像素**，颜色是 0xAARRGGBB 数字。
+styleboxResolve = function(sb, theme){
+	theme = theme : nodio.gui.theme();
+	var out = stylebox();
+	for(i=1;#boxFields;1){
+		var k = boxFields[i];
+		var v = sb[k];
+		if(v === null || v === undefined || v == -1) continue;
+		if(type(v) == "string"){
+			// 语义角色名 → 主题色值
+			var c = theme[v];
+			if(c === null || c === undefined) continue;
+			out[k] = c;
+		}
+		else{
+			out[k] = v;
+		}
+	}
+	// ---- 主题默认值 ----
+	if(out.fg == -1) out.fg = theme.textPrimary;
+	if(out.borderColor == -1) out.borderColor = theme.borderPrimary;
+	if(out.borderW == -1) out.borderW = theme.borderWidth;
+	if(out.radius == -1) out.radius = theme.radiusMedium;
+	if(out.fontPx == -1) out.fontPx = theme.fontSizeMedium;
+	if(out.align == -1) out.align = 1;       // 水平居中
+	if(out.valign == -1) out.valign = 1;     // 垂直居中
+	if(out.ellipsis == -1) out.ellipsis = 1; // 超长省略
+	if(out.padL == -1) out.padL = theme.paddingSmall;
+	if(out.padT == -1) out.padT = theme.paddingSmall;
+	if(out.padR == -1) out.padR = theme.paddingSmall;
+	if(out.padB == -1) out.padB = theme.paddingSmall;
+	// 四角圆角：没单独指定就跟随 radius
+	if(out.radiusTL == -1) out.radiusTL = out.radius;
+	if(out.radiusTR == -1) out.radiusTR = out.radius;
+	if(out.radiusBR == -1) out.radiusBR = out.radius;
+	if(out.radiusBL == -1) out.radiusBL = out.radius;
+	// 四向描边：没单独指定就跟随 borderW / borderColor
+	if(out.borderTopW == -1) out.borderTopW = out.borderW;
+	if(out.borderRightW == -1) out.borderRightW = out.borderW;
+	if(out.borderBottomW == -1) out.borderBottomW = out.borderW;
+	if(out.borderLeftW == -1) out.borderLeftW = out.borderW;
+	if(out.borderTopColor == -1) out.borderTopColor = out.borderColor;
+	if(out.borderRightColor == -1) out.borderRightColor = out.borderColor;
+	if(out.borderBottomColor == -1) out.borderBottomColor = out.borderColor;
+	if(out.borderLeftColor == -1) out.borderLeftColor = out.borderColor;
+	return out;
+}
+
+// ---------- Style：状态 → 样式盒 ----------
+//
+// style = {
+//   name    = "button",
+//   cls     = "primary",   // 语义角色（primary/info/success/warning/error/default）
+//   modifier= "outline",   // outline / text / ghost
+//   size    = "medium",    // tiny / small / medium / large
+//   states  = { normal={...}; hover={...}; pressed={...}; disabled={...} };
+// }
+style = function(opt){
+	opt = opt : {};
+	return {
+		name     = opt.name : "";
+		cls      = opt.cls : "default";
+		modifier = opt.modifier : "";
+		size     = opt.size : "medium";
+		states   = opt.states : {};
+	};
+}
+
+// 取某个状态下的样式盒（已解析）
+styleResolve = function(st, state, theme){
+	theme = theme : nodio.gui.theme();
+	if(!st) return styleboxResolve(stylebox(), theme);
+	var base = stylebox(st.states.normal);
+	var over = null;
+	if(state && state != "normal"){
+		over = stylebox(st.states[state]);
+	}
+	var merged = styleboxMerge(base, over);
+	return styleboxResolve(merged, theme);
+}
+
+// ---------- 尺寸档位 ----------
+// 返回 {h; fontPx; padX; gap}
+styleMetrics = function(size){
+	var r = { h = 32; fontPx = 13; padX = 12; gap = 8 };
+	if(size == "tiny"){ r.h = 24; r.fontPx = 11; r.padX = 8; r.gap = 4 }
+	elseif(size == "small"){ r.h = 28; r.fontPx = 12; r.padX = 10; r.gap = 6 }
+	elseif(size == "large"){ r.h = 40; r.fontPx = 16; r.padX = 16; r.gap = 12 }
+	return r;
+}
+
+// ---------- 预置样式 ----------
+
+// 按钮：class(primary/info/success/warning/error/default)
+//       modifier(outline/text/ghost)  size(tiny/small/medium/large)
+styleButton = function(cls, modifier, size){
+	cls = cls : "default";
+	modifier = modifier : "";
+	var m = styleMetrics(size);
+	// 颜色角色
+	var base = "bgSecondary";
+	var hov = "bgHover";
+	var prs = "bgActive";
+	var fg = "textPrimary";
+	var bd = "borderPrimary";
+	var bdh = "borderHover";
+	if(cls == "primary"){ base = "primary"; hov = "primaryHover"; prs = "primaryPressed"; fg = "textInverse" }
+	elseif(cls == "info"){ base = "info"; hov = "infoHover"; prs = "infoPressed"; fg = "textInverse" }
+	elseif(cls == "success"){ base = "success"; hov = "successHover"; prs = "successPressed"; fg = "textInverse" }
+	elseif(cls == "warning"){ base = "warning"; hov = "warningHover"; prs = "warningPressed"; fg = "textPrimary" }
+	elseif(cls == "error"){ base = "error"; hov = "errorHover"; prs = "errorPressed"; fg = "textInverse" }
+	if(modifier == "outline"){
+		base = "bgPrimary"; hov = "bgHover"; prs = "bgActive";
+		fg = (cls == "default") ? "textPrimary" : cls;
+		bd = (cls == "default") ? "borderPrimary" : cls;
+		bdh = (cls == "default") ? "borderHover" : cls;
+	}
+	elseif(modifier == "text" || modifier == "ghost"){
+		base = "bgPrimary"; hov = "bgHover"; prs = "bgActive";
+		fg = (cls == "default") ? "textPrimary" : cls;
+		bd = "bgPrimary"; bdh = "bgPrimary";
+	}
+	return style({
+		name = "button";
+		cls = cls;
+		modifier = modifier;
+		size = size;
+		states = {
+			normal = {
+				bg = base; fg = fg; borderColor = bd; borderW = 1;
+				radius = "radiusMedium"; fontPx = m.fontPx;
+				padL = m.padX; padR = m.padX; padT = 0; padB = 0;
+			};
+			hover = { bg = hov; borderColor = bdh };
+			pressed = { bg = prs; borderColor = bdh };
+			disabled = { bg = "bgDisabled"; fg = "textDisabled"; borderColor = "borderSecondary" };
+		};
+	});
+}
+
+// 输入框
+styleInput = function(size){
+	var m = styleMetrics(size);
+	return style({
+		name = "input";
+		size = size;
+		states = {
+			normal = {
+				bg = "bgPrimary"; fg = "textPrimary";
+				borderColor = "borderPrimary"; borderW = 1;
+				radius = "radiusMedium"; fontPx = m.fontPx;
+				padL = m.padX; padR = m.padX; padT = 0; padB = 0;
+			};
+			hover = { borderColor = "borderHover" };
+			pressed = { borderColor = "borderFocus" };
+			focused = { borderColor = "borderFocus" };
+			disabled = { bg = "bgDisabled"; fg = "textDisabled" };
+		};
+	});
+}
+
+// 复选框 / 单选框
+styleCheck = function(size){
+	var m = styleMetrics(size);
+	return style({
+		name = "check";
+		size = size;
+		states = {
+			normal = {
+				bg = "bgPrimary"; fg = "textPrimary";
+				borderColor = "borderPrimary"; borderW = 1;
+				radius = "radiusSmall"; fontPx = m.fontPx;
+			};
+			hover = { borderColor = "borderHover" };
+			pressed = { bg = "bgActive" };
+			checked = { bg = "primary"; borderColor = "primary"; fg = "textInverse" };
+			disabled = { bg = "bgDisabled"; fg = "textDisabled" };
+		};
+	});
+}
+
+// 文本标签
+styleLabel = function(role, size){
+	var m = styleMetrics(size);
+	return style({
+		name = "label";
+		size = size;
+		states = {
+			normal = {
+				bg = 0; fg = (role : "textPrimary");
+				borderW = 0; radius = 0; fontPx = m.fontPx;
+				align = 0; valign = 1; ellipsis = 1;
+			};
+			disabled = { fg = "textDisabled" };
+		};
+	});
+}
+
+// 容器 / 卡片
+stylePanel = function(){
+	return style({
+		name = "panel";
+		states = {
+			normal = {
+				bg = "bgSecondary"; fg = "textPrimary";
+				borderColor = "borderPrimary"; borderW = 1;
+				radius = "radiusLarge"; fontPx = 13;
+			};
+		};
+	});
+}
+
+// 徽标
+styleBadge = function(){
+	return style({
+		name = "badge";
+		states = {
+			normal = {
+				bg = "error"; fg = "textInverse";
+				borderW = 0; radius = "radiusFull"; fontPx = 10;
+			};
+		};
+	});
+}
+
+// 进度条
+styleProgress = function(){
+	return style({
+		name = "progress";
+		states = {
+			normal = {
+				bg = "bgTertiary"; fg = "primary";
+				borderW = 0; radius = "radiusSmall"; fontPx = 11;
+			};
+		};
+	});
+}
+
+}

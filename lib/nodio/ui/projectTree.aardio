@@ -1,0 +1,159 @@
+// nodio.ui.projectTree — 工程树（**自绘**，基于 nodio.ui.tree）。
+//
+// 为什么不用原生 treeview：原生 treeview 的配色消息在本机会崩进程
+// （comctl32 把 lParam 当指针解引用，见 docs/capability-gap.md §1.11.4），
+// 引擎原生控件表也没有 insertItem/setItemData —— 详见 nodio.ui.tree 的说明。
+//
+// 对外接口保持和原来（treeview 包装版）一致，IDE 侧不用改：
+//   · addNode(text, path, parent) → 节点句柄
+//   · pathOf(node) / nodeAt(x,y) / selectedNode() / setText / expand
+//   · onOpen(path, node) / onSelect(path, node) / onContextMenu(x,y)
+//
+// 节点图标：目录 = 文件夹（展开时用打开的文件夹），文件按扩展名区分
+// （aardio/nodio 源码用 </> 图标，其余用普通文件图标）。
+//
+// 用法：
+//   tree = nodio.ui.projectTree(winform, {left=0;top=0;right=240;bottom=600})
+//   root = tree.addNode("工程", null, null)
+//   tree.addNode("main.nodio", "D:\\x\\main.nodio", root)
+//   tree.onOpen = function(path, node){ ... }
+//   tree.onSelect = function(path, node){ ... }
+//   tree.onContextMenu = function(x, y){ ... }   // x,y 是**屏幕坐标**
+namespace nodio.ui{
+import nodio.ui.rect;
+import nodio.ui.tree;
+
+var __ptSeq = 0;
+
+// 按扩展名选文件图标
+var __fileIcon = function(path){
+	if(!path) return "file";
+	var ext = string.lower(..io.splitpath(path).ext);
+	if(ext == ".aardio" || ext == ".nodio") return "fileCode";
+	return "file";
+}
+
+projectTree = function(winform, opt){
+	opt = opt : {};
+	var self = {
+		winform  = winform;
+		ctrl     = null;
+		tree     = null;
+		rect     = opt.rect;
+		onOpen   = null;
+		onSelect = null;
+		onContextMenu = null;   // function(x, y) —— x,y 是屏幕坐标
+	};
+
+	__ptSeq = __ptSeq + 1;
+	var r = opt.rect : {left=0; top=0; right=240; bottom=600};
+	self.tree = nodio.ui.tree(winform, {
+		left = r.left; top = r.top; right = r.right; bottom = r.bottom;
+	});
+	self.ctrl = self.tree.ctrl;
+
+	// 节点加完后才知道是不是目录 —— 这里统一在 addNode 时先按「还没有子节点」
+	// 处理，目录图标由 IDE 在建完子节点后用 markDir 修正。
+	//
+	// ⚠ 目录节点要打 isDir 标记：IDE 的文件操作（新建文件放哪、
+	// 删除是删文件还是删目录）全靠它判断，不能靠 icon 名字反推。
+	var markDir = function(node){
+		if(!node) return;
+		node.icon = "folder";
+		node.iconOpen = "folderOpen";
+		node.isDir = true;
+	}
+
+	// 清空
+	self.clear = function(){
+		self.tree.clear();
+	}
+
+	// 加节点：text 显示，path 存进节点数据，parentNode 为父节点句柄
+	self.addNode = function(text, path, parentNode){
+		var node = self.tree.addNode(text, path, parentNode);
+		if(node) node.icon = __fileIcon(path);
+		return node;
+	}
+
+	// 节点是不是目录（markDir 打上的标记）
+	self.isDir = function(node){
+		return (node && node.isDir) ? true : false;
+	}
+
+	// 节点的父目录绝对路径（根节点返回它自己的路径；
+	// 文件节点返回所在目录 —— 「新建文件」默认落在父目录里）
+	self.dirOf = function(node){
+		if(!node) return null;
+		if(node.isDir) return self.pathOf(node);
+		var p = node.parent;
+		if(p) return self.pathOf(p);
+		return null;
+	}
+
+	// 标记某个节点为目录（文件夹图标 + 展开时用打开的文件夹）
+	self.markDir = function(node){
+		markDir(node);
+		self.tree.board.invalidate();
+	}
+
+	// 节点路径（只认字符串，根节点返回 null）
+	self.pathOf = function(node){
+		return self.tree.pathOf(node);
+	}
+
+	// 光标下的节点（x,y 为**屏幕坐标**）；没命中返回 null
+	self.nodeAt = function(x,y){
+		return self.tree.nodeAtScreen(x,y);
+	}
+
+	// 当前选中的节点（没有选中返回 null）
+	self.selectedNode = function(){
+		return self.tree.selectedNode();
+	}
+
+	self.setText = function(node, text){
+		self.tree.setText(node, text);
+	}
+
+	self.setIcon = function(node, icon){
+		self.tree.setIcon(node, icon);
+	}
+
+	// 展开
+	self.expand = function(node){
+		self.tree.expand(node);
+	}
+
+	self.collapse = function(node){
+		self.tree.collapse(node);
+	}
+
+	// 重新摆放
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		self.tree.layout(l, t, r, b);
+	}
+
+	// 双击打开
+	self.tree.onOpen = function(node){
+		if(self.onOpen) return self.onOpen(self.pathOf(node), node);
+	}
+	// 选中
+	self.tree.onSelect = function(node){
+		if(self.onSelect) return self.onSelect(self.pathOf(node), node);
+	}
+	// 右键：屏幕坐标（官方 win.ui.tracker 的 onContextMenu 语义）
+	self.tree.onContextMenu = function(x,y){
+		if(self.onContextMenu) self.onContextMenu(x,y);
+	}
+
+	self.layout();
+	return self;
+}
+}

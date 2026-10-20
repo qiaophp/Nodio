@@ -1,3 +1,7 @@
+// round 43: two threads, one wait each.
+//
+// Official contract: thread.waitOne returns the 1-based index of the
+// signalled handle (see t28), so two waits give "11", not "truetrue".
 import thread;
 var t0 = time.tick();
 var h1 = thread.create(function() {

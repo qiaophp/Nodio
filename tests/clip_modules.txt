@@ -1,0 +1,23 @@
+# 定向 sweep 清单（E-17 回归用）：官方库里引用 win.clip 的 21 个公开模块。
+# 来源：对 D:\aardio\lib 做 `win\.clip` 全量检索后与 tests\public_lib_modules.txt 求交。
+autos.skills.videoDownloader
+autos.tools.handlers
+autos.ui.memories
+process.adb.clipboard
+web.rest.aiChat.settingForm
+win.clip
+win.clip.bitmap
+win.clip.chromiumUrl
+win.clip.data
+win.clip.file
+win.clip.gif
+win.clip.html
+win.clip.png
+win.clip.rtf
+win.clip.screen
+win.clip.sourceUrl
+win.clip.viewer
+win.ui.ctrl.pick
+win.ui.ctrl.richedit
+winex.editor
+winex.selection

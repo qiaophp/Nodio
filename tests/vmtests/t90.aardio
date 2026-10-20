@@ -1,0 +1,101 @@
+// round 45: 官方源码级 win.ui 右键链路（win.ui.tracker + WM_CONTEXTMENU）
+//
+// 这条链路的官方契约全部来自官方源码，无自造 API：
+//   D:\aardio\lib\win\ui\tracker.aardio:150-166
+//     [0x204 WM_RBUTTONDOWN] -> onRightMouseDown(wParam,lParam)
+//     [0x205 WM_RBUTTONUP]   -> onRightMouseUp(wParam,lParam)
+//     [0x7B  WM_CONTEXTMENU] -> onContextMenu(x,y,wParam)
+//       x,y 为屏幕坐标（官方 getMessagePos 取 lParam 里的坐标，
+//       lParam 为 -1 时退回真实光标位置）
+//   D:\aardio\lib\win\ui\ctrl\metaProperty\_.aardio:333-400
+//     ctrl.wndproc = { [消息ID] = function(hwnd,message,wParam,lParam) } }
+//     走元表 _set，装 _wndproc_c 跳板并 SetWindowPointer(GWL_WNDPROC)
+//   D:\aardio\lib\win\ui\tracker.aardio:10
+//     tracker 用 `this = ctrl` 替换实例后再装 wndproc —— 这要求引擎
+//     在 this 被重绑定后，成员赋值走元表 _set 而不是直写实例表。
+import win.ui;
+import win.ui.tracker;
+import win.ui.menu;
+
+var f = win.form(text="t90");
+
+// ---- 1) 控件层：tracker + 官方消息表
+f.add({ btn = {cls="button"; text="B"; left=10; top=10; right=90; bottom=40} });
+var btn = f.btn;
+win.ui.tracker(btn);
+// 只认第一条 WM_CONTEXTMENU：0x205 弹起会让系统按标准 Win32 行为另发
+// 一条 WM_CONTEXTMENU（lParam = -1，坐标取真实光标位置），那条不是确定值。
+var ctrlCtx = 0;
+btn.onContextMenu = function(x,y){
+	ctrlCtx++;
+	if(ctrlCtx == 1) io.print("CTRL-CTX " + x + "," + y);
+};
+btn.onRightMouseDown = function(w,l){ io.print("CTRL-RMBDOWN"); };
+btn.onRightMouseUp = function(w,l){ io.print("CTRL-RMBUP"); };
+
+// lParam 低字=x 高字=y（屏幕坐标）
+var lp = 321 | (654 << 16);
+::User32.PostMessage(btn.hwnd, 0x7B, 0, lp);
+::User32.PostMessage(btn.hwnd, 0x204, 0, lp);
+::User32.PostMessage(btn.hwnd, 0x205, 0, lp);
+win.delay(200);
+
+// ---- 2) 窗体层：tracker 装到窗体
+win.ui.tracker(f);
+var formCtx = 0;
+f.onContextMenu = function(x,y){
+	formCtx++;
+	// 窗体在 WM_RBUTTONUP 之后会收到系统补发的 WM_CONTEXTMENU，
+	// lParam == -1 —— 官方 tracker 按官方契约回退到**真实光标位置**
+	// （tracker.aardio:163-164，win.getMessagePos() 无参即真实光标），
+	// 那条的坐标取决于鼠标在哪，不是确定值，所以这里只断言"被触发"。
+	// 确定性的坐标断言见 tests/ide_ctx/ctx.nodio（只投递 0x7B 一条）。
+	if(formCtx == 1) io.print("FORM-CTX-OK");
+};
+f.onRightMouseUp = function(w,l){ io.print("FORM-RMBUP"); };
+::User32.PostMessage(f.hwnd, 0x7B, 0, lp);
+::User32.PostMessage(f.hwnd, 0x205, 0, lp);
+win.delay(200);
+
+// ---- 3) 官方菜单 API：菜单栏对象 + 弹出菜单对象
+var m = win.ui.menu(f);
+io.print("MENU " + (type(m.handle) == "pointer") + " " + (type(m.add("复制", function(id){})) == "number"));
+// 弹出菜单是另一个类（win.ui.popmenu），popup()/popId() 走 TrackPopupMenu
+var pm = win.ui.popmenu(f);
+io.print("POPMENU " + (type(pm.handle) == "pointer") + " " + (type(pm.add("复制", function(id){})) == "number"));
+io.print("POPMENU-API " + (type(win.ui.popmenu.CreatePopupMenu()) == "pointer"));
+
+// ---- 3.1) 装上官方 wndproc 之后，官方控件的**指针型返回值**必须仍是完整的 64 位
+//   官方 win/api.aardio:11 把 ::CallWindowProc 声明成 int 返回（32 位进程的写法），
+//   64 位下会把 LRESULT 截成低 32 位 → 官方 treeview 的 HTREEITEM 只剩一半 →
+//   父节点句柄损坏 → **插入子节点直接失败**（IDE 工程树只剩根节点）。
+f.add({ tv = {cls="treeview";left=10;top=100;right=220;bottom=260} });
+var tv = f.tv;
+win.ui.tracker(tv);                       // ← 官方窗口过程装上
+var hRoot = tv.insertItem({text="root"}, null);
+var hChild = tv.insertItem({text="child"}, hRoot);
+io.print("TREE-INSERT " + (hChild ? 1 : 0));
+
+// ---- 4) this = obj 实例替换后，成员赋值必须落在新对象上
+class rebind {
+	ctor(t){
+		this = t;
+		this.hit = "REBOUND";
+	}
+}
+var target = {};
+var rr = rebind(target);
+io.print("REBIND " + (rr === target) + " " + tostring(target.hit));
+
+// ---- 5) ctor 里的成员初始化仍必须绕过只读属性的 _set
+//     （官方 gdip.family 语义：ctor 写 this.name，而元表把 name 声明为只读）
+class ro {
+	ctor(){ this.name = "N"; }
+	@_metaProperty;
+}
+ro._metaProperty = { _get = { name = { _get = function(){ return "READONLY"; } } } };
+var ok = true;
+try{ ro(); }catch(e){ ok = false }
+io.print("CTORINIT " + tostring(ok));
+
+f.close();

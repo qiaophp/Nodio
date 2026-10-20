@@ -22,6 +22,7 @@ parse = function(text, rootDir){
 				path    = p;
 				embed   = ..string.match(line, 'embed="true"') !== null;
 				ignored = ..string.match(line, 'ignored="true"') !== null;
+				local   = ..string.match(line, 'local="true"') !== null;
 			};
 		}
 	}
@@ -38,7 +39,7 @@ parse = function(text, rootDir){
 // Read a .nproj/.aproj file into a model (null when unreadable).
 load = function(projFile){
 	var full = ..io.fullpath(projFile);
-	var text = ..io.readFile(full);
+	var text = ..string.load(full);
 	if(text === null) return null;
 	var dir = ..io.splitpath(full).dir;
 	var model = parse(text, dir);
@@ -60,4 +61,134 @@ buildTree = function(tv, hRoot, model){
 	for(i=1;model.count;1){
 		tv.insertItem({ text = model.files[i].path }, hRoot);
 	}
+}
+
+// Convenience: an array of {path; full} — path as shown in the tree,
+// full = absolute path on disk.
+paths = function(model){
+	var out = {};
+	for(i=1;model.count;1){
+		var p = model.files[i].path;
+		..table.push(out, { path = p; full = model.root ++ p });
+	}
+	return out;
+}
+
+// ---------- 工程清单维护（新建 / 重命名 / 删除后同步工程文件）----------
+//
+// 工程清单 = .nproj / .aproj 里的 <file path="..."/> 条目。
+// 磁盘上的文件改了，清单也得跟着改，否则新文件不会被打进发布包。
+// 官方 aardio 的 .aproj 由官方 IDE 管，我们只读不写（见 save）。
+
+// XML 属性值转义
+var xmlAttr = function(s){
+	s = ..string.replaceLiteral(s, '&', '&amp;');
+	s = ..string.replaceLiteral(s, '<', '&lt;');
+	s = ..string.replaceLiteral(s, '>', '&gt;');
+	s = ..string.replaceLiteral(s, '"', '&quot;');
+	return s;
+}
+
+// 绝对路径 → 工程根之内的相对路径（不在工程里返回 null）
+relPath = function(model, abs){
+	if(!model.root) return null;
+	if(!..string.startsWith(abs, model.root, true)) return null;
+	var rel = ..string.sub(abs, #model.root + 1);
+	if(rel === null) return null;
+	return rel;
+}
+
+// 加一个文件条目（已存在同名条目返回 false）
+addFile = function(model, rel){
+	if(!rel) return false;
+	for(i=1;model.count;1){
+		if(..string.lower(model.files[i].path) == ..string.lower(rel)) return false;
+	}
+	model.count = model.count + 1;
+	model.files[model.count] = {path=rel; embed=false; ignored=false; local=false};
+	return true;
+}
+
+// 删一个文件条目
+removeFile = function(model, rel){
+	for(i=1;model.count;1){
+		if(..string.lower(model.files[i].path) == ..string.lower(rel)){
+			..table.remove(model.files, i);
+			model.count = #model.files;
+			return true;
+		}
+	}
+	return false;
+}
+
+// 改一个文件条目（重命名）
+renameFile = function(model, oldRel, newRel){
+	for(i=1;model.count;1){
+		if(..string.lower(model.files[i].path) == ..string.lower(oldRel)){
+			model.files[i].path = newRel;
+			return true;
+		}
+	}
+	return false;
+}
+
+// 目录改名：清单里所有以 oldRel 开头的条目一起挪到 newRel 前缀下
+renameDir = function(model, oldRel, newRel){
+	var n = 0;
+	for(i=1;model.count;1){
+		var p = model.files[i].path;
+		if(..string.startsWith(p, oldRel, true)){
+			model.files[i].path = newRel ++ ..string.sub(p, #oldRel + 1);
+			n = n + 1;
+		}
+	}
+	return n;
+}
+
+// 删目录：清单里所有在该目录下的条目一起删
+removeDir = function(model, rel){
+	var keep = {};
+	var j = 0;
+	var n = 0;
+	for(i=1;model.count;1){
+		var p = model.files[i].path;
+		if(..string.startsWith(p, rel, true)){
+			n = n + 1;
+			continue;
+		}
+		j = j + 1;
+		keep[j] = model.files[i];
+	}
+	model.files = keep;
+	model.count = j;
+	return n;
+}
+
+// 写回工程文件（.nproj）
+//
+// ⚠ 只写 .nproj：.aproj 是官方 aardio 的工程文件，格式由官方 IDE 管，
+// 我们改了可能和官方对不上（官方还认 <res> 之类的段）。
+save = function(model){
+	if(!model.path) return false;
+	if(!..string.endsWith(..string.lower(model.path), ".nproj")) return false;
+	var out = '<?xml version="1.0" encoding="utf-8"?>\n';
+	if(model.start){
+		var rel = relPath(model, model.start);
+		if(rel) out = out ++ '<project start="' ++ xmlAttr(rel) ++ '">\n';
+		else out = out ++ '<project>\n';
+	}
+	else{
+		out = out ++ '<project>\n';
+	}
+	for(i=1;model.count;1){
+		var f = model.files[i];
+		var line = '\t<file path="' ++ xmlAttr(f.path) ++ '"';
+		if(f.embed) line = line ++ ' embed="true"';
+		if(f.ignored) line = line ++ ' ignored="true"';
+		if(f.local) line = line ++ ' local="true"';
+		line = line ++ ' />\n';
+		out = out ++ line;
+	}
+	out = out ++ '</project>\n';
+	return ..string.save(model.path, out);
 }

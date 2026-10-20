@@ -1,0 +1,56 @@
+import io;
+import string;
+
+// ① 循环体里声明 var：不能影响外层变量和循环计数
+var f = function(){
+	var n = 0;
+	var name = "";
+	var i = 0;
+	for(i=1;3;1){
+		var c1 = "x";
+		name = "hello";
+		n = n + 1;
+	}
+	return n ++ "|" ++ name;
+}
+io.print(f());
+
+// ② 对照组：循环体不声明 var
+var g = function(){
+	var n = 0;
+	for(i=1;3;1){
+		n = n + 1;
+	}
+	return n;
+}
+io.print(g());
+
+// ③ 嵌套循环 + 循环体里声明 var
+var h = function(){
+	var total = 0;
+	for(i=1;3;1){
+		for(j=1;3;1){
+			var t = i * j;
+			total = total + t;
+		}
+	}
+	return total;
+}
+io.print(h());
+
+// ④ 循环变量在循环体里被重新赋值
+var k = function(){
+	var out = "";
+	for(i=1;3;1){
+		i = i + 0;
+		out = out ++ i;
+	}
+	return out;
+}
+io.print(k());
+
+// ⑤ string.find 是**模式匹配**，string.indexOf 才是字面查找
+io.print(tostring(string.find("myFunc", ".")));
+io.print(tostring(string.find("myFunc", " ")));
+io.print(tostring(string.indexOf("myFunc", ".")));
+io.print(tostring(string.indexOf("myFunc", " ")));

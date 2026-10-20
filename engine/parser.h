@@ -704,6 +704,18 @@ namespace NodioVM
                                           Peek(1).text == L")" ||
                                           Peek(1).text == L","))))
             {
+                // only a variable/member/index may be incremented: '1++'
+                // has no assignable target, and silently ignoring it
+                // turns a for-loop step into a no-op (an infinite loop).
+                if (e->k != Node::Ident && e->k != Node::Member &&
+                    e->k != Node::Index)
+                {
+                    if (err && err->empty())
+                        (*err) = L"语法错误: 不能对常量自增/自减 @ 行 " +
+                                 std::to_wstring(Peek().line);
+                    p++;   // consume the postfix operator
+                    return e;
+                }
                 p++;   // consume the postfix operator
                 PNode asg = New(Node::Assign);
                 asg->str = (p >= 2 && toks[p - 1].text == L"++") ? L"+=" : L"-=";
@@ -1971,8 +1983,28 @@ namespace NodioVM
             if (!rel.empty() && rel[0] == L'~' &&
                 rel.size() > 1 && (rel[1] == L'/' || rel[1] == L'\\'))
             {
-                rootForm = strEmbedRoot.empty() ? L""
-                    : strEmbedRoot + L"\\" + rel.substr(2);
+                wstring afterTilde = rel.substr(2);
+                if (afterTilde.rfind(L"lib\\", 0) == 0 || afterTilde.rfind(L"lib/", 0) == 0)
+                {
+                    wstring sub = afterTilde.substr(4);
+                    wchar_t szOverlay[MAX_PATH] = L"";
+                    if (GetEnvironmentVariableW(L"NODIO_OVERLAY_LIBDIR", szOverlay, MAX_PATH) > 0)
+                    {
+                        wstring candO = wstring(szOverlay) + L"\\" + sub;
+                        if (_waccess(candO.c_str(), 0) == 0) rootForm = candO;
+                    }
+#if defined(_WIN64) || defined(__x86_64__)
+                    if (rootForm.empty() && _waccess((L"D:\\Nodio\\lib\\" + sub).c_str(), 0) == 0)
+                        rootForm = L"D:\\Nodio\\lib\\" + sub;
+#endif
+                    if (rootForm.empty() && _waccess((L"D:\\aardio\\lib\\" + sub).c_str(), 0) == 0)
+                        rootForm = L"D:\\aardio\\lib\\" + sub;
+                }
+                if (rootForm.empty())
+                {
+                    rootForm = strEmbedRoot.empty() ? L""
+                        : strEmbedRoot + L"\\" + rel.substr(2);
+                }
                 rel = rel.substr(2);
             }
             wstring normRel = rel;
@@ -2510,14 +2542,14 @@ namespace NodioVM
                         continue;
                     }
                     // round M2: struct member declaration —
-                    //   int x;  WORD name[32];  int left = expr;
+                    //   int x;  WORD name[32];  int left = expr;  INT value;
                     // emits a normal pair (init or null) plus a "_struct"
                     // layout string consumed by raw.struct/raw.api/raw.convert
                     if (Peek().t == TIdent && IsStructType(Peek().text) &&
-                        Peek(1).t == TIdent)
+                        (Peek(1).t == TIdent || (Peek(1).t == TPunct && (Peek(1).text == L";" || Peek(1).text == L"," || Peek(1).text == L"}"))))
                     {
                         wstring strType = Next().text;
-                        wstring strName = Next().text;
+                        wstring strName = (Peek().t == TIdent) ? Next().text : L"value";
                         int nArr = 0;
                         if (IsPunct(L"["))
                         {

@@ -46,4 +46,41 @@ namespace NodioVM
     }
 
     // ---------------- struct layout & serialization helpers ----------------
+
+    wstring ObjectKeyOf(const Value& v)
+    {
+        switch (v.t)
+        {
+        case Value::TableT:
+            if (v.tab)
+            {
+                wchar_t buf[32];
+                swprintf(buf, 32, L"table:%p", (void*)v.tab.get());
+                return buf;
+            }
+            return L"table:null";
+        case Value::Class:
+            if (v.tab)
+            {
+                wchar_t buf[32];
+                swprintf(buf, 32, L"class:%p", (void*)v.tab.get());
+                return buf;
+            }
+            return L"class:null";
+        case Value::Func:
+        {
+            wchar_t buf[32];
+            swprintf(buf, 32, L"func:%p",
+                     v.native ? (void*)&v.native : (void*)v.fn.get());
+            return buf;
+        }
+        case Value::Pointer:
+        {
+            wchar_t buf[32];
+            swprintf(buf, 32, L"ptr:%p", v.ptr);
+            return buf;
+        }
+        default: return v.ToString();
+        }
+    }
 }

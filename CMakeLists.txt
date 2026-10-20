@@ -38,5 +38,6 @@ target_compile_definitions(nodio_common INTERFACE
 add_subdirectory(engine)
 add_subdirectory(publish)
 add_subdirectory(apps/nodio)
+add_subdirectory(apps/nodio-stub)
 add_subdirectory(apps/nodio-lsp)
 add_subdirectory(apps/nodio-dap)

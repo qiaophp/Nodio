@@ -1,0 +1,15 @@
+// probe: is io.readFile the ENGINE builtin (encoding modes + embedded FS) or the
+// official library alias (file.read)?  The engine builtin returns bytes for
+// "raw"; the official alias treats arg2 as a byte count -> null.
+var p = ..io.fullpath("probe_io.txt");
+..io.writeFile(p, "ABC");
+io.print("disk file size :", ..io.getSize(p));
+io.print("io.file.read() :", tostring(..io.file(p, "rb").read()));
+io.print("io.readFile(raw):", tostring(..io.readFile(p, "raw")));
+io.print("io.readFile()  :", tostring(..io.readFile(p)));
+io.print("io.readFile(1) :", tostring(..io.readFile(p, 1)));
+io.print("--- does the official builtin module shadow global.io? ---");
+io.print("io.joinpath2   :", type(..io.joinpath2));
+io.print("io.localpath   :", type(..io.localpath));
+io.print("io.readFile    :", type(..io.readFile));
+..io.remove(p);

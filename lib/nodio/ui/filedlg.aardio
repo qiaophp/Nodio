@@ -1,0 +1,191 @@
+// nodio.ui.filedlg — 系统文件对话框（打开 / 另存为）。
+//
+// ── 为什么自己手写结构体 ────────────────────────────────
+// 官方 `fsys.dlg` 的 OPENFILENAME 在 Nodio 上算出 **144 字节**，而 Windows 的
+// OPENFILENAMEW 是 **152 字节**：Windows 里 hwndOwner 是 HWND（8 字节），
+// 官方声明成了 INT（4 字节），后面所有字段整体错位 8 字节 →
+// `GetOpenFileName` 读到的全是垃圾，**立刻返回 FALSE**（实测：秒退、返回 null）。
+//
+// 这里按 Windows 的真实偏移逐字段排好（见 OFN 的注释），实测对话框正常弹出。
+//
+// ── 字符串字段为什么不用 ustring ────────────────────────
+// 结构体里的 ustring 字段在 FFI 里会被重新打包成 UTF-16 缓冲区，
+// 而那段代码对「纯 ASCII 且含 NUL」的串会误判成 UTF-16 字节串再解一次
+// （ASCII 过滤器就会变成乱码）。所以这里统一自己用
+// `raw.buffer(raw.toUtf16(s))` 造 UTF-16 缓冲区，用 pointer 字段传。
+//
+// ── 过滤器格式 ────────────────────────────────────────
+// 用竖线分隔的成对描述： "所有文件|*.*|aardio 源文件|*.aardio|" →
+// 内部转成 Windows 要的 "描述\0通配符\0…\0\0"。
+//
+// ⚠ NUL 必须用 '\u0000'，**不能**用 '\0'：
+// aardio 的 '\0' 是**字节转义**，带它的字面量是「字节串」，
+// 跟普通字符串拼接会把整串降级成字节串（中文被按 UTF-8 编码成字节），
+// 再做 UTF-16 转换就成乱码了（实测过滤器下拉框显示乱码）。
+// '\u0000' 不是字节转义，得到的仍是正常字符串。
+var NUL = '\u0000';
+namespace nodio.ui{
+import raw;
+
+// OPENFILENAMEW（x64）—— 字段偏移 = Windows 头文件里的真实偏移
+var OFN = class{
+	INT lStructSize;            // 0
+	INT _pad0;                  // 4
+	pointer hwndOwner;          // 8   (HWND)
+	pointer hInstance;          // 16
+	pointer lpstrFilter;        // 24  (LPCWSTR)
+	pointer lpstrCustomFilter;  // 32
+	INT nMaxCustFilter;         // 40
+	INT nFilterIndex;           // 44
+	pointer lpstrFile;          // 48  (LPWSTR)
+	INT nMaxFile;               // 56
+	INT _pad1;                  // 60
+	pointer lpstrFileTitle;     // 64
+	INT nMaxFileTitle;          // 72
+	INT _pad2;                  // 76
+	pointer lpstrInitialDir;    // 80
+	pointer lpstrTitle;         // 88
+	INT Flags;                  // 96
+	WORD nFileOffset;           // 100
+	WORD nFileExtension;        // 102
+	pointer lpstrDefExt;        // 104
+	pointer lCustData;          // 112
+	pointer lpfnHook;           // 120
+	pointer lpTemplateName;     // 128
+	pointer pvReserved;         // 136
+	INT dwReserved;             // 144
+	INT FlagsEx;                // 148
+}
+
+// _OFN_ 标志位
+var OFN_EXPLORER      = 0x80000;
+var OFN_FILEMUSTEXIST = 0x1000;
+var OFN_PATHMUSTEXIST = 0x800;
+var OFN_NOCHANGEDIR   = 0x8;
+var OFN_HIDEREADONLY  = 0x4;
+var OFN_OVERWRITEPROMPT = 0x2;
+
+var MAX_PATH_CHARS = 520;
+
+// UTF-16 缓冲区：内容 + 一个 NUL 终结符
+// `string.len` 是 wchar（UTF-16 码元）数 → 字节数 = 2 倍。
+var __u16 = function(s){
+	if(s === null || s === undefined) s = "";
+	var n = ..string.len(s);
+	return ..raw.buffer((n + 1) * 2, ..string.toUtf16(s));
+}
+
+// 过滤器： "desc|pat|desc|pat|" → "desc\0pat\0desc\0pat\0"（末尾再补一个 NUL）
+var __filter16 = function(filter){
+	if(!filter) filter = "所有文件|*.*|";
+	var items = ..string.split(filter, '|');
+	// 去掉尾部空项
+	var out = {};
+	for(i=1;#items;1){
+		var it = items[i];
+		if(it === null || it === undefined) continue;
+		if(#it == 0 && i == #items) continue;
+		..table.push(out, it);
+	}
+	if(#out == 0){
+		..table.push(out, "所有文件");
+		..table.push(out, "*.*");
+	}
+	// 描述/通配符成对；落单的最后一项当通配符
+	if(#out % 2 != 0) ..table.push(out, "*.*");
+	var s = "";
+	for(i=1;#out;1){
+		s = s ++ out[i] ++ NUL;
+	}
+	return __u16(s ++ NUL);
+}
+
+// 从缓冲区读回路径（到第一个 NUL 为止）
+var __readPath = function(buf, chars){
+	var s = ..raw.readW(buf, chars);
+	if(s === null) return "";
+	var parts = ..string.split(s, NUL);
+	return parts[1] : "";
+}
+
+filedlg = function(winform, opt){
+	opt = opt : {};
+	var self = {
+		winform = winform,
+		owner = opt.owner,               // 父窗体（默认 winform）
+		filter = opt.filter : '所有文件|*.*|',
+		defExt = opt.defExt : "",
+		dir = opt.dir : "",              // 上次使用的目录（记住）
+	};
+
+	self.__ownerHwnd = function(){
+		var o = self.owner : self.winform;
+		if(!o) return 0;
+		try{ return o.hwnd }catch(e){}
+		return 0;
+	};
+
+	// 通用实现：mode = "open" | "save"
+	self.__run = function(mode, filter, title, dir, defFile){
+		var isSave = (mode == "save");
+		var buf = ..raw.buffer(MAX_PATH_CHARS * 2);
+		var ofn = OFN();
+		ofn.lStructSize = 152;
+		ofn.hwndOwner = self.__ownerHwnd();
+		ofn.hInstance = 0;
+		ofn.lpstrFilter = __filter16(filter : self.filter);
+		ofn.lpstrCustomFilter = 0;
+		ofn.nMaxCustFilter = 0;
+		ofn.nFilterIndex = 1;
+		ofn.lpstrFile = buf;
+		ofn.nMaxFile = MAX_PATH_CHARS;
+		ofn.lpstrFileTitle = 0;
+		ofn.nMaxFileTitle = 0;
+		ofn.lpstrInitialDir = __u16(dir : self.dir);
+		ofn.lpstrTitle = __u16(title : (isSave ? "另存为" : "打开文件"));
+		ofn.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+			| OFN_HIDEREADONLY | (isSave ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+		ofn.nFileOffset = 0;
+		ofn.nFileExtension = 0;
+		ofn.lpstrDefExt = __u16(self.defExt);
+		ofn.lCustData = 0;
+		ofn.lpfnHook = 0;
+		ofn.lpTemplateName = 0;
+		ofn.pvReserved = 0;
+		ofn.dwReserved = 0;
+		ofn.FlagsEx = 0;
+		// 默认文件名
+		if(defFile){
+			try{
+				var b2 = ..raw.buffer(MAX_PATH_CHARS * 2, ..string.toUtf16(defFile));
+				ofn.lpstrFile = b2;
+			}catch(e){}
+		}
+		var ok = 0;
+		if(isSave){
+			ok = ::Comdlg32.GetSaveFileName(ofn);
+		}
+		else{
+			ok = ::Comdlg32.GetOpenFileName(ofn);
+		}
+		if(!ok) return null;
+		var path = __readPath(buf, MAX_PATH_CHARS);
+		if(#path == 0) return null;
+		// 记住目录
+		var pi = ..io.splitpath(path);
+		if(pi && pi.dir) self.dir = pi.dir;
+		return path;
+	};
+
+	// 打开文件：返回路径或 null
+	self.open = function(filter, title, dir, defFile){
+		return self.__run("open", filter, title, dir, defFile);
+	};
+	// 另存为：返回路径或 null
+	self.save = function(filter, title, dir, defFile){
+		return self.__run("save", filter, title, dir, defFile);
+	};
+	return self;
+}
+
+}

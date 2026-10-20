@@ -89,6 +89,9 @@ Get-ChildItem $tests -File | Where-Object { $_.BaseName -match '^t\d\d$' -and ($
     if (-not $p.WaitForExit(20000)) { $p.Kill(); $p.WaitForExit(5000) }
     $out = ($outTask.Result + $errTask.Result)
     $out = $out -replace "`r", '' -replace "`n", ''
+    # S-2: a runtime error carries the script's own path ("@ <file>:<line>"),
+    # so normalize it — the expectation files must stay machine independent
+    $out = $out.Replace($_.FullName, '<SCRIPT>')
     $expect = (Get-Content $expectFile -Raw -Encoding UTF8)
     $expect = $expect -replace "`r", '' -replace "`n", ''
     if ($out -eq $expect) { $pass++; Write-Host "PASS $name" }
@@ -152,5 +155,12 @@ Write-Host "== $pass passed, $fail failed, $skip skipped =="
 if ($srvProc -and -not $srvProc.HasExited) {
     & taskkill /PID $srvProc.Id /T /F 2>$null | Out-Null
 }
+# ...and killing the wrapper is not enough when this script itself was
+# interrupted (Ctrl+C / crash): the python listener then survives as an
+# orphan. Sweep by command line so a leftover from an earlier aborted run
+# is reclaimed too (match on the script path, not on "python").
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match 'webroot\\_srv\.py' } |
+    ForEach-Object { & taskkill /PID $_.ProcessId /T /F 2>$null | Out-Null }
 if ($fail -gt 0) { exit 1 }
 exit 0

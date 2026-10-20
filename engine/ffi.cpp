@@ -177,7 +177,7 @@ namespace NodioVM
 #endif
         // interp methods are not declared yet at this point — dispatch
         // through a function pointer installed at InitBuiltins time
-        if (!g_cbDispatch || !ctx)
+        if (!g_cbDispatch || !ctx || ctx->released)
             return 0;
         return g_cbDispatch(ctx, args);
     }
@@ -189,6 +189,83 @@ namespace NodioVM
         return CallbackShim(ctx, stack);
     }
 #endif
+
+    // ---- trampoline memory pool ----------------------------------------
+    // Every native callback needs a small executable stub. Giving each one
+    // its own VirtualAlloc page would burn a full 4 KB page per callback,
+    // and the official library creates one callback per window/hook/object
+    // (win.form installs a window procedure, key.hook a low level hook,
+    // win.subclass another one). The pool carves the stubs out of 64 KB
+    // pages instead, so a callback costs 256 bytes of address space.
+    // Released slots are NOT reused: native code that still holds the
+    // function pointer may call it after the collector released the
+    // callback, and a reused slot would then jump into an unrelated
+    // callback. The slot keeps a neutralized "return 0" stub instead.
+    namespace
+    {
+        const size_t kTrampSlot = 256;    // x64 stub is 160 bytes
+        const size_t kTrampPage = 64 * 1024;
+        std::vector<uint8_t*> g_trampPages;
+        uint8_t* g_trampCur = nullptr;
+        size_t g_trampLeft = 0;
+
+        uint8_t* TrampAlloc()
+        {
+            if (g_trampLeft < kTrampSlot)
+            {
+                uint8_t* page = (uint8_t*)VirtualAlloc(nullptr, kTrampPage,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if (!page) return nullptr;
+                g_trampPages.push_back(page);
+                g_trampCur = page;
+                g_trampLeft = kTrampPage;
+            }
+            uint8_t* p = g_trampCur;
+            g_trampCur += kTrampSlot;
+            g_trampLeft -= kTrampSlot;
+            return p;
+        }
+    }
+
+    void ReleaseCallback(CbCtx* ctx)
+    {
+        if (!ctx || ctx->released) return;
+        ctx->released = true;
+        // Drop the script side first: the closure and everything it
+        // captured must not stay pinned by the native registry. Without
+        // this the collector could never reclaim a callback's owner.
+        ctx->fn = Value();
+        ctx->owner = Value();
+        for (auto it = g_cbs.begin(); it != g_cbs.end(); ++it)
+        {
+            if (*it == ctx) { g_cbs.erase(it); break; }
+        }
+        // Neutralize the stub. Native code may still hold the pointer (the
+        // official contract warns about exactly this), and a late call must
+        // return 0 instead of entering a released context.
+        if (ctx->code)
+        {
+            unsigned char* c = (unsigned char*)ctx->code;
+            size_t n = 0;
+            c[n++] = 0x31; c[n++] = 0xC0;          // xor eax,eax
+#if defined(_MIX86)
+            if (ctx->popBytes > 0)
+            {
+                c[n++] = 0xC2;                   // ret imm16
+                c[n++] = (unsigned char)(ctx->popBytes & 0xFF);
+                c[n++] = (unsigned char)((ctx->popBytes >> 8) & 0xFF);
+            }
+            else
+            {
+                c[n++] = 0xC3;                   // ret
+            }
+#else
+            c[n++] = 0xC3;                       // ret (caller cleans)
+#endif
+            FlushInstructionCache(GetCurrentProcess(), ctx->code, n);
+            ctx->code = nullptr;
+        }
+    }
 
     void CallbackTrampoline(CbCtx* ctx)
     {
@@ -220,8 +297,9 @@ namespace NodioVM
             code[n++] = (unsigned char)((popBytes >> 8) & 0xFF);
         }
         ctx->codeSize = n;
-        ctx->code = VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE,
-                                 PAGE_EXECUTE_READWRITE);
+        ctx->popBytes = popBytes;
+        ctx->code = TrampAlloc();
+        if (!ctx->code) return;
         memcpy(ctx->code, code, n);
         FlushInstructionCache(GetCurrentProcess(), ctx->code, n);
 #else
@@ -234,9 +312,8 @@ namespace NodioVM
         // in our own frame, then invoke the C++ shim with
         //   RCX=ctx  RDX=rsp_entry  R8=&xmm_save
         //   sub rsp,0x78 (frame, 16-aligned)  →  sub rsp,0x30 (shadow)
-        unsigned char* c = (unsigned char*)VirtualAlloc(
-            nullptr, 160, MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE);
+        unsigned char* c = (unsigned char*)TrampAlloc();
+        if (!c) return;
         int n = 0;
         auto put = [&c, &n](const unsigned char* p, int len)
         { memcpy(c + n, p, (size_t)len); n += len; };

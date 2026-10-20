@@ -5,7 +5,9 @@ rewrite whose IDE is **self-hosted** — written in aardio and running on the
 Nodio VM — replacing the retired MFC shell.
 
 Module map lives in `docs/architecture.md`; the compatibility ledger in
-`docs/roadmap.md`.
+`docs/roadmap.md`; the **"compatible *and* better than official aardio"**
+checklist in `docs/surpass.md` (every item states what official aardio does,
+what Nodio does instead, and how it is verified).
 
 ## Repository layout
 

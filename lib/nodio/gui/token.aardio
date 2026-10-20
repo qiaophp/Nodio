@@ -1,0 +1,127 @@
+// nodio.gui.token — 设计令牌（尺度档位 + 原始色板）。
+//
+// 移植自 Zan.Gui 的 Styling 层：Palette.zan / Space.zan / Radius.zan /
+// WidgetSize.zan。Zan.Gui 用 class + const 组织，aardio 没有 const，
+// 这里改成一组**命名空间里的表**，语义完全一致：
+//
+//   令牌表            含义
+//   ----------------  --------------------------------------------------
+//   space             8pt 网格间距档位（杜绝魔数）
+//   radius            圆角档位
+//   size              控件高度档位
+//   fontSize          字号档位
+//   iconSize          图标尺寸档位
+//   palette           原始色板（ARGB）
+//
+// 单位约定（与 nodio.ui 组件层一致）：
+//   · 所有度量都是**逻辑像素**（96dpi 基准），绘制时由 ctx 按 DPI 换算；
+//   · 颜色是 0xAARRGGBB（gdip 的 ARGB）。
+namespace nodio.gui{
+
+// ---------- 8pt 网格间距档位 ----------
+var space = {
+	none = 0;   // 无间距
+	xxs  = 2;   // 微小缝隙
+	xs   = 4;   // 紧凑间距
+	s    = 8;   // 基础单元
+	sm   = 12;  // 次级中等
+	m    = 16;  // 标准中等
+	l    = 24;  // 大间距
+	xl   = 32;  // 特大间距
+	xxl  = 48;  // 巨型间距
+};
+
+// ---------- 圆角档位 ----------
+var radius = {
+	none = 0;    // 直角
+	xs   = 2;    // 微圆角
+	s    = 4;    // 小圆角
+	m    = 8;    // 标准圆角
+	l    = 12;   // 中圆角
+	xl   = 16;   // 大圆角
+	full = 9999; // 胶囊
+};
+
+// ---------- 控件高度档位 ----------
+var size = {
+	mini   = 24;  // 紧凑微型
+	small  = 28;  // 次紧凑
+	medium = 32;  // 桌面标准
+	large  = 40;  // 强调型大控件
+};
+
+// ---------- 字号档位（逻辑像素）----------
+var fontSize = {
+	tiny   = 11;
+	small  = 12;
+	medium = 13;
+	large  = 16;
+	huge   = 20;
+};
+
+// ---------- 图标尺寸档位（逻辑像素）----------
+var iconSize = {
+	caption = 10;
+	small   = 12;
+	medium  = 16;
+	large   = 20;
+};
+
+// ---------- 原始色板（ARGB）----------
+// Slate 质感：低饱和、不刺眼，深色工作台长时间看着舒服。
+var palette = {
+	slate900 = 0xFF0F172A;   // 深邃底色
+	slate800 = 0xFF1E293B;   // 卡片表面
+	slate700 = 0xFF334155;   // 悬浮高亮 / 描边
+	slate600 = 0xFF475569;
+	slate500 = 0xFF64748B;   // 弱文字
+	slate400 = 0xFF94A3B8;   // 次级文字
+	slate300 = 0xFFCBD5E1;
+	slate200 = 0xFFE2E8F0;
+	slate100 = 0xFFF1F5F9;
+	slate50  = 0xFFF8FAFC;   // 高对比正文
+
+	blue500   = 0xFF3B82F6;  // 科技蓝
+	blue600   = 0xFF2563EB;
+	blue700   = 0xFF1D4ED8;
+	emerald500= 0xFF10B981;  // 翠绿
+	emerald600= 0xFF059669;
+	amber500  = 0xFFF59E0B;  // 琥珀
+	amber600  = 0xFFD97706;
+	rose500   = 0xFFEF4444;  // 珊瑚红
+	rose600   = 0xFFDC2626;
+	cyan500   = 0xFF06B6D4;
+	violet500 = 0xFF8B5CF6;
+};
+
+// ---------- 令牌总表（供外部一次性取用）----------
+var token = {
+	space    = space;
+	radius   = radius;
+	size     = size;
+	fontSize = fontSize;
+	iconSize = iconSize;
+	palette  = palette;
+};
+
+// 便捷取用：tokenSpace("s") → 8
+tokenSpace = function(k){
+	return space[k];
+}
+tokenRadius = function(k){
+	return radius[k];
+}
+tokenSize = function(k){
+	return size[k];
+}
+tokenFontSize = function(k){
+	return fontSize[k];
+}
+tokenIconSize = function(k){
+	return iconSize[k];
+}
+tokenColor = function(k){
+	return palette[k];
+}
+
+}

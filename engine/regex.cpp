@@ -790,9 +790,33 @@ namespace NodioVM
 
     // ---------------- pattern compiler ----------------
 
+    struct CompiledRE
+    {
+        vector<vector<RE>> branches;
+        bool anchored = false;
+        int nGroups = 0;
+        bool ok = false;
+        wstring err;
+    };
+
     bool RECompile(const wstring& pat, vector<vector<RE>>& branches,
                           bool* pAnchored, int* pGroups, wstring* err)
     {
+        thread_local std::unordered_map<wstring, CompiledRE> s_reCache;
+        auto it = s_reCache.find(pat);
+        if (it != s_reCache.end())
+        {
+            if (!it->second.ok)
+            {
+                if (err) *err = it->second.err;
+                return false;
+            }
+            branches = it->second.branches;
+            if (pAnchored) *pAnchored = it->second.anchored;
+            if (pGroups) *pGroups = it->second.nGroups;
+            return true;
+        }
+
         REParser ps(pat, err);
         bool anchored = false;
         size_t j = 0;
@@ -800,12 +824,23 @@ namespace NodioVM
         ps.i = j;
         vector<RE> els;
         if (!ps.ParseSeq(els, 0))
+        {
+            if (s_reCache.size() >= 128) s_reCache.clear();
+            s_reCache[pat] = { {}, false, 0, false, err ? *err : L"" };
             return false;
+        }
         branches.push_back(std::move(els));
-        if (!err->empty())
+        if (err && !err->empty())
+        {
+            if (s_reCache.size() >= 128) s_reCache.clear();
+            s_reCache[pat] = { {}, false, 0, false, *err };
             return false;
-        *pAnchored = anchored;
-        *pGroups = ps.nGroups;
+        }
+        if (pAnchored) *pAnchored = anchored;
+        if (pGroups) *pGroups = ps.nGroups;
+
+        if (s_reCache.size() >= 128) s_reCache.clear();
+        s_reCache[pat] = { branches, anchored, ps.nGroups, true, L"" };
         return true;
     }
 }

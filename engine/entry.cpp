@@ -1,8 +1,10 @@
 // entry.cpp — public entry points: syntax check, source runner,
 // crash reporting and the embed-path root.
 #include "engine/common.h"
+#include "engine/NodioVM.h"
 #include "engine/parser.h"
 #include "engine/interp.h"
+#include "engine/compiler.h"
 
 namespace NodioVM
 {
@@ -77,6 +79,8 @@ namespace NodioVM
             wstring cfgLib = GetNodioConfig().libDir;
             if (!cfgLib.empty())
                 wcsncpy_s(szLib, cfgLib.c_str(), _TRUNCATE);
+            else if (_waccess(L"D:\\aardio\\lib", 0) == 0)
+                wcsncpy_s(szLib, L"D:\\aardio\\lib", _TRUNCATE);
         }
         wstring strLib = szLib;
         if (strLib.size() < 2) return L"";
@@ -92,20 +96,29 @@ namespace NodioVM
     int RunSource(const wstring& src, wstring* strError,
                   const wstring* pBaseDir,
                   const std::unordered_map<wstring, wstring>* pEmbedded,
-                  bool bDebug, const wstring* pBreakLines)
+                  bool bDebug, const wstring* pBreakLines,
+                  const wstring* pScriptFile)
     {
         _set_invalid_parameter_handler(SilentInvalidParameterHandler);
         SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
         SetUnhandledExceptionFilter(CrashFilter);
         setvbuf(stderr, nullptr, _IONBF, 0);
         wstring localErr;
-        vector<Tok> toks = Lex(src, &localErr);
-        Parser ps{ toks, 0, &localErr };
-        if (pBaseDir)
-            ps.strEmbedBase = *pBaseDir;
-        ps.strEmbedRoot = EmbedRoot();
-        PNode prog = ps.ParseBlock();   // whole program as a block
-        if (!localErr.empty())
+        PNode prog;
+        if (IsBytecode(src))
+        {
+            prog = DeserializeNode(src, &localErr);
+        }
+        else
+        {
+            vector<Tok> toks = Lex(src, &localErr);
+            Parser ps{ toks, 0, &localErr };
+            if (pBaseDir)
+                ps.strEmbedBase = *pBaseDir;
+            ps.strEmbedRoot = EmbedRoot();
+            prog = ps.ParseBlock();   // whole program as a block
+        }
+        if (!localErr.empty() || !prog)
         {
             if (strError) *strError = localErr;
             return -1;
@@ -117,6 +130,47 @@ namespace NodioVM
         if (pEmbedded)
             it.embedded = *pEmbedded;
         it.bDebug = bDebug;
+        // external debug session: a DAP adapter spawned us with control
+        // pipes — every breakpoint stop (and initial step) goes to it.
+        // Two UNIDIRECTIONAL pipes (a synchronous duplex handle cannot be
+        // read and written concurrently from different threads):
+        //   NODIO_DEBUG_PIPE : events   (engine -> adapter, write-only)
+        //   NODIO_DEBUG_CMD  : commands (adapter -> engine, read-only)
+        {
+            wchar_t szPipe[256] = L"";
+            if (GetEnvironmentVariableW(L"NODIO_DEBUG_PIPE", szPipe, 256) > 0 &&
+                szPipe[0])
+            {
+                HANDLE hEv = CreateFileW(szPipe, GENERIC_WRITE, 0, nullptr,
+                                         OPEN_EXISTING, 0, nullptr);
+                if (hEv != INVALID_HANDLE_VALUE)
+                {
+                    wchar_t szCmd[256] = L"";
+                    if (GetEnvironmentVariableW(L"NODIO_DEBUG_CMD",
+                                                szCmd, 256) > 0 && szCmd[0])
+                    {
+                        HANDLE hCmd = CreateFileW(szCmd, GENERIC_READ, 0,
+                                                  nullptr, OPEN_EXISTING,
+                                                  0, nullptr);
+                        if (hCmd != INVALID_HANDLE_VALUE)
+                        {
+                            it.hDebugPipe = hEv;      // events out
+                            it.hDebugCmd = hCmd;      // commands in
+                            it.bDebug = true;
+                            it.bStep = true;   // stop at the first statement
+                        }
+                        else
+                        {
+                            CloseHandle(hEv);
+                        }
+                    }
+                    else
+                    {
+                        CloseHandle(hEv);
+                    }
+                }
+            }
+        }
         if (pBreakLines)
         {
             // "3,7,12" -> breakpoint set
@@ -206,6 +260,14 @@ namespace NodioVM
         auto mainEnv = std::make_shared<Env>();
         mainEnv->self = mainEnv;
         mainEnv->parent = it.globals.self;
+        // S-2: the main script owns its own file — a runtime error in it
+        // reports "<script>:<line>" instead of a bare line number.
+        if (pScriptFile && !pScriptFile->empty())
+            mainEnv->srcFile = *pScriptFile;
+        // The main script's own variables live in this frame; nothing in
+        // the VM root graph points down to it, so it must be registered
+        // or the collector would free the script's globals.
+        Interp::GcFrameScope fsMain(it, mainEnv);
         try
         {
             it.ExecBlock(prog, mainEnv.get());
@@ -219,21 +281,19 @@ namespace NodioVM
             wstring whatW((size_t)max(nW, 1), 0);
             if (nW > 1)
                 MultiByteToWideChar(CP_UTF8, 0, e.what(), -1, &whatW[0], nW);
-            localErr = L"运行错误: C++ 异常 " + whatW + L" @ 行 " +
-                       std::to_wstring(it.nErrLine);
+            localErr = L"运行错误: C++ 异常 " + whatW;
         }
         catch (...)
         {
-            localErr = L"运行错误: 未知 C++ 异常 @ 行 " +
-                       std::to_wstring(it.nErrLine);
+            localErr = L"运行错误: 未知 C++ 异常";
         }
         if (!localErr.empty())
         {
-            // runtime errors carry the innermost statement line; parse errors
-            // already embed one via the parser
-            if (localErr.find(L"运行错误") != wstring::npos &&
-                it.nErrLine > 0)
-                localErr += (L" @ 行 " + std::to_wstring(it.nErrLine));
+            // S-2: the top-level report point.  It appends the location
+            // (" @ <file>:<line>") unless the message already carries one
+            // (a library compile error quotes the parser's own line).
+            if (!HasErrorLocation(localErr) && it.nErrLine > 0)
+                AppendErrorLocation(&localErr, it.strErrFile, it.nErrLine);
             if (strError) *strError = localErr;
             return -1;
         }

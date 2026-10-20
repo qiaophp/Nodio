@@ -1,13 +1,216 @@
-// app/dapClient.nodio — nodio-dap client (milestone M3).
+// app/dapClient.nodio — nodio-dap client.
 //
-// The server binary speaks DAP over stdio (apps/nodio-dap/main.cpp). Wiring
-// it up means: spawn it with process.popen, drive the launch/initialize
-// handshake, push setBreakpoints, and surface stopped / stackTrace /
-// variables into the IDE. Not implemented yet — this module is the seam.
+// Speaks Content-Length framed JSON-RPC (DAP) over stdio to nodio-dap.exe.
+// Same transport facts as lspClient (see that file): popen + peek-driven
+// polling, single-quoted CRLF literals, persistent inbox, codepage 65001.
+import process.popen;
+import JSON;
 
-exeName = "nodio-dap.exe";
+var p = null;           // popen process
+var nextSeq = 1;        // DAP request seq
+var inbox = "";         // accumulated server bytes (peek() consumes!)
+var readyFlag = false;  // launch acknowledged
+var stoppedFlag = false;
+var lastVars = {};      // latest variables snapshot
+var lastStack = {};     // latest stack frames
+var stopLine = null;    // current stop line (0-based)
+var terminatedFlag = false;
 
-// Returns a session handle, or null while the protocol layer is unimplemented.
-start = function(libDir){
-	return null;
-}
+// ---------- framing ----------
+var sendRaw = function(body){
+	if(!p) return;
+	p.writeUtf8("Content-Length: " ++ #body ++ '\r\n\r\n' ++ body);
+	p.writeUtf8('\n');
+};
+
+var request = function(command, args){
+	if(!p) return null;
+	var seq = nextSeq;
+	nextSeq = nextSeq + 1;
+	var body = JSON.stringify({ seq = seq; type = "request"; command = command; arguments = args : {} });
+	sendRaw(body);
+	return seq;
+};
+
+// drain all complete frames; dispatch events, capture responses.
+// returns the response matching wantSeq or null.
+var poll = function(wantSeq){
+	if(!p) return null;
+	var found = null;
+	var o = p.peek(0);
+	if(o !== null && o !== false && #o > 0) inbox = inbox ++ o;
+	while(true){
+		var hEnd = ..string.indexOf(inbox, '\r\n\r\n');
+		if(hEnd === null) break;
+		var head = ..string.left(inbox, hEnd - 1);
+		var cl = ..string.match(head, "Content-Length:\s*(\d+)");
+		if(cl === null){ inbox = ..string.slice(inbox, 2); continue }
+		var nLen = tonumber(cl);
+		var bodyStart = hEnd + 4;
+		if((#inbox - bodyStart + 1) < nLen) break;
+		var body = ..string.mid(inbox, bodyStart, nLen);
+		inbox = ..string.slice(inbox, bodyStart + nLen);
+		var msg = JSON.parse(body);
+		if(!msg) continue;
+		if(msg.type == "event" && msg.event == "stopped"){
+			stoppedFlag = true;
+			var b = msg.body : {};
+			stopLine = b.line !== null ? tonumber(b.line) : 0;
+		}
+		elseif(msg.type == "event" && msg.event == "terminated"){
+			terminatedFlag = true;
+		}
+		elseif(msg.type == "response" && wantSeq !== null && tonumber(msg.request_seq) === tonumber(wantSeq)){
+			found = msg;
+		}
+	}
+	return found;
+};
+
+// ---------- public API ----------
+start = function(exePath){
+	if(p) return null;
+	p = process.popen(exePath);
+	if(!p) return null;
+	p.codepage = 65001;
+	nextSeq = 1; inbox = ""; readyFlag = false;
+	stoppedFlag = false; terminatedFlag = false;
+	lastVars = {}; lastStack = {}; stopLine = null;
+	var seq = request("initialize", { adapterID = "nodio" });
+	for(i=1;25;1){
+		sleep(20);
+		if(poll(seq) !== null) break;
+	}
+	return self;
+};
+
+// spawn the debuggee; true on success
+launch = function(scriptPath){
+	if(!p) return "no-adapter";
+	readyFlag = false;
+	stoppedFlag = false;
+	terminatedFlag = false;
+	var seq = request("launch", { program = scriptPath; noDebug = false });
+	for(i=1;50;1){
+		sleep(20);
+		var r = poll(seq);
+		if(r !== null){
+			if(r.success === false) return r.message : "launch-failed";
+			break;
+		}
+	}
+	readyFlag = true;
+	// configurationDone lets the engine begin (it starts stopped)
+	request("configurationDone", {});
+	return true;
+};
+
+// breakpoints: lines = array of 1-based line numbers (client passes them
+// 0-based → we add 1 so the editor's 0-based marks map cleanly)
+setBreakpoints = function(path, lines0){
+	if(!p) return;
+	var bps = {};
+	for(i=1;#lines0;1){ bps[i] = { line = lines0[i] + 1 } }
+	request("setBreakpoints", { source = { path = path }; breakpoints = bps });
+};
+
+next = function(){
+	if(!p || !stoppedFlag) return;
+	stoppedFlag = false;
+	request("next", {});
+};
+
+resume = function(){
+	if(!p || !stoppedFlag) return;
+	stoppedFlag = false;
+	request("continue", {});
+};
+
+// capture current vars + stack (call after a stopped event)
+refresh = function(){
+	if(!p || !stoppedFlag) return;
+	var s1 = request("variables", { variablesReference = 100 });
+	var s2 = request("stackTrace", { threadId = 1 });
+	for(i=1;25;1){
+		sleep(20);
+		var r1 = poll(s1);
+		var r2 = poll(s2);
+		if(r1 !== null && r2 !== null) break;
+	}
+	// r1/r2 captured via poll side effects; re-request through poll results
+};
+
+// vars from the last stop — array of {name;value}
+getVars = function(){
+	if(!p) return {};
+	if(!stoppedFlag) return lastVars;
+	var seq = request("variables", { variablesReference = 100 });
+	var out = {};
+	for(i=1;50;1){
+		sleep(20);
+		var r = poll(seq);
+		if(r !== null){
+			var vs = r.body ? r.body.variables : null;
+			if(vs){
+				for(k,v in vs){
+					..table.push(out, {
+						name = tostring(v.name);
+						value = tostring(v.value);
+					});
+				}
+			}
+			lastVars = out;
+			return out;
+		}
+	}
+	return lastVars;
+};
+
+// stack — array of {line(0-based);name}
+stackTrace = function(){
+	if(!p) return {};
+	var seq = request("stackTrace", { threadId = 1 });
+	var out = {};
+	for(i=1;50;1){
+		sleep(20);
+		var r = poll(seq);
+		if(r !== null){
+			var fs = r.body ? r.body.stackFrames : null;
+			if(fs){
+				for(k,v in fs){
+					..table.push(out, {
+						line = v.line !== null ? tonumber(v.line) : 0;
+						name = tostring(v.name);
+					});
+				}
+			}
+			lastStack = out;
+			return out;
+		}
+	}
+	return lastStack;
+};
+
+// ev(name, data) callback; returns false when the session ended.
+// stoppedFlag stays set after the event — getVars()/next()/resume()
+// consume it, so callers can inspect variables between stops.
+pollEvents = function(ev){
+	if(!p) return false;
+	poll(null);
+	if(stoppedFlag) ev("stopped", { line = stopLine : 0 });
+	if(terminatedFlag){ ev("terminated", {}) ; return false }
+	return p !== null;
+};
+
+ready = function(){ return p !== null && readyFlag };
+isStopped = function(){ return stoppedFlag };
+isRunning = function(){ return p !== null };
+
+stop = function(){
+	if(!p) return;
+	request("disconnect", {});
+	p.writeClose();
+	p.close();
+	p = null;
+	readyFlag = false;
+};

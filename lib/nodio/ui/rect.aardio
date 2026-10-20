@@ -1,0 +1,116 @@
+// nodio.ui.rect — 控件几何/文本的**方言无关**封装。
+//
+// 背景：Nodio 里同时存在两套控件方言——
+//   · 官方 win.ui 控件：setPos(x, y, 宽, 高)，text 是**属性**
+//   · 引擎原生控件：    setPos(l, t, r, b)，     text 是**函数**
+// 两套混用会让布局整体错乱（官方 IDE 的页面就是被 setPos 语义不一致
+// 弄歪的：底部 dock 的页签跑到了窗口最上方）。
+//
+// 这里的做法是绕开 ctrl.setPos，统一走 win.setPos(hwnd, x, y, 宽, 高)：
+// 官方 win.setPos 与引擎内置 win.setPos 语义一致（x,y,宽,高；物理像素；
+// 不做 DPI 缩放），两边都安全。
+//
+// 用法：
+//   nodio.ui.setRect(ctrl, 10, 20, 110, 50)   // 左上右下
+//   nodio.ui.moveTo(ctrl, 10, 20)              // 只挪位置
+//   nodio.ui.getCtrlText(ctrl)                 // 读文本
+//   nodio.ui.setCtrlText(ctrl, "新文本")        // 写文本
+namespace nodio.ui{
+
+// 把控件摆到矩形 (left, top, right, bottom)
+//
+// 用原始 win.setPos（官方 ctrl.setPos 会走官方 DPI/自适应链路，
+// 里面调用的 FFI 在 Nodio 里会触发引擎断言，而且官方那套是按
+// 「设计时矩形」重新摆放控件的，自绘组件会被弹回原处）。
+// 配套的：addCtrl() 建控件时关掉 autoResize，让官方不要再管我们的位置。
+setRect = function(ctrl, left, top, right, bottom){
+	if(!ctrl) return;
+	var hwnd = ctrl.hwnd;
+	if(!hwnd) return;
+	..win.setPos(hwnd, left, top, right - left, bottom - top);
+}
+
+// 只挪位置，不改大小
+moveTo = function(ctrl, left, top){
+	if(!ctrl) return;
+	var hwnd = ctrl.hwnd;
+	if(!hwnd) return;
+	..win.setPos(hwnd, left, top, null, null);
+}
+
+// 读控件文本：官方控件 text 是属性，引擎原生控件 text 是函数
+getCtrlText = function(ctrl){
+	if(!ctrl) return "";
+	var v = ctrl.text;
+	if(type(v) == "function"){
+		try{ v = v() }catch(e){ return "" }
+	}
+	if(v === null || v === undefined) return "";
+	return v;
+}
+
+// 写控件文本
+setCtrlText = function(ctrl, text){
+	if(!ctrl) return;
+	if(type(ctrl.text) == "function"){
+		try{ ctrl.text(text) }catch(e){}
+	}
+	else{
+		ctrl.text = text;
+	}
+}
+
+// 读一个属性值（官方控件的属性表 / 引擎原生控件的函数）
+getCtrlProp = function(ctrl, name){
+	if(!ctrl) return null;
+	var v = ctrl[name];
+	if(type(v) == "function"){
+		try{ v = v() }catch(e){ return null }
+	}
+	return v;
+}
+
+// 写一个属性值：官方控件支持 ctrl.x = v（属性），引擎原生控件是 ctrl.x(v)
+setCtrlProp = function(ctrl, name, value){
+	if(!ctrl) return false;
+	try{
+		if(type(ctrl[name]) == "function") ctrl[name](value);
+		else ctrl[name] = value;
+		return true;
+	}
+	catch(e){
+		return false;
+	}
+}
+
+// 加一个控件并取回它。
+// 官方 win.form.add 返回「名字 → 控件」的映射表；引擎原生 form 的形状不同，
+// 所以两种都试一遍。
+//
+// autoResize=false：官方窗体默认把控件登记进自动缩放名单，窗体做 DPI 缩放
+// 或自适应时会按「设计时矩形」重新摆放它 —— 自绘组件会被弹回创建时的位置
+// （设计画布的底板就曾在窗体 show 时被弹回 0,0,400,300）。
+// 位置一律由 nodio.ui.setRect 管，所以这里关掉它。
+addCtrl = function(form, name, tParam){
+	if(!form) return null;
+	tParam = tParam : {};
+	if(tParam.autoResize === null) tParam.autoResize = false;
+	var res = form.add({ [name] = tParam });
+	if(type(res) == "table" && res[name]) return res[name];
+	try{ return form[name] }catch(e){}
+	return null;
+}
+
+// 光标的屏幕坐标（由窗口句柄 + lParam 算）。
+// 拖拽必须用屏幕坐标：控件在拖动过程中会跟着鼠标走，
+// lParam（客户区坐标）会跟着变，用它算增量会漂移。
+mouseScreen = function(hwnd, lParam){
+	var r = ..win.getRect(hwnd, true);
+	if(!r) return null;
+	return {
+		x = r.left + (lParam & 0xFFFF);
+		y = r.top + ((lParam >> 16) & 0xFFFF);
+	};
+}
+
+}

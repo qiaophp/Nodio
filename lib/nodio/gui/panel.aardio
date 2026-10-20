@@ -1,0 +1,189 @@
+// nodio.gui.panel — 容器 / 徽标 / 进度条 / 分隔线。
+//
+// 移植自 Zan.Gui 的 Gui/Widget/Panel.zan（容器）+ Flex/Row/Column 的排布思想：
+//   容器负责**按方向排列子控件**（row / column），子控件自己画自己。
+//   这就是「自定义组件能加进设计器」的落点：写一个 nodio.gui.widget 子类，
+//   丢进 panel，panel 负责排版。
+//
+// 另外三个是 Zan.Gui 的 Badge / Progress / 对应分隔线的移植。
+namespace nodio.gui{
+import nodio.gui.widget;
+import nodio.gui.style;
+import nodio.gui.theme;
+import nodio.gui.ctx;
+
+// ---------- 容器 ----------
+panel = function(opt){
+	opt = opt : {};
+	var self = ..nodio.gui.widget({
+		style = opt.style : ..nodio.gui.stylePanel();
+	});
+	self.children = {};
+	self.dir = opt.dir : "row";       // row | column
+	self.gap = opt.gap : 8;           // 逻辑像素
+	self.pad = opt.pad : 8;           // 逻辑像素
+	self.align = opt.align : "start"; // start | center | end（交叉轴）
+	self.onClick = opt.onClick;
+
+	// 加子控件
+	self.add = function(w){
+		..table.push(self.children, w);
+		// 子控件的宿主是容器自己：子控件重绘 → 容器重绘 → 宿主重绘
+		w.host = self;
+		return w;
+	}
+
+	// 排版：按方向依次摆放子控件
+	self.layout = function(g){
+		var n = #self.children;
+		if(n == 0) return;
+		var pad = g.s(self.pad);
+		var gap = g.s(self.gap);
+		var x = self.rect.left + pad;
+		var y = self.rect.top + pad;
+		var availW = self.rect.right - self.rect.left - pad*2;
+		var availH = self.rect.bottom - self.rect.top - pad*2;
+		if(self.dir == "column"){
+			// 先按各自的高度排，再按 align 调整横向
+			var totalH = 0;
+			for(i=1;n;1){
+				totalH = totalH + self.children[i].height();
+			}
+			totalH = totalH + gap * (n - 1);
+			var offY = 0;
+			if(self.align == "center") offY = (availH - totalH) / 2;
+			elseif(self.align == "end") offY = availH - totalH;
+			if(offY < 0) offY = 0;
+			var cy = y + offY;
+			for(i=1;n;1){
+				var c = self.children[i];
+				var ch = c.height();
+				var cx = x;
+				if(self.align == "center") cx = x + (availW - c.width()) / 2;
+				elseif(self.align == "end") cx = x + availW - c.width();
+				c.setRect(cx, cy, cx + c.width(), cy + ch);
+				cy = cy + ch + gap;
+			}
+		}
+		else{
+			var totalW = 0;
+			for(i=1;n;1){
+				totalW = totalW + self.children[i].width();
+			}
+			totalW = totalW + gap * (n - 1);
+			var offX = 0;
+			if(self.align == "center") offX = (availW - totalW) / 2;
+			elseif(self.align == "end") offX = availW - totalW;
+			if(offX < 0) offX = 0;
+			var cx2 = x + offX;
+			for(i=1;n;1){
+				var c2 = self.children[i];
+				var cw = c2.width();
+				var cy2 = y;
+				if(self.align == "center") cy2 = y + (availH - c2.height()) / 2;
+				elseif(self.align == "end") cy2 = y + availH - c2.height();
+				c2.setRect(cx2, cy2, cx2 + cw, cy2 + c2.height());
+				cx2 = cx2 + cw + gap;
+			}
+		}
+	}
+
+	self.paint = function(g, rc){
+		var th = g.theme;
+		var sb = self.box(th);
+		var x = rc.left;
+		var y = rc.top;
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var r = g.s(sb.radius);
+		if(sb.bg) g.round(sb.bg, x, y, w, h, r);
+		var bw = g.s(sb.borderW);
+		if(bw > 0) g.roundLine(sb.borderColor, x, y, w, h, r, bw);
+		// 子控件
+		self.layout(g);
+		for(i=1;#self.children;1){
+			var c = self.children[i];
+			if(!c.visible) continue;
+			c.paint(g, c.rect);
+		}
+	}
+	return self;
+}
+
+// ---------- 徽标 ----------
+badge = function(opt){
+	opt = opt : {};
+	var self = ..nodio.gui.widget({
+		text = opt.text;
+		style = opt.style : ..nodio.gui.styleBadge();
+	});
+	self.onClick = opt.onClick;
+	self.paint = function(g, rc){
+		var th = g.theme;
+		var sb = self.box(th);
+		var x = rc.left;
+		var y = rc.top;
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var r = g.s(sb.radius);
+		g.round(sb.bg, x, y, w, h, r);
+		g.text(self.text, sb.fg, sb.fontPx, x, y, w, h,
+			{align=1; valign=1; ellipsis=0});
+	}
+	return self;
+}
+
+// ---------- 进度条 ----------
+progress = function(opt){
+	opt = opt : {};
+	var self = ..nodio.gui.widget({
+		style = opt.style : ..nodio.gui.styleProgress();
+	});
+	self.value = opt.value : 0;      // 0..100
+	self.onClick = opt.onClick;
+	self.paint = function(g, rc){
+		var th = g.theme;
+		var sb = self.box(th);
+		var x = rc.left;
+		var y = rc.top;
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var r = g.s(sb.radius);
+		g.round(sb.bg, x, y, w, h, r);
+		var v = self.value;
+		if(v < 0) v = 0;
+		if(v > 100) v = 100;
+		var fw = w * v / 100;
+		if(fw > 0) g.round(sb.fg, x, y, fw, h, r);
+	}
+	return self;
+}
+
+// ---------- 分隔线 ----------
+separator = function(opt){
+	opt = opt : {};
+	var self = ..nodio.gui.widget({
+		style = opt.style : ..nodio.gui.style({
+			name = "separator";
+			states = {
+				normal = { bg = 0; fg = "divider"; borderW = 0; radius = 0; fontPx = 12 };
+			};
+		});
+	});
+	self.vertical = opt.vertical;     // true = 竖线
+	self.paint = function(g, rc){
+		var th = g.theme;
+		var sb = self.box(th);
+		if(self.vertical){
+			var x = rc.left + (rc.right - rc.left)/2;
+			g.line(sb.fg, x, rc.top, x, rc.bottom, g.s(1));
+		}
+		else{
+			var y = rc.top + (rc.bottom - rc.top)/2;
+			g.line(sb.fg, rc.left, y, rc.right, y, g.s(1));
+		}
+	}
+	return self;
+}
+
+}

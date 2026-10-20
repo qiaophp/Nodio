@@ -1,0 +1,41 @@
+// probe: capability gap micro-probes for the failing vm tests
+import json;
+import time;
+import thread;
+import string;
+
+io.print("--- json.stringify ---");
+var obj = json.parse('{"name":"aardio","n":43,"arr":[1,2,3]}');
+io.print("parsed type:", type(obj));
+io.print("stringify:", json.stringify(obj));
+io.print("keys:", obj.name, obj.n, obj.arr[2]);
+
+io.print("--- time.date ---");
+io.print("date:", time.date());
+io.print("year:", time.date("%Y"));
+io.print("tick:", time.tick());
+
+io.print("--- string.hex ---");
+io.print("hex:", string.hex("AB"));
+io.print("unhex:", string.unhex("4142"));
+
+io.print("--- thread ---");
+var h = thread.create(function(x){ thread.set("probe_r", x*2); return x*2; }, 21);
+io.print("waitOne:", tostring(thread.waitOne(h, 3000)));
+io.print("get:", tostring(thread.get("probe_r")));
+
+io.print("--- io.readFile modes ---");
+var p = io.fullpath("probe_gbk.txt");
+io.writeFile(p, "中文ABC", "gbk");
+io.print("gbk size on disk:", io.getSize(p));
+var raw = io.readFile(p, "raw");
+io.print("raw:", raw === null ? "null" : "#" ++ #raw);
+var txt = io.readFile(p, "gbk");
+io.print("gbk read:", txt === null ? "null" : txt);
+var u8p = io.fullpath("probe_u8.txt");
+io.writeFile(u8p, "中文ABC", "utf8");
+io.print("u8 size on disk:", io.getSize(u8p));
+var t2 = io.readFile(u8p);
+io.print("u8 read:", t2 === null ? "null" : t2);
+io.remove(p);
+io.remove(u8p);

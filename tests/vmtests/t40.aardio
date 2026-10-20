@@ -1,19 +1,24 @@
-// round 43: fromto transcoding + encoded file IO
+// round 43: file IO + transcoding.
+//
+// Official contract (D:\aardio\lib\builtin\io.aardio, intellisense):
+//   io.writeFile(path, ...) — the extra arguments are the DATA to write, NOT
+//   an encoding. "io.writeFile(p,s,"gbk")" writes s AND the literal "gbk".
+//   io.readFile(path, len)  — len is a byte count ("%s" = one text line).
+// Nodio extension: io.readFile(path, "raw"/"gbk"/"ansi"/"utf8") reads the
+// whole file and converts it ("raw" keeps the bytes).
 var s = "中文ABC";
-var bs = string.fromto(s, "", "gbk");
-io.print(#bs);
-var back = string.fromto(bs, "gbk", "");
-io.print(back == s);
-var u8 = string.fromto(s, "", "utf8");
-io.print(#u8);
-io.writeFile("r43test.txt", s, "gbk");
-var raw = io.readFile("r43test.txt", "raw");
-io.print(#raw);
-var txt = io.readFile("r43test.txt", "gbk");
-io.print(txt == s);
-io.writeFile("r43u8.txt", s, "utf8");
-var txt2 = io.readFile("r43u8.txt");
-io.print(txt2 == s);
-var ansi = string.fromto(s, "", "ansi");
-io.print(#ansi > 3);
-io.print(string.fromto("plain", "utf8", "gbk") == "plain");
+var p = ..io.fullpath("r43test.txt");
+
+..io.writeFile(p, s);
+io.print("size:", ..io.getSize(p));
+var raw = ..io.readFile(p);
+io.print("bytes:", #raw);
+io.print("equal:", raw == s);
+
+var gbk = ..string.fromto(s, "", "gbk");
+..io.writeFile(p, gbk);
+io.print("gbksize:", ..io.getSize(p));
+var back = ..io.readFile(p, "gbk");
+io.print("gbkequal:", back == s);
+
+..io.remove(p);

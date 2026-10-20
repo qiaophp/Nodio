@@ -18,19 +18,102 @@ namespace NodioVM
         return u8;
     }
 
+    // ---- published payload: the embedded file system ----
+    // A published exe carries its resources inside the appended payload; the
+    // manifest keys are lib-relative paths with '\' separators. "~\res\x"
+    // (EXE root), "/res/x" (app root) and bare relative keys all resolve to
+    // the same key.
+    //
+    // The lookup lives HERE and not on the io.readFile builtin because the
+    // official builtin library replaces global.io with its own namespace,
+    // where io.readFile is the deprecated file.read alias — anything hung
+    // off the io.readFile builtin is unreachable (the official alias wins).
+    // io.file is the funnel every file read goes through, so the embedded
+    // lookup has to live there.
+    static wstring EmbeddedPayloadKey(const wstring& path)
+    {
+        if (!g_interpCurrent || path.empty()) return L"";
+        auto& emb = g_interpCurrent->embedded;
+        if (emb.empty()) return L"";
+        wstring key = path;
+        if (key[0] == L'~') key = key.substr(1);
+        if (!key.empty() && (key[0] == L'\\' || key[0] == L'/'))
+            key = key.substr(1);
+        for (auto& c : key)
+            if (c == L'/') c = L'\\';
+        if (emb.find(key) != emb.end()) return key;
+        // the original spelling may itself be the manifest key
+        if (key != path && emb.find(path) != emb.end()) return path;
+        return L"";
+    }
+
+    // A file handle: a disk FILE* or a published-payload resource buffer.
+    // The payload buffer holds the raw bytes (one byte per wchar in the
+    // engine's byte-string convention becomes one std::string byte here).
+    struct IoFileState
+    {
+        FILE* f = nullptr;
+        std::string mem;
+        size_t memPos = 0;
+        bool bMem = false;
+        bool bClosed = false;
+        ~IoFileState() { if (f) fclose(f); }
+    };
+    // a file state is "open" when it has a disk handle or a payload buffer
+    static bool ioFileOpen(const std::shared_ptr<IoFileState>& st)
+    {
+        return st && !st->bClosed && (st->f != nullptr || st->bMem);
+    }
+    static long long ioFilePos(const std::shared_ptr<IoFileState>& st)
+    {
+        if (!st) return -1;
+        if (st->bMem) return (long long)st->memPos;
+        if (!st->f) return -1;
+        return _ftelli64(st->f);
+    }
+    static bool ioFileSetPos(const std::shared_ptr<IoFileState>& st, long long p)
+    {
+        if (!st) return false;
+        if (st->bMem)
+        {
+            if (p < 0) return false;
+            st->memPos = (size_t)p;
+            return true;
+        }
+        if (!st->f) return false;
+        return _fseeki64(st->f, p, SEEK_SET) == 0;
+    }
+
     // ---- fibers (纤程) ----
     // A fiber has its own stack and can be suspended and resumed, but it is not
     // a thread and fibers never run concurrently. Implemented on Win32 fibers.
-    struct VMFiber
+    //
+    // A fiber runs on its OWN C++ stack, so the VM's stack-structured state
+    // has to travel with it (see FiberCtx): the GC frame stack, the explicit
+    // root stack, the epoch stack, the control-flow flags and the
+    // meta-dispatch owner. Without this, a fiber that yields in the middle of
+    // a call leaves its frame on top of the resumer's frame stack, and the
+    // resumer's pop_back() then removes the WRONG frame - the collector
+    // loses live frames (the same failure mode as "a running frame got
+    // collected"), and the two execution streams' control flow gets mixed
+    // up (a `return` inside a fiber aborts the resumer's loop).
+    // VMFiber itself lives in common.h: the collector needs it to release
+    // the execution context of an abandoned fiber.
+    // The thread's root fiber and the fiber running right now are
+    // per-thread: a Win32 fiber can only be resumed on the thread that
+    // created it.
+    static thread_local void* g_mainFiber = nullptr;
+
+    // The fiber that is running right now. It belongs to the execution
+    // context, not to the thread: a fiber may resume another fiber, and
+    // then BOTH are on the stack - a single slot would make the inner
+    // fiber's yield() hand control to the wrong place.
+    static VMFiber* CurRunningFiber()
     {
-        void* hFiber = nullptr;
-        Value fn;
-        wstring status = L"suspended";   // suspended | running | dead
-        vector<Value> inArgs;             // arguments for the next resume
-        vector<Value> outVals;            // values yielded or returned
-    };
-    static void* g_mainFiber = nullptr;
-    static VMFiber* g_runningFiber = nullptr;
+        Interp* it = g_interpCurrent;
+        if (it && it->curCtx) return it->curCtx->runningFiber;
+        return nullptr;
+    }
 
     static VMFiber* FiberOf(const Value& v)
     {
@@ -46,9 +129,52 @@ namespace NodioVM
     {
         auto tb = std::make_shared<Table>();
         tb->map[L"__fiber"] = Value::Pointer_(co);
+        // The collector uses this to tell a live fiber from an abandoned
+        // one: when the script drops the fiber value, the table becomes
+        // unreachable and the fiber's context can be released.
+        if (co && co->ctx) co->ctx->fiberVal = tb;
         Value v = Value::Table_(tb);
         // yield() / resume() / status() use the pointer key above
         return v;
+    }
+
+    // Move the VM's stack-structured state from the running context into the
+    // target context and load the target's state. After the call the
+    // interpreter's live stacks belong to the target context.
+    static void FiberCtxSwitch(Interp* it, FiberCtx* dst)
+    {
+        if (!it || !dst) return;
+        FiberCtx* src = it->curCtx;
+        if (!src || src == dst) return;
+
+        src->gcFrames.swap(it->gcFrames);
+        it->gcFrames.swap(dst->gcFrames);
+        src->roots.swap(g_gcRoots);
+        g_gcRoots.swap(dst->roots);
+        src->epochStack.swap(g_gcEpochStack);
+        g_gcEpochStack.swap(dst->epochStack);
+
+        std::swap(src->nReturn, it->nReturn);
+        std::swap(it->nReturn, dst->nReturn);
+        std::swap(src->nBreak, it->nBreak);
+        std::swap(it->nBreak, dst->nBreak);
+        std::swap(src->nContinue, it->nContinue);
+        std::swap(it->nContinue, dst->nContinue);
+
+        Value tmp = src->ret; src->ret = it->ret; it->ret = tmp;
+        tmp = dst->ret; dst->ret = it->ret; it->ret = tmp;
+
+        tmp = src->owner; src->owner = Interp::GetCurrentOwner();
+        Interp::SetCurrentOwner(tmp);
+        tmp = dst->owner; dst->owner = Interp::GetCurrentOwner();
+        Interp::SetCurrentOwner(tmp);
+
+        std::swap(src->metaDepth, g_metaDispatchDepth);
+        std::swap(g_metaDispatchDepth, dst->metaDepth);
+        src->metaActive.swap(g_metaDispatchActive);
+        g_metaDispatchActive.swap(dst->metaActive);
+
+        it->curCtx = dst;
     }
 
     static void CALLBACK VMFiberEntry(void* pParam)
@@ -56,23 +182,56 @@ namespace NodioVM
         VMFiber* co = (VMFiber*)pParam;
         Interp* it = g_interpCurrent;
         Value r;
-        if (it && co->fn.t == Value::Func)
+        if (it && co->ctx && co->ctx->fn.t == Value::Func)
         {
             vector<Value> args = co->inArgs;
-            r = it->CallVmFunc(co->fn, args);
+            r = it->CallVmFunc(co->ctx->fn, args);
         }
         co->outVals.clear();
         co->outVals.push_back(r);
         if (r.mrets)
             for (auto& v : *r.mrets) co->outVals.push_back(v);
         co->status = L"dead";
-        SwitchToFiber(g_mainFiber);   // never returns
+        // Hand the execution back to whoever resumed this fiber. The
+        // context switch has to happen BEFORE the cleanup below: the
+        // fiber's own leftovers live in its context only after the switch.
+        FiberCtx* back = co->resumeCtx;
+        if (it && back) FiberCtxSwitch(it, back);
+        // The fiber is finished: its frames, its explicit roots and its
+        // entry function are no longer live, so they must leave the GC root
+        // set - otherwise every fiber that ever ran would keep its closure
+        // alive for the rest of the process.
+        if (co->ctx)
+        {
+            co->ctx->fn = Value();
+            co->ctx->gcFrames.clear();
+            co->ctx->roots.clear();
+            co->ctx->ret = Value();
+        }
+        if (it && co->ctx)
+        {
+            for (size_t i = 0; i < it->fiberCtxs.size(); i++)
+            {
+                if (it->fiberCtxs[i] == co->ctx)
+                {
+                    it->fiberCtxs.erase(it->fiberCtxs.begin() + i);
+                    break;
+                }
+            }
+        }
+        SwitchToFiber(co->resumeFiber);   // never returns
     }
 
-    static void FiberMainInit()
+    static void FiberMainInit(Interp* it)
     {
         if (!g_mainFiber)
-            g_mainFiber = ConvertThreadToFiber(nullptr);
+        {
+            void* f = ConvertThreadToFiber(nullptr);
+            if (!f) f = GetCurrentFiber();   // the thread is already a fiber
+            g_mainFiber = f;
+        }
+        if (it && it->mainCtx.osFiber == nullptr)
+            it->mainCtx.osFiber = g_mainFiber;
     }
 
     // one shared implementation for create / fiber.create
@@ -80,15 +239,27 @@ namespace NodioVM
     {
         if (fn.t != Value::Func)
             return Value();
-        FiberMainInit();
+        Interp* it = g_interpCurrent;
+        if (!it)
+            return Value();
+        FiberMainInit(it);
         VMFiber* co = new VMFiber();
-        co->fn = fn;
+        co->ctx = std::make_shared<FiberCtx>();
+        co->ctx->fn = fn;
         co->hFiber = CreateFiber(0, VMFiberEntry, co);
         if (!co->hFiber)
         {
             delete co;
             return Value();
         }
+        co->ctx->osFiber = co->hFiber;
+        co->ctx->fiber = co;
+        co->ctx->runningFiber = co;
+        // The fiber's context holds its frames, its explicit roots and its
+        // entry function. The VM root graph cannot reach any of it (a fiber
+        // value only carries a native pointer), so the collector has to be
+        // told about it explicitly.
+        it->fiberCtxs.push_back(co->ctx);
         return MakeFiberValue(co);
     }
 
@@ -110,13 +281,26 @@ namespace NodioVM
             f.mrets = ex;
             return f;
         }
-        FiberMainInit();
+        Interp* it = g_interpCurrent;
+        if (!it)
+        {
+            if (errMsg) *errMsg = L"没有活动的解释器";
+            return Value();
+        }
+        FiberMainInit(it);
         co->inArgs = args;
         co->outVals.clear();
         co->status = L"running";
-        g_runningFiber = co;
+        // Switch the VM's execution context to the fiber's before handing
+        // over the CPU: the fiber runs on its own C++ stack, so the frame
+        // stack, the root stack and the control-flow flags must travel
+        // with it.
+        co->resumeCtx = it->curCtx;
+        co->resumeFiber = (co->resumeCtx && co->resumeCtx->osFiber)
+                        ? co->resumeCtx->osFiber : g_mainFiber;
+        if (co->ctx) FiberCtxSwitch(it, co->ctx.get());
         SwitchToFiber(co->hFiber);
-        g_runningFiber = nullptr;
+        // the fiber switched the context back to the resumer by itself
         if (co->status != L"dead")
             co->status = L"suspended";
         Value ok = Value::Bool_(true);
@@ -129,12 +313,17 @@ namespace NodioVM
     // yield(...) — suspend the running fiber, handing values to resume
     static Value FiberYield(const vector<Value>& vals)
     {
-        VMFiber* co = g_runningFiber;
+        VMFiber* co = CurRunningFiber();
         if (!co)
             return Value();
         co->outVals = vals;
         co->status = L"suspended";
-        SwitchToFiber(g_mainFiber);
+        // Hand the execution back to the resumer. The VM's execution
+        // context has to travel with the fiber, or both flows would share
+        // one frame stack and the collector would lose live frames.
+        Interp* it = g_interpCurrent;
+        if (it && co->resumeCtx) FiberCtxSwitch(it, co->resumeCtx);
+        SwitchToFiber(co->resumeFiber);
         // resumed: the values passed to resume become the yield's result
         if (!co->inArgs.empty())
             return co->inArgs[0];
@@ -481,6 +670,7 @@ DWORD WINAPI ThreadWorkerProc(LPVOID pv)
     auto local = std::make_shared<Env>();
     local->self = local;
     local->parent = wt.globals.self;
+    Interp::GcFrameScope fsThread(wt, local);
     if (job->owner.t != Value::Null)
         local->vars[L"owner"] = job->owner;
 for (size_t i = 0; i < job->params.size(); i++)
@@ -507,6 +697,7 @@ for (size_t i = 0; i < job->params.size(); i++)
     }
     wt.nReturn = 0;
     Value r = wt.ExecBlock(job->fnBody, local.get());
+    CleanDeadEnv(local);
     std::lock_guard<std::mutex> lk(g_threadStatesMutex);
     if (threadErr.empty())
         job->st->result = DeepCopy(r);
@@ -710,6 +901,7 @@ Value CreateSize64(uint64_t val)
     if (!g_size64_meta)
     {
         g_size64_meta = std::make_shared<Table>();
+        GcAddRootTable(g_size64_meta);   // permanent root: static holder
         g_size64_meta->map[L"_tostring"] = NF([](vector<Value>& a) -> Value {
             Value self = (!a.empty() && IsSize64(a[0])) ? a[0] : Interp::GetCurrentOwner();
             uint64_t u = GetSize64Val(self);
@@ -2634,14 +2826,18 @@ void Interp::InitBuiltins()
                 tb->map[L"_exefile"] = Value::Str_(exeFileStr);
                 auto writer = [](vector<Value>& a, const wchar_t* sep,
                                  bool nl) -> Value {
-                    wstring out;
+                    // Official aardio strings are byte arrays: writing a
+                    // string to the console writes its bytes, so a raw byte
+                    // string must not be re-encoded as UTF-8 text.
+                    std::string out;
+                    std::string sepBytes = Utf8Bytes(sep);
                     for (size_t i = 0; i < a.size(); i++)
                     {
-                        if (i) out += sep;
-                        out += a[i].ToString();
+                        if (i) out += sepBytes;
+                        out += ValueByteForm(a[i]);
                     }
-                    if (nl) out += L"\n";
-                    WriteU8(stdout, out);
+                    if (nl) out += "\n";
+                    fwrite(out.data(), 1, out.size(), stdout);
                     fflush(stdout);
                     return Value();
                 };
@@ -2657,11 +2853,8 @@ void Interp::InitBuiltins()
                 // content flows as byte strings — one wchar per raw byte,
                 // every char <= 0xFF. TEXT values written are encoded
                 // UTF-8; a byte string is written as-is.
-                struct IoFileState
-                {
-                    FILE* f = nullptr;
-                    ~IoFileState() { if (f) fclose(f); }
-                };
+                // A file handle: a disk FILE* or a published-payload
+                // resource buffer (payload resources have no disk file).
                 auto ioFileBytesToValue = [](const std::string& raw) -> Value {
                     wstring s((size_t)raw.size(), 0);
                     for (size_t k = 0; k < raw.size(); k++)
@@ -2728,7 +2921,116 @@ void Interp::InitBuiltins()
                     tb2->map[L"read"] = NF([st, ioFileBytesToValue,
                                             ioFileFail](
                             vector<Value>& a) -> Value {
-                        if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                        if (!ioFileOpen(st)) return ioFileFail(L"文件已关闭", 9);
+                        // Nodio extension: an encoding name reads the WHOLE
+                        // file and converts it ("raw" keeps the bytes). The
+                        // official io.readFile contract is a byte count or
+                        // "%s" — official code never passes an encoding, so
+                        // this branch is purely additive.
+                        if (!a.empty() && a[0].t == Value::Str)
+                        {
+                            wstring encLow = a[0].s;
+                            for (auto& c : encLow) c = towlower(c);
+                            if (encLow == L"raw" || encLow == L"utf8" ||
+                                encLow == L"utf-8" || encLow == L"gbk" ||
+                                encLow == L"gb2312" || encLow == L"gb18030" ||
+                                encLow == L"ansi" || encLow == L"acp")
+                            {
+                                std::string all;
+                                if (st->bMem)
+                                {
+                                    all.assign(st->mem.data() + st->memPos,
+                                               st->mem.size() - st->memPos);
+                                    st->memPos = st->mem.size();
+                                }
+                                else
+                                {
+                                    char buf[8192]; size_t got;
+                                    while ((got = fread(buf, 1, sizeof(buf),
+                                                        st->f)) > 0)
+                                        all.append(buf, got);
+                                }
+                                if (all.empty()) return Value();
+                                if (encLow == L"raw")
+                                {
+                                    wstring raw((size_t)all.size(), 0);
+                                    for (size_t k = 0; k < all.size(); k++)
+                                        raw[k] = (wchar_t)(unsigned char)all[k];
+                                    Value ret = Value::Str_(raw);
+                                    ret.bRawBytes = true;
+                                    return ret;
+                                }
+                                UINT cp = CodepageOf(a[0], CP_UTF8);
+                                size_t off = 0;
+                                if (cp == CP_UTF8 && all.size() >= 3 &&
+                                    (unsigned char)all[0] == 0xEF &&
+                                    (unsigned char)all[1] == 0xBB &&
+                                    (unsigned char)all[2] == 0xBF)
+                                    off = 3;   // strip the UTF-8 BOM
+                                int w = MultiByteToWideChar(cp, 0,
+                                    all.data() + off,
+                                    (int)(all.size() - off), nullptr, 0);
+                                wstring dec((size_t)(w > 0 ? w : 0), 0);
+                                if (w > 0)
+                                    MultiByteToWideChar(cp, 0, all.data() + off,
+                                        (int)(all.size() - off), &dec[0], w);
+                                return Value::Str_(dec);
+                            }
+                        }
+                        if (st->bMem)
+                        {
+                            // payload resource: the same contract as the
+                            // disk path (no arg = one line, n>0 = n bytes,
+                            // -1 = all remaining, struct = struct read)
+                            std::string raw;
+                            bool bLine = a.empty() || a[0].t == Value::Null;
+                            if (!a.empty() && (a[0].t == Value::TableT ||
+                                               a[0].t == Value::Class))
+                            {
+                                int total =
+                                    a[0].tab ? CalcStructTotalSize(a[0]) : 0;
+                                if (total <= 0) return Value();
+                                size_t avail = st->mem.size() - st->memPos;
+                                size_t got = min((size_t)total, avail);
+                                if (got == 0) return Value();
+                                raw.assign(st->mem.data() + st->memPos, got);
+                                st->memPos += got;
+                                auto cp = std::make_shared<Table>();
+                                cp->map = a[0].tab->map;
+                                Value vCp = Value::Table_(cp);
+                                StructDeserialize(vCp, raw.data());
+                                return vCp;
+                            }
+                            long long want = -1;
+                            if (!bLine) want = (long long)BNum(a[0]);
+                            size_t avail = st->mem.size() - st->memPos;
+                            if (bLine)
+                            {
+                                size_t e = st->memPos;
+                                while (e < st->mem.size() && st->mem[e] != '\n')
+                                    e++;
+                                if (e < st->mem.size()) e++;   // keep the newline
+                                if (e > st->memPos)
+                                {
+                                    raw.assign(st->mem.data() + st->memPos,
+                                               e - st->memPos);
+                                    st->memPos = e;
+                                }
+                            }
+                            else if (want == -1)
+                            {
+                                raw.assign(st->mem.data() + st->memPos, avail);
+                                st->memPos = st->mem.size();
+                            }
+                            else if (want > 0)
+                            {
+                                size_t got = min((size_t)want, avail);
+                                raw.assign(st->mem.data() + st->memPos, got);
+                                st->memPos += got;
+                            }
+                            if (raw.empty()) return Value();
+                            return ioFileBytesToValue(raw);
+                        }
                         std::string raw;
                         bool bLine = a.empty() || a[0].t == Value::Null;
                         if (!a.empty() && (a[0].t == Value::TableT ||
@@ -2787,7 +3089,15 @@ void Interp::InitBuiltins()
                     tb2->map[L"readAll"] = NF([st, ioFileBytesToValue,
                                                ioFileFail](
                             vector<Value>&) -> Value {
-                        if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                        if (!ioFileOpen(st)) return ioFileFail(L"文件已关闭", 9);
+                        if (st->bMem)
+                        {
+                            std::string raw(st->mem.data() + st->memPos,
+                                            st->mem.size() - st->memPos);
+                            st->memPos = st->mem.size();
+                            if (raw.empty()) return Value();
+                            return ioFileBytesToValue(raw);
+                        }
                         std::string raw;
                         char buf[8192];
                         size_t got;
@@ -2797,7 +3107,7 @@ void Interp::InitBuiltins()
                         return ioFileBytesToValue(raw);
                     });
                     tb2->map[L"readBuffer"] = NF([st](vector<Value>& a) -> Value {
-                        if (!st->f || a.empty()) return Value();
+                        if (!ioFileOpen(st) || a.empty()) return Value();
                         void* pBuf = nullptr;
                         size_t bsz = 0;
                         if (a[0].t == Value::Pointer)
@@ -2823,12 +3133,22 @@ void Interp::InitBuiltins()
                         if (a.size() > 1 && a[1].t == Value::Num)
                             want = (size_t)(long long)a[1].n;
                         if (want == 0) return Value();
+                        if (st->bMem)
+                        {
+                            size_t avail = st->mem.size() - st->memPos;
+                            size_t got = min(want, avail);
+                            if (got == 0) return Value();
+                            memcpy(pBuf, st->mem.data() + st->memPos, got);
+                            st->memPos += got;
+                            return Value::Num_((double)got);
+                        }
                         size_t got = fread(pBuf, 1, want, st->f);
                         if (got == 0) return Value();
                         return Value::Num_((double)got);
                     });
-                    tb2->map[L"writeBuffer"] = NF([st](vector<Value>& a) -> Value {
-                        if (!st->f || a.empty()) return Value();
+                    tb2->map[L"writeBuffer"] = NF([st, ioFileFail](vector<Value>& a) -> Value {
+                        if (!ioFileOpen(st) || a.empty()) return Value();
+                        if (st->bMem) return ioFileFail(L"载荷资源为只读", 5);
                         const void* pBuf = nullptr;
                         size_t bsz = 0;
                         if (a[0].t == Value::Pointer)
@@ -2859,7 +3179,37 @@ void Interp::InitBuiltins()
                     // If bytes > 0: read preceding `bytes` bytes and move position backward;
                     // If bytes < 0: seek to absolute position -bytes and read to original position.
                     tb2->map[L"readback"] = NF([st, ioFileBytesToValue, ioFileFail](vector<Value>& a) -> Value {
-                        if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                        if (!ioFileOpen(st)) return ioFileFail(L"文件已关闭", 9);
+                        if (st->bMem)
+                        {
+                            long long cur = (long long)st->memPos;
+                            if (cur <= 0) return Value();
+                            long long startPos = 0;
+                            if (a.empty() || a[0].t == Value::Null)
+                            {
+                                long long p = cur;
+                                if (p > 0 && st->mem[p - 1] == '\n')
+                                {
+                                    p--;
+                                    if (p > 0 && st->mem[p - 1] == '\r') p--;
+                                }
+                                while (p > 0 && st->mem[p - 1] != '\n') p--;
+                                startPos = p;
+                            }
+                            else if (a[0].t == Value::Num)
+                            {
+                                long long n = (long long)BNum(a[0]);
+                                if (n > 0) startPos = (cur > n) ? (cur - n) : 0;
+                                else if (n < 0) startPos = -n;
+                                if (startPos >= cur) return Value();
+                            }
+                            else return Value();
+                            size_t want = (size_t)(cur - startPos);
+                            if (want == 0) return Value();
+                            std::string raw(st->mem.data() + startPos, want);
+                            st->memPos = (size_t)startPos;
+                            return ioFileBytesToValue(raw);
+                        }
                         long long cur = _ftelli64(st->f);
                         if (cur <= 0) return Value();
                         long long startPos = 0;
@@ -2943,7 +3293,8 @@ void Interp::InitBuiltins()
                     // structs write raw. Returns true, or null,errmsg,code.
                     tb2->map[L"write"] = NF([st, ioFileArgBytes, ioFileFail](
                             vector<Value>& a) -> Value {
-                        if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                        if (!ioFileOpen(st)) return ioFileFail(L"文件已关闭", 9);
+                        if (st->bMem) return ioFileFail(L"载荷资源为只读", 5);
                         std::string out;
                         for (auto& v : a)
                             if (!ioFileArgBytes(v, out))
@@ -2957,7 +3308,8 @@ void Interp::InitBuiltins()
                     tb2->map[L"writeLine"] =
                         NF([st, ioFileArgBytes, ioFileFail](
                                vector<Value>& a) -> Value {
-                            if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                            if (!ioFileOpen(st)) return ioFileFail(L"文件已关闭", 9);
+                            if (st->bMem) return ioFileFail(L"载荷资源为只读", 5);
                             std::string out;
                             for (auto& v : a)
                                 if (!ioFileArgBytes(v, out))
@@ -2970,24 +3322,24 @@ void Interp::InitBuiltins()
                         });
                     tb2->map[L"flush"] = NF([st, ioFileFail](
                             vector<Value>&) -> Value {
-                        if (!st->f) return ioFileFail(L"文件已关闭", 9);
+                        if (!ioFileOpen(st)) return ioFileFail(L"文件已关闭", 9);
+                        if (st->bMem) return Value::Bool_(true);
                         return fflush(st->f) == 0
                             ? Value::Bool_(true)
                             : ioFileFail(L"刷新失败", errno);
                     });
                     tb2->map[L"close"] = NF([st](vector<Value>&) -> Value {
                         if (st->f) { fclose(st->f); st->f = nullptr; }
+                        st->bClosed = true;
                         return Value::Bool_(true);
                     });
                     tb2->map[L"tell"] = NF([st](vector<Value>&) -> Value {
-                        if (!st->f) return Value();
-                        long long p = _ftelli64(st->f);
+                        long long p = ioFilePos(st);
                         return p >= 0 ? Value::Num_((double)p) : Value();
                     });
                     // seek(whence, offset) — "set"/"cur"/"end" or 0/1/2;
                     // returns the new position
                     tb2->map[L"seek"] = NF([st](vector<Value>& a) -> Value {
-                        if (!st->f) return Value();
                         int origin = SEEK_SET;
                         if (!a.empty() && a[0].t == Value::Str)
                         {
@@ -3004,11 +3356,24 @@ void Interp::InitBuiltins()
                         }
                         long long off =
                             a.size() > 1 ? (long long)BNum(a[1]) : 0;
+                        if (st->bMem)
+                        {
+                            long long base = (origin == SEEK_CUR)
+                                ? ioFilePos(st)
+                                : (origin == SEEK_END
+                                        ? (long long)st->mem.size() : 0);
+                            long long p = base + off;
+                            if (p < 0) return Value();
+                            st->memPos = (size_t)p;
+                            return Value::Num_((double)p);
+                        }
+                        if (!st->f) return Value();
                         if (_fseeki64(st->f, off, origin) != 0) return Value();
                         long long p = _ftelli64(st->f);
                         return p >= 0 ? Value::Num_((double)p) : Value();
                     });
                     tb2->map[L"size"] = NF([st](vector<Value>&) -> Value {
+                        if (st->bMem) return Value::Num_((double)st->mem.size());
                         if (!st->f) return Value();
                         long long cur = _ftelli64(st->f);
                         _fseeki64(st->f, 0, SEEK_END);
@@ -3017,7 +3382,9 @@ void Interp::InitBuiltins()
                         return Value::Num_((double)end);
                     });
                     tb2->map[L"eof"] = NF([st](vector<Value>&) -> Value {
-                        if (!st->f) return Value::Bool_(true);
+                        if (!ioFileOpen(st)) return Value::Bool_(true);
+                        if (st->bMem)
+                            return Value::Bool_(st->memPos >= st->mem.size());
                         return Value::Bool_(feof(st->f) != 0);
                     });
                     // mode(flags) — _O_TEXT(0x4000) / _O_BINARY(0x8000)
@@ -3090,7 +3457,26 @@ void Interp::InitBuiltins()
                     }
                     else
                     {
-                        wstring path = ResolveTildeDisk(a[0].ToString());
+                        // published payload: the embedded map IS the exe's
+                        // virtual file system — a resource shipped inside
+                        // the payload has no disk file, so it is opened from
+                        // its bytes. Payload resources are read-only.
+                        wstring srcPath = a[0].ToString();
+                        wstring key = EmbeddedPayloadKey(srcPath);
+                        if (!key.empty() && m2.find(L'w') == wstring::npos &&
+                            m2.find(L'a') == wstring::npos &&
+                            m2.find(L'+') == wstring::npos)
+                        {
+                            auto st = std::make_shared<IoFileState>();
+                            auto eit = g_interpCurrent->embedded.find(key);
+                            const wstring& bytes = eit->second;
+                            st->mem.resize(bytes.size());
+                            for (size_t k = 0; k < bytes.size(); k++)
+                                st->mem[k] = (char)(unsigned char)bytes[k];
+                            st->bMem = true;
+                            return ioFileMake(st);
+                        }
+                        wstring path = ResolveTildeDisk(srcPath);
                         if (_wfopen_s(&pf, path.c_str(), m2.c_str()) != 0)
                             pf = nullptr;
                         if (!pf) return Value();
@@ -3132,24 +3518,13 @@ void Interp::InitBuiltins()
                     wstring s3;
                     wstring enc3 = a.size() > 1 && a[1].t != Value::Null
                         ? BStr(a[1]) : L"utf8";
-                    // M6: published payload — "~\res\x" (exe-relative) or a
-                    // bare relative key resolves from the embedded FS first
-                    // (libEmbed exes carry res/ + the lib closure)
+                    // published payload — the embedded map IS the exe's
+                    // virtual file system (see EmbeddedPayloadKey)
                     bool bHit = false;
                     if (g_interpCurrent && a[0].t == Value::Str)
                     {
-                        wstring p = BStr(a[0]);
-                        wstring key = p;
-                        if (!key.empty() && key[0] == L'~')
-                            key = key.substr(1);
-                        if (!key.empty() &&
-                            (key[0] == L'\\' || key[0] == L'/'))
-                            key = key.substr(1);
-                        auto eit = g_interpCurrent->embedded.find(key);
-                        if (eit == g_interpCurrent->embedded.end() &&
-                            key != p)
-                            eit = g_interpCurrent->embedded.find(p);
-                        if (eit != g_interpCurrent->embedded.end())
+                        wstring key = EmbeddedPayloadKey(BStr(a[0]));
+                        if (!key.empty())
                         {
                             bHit = true;
                             // The embedded map already stores payload bytes
@@ -3157,7 +3532,7 @@ void Interp::InitBuiltins()
                             // convention), so "raw" is a straight copy —
                             // re-encoding through UTF-8 would inflate
                             // multi-byte sequences and corrupt binaries.
-                            s3 = eit->second;
+                            s3 = g_interpCurrent->embedded.find(key)->second;
                             if (enc3 == L"raw")
                             {
                                 Value ret = Value::Str_(s3);
@@ -3444,6 +3819,51 @@ void Interp::InitBuiltins()
                         (attr & FILE_ATTRIBUTE_DIRECTORY) && mode != 0)
                         return Value();      // a directory is not a file
                     return Value::Str_(full); });
+
+            // ---- io.listFiles(path, mask) — directory listing ----
+            // Returns a table carrying an array of {name; path; isDir; size}.
+            // mask defaults to "*.*"; "." and ".." are skipped.
+            tb->map[L"listFiles"] = NF([](vector<Value>& a) -> Value {
+                if (a.empty() || a[0].t != Value::Str) return Value();
+                wstring dir = BStr(a[0]);
+                if (dir.empty()) return Value();
+                if (dir.back() != L'\\' && dir.back() != L'/') dir += L"\\";
+                wstring mask = (a.size() > 1 && a[1].t == Value::Str)
+                                   ? BStr(a[1]) : L"*.*";
+                if (mask.empty()) mask = L"*.*";
+                WIN32_FIND_DATAW fd = { 0 };
+                HANDLE h = FindFirstFileW((dir + mask).c_str(), &fd);
+                if (h == INVALID_HANDLE_VALUE) return Value();
+                auto out = std::make_shared<Table>();
+                do
+                {
+                    wstring name = fd.cFileName;
+                    if (name == L"." || name == L"..") continue;
+                    auto it = std::make_shared<Table>();
+                    it->map[L"name"] = Value::Str_(name);
+                    it->map[L"path"] = Value::Str_(dir + name);
+                    it->map[L"isDir"] = Value::Bool_(
+                        (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+                    it->map[L"size"] = Value::Num_(
+                        (double)(((LONGLONG)fd.nFileSizeHigh << 32) |
+                                  (LONGLONG)fd.nFileSizeLow));
+                    out->arr.push_back(Value::Table_(it));
+                } while (FindNextFileW(h, &fd));
+                FindClose(h);
+                return Value::Table_(out); });
+
+            // ---- io.getSize(path) — file size in bytes ----
+            tb->map[L"getSize"] = NF([](vector<Value>& a) -> Value {
+                if (a.empty() || a[0].t != Value::Str) return Value();
+                wstring path = BStr(a[0]);
+                if (path.empty()) return Value();
+                WIN32_FILE_ATTRIBUTE_DATA fad = { 0 };
+                if (!GetFileAttributesExW(path.c_str(),
+                                          GetFileExInfoStandard, &fad))
+                    return Value();
+                LONGLONG nSize = ((LONGLONG)fad.nFileSizeHigh << 32) |
+                                 (LONGLONG)fad.nFileSizeLow;
+                return Value::Num_((double)nSize); });
                 tb->map[L"writeFile"] = NF([](vector<Value>& a) {
                     FILE* pf = nullptr;
                     if (_wfopen_s(&pf, BStr(a[0]).c_str(), L"wb") != 0 || !pf)
@@ -3506,14 +3926,16 @@ void Interp::InitBuiltins()
             {
                 auto tb = GetRoot(L"console").tab;
                 auto writer = [](vector<Value>& a, bool nl) -> Value {
-                    wstring out;
+                    // Strings are byte arrays in official aardio: console
+                    // output writes the bytes verbatim.
+                    std::string out;
                     for (size_t i = 0; i < a.size(); i++)
                     {
-                        if (i) out += L" ";
-                        out += a[i].ToString();
+                        if (i) out += " ";
+                        out += ValueByteForm(a[i]);
                     }
-                    if (nl) out += L"\n";
-                    WriteU8(stdout, out);
+                    if (nl) out += "\n";
+                    fwrite(out.data(), 1, out.size(), stdout);
                     fflush(stdout);
                     return Value();
                 };
@@ -3528,17 +3950,23 @@ void Interp::InitBuiltins()
                 tb->map[L"dump"] = NF([writer](vector<Value>& a) {
                     for (auto& v : a)
                     {
+                        std::string out;
                         if (v.t == Value::TableT && v.tab)
                         {
-                            wstring out = L"{ ";
+                            out = "{ ";
                             for (auto& kv : v.tab->map)
-                                out += kv.first + L"=" + kv.second.ToString() + L"; ";
-                            out += L"}";
-                            WriteU8(stdout, out);
+                            {
+                                out += Utf8Bytes(kv.first);
+                                out += "=";
+                                out += ValueByteForm(kv.second);
+                                out += "; ";
+                            }
+                            out += "}";
                         }
                         else
-                            WriteU8(stdout, v.ToString());
-                        WriteU8(stdout, L"\n");
+                            out = ValueByteForm(v);
+                        out += "\n";
+                        fwrite(out.data(), 1, out.size(), stdout);
                     }
                     fflush(stdout);
                     return Value(); });
@@ -3556,6 +3984,171 @@ void Interp::InitBuiltins()
             // ---- time (round 30) ----
             {
                 auto tb = GetRoot(L"time").tab;
+
+                // ---- ParseTimeText ----
+                // Official aardio parses a time from text with the SAME
+                // format specifiers used to format it
+                // (docs/library-guide/builtin/time/time.md):
+                //   - the format's markers (%Y %m %d %H %M %S ...) pick the
+                //     values out of the text, other characters are matched
+                //     loosely;
+                //   - a format that requires a date part the text does not
+                //     provide makes the parse FAIL -> time() returns null;
+                //   - a format that requires a time part the text does not
+                //     provide also fails, unless lax was passed;
+                //   - with no explicit format the default is
+                //     "%Y/%m/%d %H:%M:%S" but the time part may be omitted.
+                // Returns false when the text cannot supply the required parts.
+                auto parseTimeText = [](const wstring& text, const wstring& fmtIn,
+                                        int& y, int& mo, int& d,
+                                        int& h, int& mi, int& sec,
+                                        wstring& endstr) -> bool {
+                    wstring fmt = fmtIn;
+                    if (!fmt.empty() && fmt[0] == L'!') fmt = fmt.substr(1);
+                    struct Marker { wchar_t code; int* val; int maxDigits; };
+                    std::vector<Marker> markers;
+                    for (size_t i = 0; i < fmt.size(); i++)
+                    {
+                        if (fmt[i] != L'%') continue;
+                        if (i + 1 >= fmt.size()) break;
+                        wchar_t c = fmt[++i];
+                        if (c == L'%') continue;
+                        switch (c)
+                        {
+                        case L'Y': markers.push_back({ c, &y, 4 }); break;
+                        case L'y': markers.push_back({ c, &y, 2 }); break;
+                        case L'm': markers.push_back({ c, &mo, 2 }); break;
+                        case L'd': markers.push_back({ c, &d, 2 }); break;
+                        case L'H': markers.push_back({ c, &h, 2 }); break;
+                        case L'I': markers.push_back({ c, &h, 2 }); break;
+                        case L'M': markers.push_back({ c, &mi, 2 }); break;
+                        case L'S': markers.push_back({ c, &sec, 2 }); break;
+                        case L'b': markers.push_back({ c, &mo, 0 }); break;
+                        case L'B': markers.push_back({ c, &mo, 0 }); break;
+                        default: break;   // %a %A %b %B %p %Z are optional
+                        }
+                    }
+                    size_t pos = 0;
+                    std::vector<char> done(markers.size(), 0);
+                    for (size_t k = 0; k < markers.size(); k++)
+                    {
+                        if (done[k]) continue;
+                        // ISO8601 compatibility: the date may be written
+                        // without separators even when the format string
+                        // spells the separators out ("20170822" with
+                        // "%Y/%m/%d"). The date must be 8 digits (yyyymmdd)
+                        // or 6 digits (yymmdd), and the month/day markers
+                        // must follow.
+                        if (markers[k].code == L'Y' &&
+                            k + 2 < markers.size() &&
+                            markers[k + 1].code == L'm' &&
+                            markers[k + 2].code == L'd')
+                        {
+                            size_t n = 0;
+                            while (pos + n < text.size() && n < 8 &&
+                                   iswdigit(text[pos + n])) n++;
+                            if (n == 8)
+                            {
+                                y = _wtoi(text.substr(pos, 4).c_str());
+                                mo = _wtoi(text.substr(pos + 4, 2).c_str());
+                                d = _wtoi(text.substr(pos + 6, 2).c_str());
+                                pos += 8;
+                                done[k + 1] = 1;
+                                done[k + 2] = 1;
+                                continue;
+                            }
+                            if (n == 6)
+                            {
+                                int yy = _wtoi(text.substr(pos, 2).c_str());
+                                y = (yy < 70) ? 2000 + yy : 1900 + yy;
+                                mo = _wtoi(text.substr(pos + 2, 2).c_str());
+                                d = _wtoi(text.substr(pos + 4, 2).c_str());
+                                pos += 6;
+                                done[k + 1] = 1;
+                                done[k + 2] = 1;
+                                continue;
+                            }
+                        }
+                        // a month name: %b (abbreviated) / %B (full)
+                        if (markers[k].code == L'b' || markers[k].code == L'B')
+                        {
+                            static const wchar_t* kMon[12] = {
+                                L"january", L"february", L"march", L"april",
+                                L"may", L"june", L"july", L"august",
+                                L"september", L"october", L"november",
+                                L"december" };
+                            while (pos < text.size() && !iswalpha(text[pos])) pos++;
+                            size_t ns = pos;
+                            while (ns < text.size() && iswalpha(text[ns])) ns++;
+                            wstring low = text.substr(pos, ns - pos);
+                            for (auto& c : low) c = towlower(c);
+                            int mnum = 0;
+                            for (int mi2 = 0; mi2 < 12; mi2++)
+                            {
+                                wstring full = kMon[mi2];
+                                if (low.size() >= 3 && low.size() <= full.size() &&
+                                    full.compare(0, low.size(), low) == 0)
+                                {
+                                    mnum = mi2 + 1;
+                                    break;
+                                }
+                            }
+                            if (!mnum) return false;
+                            mo = mnum;
+                            pos = ns;
+                            continue;
+                        }
+                        // separators are matched loosely
+                        while (pos < text.size() && !iswdigit(text[pos])) pos++;
+                        if (pos >= text.size()) return false;
+                        int v = 0, n = 0;
+                        while (pos < text.size() && iswdigit(text[pos]) &&
+                               n < markers[k].maxDigits)
+                        {
+                            v = v * 10 + (text[pos] - L'0');
+                            pos++; n++;
+                        }
+                        if (n == 0) return false;
+                        if (markers[k].code == L'y' && n <= 2)
+                            v += (v < 70) ? 2000 : 1900;
+                        *(markers[k].val) = v;
+                    }
+                    // official: skip leading blanks, then keep the run of
+                    // non-blank characters that follows the last marker
+                    while (pos < text.size() && iswspace(text[pos])) pos++;
+                    size_t endPos = pos;
+                    while (endPos < text.size() && !iswspace(text[endPos])) endPos++;
+                    endstr = text.substr(pos, endPos - pos);
+                    if (mo < 1 || mo > 12) return false;
+                    if (d < 1 || d > 31) return false;
+                    if (h < 0 || h > 23) return false;
+                    if (mi < 0 || mi > 59) return false;
+                    if (sec < 0 || sec > 59) return false;
+                    return true;
+                };
+                // Candidate formats for one text: the format itself, then
+                // the same format with the trailing time markers dropped
+                // one by one ("%Y/%m/%d %H:%M:%S" -> "%Y/%m/%d %H:%M" ->
+                // "%Y/%m/%d %H" -> "%Y/%m/%d"). Official: with lax the
+                // trailing time parts may be omitted, and with no explicit
+                // format the time part may always be omitted.
+                auto timeFormatCandidates = [](const wstring& f)
+                {
+                    std::vector<wstring> out;
+                    out.push_back(f);
+                    std::vector<size_t> tpos;
+                    for (size_t i = 0; i + 1 < f.size(); i++)
+                    {
+                        if (f[i] != L'%') continue;
+                        wchar_t c = f[i + 1];
+                        if (c == L'H' || c == L'I' || c == L'M' || c == L'S')
+                            tpos.push_back(i);
+                        i++;
+                    }
+                    for (size_t k = tpos.size(); k-- > 0; )
+                        out.push_back(f.substr(0, tpos[k]));
+                    return out;
+                };
 
                 auto timeMeta = std::make_shared<Table>();
                 auto getSelf = [](const vector<Value>& a) -> Value {
@@ -3825,10 +4418,13 @@ void Interp::InitBuiltins()
                     return Value();
                 });
 
-                auto timeCtor = NF([timeMeta](vector<Value>& a) -> Value {
+                auto timeCtor = NF([timeMeta, parseTimeText, timeFormatCandidates](vector<Value>& a) -> Value {
                     SYSTEMTIME st;
                     GetLocalTime(&st);
                     wstring fmt = L"%Y/%m/%d %H:%M:%S";
+                    // text left over after the last parsed time value: the
+                    // official time object keeps it in its endstr property
+                    wstring strEndStr;
                     if (!a.empty())
                     {
                         if (a.size() >= 3 && a[0].t == Value::Num && a[1].t == Value::Num && a[2].t == Value::Num)
@@ -3863,43 +4459,61 @@ void Interp::InitBuiltins()
                         }
                         else if (a[0].t == Value::Str)
                         {
-                            if (a.size() > 1 && a[1].t == Value::Str) fmt = a[1].s;
+                            // Official: the text is parsed with the same
+                            // format specifiers used to format a time, and a
+                            // text that cannot supply the required parts
+                            // makes time() return null.
+                            bool bHasFmt = a.size() > 1 && a[1].t == Value::Str;
+                            if (bHasFmt) fmt = a[1].s;
+                            bool bLax = a.size() > 3 && a[3].Truthy();
                             int y = 0, m = 1, d = 1, h = 0, mi = 0, s = 0;
-                            int count = swscanf_s(a[0].s.c_str(), L"%d/%d/%d %d:%d:%d", &y, &m, &d, &h, &mi, &s);
-                            if (count < 3)
+                            bool bOk = false;
+                            // Candidate formats: the requested one, then the
+                            // same one with the trailing time markers
+                            // dropped one by one ("%Y/%m/%d %H:%M:%S" ->
+                            // "%Y/%m/%d %H:%M" -> "%Y/%m/%d %H" ->
+                            // "%Y/%m/%d"). Official: with lax the trailing
+                            // time parts may be omitted; with no explicit
+                            // format the time part may always be omitted,
+                            // while the date part is always required.
+                            std::vector<wstring> cands;
+                            if (bHasFmt)
                             {
-                                y = 0; m = 1; d = 1; h = 0; mi = 0; s = 0;
-                                count = swscanf_s(a[0].s.c_str(), L"%d-%d-%d %d:%d:%d", &y, &m, &d, &h, &mi, &s);
+                                cands = timeFormatCandidates(fmt);
+                                if (!bLax) cands.resize(1);
                             }
-                            if (count < 3)
+                            else
                             {
-                                y = 0; m = 1; d = 1; h = 0; mi = 0; s = 0;
-                                count = swscanf_s(a[0].s.c_str(), L"%d-%d-%d", &y, &m, &d);
+                                cands = timeFormatCandidates(L"%Y/%m/%d %H:%M:%S");
                             }
-                            if (count < 3)
+                            for (const auto& cf : cands)
                             {
-                                y = 0; m = 1; d = 1; h = 0; mi = 0; s = 0;
-                                count = swscanf_s(a[0].s.c_str(), L"%d/%d/%d", &y, &m, &d);
+                                int ty = 0, tmo = 1, td = 1, th = 0, tmi = 0, ts = 0;
+                                wstring tend;
+                                if (!parseTimeText(a[0].s, cf, ty, tmo, td, th, tmi, ts, tend))
+                                    continue;
+                                y = ty; m = tmo; d = td; h = th; mi = tmi; s = ts;
+                                strEndStr = tend;
+                                bOk = true;
+                                break;
                             }
-                            if (count >= 3 && y > 0)
-                            {
-                                st.wYear = (WORD)y;
-                                st.wMonth = (WORD)m;
-                                st.wDay = (WORD)d;
-                                st.wHour = (WORD)h;
-                                st.wMinute = (WORD)mi;
-                                st.wSecond = (WORD)s;
-                                st.wMilliseconds = 0;
-                                tm tmb{};
-                                tmb.tm_year = y - 1900;
-                                tmb.tm_mon = m - 1;
-                                tmb.tm_mday = d;
-                                tmb.tm_hour = h;
-                                tmb.tm_min = mi;
-                                tmb.tm_sec = s;
-                                mktime(&tmb);
-                                st.wDayOfWeek = (WORD)tmb.tm_wday;
-                            }
+                            if (!bOk) return Value();   // official returns null
+                            st.wYear = (WORD)y;
+                            st.wMonth = (WORD)m;
+                            st.wDay = (WORD)d;
+                            st.wHour = (WORD)h;
+                            st.wMinute = (WORD)mi;
+                            st.wSecond = (WORD)s;
+                            st.wMilliseconds = 0;
+                            tm tmb{};
+                            tmb.tm_year = y - 1900;
+                            tmb.tm_mon = m - 1;
+                            tmb.tm_mday = d;
+                            tmb.tm_hour = h;
+                            tmb.tm_min = mi;
+                            tmb.tm_sec = s;
+                            mktime(&tmb);
+                            st.wDayOfWeek = (WORD)tmb.tm_wday;
                         }
                         else if (a[0].t == Value::TableT && a[0].tab)
                         {
@@ -3930,6 +4544,11 @@ void Interp::InitBuiltins()
                     inst->map[L"second"] = Value::Num_(st.wSecond);
                     inst->map[L"milliseconds"] = Value::Num_(st.wMilliseconds);
                     inst->map[L"format"] = Value::Str_(fmt);
+                    // official: the text after the last parsed value is
+                    // kept in the endstr property (used by time.iso8601 to
+                    // read the trailing time zone)
+                    if (!strEndStr.empty())
+                        inst->map[L"endstr"] = Value::Str_(strEndStr);
                     inst->map[L"_meta"] = Value::Table_(timeMeta);
                     return Value::Table_(inst);
                 });
@@ -4060,11 +4679,24 @@ void Interp::InitBuiltins()
                 auto clip = std::make_shared<Table>();
                 tb->map[L"clip"] = Value::Table_(clip);
                 // win.getMessagePos(lParam) — the mouse position packed into
-                // an lParam (WM_MOUSEMOVE & friends), returned as x,y
+                // an lParam (WM_MOUSEMOVE & friends), returned as x,y.
+                // Called with no argument it returns the current cursor
+                // position (official contract — win.ui.tracker falls back to
+                // it when the lParam is -1, i.e. the menu key / Shift+F10).
                 tb->map[L"getMessagePos"] = NF([](vector<Value>& a) -> Value {
-                    long long lp = a.empty() ? 0 : (long long)BNum(a[0]);
-                    short x = (short)(lp & 0xFFFF);
-                    short y = (short)((lp >> 16) & 0xFFFF);
+                    short x = 0, y = 0;
+                    if (a.empty())
+                    {
+                        POINT pt = { 0, 0 };
+                        GetCursorPos(&pt);
+                        x = pt.x; y = pt.y;
+                    }
+                    else
+                    {
+                        long long lp = (long long)BNum(a[0]);
+                        x = (short)(lp & 0xFFFF);
+                        y = (short)((lp >> 16) & 0xFFFF);
+                    }
                     Value vx = Value::Num_((double)x);
                     auto ex = std::make_shared<vector<Value>>();
                     ex->push_back(Value::Num_((double)y));
@@ -4082,65 +4714,229 @@ void Interp::InitBuiltins()
                     wstring title = a.size() > 1 ? a[1].ToString() : GetNodioConfig().defaultTitle;
                     return Value::Bool_(MessageBoxW(nullptr, text.c_str(),
                         title.c_str(), MB_OKCANCEL | MB_ICONQUESTION) == IDOK); });
-                clip->map[L"write"] = NF([](vector<Value>& a) {
-                    wstring text = a.empty() ? L"" : a[0].ToString();
-                    BOOL ok = FALSE;
-                    for (int retry = 0; retry < 10; retry++)
+                // ---- win.clip: 官方 API 面（E-17） ----
+                // 官方 win/clip/_.aardio（namespace win.clip;）定义 12 个成员：
+                //   readUtf16 / read / write / writeBitmap / readBitmap /
+                //   clear / test / formats / formatNames / getFormatName /
+                //   eachFormat / readUnicode
+                // 此前引擎内置兜底只有 read/write（2/12），其余成员缺失；而
+                // `import win.clip;` 会让官方包整体覆盖内置实现，于是同一条
+                // API 在「导入 / 未导入」两条路径上行为不一致（IDE 的
+                // editor.nodio 用的是未导入的内置实现，官方文档却要求显式
+                // `import win.clip;`）。这里按官方语义把内置实现补齐到官方
+                // API 面，两条路径的 API 面一致：
+                //   · write(str, rep)：rep 控制复制前是否清空剪贴板（官方：
+                //     rep 为 null 或 true 时先 EmptyClipboard），成功返回
+                //     剪贴板数据句柄（官方契约，不是 bool）。
+                //   · read() / readUtf16()：剪贴板里没有 CF_UNICODETEXT 时
+                //     返回 null（官方语义），而不是空串——官方 aardio 里空串
+                //     是真值，返回 null 才能让 `if(s)` 正确地跳过粘贴。
+                //   · 官方包的 read() 返回 UTF-8 字节串（官方 aardio 的字符串
+                //     是 UTF-8 字节串）；Nodio 的字符串是宽文本，内置 read()
+                //     返回宽文本——剪贴板载荷（CF_UNICODETEXT）一致，仅编码
+                //     不同；richedit 的 text/selText 两种形态都接受（已实测）。
+                {
+                    // 打开剪贴板（官方语义：OpenClipboard 失败即静默失败）。
+                    // 无捕获 lambda → 可按值复制进长期存活的 native 闭包。
+                    auto clipOpen = [](bool bEmpty) -> bool
                     {
-                        if (OpenClipboard(nullptr))
+                        for (int retry = 0; retry < 10; retry++)
                         {
-                            EmptyClipboard();
-                            int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
-                                (int)text.size(), nullptr, 0, nullptr, nullptr);
-                            HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE,
-                                                    (size_t)n + 2);
-                            if (h)
+                            if (OpenClipboard(nullptr))
                             {
-                                char* p = (char*)GlobalLock(h);
-                                WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
-                                    (int)text.size(), p, n, nullptr, nullptr);
-                                p[n] = 0; p[n + 1] = 0;
-                                GlobalUnlock(h);
-                                // clipboard text is Unicode: put CF_UNICODETEXT
-                                int w2 = (int)text.size();
-                                HGLOBAL h2 = GlobalAlloc(GMEM_MOVEABLE,
-                                    (size_t)(w2 + 1) * 2);
-                                if (h2)
-                                {
-                                    wchar_t* q = (wchar_t*)GlobalLock(h2);
-                                    memcpy(q, text.c_str(), (size_t)w2 * 2);
-                                    q[w2] = 0;
-                                    GlobalUnlock(h2);
-                                    ok = SetClipboardData(CF_UNICODETEXT, h2) != nullptr;
-                                }
-                                GlobalFree(h);
+                                if (bEmpty) EmptyClipboard();
+                                return true;
                             }
-                            CloseClipboard();
-                            if (ok)
-                                Sleep(30);
-                            break;
+                            Sleep(10);
                         }
-                        Sleep(10);
-                    }
-                    return Value::Bool_(ok != FALSE); });
-                clip->map[L"read"] = NF([](vector<Value>&) {
-                    wstring out;
-                    for (int retry = 0; retry < 10; retry++)
+                        return false;
+                    };
+                    // 读 CF_UNICODETEXT：pOk=剪贴板可用，pHas=该格式存在
+                    auto clipReadText = [clipOpen](bool* pOk, bool* pHas) -> wstring
                     {
-                        if (OpenClipboard(nullptr))
+                        *pOk = false; *pHas = false;
+                        wstring out;
+                        if (!clipOpen(false)) return out;
+                        HANDLE h = GetClipboardData(CF_UNICODETEXT);
+                        if (h)
                         {
-                            HANDLE h = GetClipboardData(CF_UNICODETEXT);
-                            if (h)
-                            {
-                                wchar_t* q = (wchar_t*)GlobalLock(h);
-                                if (q) { out = q; GlobalUnlock(h); }
-                            }
-                            CloseClipboard();
-                            break;
+                            *pHas = true;
+                            const wchar_t* q = (const wchar_t*)GlobalLock(h);
+                            if (q) { out = q; GlobalUnlock(h); }
                         }
-                        Sleep(10);
+                        CloseClipboard();
+                        *pOk = true;
+                        return out;
+                    };
+                    // 列出剪贴板格式 ID（官方 formats()）
+                    auto clipFormatIds = [clipOpen](bool* pOk) -> std::vector<UINT>
+                    {
+                        std::vector<UINT> ids;
+                        *pOk = false;
+                        if (!clipOpen(false)) return ids;
+                        UINT f = 0;
+                        while ((f = EnumClipboardFormats(f)) != 0) ids.push_back(f);
+                        CloseClipboard();
+                        *pOk = true;
+                        return ids;
+                    };
+                    // 官方 formatNames：系统预定义剪贴板格式的友好名称
+                    auto tbFmtNames = std::make_shared<Table>();
+                    {
+                        struct FmtName { UINT id; const wchar_t* name; };
+                        static const FmtName kFmtNames[] = {
+                            { 1, L"Text" }, { 2, L"Bitmap" }, { 3, L"Metafilepict" },
+                            { 4, L"Sylk" }, { 5, L"DIF" }, { 6, L"TIFF" },
+                            { 7, L"OEM Text" }, { 8, L"DIB" }, { 9, L"Palette" },
+                            { 10, L"Pendata" }, { 11, L"RIFF" }, { 12, L"Wave" },
+                            { 13, L"Unicode Text" }, { 14, L"Enhmetafile" },
+                            { 17, L"DIBV5" }, { 0x0080, L"Owner Display" },
+                            { 0x0081, L"DSP Text" }, { 0x0082, L"DSP Bitmap" },
+                            { 0x0083, L"DSP Metafilepict" }, { 0x008E, L"DSP Enhmetafile" },
+                            { 0x0200, L"Private First" }, { 0x02FF, L"Private Last" },
+                            { 0x0300, L"GDI Object First" }, { 0x03FF, L"GDI Object Last" }
+                        };
+                        for (const auto& k : kFmtNames)
+                            tbFmtNames->map[std::to_wstring(k.id)] = Value::Str_(k.name);
                     }
-                    return Value::Str_(out); });
+                    clip->map[L"formatNames"] = Value::Table_(tbFmtNames);
+
+                    clip->map[L"write"] = NF([clipOpen](vector<Value>& a) -> Value {
+                        // 官方 write(str, rep)：rep 为 null 或 true 时先清空
+                        // 剪贴板；成功返回剪贴板数据句柄。
+                        wstring text = a.empty() ? L"" : a[0].ToString();
+                        bool rep = a.size() < 2 || a[1].t == Value::Null || a[1].Truthy();
+                        if (text.empty()) return Value();
+                        if (!clipOpen(rep)) return Value();
+                        // CF_UNICODETEXT：NUL 结尾的 UTF-16LE
+                        size_t bytes = text.size() * 2;
+                        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes + 2);
+                        if (!h) { CloseClipboard(); return Value(); }
+                        wchar_t* q = (wchar_t*)GlobalLock(h);
+                        memcpy(q, text.c_str(), bytes);
+                        q[text.size()] = 0;
+                        GlobalUnlock(h);
+                        HANDLE hdl = SetClipboardData(CF_UNICODETEXT, h);
+                        CloseClipboard();
+                        if (!hdl) return Value();
+                        Sleep(30);
+                        return Value::Num_((double)(INT_PTR)hdl); });
+                clip->map[L"read"] = NF([clipReadText](vector<Value>&) -> Value {
+                    bool ok = false, has = false;
+                    wstring s = clipReadText(&ok, &has);
+                    if (!ok || !has) return Value();   // 官方：无文本返回 null
+                    return Value::Str_(s); });
+                clip->map[L"readUtf16"] = NF([clipReadText](vector<Value>&) -> Value {
+                    bool ok = false, has = false;
+                    wstring s = clipReadText(&ok, &has);
+                    if (!ok || !has) return Value();
+                    return Value::Str_(s); });
+                // 官方 readUnicode 是 readUtf16 的别名（已废弃）
+                clip->map[L"readUnicode"] = clip->map[L"readUtf16"];
+                clip->map[L"clear"] = NF([clipOpen](vector<Value>&) -> Value {
+                    if (!clipOpen(true)) return Value();
+                    CloseClipboard();
+                    return Value::Bool_(true); });
+                clip->map[L"formats"] = NF([clipFormatIds](vector<Value>&) -> Value {
+                    bool ok = false;
+                    auto ids = clipFormatIds(&ok);
+                    if (!ok) return Value();     // 官方：OpenClipboard 失败返回 null
+                    auto tb = std::make_shared<Table>();
+                    for (UINT id : ids) tb->arr.push_back(Value::Num_((double)id));
+                    return Value::Table_(tb); });
+                clip->map[L"test"] = NF([clipFormatIds](vector<Value>& a) -> Value {
+                    // 官方 test(f, ...)：参数是格式 ID（数值）或它们的数组，
+                    // 返回剪贴板里是否存在其中任意一种格式。
+                    std::vector<UINT> want;
+                    auto addOne = [&want](const Value& v)
+                    {
+                        if (v.t == Value::TableT && v.tab)
+                        {
+                            for (auto& e : v.tab->arr)
+                                want.push_back((UINT)BNum(e));
+                            for (auto& kv : v.tab->map)
+                            {
+                                bool bNum = !kv.first.empty();
+                                for (wchar_t c : kv.first)
+                                    if (c < L'0' || c > L'9') { bNum = false; break; }
+                                if (bNum) want.push_back((UINT)BNum(kv.second));
+                            }
+                        }
+                        else if (v.t != Value::Null)
+                        {
+                            want.push_back((UINT)BNum(v));
+                        }
+                    };
+                    for (auto& v : a) addOne(v);
+                    if (want.empty()) return Value::Bool_(false);
+                    bool ok = false;
+                    auto ids = clipFormatIds(&ok);
+                    if (!ok) return Value();
+                    for (UINT id : ids)
+                        for (UINT w : want)
+                            if (id == w) return Value::Bool_(true);
+                    return Value::Bool_(false); });
+                clip->map[L"getFormatName"] = NF([tbFmtNames](vector<Value>& a) -> Value {
+                    UINT id = a.empty() ? 0 : (UINT)(INT_PTR)(long long)BNum(a[0]);
+                    bool friendly = a.size() > 1 && a[1].Truthy();
+                    wchar_t buf[80] = L"";
+                    if (GetClipboardFormatNameW(id, buf, 80))
+                        return Value::Str_(buf);
+                    if (friendly)
+                    {
+                        auto it = tbFmtNames->map.find(std::to_wstring(id));
+                        if (it != tbFmtNames->map.end()) return it->second;
+                        return Value::Str_(L"Unknown");
+                    }
+                    return Value(); });
+                clip->map[L"eachFormat"] = NF([clipFormatIds, tbFmtNames](vector<Value>&) -> Value {
+                    // 官方 eachFormat() 始终返回一个迭代器（剪贴板不可用时
+                    // 迭代器为空）：var ids = formats(); return function(){...}
+                    bool ok = false;
+                    auto ids = clipFormatIds(&ok);
+                    auto state = std::make_shared<std::vector<UINT>>(ids);
+                    auto idx = std::make_shared<size_t>(0);
+                    return NF([state, idx, tbFmtNames](vector<Value>&) -> Value {
+                        if (*idx >= state->size()) return Value();
+                        UINT id = (*state)[(*idx)++];
+                        wstring name;
+                        wchar_t buf[80] = L"";
+                        if (GetClipboardFormatNameW(id, buf, 80)) name = buf;
+                        else
+                        {
+                            auto it = tbFmtNames->map.find(std::to_wstring(id));
+                            if (it != tbFmtNames->map.end()) name = it->second.s;
+                            else name = L"Unknown";
+                        }
+                        Value v = Value::Num_((double)id);
+                        auto ex = std::make_shared<vector<Value>>();
+                        ex->push_back(Value::Str_(name));
+                        v.mrets = ex;
+                        return v; }); });
+                clip->map[L"writeBitmap"] = NF([clipOpen](vector<Value>& a) -> Value {
+                    if (a.empty() || a[0].t == Value::Null) return Value();
+                    HBITMAP hbmp = (HBITMAP)(INT_PTR)(long long)BNum(a[0]);
+                    bool own = a.size() > 1 && a[1].Truthy();
+                    bool rep = a.size() < 3 || a[2].t == Value::Null || a[2].Truthy();
+                    if (!clipOpen(rep)) return Value();
+                    HBITMAP hSafe = (HBITMAP)CopyImage(hbmp, IMAGE_BITMAP, 0, 0,
+                                                      LR_COPYRETURNORG);
+                    HANDLE hdl = 0;
+                    if (hSafe) hdl = SetClipboardData(CF_BITMAP, hSafe);
+                    CloseClipboard();
+                    if (own && hbmp) DeleteObject(hbmp);
+                    if (!hdl) return Value();
+                    return Value::Num_((double)(INT_PTR)hdl); });
+                clip->map[L"readBitmap"] = NF([clipOpen](vector<Value>&) -> Value {
+                    if (!clipOpen(false)) return Value();
+                    HBITMAP hbmp = (HBITMAP)GetClipboardData(CF_BITMAP);
+                    HBITMAP hCopy = 0;
+                    if (hbmp) hCopy = (HBITMAP)CopyImage(hbmp, IMAGE_BITMAP, 0, 0,
+                                                         LR_DEFAULTSIZE);
+                    CloseClipboard();
+                    if (!hCopy) return Value();
+                    return Value::Num_((double)(INT_PTR)hCopy); });
+                }
                 // round 42: raw window access + common dialogs
                 tb->map[L"findWindow"] = NF([](vector<Value>& a) -> Value {
                     wstring s1 = a.size() > 0 ? BStr(a[0]) : L"";
@@ -4351,21 +5147,12 @@ void Interp::InitBuiltins()
                         // res\ under its embedded FS, and $"~\path" only
                         // resolves at publish time (EmbedRoot needs
                         // NODIO_LIBDIR). Resolve it here from the embedded
-                        // map, the same way io.readFile does, so a DLL
+                        // map, the same way io.file does, so a DLL
                         // shipped in a payload loads without a disk file.
-                        if (!strArg.empty() && strArg[0] == L'~' &&
-                            g_interpCurrent)
                         {
-                            wstring key = strArg.substr(1);
-                            if (!key.empty() &&
-                                (key[0] == L'\\' || key[0] == L'/'))
-                                key = key.substr(1);
-                            auto eit = g_interpCurrent->embedded.find(key);
-                            if (eit == g_interpCurrent->embedded.end() &&
-                                key != strArg)
-                                eit = g_interpCurrent->embedded.find(strArg);
-                            if (eit != g_interpCurrent->embedded.end())
-                                strArg = eit->second;
+                            wstring key = EmbeddedPayloadKey(strArg);
+                            if (!key.empty())
+                                strArg = g_interpCurrent->embedded.find(key)->second;
                         }
                         // Order matters: LoadLibraryW first, because a bare
                         // name like "user32.dll" must go through the normal
@@ -4373,17 +5160,17 @@ void Interp::InitBuiltins()
                         // it when the CWD is elsewhere). Only when that
                         // fails — or the argument is clearly not a path —
                         // treat the string as mapped image bytes.
+                        // A mapped image starts with 'MZ' and is full of
+                        // NULs in its headers; a path is short and NUL-free.
+                        bool bLooksMapped =
+                            strArg.size() >= 2 && strArg[0] == L'M' &&
+                            strArg[1] == L'Z' &&
+                            strArg.find(L'\0') != wstring::npos;
                         if (!strArg.empty())
                         {
-                            // A mapped image starts with 'MZ' and is full of
-                            // NULs in its headers; a path is short and
-                            // NUL-free. Try the disk path first so bare
-                            // names ("user32.dll") go through the normal
-                            // DLL search path, then fall back to mapping.
-                            bool bLooksMapped =
-                                strArg.size() >= 2 && strArg[0] == L'M' &&
-                                strArg[1] == L'Z' &&
-                                strArg.find(L'\0') != wstring::npos;
+                            // Try the disk path first so bare names
+                            // ("user32.dll") go through the normal DLL search
+                            // path, then fall back to mapping.
                             if (!bLooksMapped)
                                 hMod = LoadLibraryW(
                                     ResolveTildeDisk(strArg).c_str());
@@ -4397,7 +5184,20 @@ void Interp::InitBuiltins()
                         }
                         if (!hMod)
                         {
-                            (*err) = L"运行错误: 无法加载 DLL: " + strArg;
+                            // The argument may be a whole DLL image rather
+                            // than a path; dumping the binary into the
+                            // message buries the real cause.
+                            wstring detail;
+                            if (bLooksMapped)
+                                detail = L"(内嵌的内存映像)";
+                            else
+                            {
+                                wstring shown = strArg;
+                                if (shown.size() > 120)
+                                    shown = shown.substr(0, 120) + L"...";
+                                detail = shown;
+                            }
+                            (*err) = L"运行错误: 无法加载 DLL: " + detail;
                             return Value();
                         }
                     }
@@ -4479,6 +5279,18 @@ void Interp::InitBuiltins()
                         {
                             if (!sig.params.empty() && (sig.params[0] & 0xFF) == 0)
                                 sig.params[0] = 5 | (sig.params[0] & 0x100);
+                        }
+                        else if (strName.rfind(L"CallWindowProc", 0) == 0 ||
+                                 strName.rfind(L"DefWindowProc", 0) == 0)
+                        {
+                            // 官方 win/api.aardio:11 把这两个 API 声明成 int
+                            // 返回（32 位进程的写法）。64 位下 LRESULT 是
+                            // 指针宽的，int 会把窗口过程回传的指针句柄截成
+                            // 低 32 位 —— 官方 treeview 的 HTREEITEM 就是
+                            // 这么坏的：装上官方 wndproc（win.ui.tracker）
+                            // 之后 SendMessage 只拿回半个句柄，插入子节点
+                            // 直接失败。
+                            if (sig.ret == ARInt) sig.ret = ARI64;
                         }
 #endif
                         if (!fp && !strName.empty())
@@ -4709,6 +5521,8 @@ void Interp::InitBuiltins()
                                         long long nU = (long long)BNum(v);
                                         if (nU <= 0)
                                         {
+                                            tmpRefs.push_back(
+                                                { i, pt, nullptr, false, Value(), true, 0 });
                                             slots.push_back((SlotT)0);
                                             continue;
                                         }
@@ -4788,6 +5602,8 @@ void Interp::InitBuiltins()
                                         slots.push_back((SlotT)(INT_PTR)v.ptr);
                                         continue;
                                     }
+                                    tmpRefs.push_back(
+                                        { i, pt, nullptr, false, Value(), true, 0 });
                                     slots.push_back((SlotT)0);
                                     continue;
                                 }
@@ -5148,6 +5964,11 @@ void Interp::InitBuiltins()
                                     else
                                     {
                                         Value outVal;
+                                        if (!ref.pBuffer)
+                                        {
+                                            extras->push_back(outVal);
+                                            continue;
+                                        }
                                         switch (ref.paramType)
                                         {
                                         case 0:
@@ -5798,18 +6619,41 @@ void Interp::InitBuiltins()
                 });
                 // raw.copy(dst,src,size) — raw memory copy, returns dst
                 tb->map[L"copy"] = NF([](vector<Value>& a) -> Value {
-                    if (a.size() < 3) return a.empty() ? Value() : a[0];
+                    if (a.size() < 2) return a.empty() ? Value() : a[0];
                     void* d = nullptr; const char* s = nullptr;
                     std::string held;
+                    void* pAllocStruct = nullptr;
                     if (a[0].t == Value::Pointer) d = a[0].ptr;
                     else if (a[0].t == Value::Num)
                         d = (void*)(INT_PTR)(long long)a[0].n;
-                    if (a[1].t == Value::Str) { held = RawBytesOf(BStr(a[1])); s = held.data(); }
-                    else if (a[1].t == Value::Pointer) s = (const char*)a[1].ptr;
+                    else if (a[0].t == Value::TableT || a[0].t == Value::Class)
+                    {
+                        if (a[1].t == Value::Pointer && a[1].ptr)
+                        {
+                            StructDeserialize(a[0], a[1].ptr);
+                            return a[0];
+                        }
+                        else if (a[1].t == Value::Str)
+                        {
+                            std::string bytes = RawBytesOf(BStr(a[1]));
+                            StructDeserialize(a[0], bytes.data());
+                            return a[0];
+                        }
+                    }
+                    size_t n = a.size() > 2 && a[2].t != Value::Null ? (size_t)BNum(a[2]) : 0;
+                    if (a[1].t == Value::Str) { held = RawBytesOf(BStr(a[1])); s = held.data(); if (!n) n = held.size(); }
+                    else if (a[1].t == Value::Pointer) { s = (const char*)a[1].ptr; if (!n) n = GetBufferSize(a[1].ptr); }
                     else if (a[1].t == Value::Num)
                         s = (const char*)(INT_PTR)(long long)a[1].n;
-                    size_t n = (size_t)BNum(a[2]);
+                    else if (a[1].t == Value::TableT || a[1].t == Value::Class)
+                    {
+                        int total = 0;
+                        pAllocStruct = StructSerialize(a[1], &total);
+                        s = (const char*)pAllocStruct;
+                        if (!n) n = (size_t)total;
+                    }
                     if (d && s && n) memcpy(d, s, n);
+                    if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
                     return a[0]; });
                 // raw.concat(dst,src,len) — append src bytes to a buffer / dynamic pointer
                 auto fnConcat = NF([](vector<Value>& a) -> Value {
@@ -5992,9 +6836,21 @@ void Interp::InitBuiltins()
                                             : min(x.size(), y.size());
                     if (n > x.size() || n > y.size()) return Value::Bool_(false);
                     return Value::Bool_(memcmp(x.data(), y.data(), n) == 0); });
-                tb->map[L"toPointer"] = NF([](vector<Value>& a) -> Value {
+                tb->map[L"toPointer"] = NF([this](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t == Value::Null) return Value::Pointer_(nullptr);
                     if (a[0].t == Value::Pointer) return a[0];
+                    if (a[0].t == Value::TableT || a[0].t == Value::Class)
+                    {
+                        Value vp = GetMember(a[0], L"_topointer");
+                        if (vp.t == Value::Func || vp.native)
+                        {
+                            vector<Value> noArgs;
+                            Value r = CallOwner(vp, a[0], noArgs);
+                            if (r.t == Value::Pointer) return r;
+                            return Value::Pointer_((void*)(INT_PTR)(long long)BNum(r));
+                        }
+                    }
+                    if (a[0].ptr != nullptr) return Value::Pointer_(a[0].ptr);
                     if (a[0].t == Value::Num) return Value::Pointer_((void*)(INT_PTR)(long long)a[0].n);
                     if (a[0].t == Value::Str) return Value::Pointer_((void*)a[0].s.c_str());
                     return Value::Pointer_((void*)(INT_PTR)(long long)BNum(a[0])); });
@@ -6184,7 +7040,15 @@ void Interp::InitBuiltins()
                         }
                     };
                 // M3-c: callback(fn, "ret(p1,p2)", owner) -> function pointer
-                // (number) that APIs can call
+                // that APIs can call.
+                //
+                // Official contract (docs/library-guide/builtin/raw/callback.md):
+                // the result is a "cdata" object - it marshals as a pointer,
+                // it can be called from script, and the collector releases
+                // the native trampoline plus the script closure once the
+                // last script reference disappears. Returning a bare number
+                // (the old behaviour) left every callback - and everything
+                // its closure captured - pinned for the process lifetime.
                 auto makeCallback = [this](bool bForceCdecl) {
                     return NF([this, bForceCdecl](vector<Value>& a) -> Value {
                         if (a.size() < 2 || !(a[0].t == Value::Func))
@@ -6200,15 +7064,50 @@ void Interp::InitBuiltins()
                         }
                         if (bForceCdecl)
                             sig.bCdecl = true;
-                        CbCtx* ctx = new CbCtx();
+                        auto spCtx = std::make_shared<CbCtx>();
+                        CbCtx* ctx = spCtx.get();
                         ctx->fn = a[0];
                         if (a.size() >= 3)
                             ctx->owner = a[2];
                         ctx->sig = sig;
                         ctx->interp = this;
+                        // the cdata object below carries the script side, so
+                        // the collector reaches the closure through it - the
+                        // callback must not be a GC root on its own
+                        ctx->rooted = false;
                         CallbackTrampoline(ctx);
                         g_cbs.push_back(ctx);
-                        return Value::Num_((double)(__int64)(INT_PTR)ctx->code);
+                        void* pCode = ctx->code;
+
+                        auto spObj = std::make_shared<Table>();
+                        auto spMeta = std::make_shared<Table>();
+                        // cdata -> pointer (official _topointer meta method)
+                        spMeta->map[L"_topointer"] = NF([pCode](vector<Value>&) -> Value {
+                            return Value::Pointer_(pCode);
+                        });
+                        // a native callback can also be called from script:
+                        //   func_c(1,2,3)
+                        spMeta->map[L"_call"] = NF([spCtx](vector<Value>& a) -> Value {
+                            CbCtx* c = spCtx.get();
+                            vector<Value> args;
+                            for (size_t i = 1; i < a.size(); i++) args.push_back(a[i]);
+                            if (c->released || !c->interp || c->fn.t != Value::Func)
+                                return Value();
+                            return c->interp->CallOwner(c->fn, c->owner, args);
+                        });
+                        spObj->map[L"_meta"] = Value::Table_(spMeta);
+                        // keep the script closure alive while the cdata lives
+                        spObj->map[L"_fn"] = a[0];
+                        spObj->map[L"_owner"] = ctx->owner;
+                        // finalizer: the collector runs it when the cdata
+                        // became unreachable - release the native side
+                        spObj->map[L"_gc"] = NF([spCtx](vector<Value>&) -> Value {
+                            ReleaseCallback(spCtx.get());
+                            return Value();
+                        });
+                        Value v = Value::Pointer_(pCode);
+                        v.tab = spObj;
+                        return v;
                     });
                 };
                 auto fnCallback = makeCallback(false);
@@ -7047,9 +7946,10 @@ void Interp::InitBuiltins()
                 // worker, so a created fiber reports its own id here.
                 tb->map[L"getMainId"] =
                     NF([](vector<Value>&) -> Value {
-                    if (g_runningFiber)
+                    VMFiber* rf = CurRunningFiber();
+                    if (rf)
                         return Value::Num_(
-                            (double)(INT_PTR)(void*)g_runningFiber);
+                            (double)(INT_PTR)(void*)rf);
                     return Value::Num_(
                         (double)::GetCurrentThreadId()); });
                 // thread.status(handle) — 0 = still running ("active")
@@ -7666,6 +8566,57 @@ void Interp::InitBuiltins()
     // ---- round 38: win.form — minimal windowing ----
             {
                 auto tb = GetRoot(L"win").tab;
+                // win.setPos / win.getPos — the official win library calls
+                // ::SetWindowPos, and the engine's `::` does not resolve
+                // bare system APIs, so the geometry helpers the design
+                // canvas relies on have to be native.
+                auto HwndArg = [](const Value& v) -> HWND {
+                    if (v.t == Value::Num)
+                        return (HWND)(INT_PTR)(long long)v.n;
+                    if (v.t == Value::TableT && v.tab)
+                    {
+                        auto ih = v.tab->map.find(L"hwnd");
+                        if (ih != v.tab->map.end() &&
+                            ih->second.t == Value::Num)
+                            return (HWND)(INT_PTR)(long long)ih->second.n;
+                    }
+                    return nullptr; };
+                tb->map[L"setPos"] = NF([HwndArg](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
+                    HWND h = HwndArg(a[0]);
+                    if (!h) return Value();
+                    bool bNoMove = a.size() < 2 || a[1].t == Value::Null;
+                    bool bNoSize = a.size() < 4 || a[3].t == Value::Null;
+                    int x = bNoMove ? 0 : (int)BNum(a[1]);
+                    int y = (!bNoMove && a.size() > 2) ? (int)BNum(a[2]) : 0;
+                    int cx = bNoSize ? 0 : (int)BNum(a[3]);
+                    int cy = (!bNoSize && a.size() > 4) ? (int)BNum(a[4]) : 0;
+                    HWND after = nullptr;
+                    if (a.size() > 5 && a[5].t == Value::Pointer)
+                        after = (HWND)a[5].ptr;
+                    UINT flag = 0;
+                    if (a.size() > 6 && a[6].t == Value::Num)
+                        flag = (UINT)(long long)BNum(a[6]);
+                    else
+                        flag = SWP_NOACTIVATE | SWP_NOZORDER;
+                    if (bNoMove) flag |= SWP_NOMOVE;
+                    if (bNoSize) flag |= SWP_NOSIZE;
+                    SetWindowPos(h, after, x, y, cx, cy, flag);
+                    return Value(); });
+                tb->map[L"getPos"] = NF([HwndArg](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value();
+                    HWND h = HwndArg(a[0]);
+                    if (!h) return Value();
+                    RECT rc;
+                    if (!GetWindowRect(h, &rc)) return Value();
+                    auto out = std::make_shared<Table>();
+                    out->map[L"left"] = Value::Num_((double)rc.left);
+                    out->map[L"top"] = Value::Num_((double)rc.top);
+                    out->map[L"width"] = Value::Num_((double)(rc.right - rc.left));
+                    out->map[L"height"] = Value::Num_((double)(rc.bottom - rc.top));
+                    out->map[L"right"] = Value::Num_((double)rc.right);
+                    out->map[L"bottom"] = Value::Num_((double)rc.bottom);
+                    return Value::Table_(out); });
                 tb->map[L"form"] = NF([this](vector<Value>& a) -> Value {
                     if (!RegisterFormClass())
                     {
@@ -7703,9 +8654,12 @@ void Interp::InitBuiltins()
                         SetWindowTextW(hwnd, BStr(a2[0]).c_str());
                         return Value(); });
                     form->map[L"hwnd"] = Value::Num_((double)(INT_PTR)hwnd);
-                    form->map[L"show"] = NF([hwnd](vector<Value>&) -> Value {
-                        ShowWindow(hwnd, SW_SHOW);
-                        UpdateWindow(hwnd);
+                    form->map[L"show"] = NF([hwnd](vector<Value>& a) -> Value {
+                        // show(flag) — the official API hides the window when
+                        // the flag is false (the design canvas uses that)
+                        bool bShow = a.empty() ? true : BNum(a[0]) != 0;
+                        ShowWindow(hwnd, bShow ? SW_SHOW : SW_HIDE);
+                        if (bShow) UpdateWindow(hwnd);
                         return Value(); });
                     form->map[L"doModal"] = NF([fs, hwnd](vector<Value>&)
                         -> Value {
@@ -8089,6 +9043,24 @@ void Interp::InitBuiltins()
                         // every control exposes its HWND
                         ctrl->map[L"hwnd"] = Value::Num_(
                             (double)(INT_PTR)hC);
+                        // geometry / visibility, same shape as the official
+                        // win.ui.ctrl: setPos(left,top,right,bottom) and
+                        // show(flag). The design canvas drives the components
+                        // with them, so they have to exist here too.
+                        ctrl->map[L"setPos"] = NF([hC](vector<Value>& a3)
+                            -> Value {
+                            int l = a3.size() > 0 ? (int)BNum(a3[0]) : 0;
+                            int t = a3.size() > 1 ? (int)BNum(a3[1]) : 0;
+                            int r = a3.size() > 2 ? (int)BNum(a3[2]) : l;
+                            int b = a3.size() > 3 ? (int)BNum(a3[3]) : t;
+                            SetWindowPos(hC, nullptr, l, t, r - l, b - t,
+                                SWP_NOZORDER | SWP_NOACTIVATE);
+                            return Value(); });
+                        ctrl->map[L"show"] = NF([hC](vector<Value>& a3)
+                            -> Value {
+                            bool bShow = a3.empty() ? true : BNum(a3[0]) != 0;
+                            ShowWindow(hC, bShow ? SW_SHOW : SW_HIDE);
+                            return Value(); });
                         ctrl->map[L"text"] = NF([hC](vector<Value>&)
                             -> Value {
                             wchar_t buf[512] = L"";
@@ -8269,6 +9241,11 @@ void Interp::InitBuiltins()
                         }
                     }
                 }
+                // Official aardio strings are byte arrays, so tostring() of a
+                // string returns that same string. Returning a[0] unchanged
+                // keeps the byte representation (a raw byte string must not
+                // be re-interpreted as wide text).
+                if (a[0].t == Value::Str) return a[0];
                 return Value::Str_(a[0].ToString()); });
             Value vType = NF([](vector<Value>& a) -> Value {
                 if (a.empty()) return Value::Str_(L"null");
@@ -8569,7 +9546,31 @@ void Interp::InitBuiltins()
                         return Value();
                     PNode n = std::make_shared<Node>();
                     n->k = Node::Import;
-                    n->names.push_back(BStr(a[0]));
+                    wstring full = BStr(a[0]);
+                    if (full.find(L'\\') != wstring::npos ||
+                        full.find(L'/') != wstring::npos ||
+                        full.find(L':') != wstring::npos)
+                    {
+                        // path-style import: global.import("D:\\dir\\mod.aardio")
+                        // — the whole string is one name, no dot splitting
+                        n->names.push_back(full);
+                    }
+                    else
+                    {
+                        size_t start = 0;
+                        while (start < full.size())
+                        {
+                            size_t pos = full.find(L'.', start);
+                            if (pos == wstring::npos)
+                            {
+                                n->names.push_back(full.substr(start));
+                                break;
+                            }
+                            n->names.push_back(full.substr(start, pos - start));
+                            start = pos + 1;
+                        }
+                    }
+                    if (n->names.empty()) n->names.push_back(full);
                     return this->DoImport(n, &globals);
                 });
                 auto gtab = std::make_shared<Table>();
@@ -9218,6 +10219,13 @@ void Interp::InitBuiltins()
                 }
                 return Value(); });
             globals.vars[L"collectgarbage"] = NF([](vector<Value>&) -> Value {
+                // run a full mark & sweep cycle now
+                Interp* p = g_interpCurrent;
+                if (p) p->CollectGarbage(nullptr);
+                return Value::Num_((double)(p ? p->nGCRuns : 0));
+            });
+            globals.vars[L"__gcdump"] = NF([](vector<Value>&) -> Value {
+                GcDumpLive();
                 return Value(); });
             globals.vars[L"setlocale"] = NF([](vector<Value>& a) -> Value {
                 int cat = LC_ALL;

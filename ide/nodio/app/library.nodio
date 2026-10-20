@@ -1,0 +1,117 @@
+// app/library.nodio — the right dock's 标准库 / 范例 data.
+//
+//  · 标准库：扫描标准库根目录的顶层命名空间，附官方 config\lang\lib.txt 的中文说明
+//  · 范例：官方 examples 目录的树
+//
+// 数据源与官方 IDE 一致（见 docs/official-ide-reference.md §4）：
+// 官方把「命名空间 = 中文说明」放在 config\lang\lib.txt。
+import win.ui;
+
+// 标准库根目录（overlay 优先，其后官方库）
+libRoots = function(){
+	var out = {};
+	var overlay = ..string.getenv("NODIO_OVERLAY_LIBDIR");
+	if(!overlay) overlay = "D:\\Nodio\\lib";
+	var lib = ..string.getenv("NODIO_LIBDIR");
+	if(!lib) lib = "D:\\aardio\\lib";
+	..table.push(out, overlay);
+	..table.push(out, lib);
+	return out;
+}
+
+// 官方中文说明表：{ "命名空间" = "说明" }
+langMap = function(){
+	var map = {};
+	var p = "D:\\aardio\\config\\lang\\lib.txt";
+	// string.load 按 UTF-8 解码（io.readFile 给的是原始字节，中文会乱码）
+	var text = ..string.load(p);
+	if(!text) return map;
+	var lines = ..string.split(text, '\n');
+	for(i=1;#lines;1){
+		var line = ..string.trim(lines[i]);
+		if(line === '') continue;
+		var p1 = ..string.indexOf(line, '=');
+		if(!p1) continue;
+		var name = ..string.trim(..string.sub(line, 1, p1 - 1));
+		var desc = ..string.trim(..string.sub(line, p1 + 1));
+		if(name === '') continue;
+		map[name] = desc;
+	}
+	return map;
+}
+
+// 标准库命名空间清单：{name; desc; root}
+scanLib = function(){
+	var roots = libRoots();
+	var descs = langMap();
+	var seen = {};
+	var out = {};
+	for(r=1;#roots;1){
+		var files = ..io.listFiles(roots[r]) : {};
+		for(i=1;#files;1){
+			var f = files[i];
+			if(!f.isDir) continue;
+			if(seen[f.name]) continue;
+			seen[f.name] = true;
+			..table.push(out, {
+				name = f.name;
+				desc = descs[f.name] : "";
+				root = roots[r];
+			});
+		}
+	}
+	return out;
+}
+
+// 范例目录树（官方 examples）
+scanExamples = function(){
+	var out = {};
+	var dir = "D:\\aardio\\examples";
+	var files = ..io.listFiles(dir) : {};
+	for(i=1;#files;1){
+		if(files[i].isDir) continue;
+		if(!..string.endsWith(files[i].name, ".aardio")) continue;
+		..table.push(out, files[i]);
+	}
+	return out;
+}
+
+// 语法速查（右栏「语法」页）
+// 官方 IDE 的「语法」页是语言参考；我们没有官方那份资源，
+// 先给一份内置的速查表（够用、可离线）。
+scanSyntax = function(){
+	return {
+		{"变量声明"; "var a = 1, b = 2"};
+		{"常量"; "const PI = 3.14"};
+		{"函数"; "foo = function(a,b){ return a+b }"};
+		{'全局引用'; '..string.format("%s",x)'};
+		{"命名空间导入"; "import win.ui;"};
+		{"条件"; "if(x) {...} else {...}"};
+		{"循环"; "for(i=1;10;i=i+1){ ... }"};
+		{"遍历表"; "for(k,v in tbl){ ... }"};
+		{'表字面量'; 'var t = {a=1; b="x"; 1,2,3}'};
+		{"数组"; "var a = {}; table.push(a,1)"};
+		{'字符串'; '"abc" ++ "def"'};
+		{'字符串转义'; '双引号是原样串；带转义必须用单引号：''\n'''};
+		{'类型判断'; 'type(x) == "string"'};
+		{"异常处理"; "try{...}catch(e){...}"};
+		{'异常抛出'; 'error("出错了",2)'};
+		{"线程"; "thread.create(function(){...})"};
+		{"互斥量"; "var m = mutex(); m.lock(); m.unlock()"};
+		{'文件读写'; 'io.readFile("a.txt") / io.writeFile("a.txt",s)'};
+		{'目录遍历'; 'io.listFiles("D:\\")'};
+		{'系统调用'; '::User32.MessageBox(0,"hi","t")'};
+		{"图形绘制"; "var g = gdip.graphics(bitmap)"};
+		{"JSON"; "json.parse(s) / json.stringify(t)"};
+		{'正则'; 'string.match / string.replace'};
+		{'时间'; 'time.now() / time.format("%Y-%m-%d")'};
+		{'进程'; 'process.popen("cmd","r")'};
+		{"内置断点"; "(debug) print(x)"};
+		{"调试信息"; "import debug; (debug).queryinfo()"};
+		{'窗体'; 'var f = win.form(text="x")'};
+		{'控件'; 'f.add({cls="button";left=0;top=0;right=80;bottom=24})'};
+		{"消息循环"; "win.loopMessage()"};
+		{'右键菜单'; 'var m = win.ui.popmenu(f); m.add("复制",null)'};
+		{"自定义组件"; "nodio.designer.registry.register({name=..;cls=..})"};
+	}
+}

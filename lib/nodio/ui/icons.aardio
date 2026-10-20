@@ -1,0 +1,240 @@
+// nodio.ui.icons — 图标组件（两套）。
+//
+// 1) 字体图标：官方库自带的 FontAwesome 4.7（`lib/fonts/.res/FontAwesome.ttf`，
+//    通过 `fonts.fontAwesome.family` 注册成 GDI+ 字体家族）。
+//    目标外观（aar.chengxu.online/thread-903.htm）的工具条就是一排纯图标按钮，
+//    用字体图标画出来最省事，也和官方 IDE 的做法一致。
+//
+// 2) 控件缩略图：工具箱里每个控件的图标（FontAwesome 没有「按钮/复选框」这种
+//    控件图标），这里用 GDI+ 手绘小控件示意图 —— 和参考 IDE 的控件清单一致。
+//
+// 注意：aardio 的**双引号字符串是原样串**（没有 \u 转义），
+// 字体图标的字符必须用**单引号**写：'\uF002'。
+//
+// DPI：size 参数一律是**逻辑像素**（96dpi 基准），内部按 nodio.ui.px()
+// 换算成物理像素 —— 字体图标的字号和控件缩略图的尺寸都随系统 DPI 缩放。
+namespace nodio.ui{
+import fonts.fontAwesome;
+import nodio.ui.dpi;
+import gdip;
+
+// ---------- FontAwesome 4.7 名称 → 码点 ----------
+// 只收录 IDE 实际用得到的；码点已用 `tests/` 下的渲染探针逐个核对过。
+var glyphs = {
+	// 通用
+	search      = '\uF002';   // 放大镜
+	searchPlus  = '\uF00E';
+	crosshairs  = '\uF010';
+	check       = '\uF00C';
+	times       = '\uF00D';
+	plus        = '\uF067';
+	minus       = '\uF068';
+	pencil      = '\uF040';
+	trash       = '\uF1F8';
+	copy        = '\uF0C5';
+	cut         = '\uF0C4';
+	paste       = '\uF0EA';
+	save        = '\uF0C7';
+	undo        = '\uF0E2';
+	redo        = '\uF01E';
+	refresh     = '\uF021';
+	filter      = '\uF0B0';
+	settings    = '\uF013';   // 齿轮
+	cog         = '\uF013';   // 齿轮（别名：属性/设置页签用）
+	home        = '\uF015';
+	download    = '\uF019';
+	upload      = '\uF093';
+	envelope    = '\uF0E0';
+	book        = '\uF02D';
+	print       = '\uF02F';
+	clock       = '\uF017';
+	calendar    = '\uF073';
+	bolt        = '\uF0E7';   // 闪电（运行）
+	bug         = '\uF188';
+	terminal    = '\uF120';
+	code        = '\uF121';
+	desktop     = '\uF108';
+	eye         = '\uF06E';
+	comment     = '\uF075';
+	users       = '\uF0C0';
+	wrench      = '\uF0AD';
+	tasks       = '\uF0AE';
+	bars        = '\uF0C9';
+	list        = '\uF03A';
+	thLarge     = '\uF009';
+	archive     = '\uF187';
+	question    = '\uF128';
+	info        = '\uF129';
+	warning     = '\uF071';
+	questionCir = '\uF059';
+	infoCir     = '\uF05A';
+	checkCir    = '\uF058';
+	exclamation = '\uF12A';
+	// 文件 / 目录 / 版本控制
+	file        = '\uF15B';
+	fileCode    = '\uF1C9';
+	folder      = '\uF07B';
+	folderOpen  = '\uF07C';
+	folderO     = '\uF114';
+	git         = '\uF1D3';
+	github      = '\uF09B';
+	signIn      = '\uF090';
+	// 方向
+	chevronLeft = '\uF053';
+	chevronRight= '\uF054';
+	chevronUp   = '\uF077';
+	chevronDown = '\uF078';
+	arrowLeft   = '\uF104';
+	arrowRight  = '\uF105';
+	arrowUp     = '\uF106';
+	arrowDown   = '\uF107';
+};
+
+// 字体（按**物理**字号缓存）
+var __faFonts = {};
+
+// 图标文字格式：水平靠左 + 垂直居中
+var __iconFormat = null;
+
+// 取图标文字格式
+iconFormat = function(){
+	if(__iconFormat) return __iconFormat;
+	__iconFormat = ..gdip.stringFormat();
+	__iconFormat.align = 0;      // _StringAlignmentNear
+	__iconFormat.lineAlign = 1;  // _StringAlignmentCenter
+	return __iconFormat;
+}
+
+// 字体（size 是逻辑像素，内部换算成物理像素）
+iconFont = function(size){
+	size = size : 14;
+	var ps = ..nodio.ui.px(size);
+	var f = __faFonts[ps];
+	if(f) return f;
+	f = fonts.fontAwesome.family.createFont(ps);
+	__faFonts[ps] = f;
+	return f;
+}
+
+// 取字形字符（名字不认识返回 null）
+iconGlyph = function(name){
+	return glyphs[name];
+}
+
+// 画一个字体图标
+// graphics: gdip.graphics；x,y 是 size×size 方框的左上角；size 是逻辑字号；
+// color 0xAARRGGBB。字形在方框里水平+垂直居中。
+drawIcon = function(graphics, name, x, y, size, color){
+	var g = glyphs[name];
+	if(!g) return false;
+	color = color : 0xFFCCCCCC;
+	size = size : 14;
+	var font = iconFont(size);
+	var ps = ..nodio.ui.px(size);
+	var brush = ..gdip.solidBrush(color);
+	// 量一下字形宽度，用于水平居中
+	var m = graphics.measureString(g, font, ::RECTF(0,0,ps*4,ps*4), null);
+	var tw = m ? m.width : ps;
+	graphics.drawString(g, font, ::RECTF(x + (ps - tw) / 2, y, ps*4, ps),
+		iconFormat(), brush);
+	brush.delete();
+	return true;
+}
+
+// 量一个字体图标的宽度（居中排版用；返回物理像素）
+iconWidth = function(graphics, name, size){
+	var g = glyphs[name];
+	if(!g) return 0;
+	var m = graphics.measureString(g, iconFont(size), ::RECTF(0,0,4000,4000), null);
+	return m ? m.width : ..nodio.ui.px(size);
+}
+
+// ---------- 控件缩略图（自绘） ----------
+// cls: 控件类名（static/button/checkbox/...）
+// size: 逻辑边长（内部按 DPI 缩放）；画一个 size×size 的小控件示意图。
+// 图形按 16×16 的设计稿写死比例，再整体乘以缩放系数，保证任何 DPI 下形状一致。
+drawWidget = function(graphics, cls, x, y, size, fg, bg){
+	size = size : 16;
+	fg = fg : 0xFFCCCCCC;
+	bg = bg : 0xFF3C3C3C;
+	var pen = ..gdip.pen(fg, 1);
+	var brush = ..gdip.solidBrush(bg);
+	var s = ..nodio.ui.px(size);
+	var k = s / 16;             // 设计稿(16) → 实际尺寸的比例
+	var h = s / 2;
+	var mid = y + h;
+
+	var draw = function(kind){
+		if(kind == "button"){
+			graphics.fillRectangle(brush, x, mid, s, h);
+			graphics.drawRectangle(pen, x, mid, s, h);
+			// 中间一条横线代表文字
+			graphics.drawLine(pen, x + 3*k, mid + h/2, x + s - 3*k, mid + h/2);
+		}
+		elseif(kind == "static"){
+			graphics.drawLine(pen, x + 1*k, mid + h/2, x + s - 4*k, mid + h/2);
+			graphics.drawLine(pen, x + 1*k, mid + h/2 - 2*k, x + s - 7*k, mid + h/2 - 2*k);
+		}
+		elseif(kind == "checkbox"){
+			graphics.drawRectangle(pen, x + 1*k, mid, h, h);
+			graphics.drawLine(pen, x + 4*k, mid + h/2, x + 7*k, mid + h - 2*k);
+			graphics.drawLine(pen, x + 7*k, mid + h - 2*k, x + 11*k, mid + 2*k);
+		}
+		elseif(kind == "radio"){
+			graphics.drawEllipse(pen, x + 1*k, mid, h, h);
+			graphics.drawEllipse(pen, x + 4*k, mid + 3*k, 4*k, 4*k);
+		}
+		elseif(kind == "edit"){
+			graphics.drawRectangle(pen, x, mid, s, h);
+			graphics.drawLine(pen, x + 3*k, mid + 2*k, x + 3*k, mid + h - 2*k);
+		}
+		elseif(kind == "richedit"){
+			graphics.drawRectangle(pen, x, mid, s, h);
+			graphics.drawLine(pen, x + 2*k, mid + 3*k, x + s - 3*k, mid + 3*k);
+			graphics.drawLine(pen, x + 2*k, mid + 6*k, x + s - 5*k, mid + 6*k);
+		}
+		elseif(kind == "listbox"){
+			graphics.drawRectangle(pen, x, mid, s, h);
+			graphics.drawLine(pen, x + 1*k, mid + 4*k, x + s - 2*k, mid + 4*k);
+			graphics.drawLine(pen, x + 1*k, mid + 8*k, x + s - 4*k, mid + 8*k);
+		}
+		elseif(kind == "combobox"){
+			graphics.drawRectangle(pen, x, mid, s - 5*k, h);
+			graphics.drawLine(pen, x + s - 4*k, mid + 3*k, x + s - 1*k, mid + 3*k);
+			graphics.drawLine(pen, x + s - 4*k, mid + 5*k, x + s - 1*k, mid + 5*k);
+		}
+		elseif(kind == "listview"){
+			graphics.drawRectangle(pen, x, mid, s, h);
+			graphics.drawLine(pen, x, mid + 4*k, x + s, mid + 4*k);
+			graphics.drawLine(pen, x + 1*k, mid + 8*k, x + s - 3*k, mid + 8*k);
+		}
+		elseif(kind == "treeview"){
+			graphics.drawRectangle(pen, x + 1*k, mid, s - 1*k, h);
+			graphics.drawLine(pen, x + 4*k, mid + 2*k, x + 4*k, mid + h - 1*k);
+			graphics.drawLine(pen, x + 4*k, mid + 5*k, x + 9*k, mid + 5*k);
+			graphics.drawLine(pen, x + 9*k, mid + 5*k, x + 9*k, mid + 8*k);
+		}
+		elseif(kind == "groupbox"){
+			graphics.drawRectangle(pen, x, mid, s, h);
+			graphics.drawLine(pen, x + 2*k, mid, x + 7*k, mid);
+		}
+		elseif(kind == "tab"){
+			graphics.drawRectangle(pen, x, mid, s - 4*k, h);
+			graphics.drawLine(pen, x + 4*k, mid, x + s - 8*k, mid);
+		}
+		elseif(kind == "progress"){
+			graphics.drawRectangle(pen, x, mid, s, h);
+			graphics.fillRect(brush, x + 1*k, mid + 1*k, s/2, h - 2*k);
+		}
+		else{
+			// 未知控件：一个方块
+			graphics.drawRectangle(pen, x + 1*k, mid + 1*k, s - 2*k, h - 2*k);
+		}
+	}
+	draw(cls);
+	pen.delete();
+	brush.delete();
+	return true;
+}
+
+}

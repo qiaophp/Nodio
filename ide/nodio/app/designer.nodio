@@ -1,0 +1,166 @@
+// app/designer.nodio — the visual form designer inside the IDE.
+//
+//  · 工具箱  → 右栏「控件」页   (nodio.designer.toolbox)
+//  · 属性格  → 左栏「属性」页   (nodio.designer.propertyGrid)
+//  · 设计画布 → 覆盖在编辑器之上的子窗体 (nodio.designer.canvas)
+//  · 组件注册表 → nodio.designer.registry
+//
+// 自定义组件加入设计器的两种方式：
+//  1) 组件模块里自行注册（推荐）：
+//       import nodio.designer.registry;
+//       nodio.designer.registry.register({name="我的按钮"; cls="button";
+//                                         category="我的组件"; drawAs="button"})
+//  2) 把组件模块丢进 <工程目录>\components\，IDE 打开工程时自动 discover()，
+//     模块 import 时执行上面的 register 即可。
+//
+// 官方对应机制见 docs/official-ide-reference.md §3（ide.customCtrl 的
+// "真实类名 » 设计器替身类名" 映射，对应本模块的 drawAs 字段）。
+import win.ui;
+import nodio.designer.registry;
+import nodio.designer.toolbox;
+import nodio.designer.propertyGrid;
+import nodio.designer.canvas;
+import nodio.designer.dsg;
+
+// state
+var shell = null;        // the app.shell module
+var toolbox = null;
+var propGrid = null;
+var canvas = null;
+var visible = false;
+var curItem = null;
+
+// Bind the designer to the IDE shell.
+create = function(sh){
+	shell = sh;
+
+	// built-in controls first, so the toolbox is never empty
+	nodio.designer.registry.defaults();
+
+	// toolbox → right dock, 控件 page (页内容直接建在 IDE 主窗体上)
+	var pageCtrl = shell.rightDock.addTab("控件");
+	toolbox = nodio.designer.toolbox(pageCtrl, {
+		left = 0; top = 0; right = 280; bottom = 500;
+	});
+	toolbox.refresh();
+	shell.rightDock.addTab("控件", toolbox);
+
+	// property grid → left dock, 属性 page
+	var pageProp = shell.leftDock.addTab("属性");
+	propGrid = nodio.designer.propertyGrid(pageProp, {
+		left = 0; top = 0; right = 240; bottom = 200;
+	});
+	shell.leftDock.addTab("属性", propGrid);
+
+	// the design canvas: a self-drawn board laid over the editor area
+	canvas = nodio.designer.canvas(shell.winform, {
+		left = 0; top = 0; right = 400; bottom = 300;
+	});
+	layout();
+
+	// wiring
+	toolbox.onPick = function(spec){
+		if(!spec) return;
+		var item = canvas.add(spec, {x=20; y=20; w=120; h=30});
+		canvas.select(item.name);
+		shell.setStatus("已加入控件: " ++ spec.name);
+	}
+	canvas.onSelect = function(item){
+		curItem = item;
+		propGrid.setItems(item ? item.props : {});
+	}
+	canvas.onChange = function(item){
+		curItem = item;
+		propGrid.setItems(item ? item.props : {});
+		shell.setStatus("设计器: " ++ tostring(item ? item.name : ""));
+	}
+	propGrid.onChange = function(index, value){
+		if(!curItem) return;
+		curItem.props[index].value = value;
+		canvas.applyProps(curItem);
+		shell.setStatus("已修改属性: " ++ curItem.props[index].name);
+	}
+
+	// 设计画布右键菜单（官方 win.ui.popmenu 弹出，popId 同步返回命令 id）
+	var cvMenu = win.ui.popmenu(shell.winform);
+	var idCvCopy = cvMenu.add("复制", null);
+	var idCvDel  = cvMenu.add("删除", null);
+	cvMenu.addSeparator();
+	var idCvProp = cvMenu.add("属性", null);
+	canvas.onContextMenu = function(item, x, y){
+		if(!item) return;
+		canvas.select(item.name);
+		var id = cvMenu.popId();
+		if(!id) return;
+		if(id == idCvCopy){
+			var it2 = canvas.add(item.spec, {x=item.x+10; y=item.y+10; w=item.w; h=item.h});
+			canvas.select(it2.name);
+			shell.setStatus("已复制控件: " ++ it2.name);
+		}
+		elseif(id == idCvDel){
+			canvas.remove(item.name);
+			shell.setStatus("已删除控件: " ++ item.name);
+		}
+		elseif(id == idCvProp){
+			curItem = item;
+			propGrid.setItems(item.props);
+		}
+	}
+	return this;
+}
+
+// Keep the canvas over the editor area.
+//
+// 一律按**当前客户区尺寸**自己算：窗口显示后官方 DPI 缩放会把客户区
+// 从 1281x821 改成 1921x1231（物理像素），外面传进来的矩形可能是缩放前
+// 的旧值，照着用画布就只盖住编辑区的一小块。
+layout = function(){
+	if(!canvas || !shell) return;
+	var w,h = shell.clientWH();
+	var er = shell.editorRect(w,h);
+	if( ..string.getenv("NODIO_IDE_DIAG") ){
+		io.print("DIAG designer.layout client=" ++ w ++ "x" ++ h
+			++ " editor=" ++ er.left ++ "," ++ er.top ++ "," ++ er.right ++ "," ++ er.bottom);
+	}
+	canvas.layout(er.left, er.top + shell.docTabH(), er.right, er.bottom);
+}
+
+// Show / hide the canvas (the editor keeps its own text).
+open = function(){
+	if(!canvas) return;
+	visible = true;
+	layout();
+	canvas.show(true);
+	shell.winform.ed.show(false);
+	shell.setStatus("设计器: 就绪");
+}
+
+close = function(){
+	if(!canvas) return;
+	visible = false;
+	canvas.show(false);
+	shell.winform.ed.show(true);
+	shell.setStatus("设计器: 已关闭");
+}
+
+toggle = function(){
+	if(visible) close(); else open();
+}
+
+// Discover user components under <projectDir>\components.
+discover = function(dir){
+	if(!dir) return 0;
+	return nodio.designer.registry.discover(dir);
+}
+
+// The DSG block for the current design.
+toDSG = function(){
+	if(!canvas) return "";
+	return canvas.toDSG();
+}
+
+// Load a DSG block into the canvas.
+fromDSG = function(text){
+	if(!canvas) return false;
+	return canvas.fromDSG(text);
+}

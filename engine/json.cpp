@@ -4,9 +4,9 @@
 
 namespace NodioVM
 {
-    wstring JQuote(const wstring& str)
+    void JQuote(const wstring& str, wstring& out)
     {
-        wstring out = L"\"";
+        out += L'"';
         for (wchar_t c : str)
         {
             switch (c)
@@ -27,10 +27,17 @@ namespace NodioVM
             }
         }
         out += L'"';
+    }
+
+    wstring JQuote(const wstring& str)
+    {
+        wstring out;
+        out.reserve(str.size() + 2);
+        JQuote(str, out);
         return out;
     }
 
-    wstring JWrite(const Value& v, int indent, int depth)
+    void JWriteInternal(const Value& v, int indent, int depth, wstring& out)
     {
         wstring pad, padEnd;
         if (indent >= 0 && depth > 0)
@@ -41,23 +48,30 @@ namespace NodioVM
         wstring nl = indent >= 0 ? L"\n" : L"";
         switch (v.t)
         {
-        case Value::Null: return L"null";
-        case Value::Bool: return v.b ? L"true" : L"false";
+        case Value::Null: out += L"null"; break;
+        case Value::Bool: out += (v.b ? L"true" : L"false"); break;
         case Value::Num:
         {
             if (v.n == (long long)v.n && fabs(v.n) < 1e15)
-                return std::to_wstring((long long)v.n);
+            {
+                out += std::to_wstring((long long)v.n);
+                break;
+            }
             wchar_t buf[32];
             swprintf(buf, 32, L"%.14g", v.n);
-            return buf;
+            out += buf;
+            break;
         }
-        case Value::Str: return JQuote(v.s);
+        case Value::Str: JQuote(v.s, out); break;
         case Value::TableT:
         {
             if (!v.tab)
-                return L"null";
+            {
+                out += L"null";
+                break;
+            }
             bool asArray = !v.tab->arr.empty() && v.tab->map.empty();
-            wstring out = asArray ? L"[" : L"{";
+            out += (asArray ? L"[" : L"{");
             bool bAny = !v.tab->arr.empty() || !v.tab->map.empty();
             if (indent >= 0 && bAny)
                 out += nl;
@@ -68,7 +82,8 @@ namespace NodioVM
                 {
                     if (!bFirst) { out += L","; if (indent >= 0) out += L" "; }
                     if (indent >= 0) out += nl;
-                    out += pad + JWrite(e, indent, depth + 1);
+                    out += pad;
+                    JWriteInternal(e, indent, depth + 1, out);
                     bFirst = false;
                 }
             }
@@ -77,17 +92,27 @@ namespace NodioVM
                 for (auto& kv : v.tab->map)
                 {
                     if (!bFirst) { out += L","; if (indent >= 0) out += nl; }
-                    out += pad + JQuote(kv.first) + L": " +
-                           JWrite(kv.second, indent, depth + 1);
+                    out += pad;
+                    JQuote(kv.first, out);
+                    out += L": ";
+                    JWriteInternal(kv.second, indent, depth + 1, out);
                     bFirst = false;
                 }
             }
             if (indent >= 0 && bAny)
                 out += nl + padEnd;
-            out += asArray ? L"]" : L"}";
-            return out;
+            out += (asArray ? L"]" : L"}");
+            break;
         }
-        default: return L"null";
+        default: out += L"null"; break;
         }
+    }
+
+    wstring JWrite(const Value& v, int indent, int depth)
+    {
+        wstring out;
+        out.reserve(256);
+        JWriteInternal(v, indent, depth, out);
+        return out;
     }
 }

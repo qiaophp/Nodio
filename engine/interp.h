@@ -7,9 +7,12 @@
 
 namespace NodioVM
 {
+    extern bool g_nsTrace;   // runtime.cpp — NODIO_NS_TRACE=1 diagnostics
+
     struct Interp
     {
         wstring* err = nullptr;
+        std::shared_ptr<Env> globalsSelf;
         Env globals;
         int nBreak = 0, nContinue = 0, nReturn = 0;
         Value ret;
@@ -21,26 +24,90 @@ namespace NodioVM
         // root namespaces + module loading
         // (GetRoot/BindModule/DoImport/InitBuiltins defined at the tail)
         int nErrLine = 0;   // last statement line entered (error reporting)
+        // S-2: the file that owns the statement currently executing.  A
+        // runtime error reports " @ <file>:<line>"; the frames that raised
+        // it may already be unwinding when the report is written, so the
+        // file is kept here as a copy.
+        wstring strErrFile;
         // round 31: console mini-debugger
         bool bDebug = false;            // hooks armed
         bool bStep = false;             // stop at every statement
         std::set<int> breakpoints;      // armed lines
+        // external debug session (DAP): when set, DebugStop talks to the
+        // adapter over two unidirectional named pipes instead of the console
+        void* hDebugPipe = nullptr;     // events pipe (engine -> adapter)
+        void* hDebugCmd = nullptr;      // command pipe (adapter -> engine)
         std::unordered_map<wstring, Value> roots;    // string/math/io/...
+        // resolved bare `::` system APIs (name -> callable), see sysapi.cpp
+        std::unordered_map<wstring, Value> sysApis;
         std::unordered_map<wstring, Value> modules;  // import cache by path
         // engine-provided modules with no backing file, keyed by the name
         // passed to import ("(debug)" introspection module)
         std::unordered_map<wstring, Value> namedModules;
+        // ---- GC (gc.cpp) ----
+        // active call/block frames — the collector needs them as roots:
+        // a callee's parent chain points at the DEFINING frame, not at
+        // the caller's, so the caller's locals are otherwise invisible.
+        std::vector<std::shared_ptr<Env>> gcFrames;
+        // Register a frame that is running but NOT reachable from the VM
+        // root graph. A frame's parent chain points UP (child -> parent),
+        // and nothing points back DOWN, so block scopes, loop bodies,
+        // module bodies and the main script frame are invisible to the
+        // collector. Without this registration the collector frees a
+        // frame that is still executing - that is how the official
+        // win.loopMessage lost its MSG struct and the message loop
+        // started spinning on freed memory.
+        struct GcFrameScope
+        {
+            Interp& I;
+            std::shared_ptr<Env> sp;
+            GcFrameScope(Interp& i, std::shared_ptr<Env> e) : I(i), sp(std::move(e))
+            {
+                I.gcFrames.push_back(sp);
+            }
+            ~GcFrameScope() { I.gcFrames.pop_back(); }
+            GcFrameScope(const GcFrameScope&) = delete;
+            GcFrameScope& operator=(const GcFrameScope&) = delete;
+        };
+        bool bInGC = false;            // re-entrancy guard
+        long nLastGCTick = 0;          // allocation tick of the last sweep
+        long nGCRuns = 0;              // completed sweeps
+        long nGCFreed = 0;             // objects reclaimed by the last sweep
+        long nGCThreshold = 2000;      // allocations between automatic sweeps
+        // ---- fiber execution contexts ----
+        // The context that is running right now. A fiber swaps it on entry
+        // and back on yield, so the frame stack / root stack / control-flow
+        // flags always belong to the execution flow that pushed them.
+        FiberCtx mainCtx;
+        FiberCtx* curCtx = &mainCtx;
+        // Suspended fibers: their frames, explicit roots and entry function
+        // are NOT reachable from the VM root graph (a fiber value only holds
+        // a native pointer), so the collector has to be told about them.
+        std::vector<std::shared_ptr<FiberCtx>> fiberCtxs;
+        void CollectGarbage(Env* env);
+        void MaybeCollectGC(Env* env);
         wstring baseDir;                             // import file resolution
         std::unordered_map<wstring, wstring> embedded;   // payload v2 files
 
         explicit Interp(wstring* e) : err(e)
         {
+            // The collector must not sweep while another interpreter runs
+            // script code on another thread: its mark phase only sees its
+            // own roots. Count the live interpreters (main + workers).
+            g_activeVmThreads.fetch_add(1, std::memory_order_acq_rel);
             // globals outlives every frame: give it a self handle with a
             // no-op deleter so child frames can hold it as shared parent
-            globals.self =
+            globalsSelf =
                 std::shared_ptr<Env>(&globals, [](Env*) {});
+            globals.self = globalsSelf;
+            wchar_t szTrace[MAX_PATH] = L"";
+            if (GetEnvironmentVariableW(L"NODIO_NS_TRACE", szTrace, MAX_PATH) > 0)
+                g_nsTrace = true;
         }
-
+        ~Interp()
+        {
+            g_activeVmThreads.fetch_sub(1, std::memory_order_acq_rel);
+        }
         // ---- runtime.cpp (evaluation core) ----
         Value Eval(const PNode& n, Env* env);
         double ToNum(const Value& v);
@@ -77,6 +144,8 @@ namespace NodioVM
                                wstring* pErrMsg);
         Value GetMeta(const Value& obj);
         wstring ToStringM(const Value& v);
+        Value ToStringMValue(const Value& v);
+        Value ConcatStrings(const Value& l, const Value& r);
         Value GetMember(const Value& obj, const Value& keyVal,
                         bool bDirect = false, int ownerCallMode = 0);
         Value GetMember(const Value& obj, const wstring& key,
@@ -112,9 +181,17 @@ namespace NodioVM
         // ---- builtins.cpp (standard namespaces) ----
         void InitBuiltins();
 
-        // ---- debug.cpp (console mini-debugger) ----
+        // ---- debug.cpp (console mini-debugger + external DAP session) ----
         PNode ExprToNode(const Value& v);
         void DumpVars(Env* env);
         void DebugStop(int nLine, Env* env);
+        // external debug session: serve one stop over the named pipe.
+        // Reads "continue" / "next" / "step" / "vars" JSON commands from
+        // the pipe and writes back "stopped" / "vars" replies. Returns
+        // false when the session ended (pipe broken / disconnect).
+        bool DebugPipeStop(int nLine, Env* env);
     };
+
+    // gc.cpp - the reachability collector
+    void GcCollect(Interp& I, Env* env);
 }

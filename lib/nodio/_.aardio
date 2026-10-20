@@ -1,0 +1,15 @@
+// nodio — Nodio 标准库 overlay 的根命名空间。
+//
+// 组件按官方库的目录式布局放在 lib/nodio/ 下：
+//   lib/nodio/ui/dock.aardio           → import nodio.ui.dock
+//   lib/nodio/ui/toolbar.aardio        → import nodio.ui.toolbar
+//   lib/nodio/ui/statusbar.aardio      → import nodio.ui.statusbar
+//   lib/nodio/ui/projectTree.aardio    → import nodio.ui.projectTree
+//   lib/nodio/designer/registry.aardio → import nodio.designer.registry
+//
+// 引擎的 overlay 目录解析顺序：NODIO_OVERLAY_LIBDIR → <exe>\lib → D:\Nodio\lib，
+// overlay 优先于官方库，所以这里可以放 Nodio 自己的组件而不动官方库。
+namespace nodio{
+	version = "0.1.0";
+	name = "Nodio";
+}

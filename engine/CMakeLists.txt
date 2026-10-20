@@ -1,6 +1,8 @@
 # nodio_engine — the tree-walking aardio interpreter. Win32 + CRT only,
 # zero MFC. Public link libs are the Win32 DLLs the FFI/COM/GDI layers call.
 add_library(nodio_engine STATIC
+    compiler.cpp
+    compiler.h
     lexer.cpp
     parser.h
     value.cpp
@@ -11,9 +13,15 @@ add_library(nodio_engine STATIC
     json.cpp
     runtime.cpp
     import.cpp
+    aardio_chunk.cpp
+    aardio_chunk.h
+    aardio_vm.cpp
+    aardio_vm.h
     builtins.cpp
     debug.cpp
     gdi.cpp
+    gc.cpp
+    sysapi.cpp
     com.cpp
     entry.cpp
     common.h

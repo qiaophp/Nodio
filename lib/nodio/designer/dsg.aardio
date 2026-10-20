@@ -1,0 +1,167 @@
+// nodio.designer.dsg — DSG 块的解析与生成。
+//
+// DSG（Design Source Group）是官方 aardio 窗体源码里的设计标记：
+//
+//   /*DSG{{*/
+//   winform = win.form(text="窗体";right=759;bottom=469)
+//   winform.add(
+//       button1={cls="button";text="按钮";left=10;top=20;right=110;bottom=50}
+//   )
+//   /*}}*/
+//
+// 值的两种形态（官方就是这样）：
+//   · 字符串 → 带引号   text="按钮"
+//   · 数值   → 裸值     left=10
+// 解析与生成必须对称：parse(generate(items)) 要能拿回同样的类型，
+// 否则设计器存一次、再打开控件属性就全变成字符串了。
+//
+// 注意：aardio 的双引号字符串是**原样串**（`""` 表示一个引号），
+// 带 \r \n \t 等转义必须用单引号，所以本文件统一用单引号。
+namespace nodio.designer{
+
+dsg = {
+
+	// 数一个字符串里有几个双引号
+	__countQuote = function(s){
+		var q = 0;
+		for(c in ..string.gmatch(s, '"')) q = q + 1;
+		return q;
+	}
+
+	// 按 ; 切分属性表，但引号里的 ; 不算分隔符
+	// （引号数是奇数说明这一段还没结束，要和下一段接起来）
+	__splitBody = function(body){
+		var segs = ..string.split(body, ';');
+		var out = {};
+		var i = 1, n = #segs;
+		while(i <= n){
+			var s = segs[i];
+			var q = dsg.__countQuote(s);
+			while(q % 2 == 1 && i < n){
+				i = i + 1;
+				s = s ++ ';' ++ segs[i];
+				q = dsg.__countQuote(s);
+			}
+			..table.push(out, s);
+			i = i + 1;
+		}
+		return out;
+	}
+
+	// 裸值 → 布尔 / 数字 / 字符串
+	__bareValue = function(raw){
+		if(raw == 'true') return true;
+		if(raw == 'false') return false;
+		var n = ..tonumber(raw);
+		if(n !== null) return n;
+		return raw;
+	}
+
+	// 解析 { ... } 里的 key=value
+	__parseBody = function(body){
+		var props = {};
+		var segs = dsg.__splitBody(body);
+		for(i=1;#segs;1){
+			var seg = ..string.trim(segs[i]);
+			if(seg == '') continue;
+			// key
+			var key = ..string.match(seg, '^([\w]+)\s*=');
+			if(key === null) continue;
+			// 值：先试引号串，再试裸值
+			var qv = ..string.match(seg, '=\s*"([^"]*)"');
+			if(qv !== null){
+				props[key] = qv;
+				continue;
+			}
+			var raw = ..string.match(seg, '=(.*)');
+			if(raw === null) raw = '';
+			props[key] = dsg.__bareValue(..string.trim(raw));
+		}
+		return props;
+	}
+
+	// 字符串里的 " 要写成 ""（aardio 原样串的转义规则）
+	__escape = function(s){
+		var parts = ..string.split(s, '"');
+		var out = '';
+		for(i=1;#parts;1){
+			out = out ++ parts[i];
+			if(i < #parts) out = out ++ '""';
+		}
+		return out;
+	}
+
+	// 把属性值写成 DSG 里的字面量
+	__literal = function(v){
+		if(v === null || v === undefined) return '""';
+		var t = type(v);
+		if(t == "number") return tostring(v);
+		if(t == "boolean") return v ? 'true' : 'false';
+		return '"' ++ dsg.__escape(tostring(v)) ++ '"';
+	}
+
+	// text → item 数组 {name; cls; props}
+	parse = function(text){
+		var out = {};
+		if(!text) return out;
+		var lines = ..string.split(text, '\n');
+		for(i=1;#lines;1){
+			var line = ..string.trim(lines[i]);
+			if(line === '') continue;
+			if(..string.startsWith(line, '//')) continue;
+			if(..string.startsWith(line, '/*')) continue;
+			if(..string.startsWith(line, 'winform')) continue;
+			if(..string.startsWith(line, '}')) continue;
+			// name={ ... }
+			// 注意：string.match 返回的是**第一个捕获组**（字符串），
+			// 不是捕获组数组，所以这里分两次取名字和属性体。
+			var name = ..string.match(line, '^([\w]+)\s*=');
+			if(!name) continue;
+			var body = ..string.match(line, '\{(.*)\}');
+			if(!body) continue;
+			var props = dsg.__parseBody(body);
+			var cls = props.cls : 'static';
+			props.cls = null;
+			..table.push(out, {name=name; cls=cls; props=props});
+		}
+		return out;
+	}
+
+	// item 数组 → DSG 文本
+	generate = function(items, formText, formW, formH){
+		items = items : {};
+		var sb = '/*DSG{{*/\r\n';
+		sb = sb ++ 'winform = win.form(text="' ++ (formText : '窗体')
+			++ '";right=' ++ (formW : 759) ++ ';bottom=' ++ (formH : 469) ++ ')\r\n';
+		sb = sb ++ 'winform.add(\r\n';
+		for(i=1;#items;1){
+			var it = items[i];
+			var line = '\t' ++ it.name ++ '={cls="' ++ (it.cls : 'static') ++ '"';
+			// 属性（按 key 排序，输出稳定）
+			var keys = {};
+			for(k,v in it.props){
+				if(k == 'cls') continue;
+				..table.push(keys, k);
+			}
+			..table.sort(keys, lambda(a,b) a < b);
+			for(k=1;#keys;1){
+				var key = keys[k];
+				var val = it.props[key];
+				if(val === null) continue;
+				line = line ++ ';' ++ key ++ '=' ++ dsg.__literal(val);
+			}
+			// 几何（官方是裸值）
+			if(it.x !== null && it.x !== undefined){
+				line = line ++ ';left=' ++ it.x ++ ';top=' ++ it.y
+					++ ';right=' ++ (it.x + it.w) ++ ';bottom=' ++ (it.y + it.h);
+			}
+			line = line ++ '}';
+			if(i < #items) line = line ++ ';';
+			sb = sb ++ line ++ '\r\n';
+		}
+		sb = sb ++ ')\r\n/*}}*/\r\n';
+		return sb;
+	}
+}
+
+}

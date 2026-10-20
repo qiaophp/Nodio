@@ -1,0 +1,6 @@
+// minimal repro: calling a non-function value must raise a catchable error,
+// not crash the host with 0xC0000005.
+io.print("start");
+var f = 123;
+f();
+io.print("not reached");

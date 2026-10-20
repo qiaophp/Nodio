@@ -1,0 +1,144 @@
+// nodio.ui.statusbar — 状态栏（**自绘**）。
+//
+// 为什么不用 static 分段：官方 static 控件的 bgcolor 依赖窗体的
+// WM_CTLCOLORSTATIC，在 Nodio 里画不出来（实测手柄/底色都无效），
+// 深色主题下会留下一排白块。所以整条自己画。
+//
+// 坐标：物理像素；高度/分段宽度按逻辑像素写，用 nodio.ui.px() 换算。
+//
+// 用法：
+//   sb = nodio.ui.statusbar(winform, {height=24; panels={{"就绪";280};{"行,列";90}}})
+//   sb.setText(0, "工程: x.nproj")
+//   sb.setText("就绪", "...")     // 也可以用第一段的名称
+//   sb.layout(0, clientHeight-24, clientWidth, clientHeight)
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.rect;
+import nodio.ui.theme;
+import nodio.ui.dpi;
+
+var __sbSeq = 0;
+
+statusbar = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	// 设计常量（逻辑像素）
+	var TXT_PAD = 8;    // 文字左留白
+	var TXT_PAD2= 12;   // 文字区宽度扣减
+	var SEP_IN  = 5;    // 分隔线上下留白
+	var self = {
+		winform = winform;
+		board = null;
+		height  = ..nodio.ui.px(opt.height : 24);
+		rect    = opt.rect;
+		panels  = {};    // {name;width;text}
+		// 配色
+		bgColor   = opt.bgColor : th.bg;
+		textColor = opt.textColor : th.textDim;
+		lineColor = opt.lineColor : th.border;
+	};
+
+	__sbSeq = __sbSeq + 1;
+	var r = opt.rect : {left=0; top=0; right=800; bottom=self.height};
+	self.board = nodio.ui.board(winform, {
+		left = r.left; top = r.top; right = r.right; bottom = r.bottom;
+		fontSize = opt.fontSize : 12;
+	});
+	self.ctrl = self.board.ctrl;
+	self.board.onDraw = function(graphics, rc, bd){
+		self.__draw(graphics, rc, bd);
+	}
+
+	// 加一段（宽度是逻辑像素）
+	self.addPanel = function(name, width){
+		var p = {name=name : ""; width=..nodio.ui.px(width : 120); text=""};
+		..table.push(self.panels, p);
+		self.layout();
+		return p;
+	}
+
+	// 找到分段的序号（数字或名称）
+	self.__index = function(i){
+		if(type(i) == "number"){
+			if(i == 0) return 1;      // 0 表示第一段
+			return i;
+		}
+		for(k=1;#self.panels;1){
+			if(self.panels[k].name == i) return k;
+		}
+		return null;
+	}
+
+	self.setText = function(i, text){
+		var k = self.__index(i);
+		if(!k || !self.panels[k]) return;
+		self.panels[k].text = text;
+		self.board.invalidate();
+	}
+
+	self.getText = function(i){
+		var k = self.__index(i);
+		if(!k || !self.panels[k]) return null;
+		return self.panels[k].text;
+	}
+
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		if(!self.board) return;
+		self.board.layout(l, t, r, b);
+	}
+
+	// 绘制
+	self.__draw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var h = rc.bottom - rc.top;
+		var pTxtPad = ..nodio.ui.px(TXT_PAD);
+		var pTxtPad2 = ..nodio.ui.px(TXT_PAD2);
+		var pSepIn = ..nodio.ui.px(SEP_IN);
+		var bg = ..gdip.solidBrush(self.bgColor);
+		graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, h);
+		bg.delete();
+		// 顶部分隔线
+		var pen = ..gdip.pen(self.lineColor, 1);
+		graphics.drawLine(pen, rc.left, rc.top, rc.right, rc.top);
+		pen.delete();
+		var x = rc.left;
+		for(i=1;#self.panels;1){
+			var p = self.panels[i];
+			var brush = ..gdip.solidBrush(self.textColor);
+			graphics.drawString(p.text, font,
+				::RECTF(x + pTxtPad, rc.top, p.width - pTxtPad2, h), fmt, brush);
+			brush.delete();
+			// 分段之间的竖线
+			var sep = ..gdip.pen(self.lineColor, 1);
+			graphics.drawLine(sep, x + p.width, rc.top + pSepIn, x + p.width, rc.bottom - pSepIn);
+			sep.delete();
+			x = x + p.width + 1;
+		}
+	}
+
+	// 初始分段
+	// 两种写法都支持：{"就绪";280}（位置写法）或 {name="就绪"; width=280}
+	var list = opt.panels : {};
+	for(i=1;#list;1){
+		var p = list[i];
+		if(type(p) == "table"){
+			if(p[2] !== null && p[2] !== undefined){
+				self.addPanel(p[1] : "", p[2]);
+			}
+			else{
+				self.addPanel(p.name : "", p.width : 120);
+			}
+		}
+		else self.addPanel("", p);
+	}
+	self.layout();
+	return self;
+}
+}

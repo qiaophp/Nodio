@@ -1,0 +1,239 @@
+// nodio.gui.gallery — 组件展厅。
+//
+// 把 nodio.gui 的控件集**全部画出来**的一页：按钮（角色 / 修饰 / 尺寸）、
+// 复选框、单选框、输入框、标签、容器、徽标、进度条、分隔线。
+//
+// 它同时是这套组件体系的「活文档」：新加一个控件，往这里放一行即可。
+// IDE 把它挂在右栏「组件」页（见 ide/nodio/app/shell.nodio）。
+//
+// 排版：全部按**逻辑像素**写，绘制时由 ctx 换算成物理像素；
+// 内容比面板高时用滚轮滚动（offset 记在物理像素里）。
+namespace nodio.gui{
+import nodio.ui.dpi;
+import nodio.gui.theme;
+import nodio.gui.style;
+import nodio.gui.ctx;
+import nodio.gui.widget;
+import nodio.gui.button;
+import nodio.gui.check;
+import nodio.gui.label;
+import nodio.gui.input;
+import nodio.gui.panel;
+
+// 组件展厅
+gallery = function(winform, opt){
+	opt = opt : {};
+	var self = ..nodio.gui.host(winform, {
+		rect = opt.rect;
+		bg = "bgSecondary";
+	});
+
+	// ---------- 控件 ----------
+	var lblTitle = ..nodio.gui.label({
+		text = "nodio.gui 组件";
+		role = "textPrimary";
+		size = "large";
+	});
+	var lblSub = ..nodio.gui.label({
+		text = "Theme → Style → StyleBox → Widget";
+		role = "textTertiary";
+		size = "small";
+	});
+	self.add(lblTitle);
+	self.add(lblSub);
+
+	// 按钮（角色）
+	var btnPrimary = ..nodio.gui.button({text="主要"; cls="primary"});
+	var btnDefault = ..nodio.gui.button({text="次要"});
+	var btnSuccess = ..nodio.gui.button({text="成功"; cls="success"});
+	var btnWarning = ..nodio.gui.button({text="警告"; cls="warning"});
+	var btnError   = ..nodio.gui.button({text="危险"; cls="error"});
+	var btnInfo    = ..nodio.gui.button({text="信息"; cls="info"});
+	// 按钮（修饰）
+	var btnOutline = ..nodio.gui.button({text="描边"; cls="primary"; modifier="outline"});
+	var btnText    = ..nodio.gui.button({text="文字"; cls="primary"; modifier="text"});
+	// 按钮（尺寸）
+	var btnTiny   = ..nodio.gui.button({text="小"; size="tiny"});
+	var btnSmall  = ..nodio.gui.button({text="中"; size="small"});
+	var btnMedium = ..nodio.gui.button({text="标准"; size="medium"});
+	var btnLarge  = ..nodio.gui.button({text="大"; size="large"});
+	// 带图标
+	var btnIcon = ..nodio.gui.button({text="运行"; cls="success"; icon="bolt"});
+	// 主题预览（只切本页主题，不动全局）
+	var btnTheme = ..nodio.gui.button({
+		text="浅色"; modifier="outline";
+		onClick = function(){
+			if(self.theme){
+				self.theme = null;
+				btnTheme.text = "浅色";
+			}
+			else{
+				self.theme = ..nodio.gui.themeByName("light");
+				btnTheme.text = "深色";
+			}
+			self.invalidate();
+		}
+	});
+	// 复选 / 单选
+	var chk1 = ..nodio.gui.checkbox({text="自动保存"});
+	chk1.checked = true;
+	var chk2 = ..nodio.gui.checkbox({text="显示行号"});
+	var grp = ..nodio.gui.radioGroup();
+	var rad1 = grp.add(..nodio.gui.radio({text="浅色主题"}));
+	var rad2 = grp.add(..nodio.gui.radio({text="深色主题"}));
+	rad2.checked = true;
+	// 输入框
+	var inp = ..nodio.gui.input({text="nodio"; placeholder="搜索…"});
+	// 徽标 / 进度条
+	var badge = ..nodio.gui.badge({text="3"});
+	var prog = ..nodio.gui.progress({value=62});
+	// 卡片（容器）
+	var card = ..nodio.gui.panel({dir="column"; pad=10; gap=8; style=..nodio.gui.stylePanel()});
+	var cardLbl = ..nodio.gui.label({text="容器面板 Panel"; role="textPrimary"; size="small"});
+	var cardInp = ..nodio.gui.input({placeholder="面板里的输入框"});
+	card.add(cardLbl);
+	card.add(cardInp);
+
+	// 分组标题（每个分组一个 label —— 复用一个的话只会停在最后一段）
+	var secDefs = {
+		"按钮 · 语义角色";
+		"按钮 · 修饰与图标";
+		"按钮 · 尺寸档位";
+		"复选框 / 单选框";
+		"输入框";
+		"徽标 / 进度条";
+		"容器面板";
+	};
+	var secLabels = {};
+	for(i=1;#secDefs;1){
+		var sl = ..nodio.gui.label({text=secDefs[i]; role="textSecondary"; size="small"});
+		..table.push(secLabels, sl);
+		self.add(sl);
+	}
+
+	var sep1 = ..nodio.gui.separator();
+
+	// 全部挂到宿主
+	var all = {btnPrimary; btnDefault; btnSuccess; btnWarning; btnError; btnInfo;
+		btnOutline; btnText; btnTiny; btnSmall; btnMedium; btnLarge; btnIcon; btnTheme;
+		chk1; chk2; rad1; rad2; inp; badge; prog; card; sep1};
+	for(i=1;#all;1){
+		self.add(all[i]);
+	}
+
+	// ---------- 排版 ----------
+	var PAD = 12;
+	var GAP = 8;
+	var scroll = 0;        // 垂直滚动偏移（物理像素）
+	var contentH = 0;     // 内容总高（物理像素）
+
+	// 按钮宽度（逻辑像素）= 文字宽 + 左右内边距
+	var btnW = function(g, text, size){
+		var m = ..nodio.gui.styleMetrics(size);
+		return math.round(g.measure(text, m.fontPx) / g.scale + m.padX*2);
+	}
+
+	self.onBeforePaint = function(g, rc){
+		var L = function(v){ return math.round(v * g.scale) };
+		var W = math.floor(rc.right / g.scale);   // 可用宽度（逻辑像素）
+		var x = L(PAD);
+		var y = L(8);
+		// 先把滚动夹紧（上一次的 contentH），再排版 ——
+		// 反过来的话这一帧会画在越界位置上，而且没人再触发重绘。
+		var maxScroll = contentH - rc.bottom;
+		if(maxScroll < 0) maxScroll = 0;
+		if(scroll > maxScroll) scroll = maxScroll;
+		if(scroll < 0) scroll = 0;
+
+		// 摆放一个控件（应用滚动偏移）
+		var put = function(w, l, t, r, b){
+			w.setRect(l, t - scroll, r, b - scroll);
+		}
+		// 分组标题
+		var secIdx = 0;
+		var section = function(){
+			secIdx = secIdx + 1;
+			var sl = secLabels[secIdx];
+			put(sl, x, y, x + L(W - PAD*2), y + L(16));
+			y = y + L(18);
+		}
+		// 一行控件
+		var row = function(items, h, gap){
+			var cx = x;
+			for(i=1;#items;1){
+				var it = items[i];
+				put(it.w2, cx, y, cx + L(it.w), y + L(h));
+				cx = cx + L(it.w + gap);
+			}
+			y = y + L(h + gap);
+		}
+
+		put(lblTitle, x, y, x + L(W - PAD*2), y + L(24));
+		y = y + L(26);
+		put(lblSub, x, y, x + L(W - PAD*2), y + L(16));
+		y = y + L(20);
+		put(sep1, x, y, x + L(W - PAD*2), y + L(1));
+		y = y + L(14);
+
+		section();
+		row({{w=btnW(g,"主要","medium"); w2=btnPrimary};
+			{w=btnW(g,"次要","medium"); w2=btnDefault}}, 32, GAP);
+		row({{w=btnW(g,"成功","medium"); w2=btnSuccess};
+			{w=btnW(g,"警告","medium"); w2=btnWarning}}, 32, GAP);
+		row({{w=btnW(g,"危险","medium"); w2=btnError};
+			{w=btnW(g,"信息","medium"); w2=btnInfo}}, 32, GAP);
+
+		section();
+		row({{w=btnW(g,"描边","medium"); w2=btnOutline};
+			{w=btnW(g,"文字","medium"); w2=btnText}}, 32, GAP);
+		row({{w=btnW(g,"运行","medium") + 24; w2=btnIcon};
+			{w=btnW(g,"浅色","medium"); w2=btnTheme}}, 32, GAP);
+
+		section();
+		row({{w=btnW(g,"小","tiny"); w2=btnTiny};
+			{w=btnW(g,"中","small"); w2=btnSmall};
+			{w=btnW(g,"标准","medium"); w2=btnMedium};
+			{w=btnW(g,"大","large"); w2=btnLarge}}, 40, GAP);
+
+		section();
+		put(chk1, x, y, x + L(W - PAD*2), y + L(22));
+		y = y + L(24);
+		put(chk2, x, y, x + L(W - PAD*2), y + L(22));
+		y = y + L(24);
+		put(rad1, x, y, x + L(W - PAD*2), y + L(22));
+		y = y + L(24);
+		put(rad2, x, y, x + L(W - PAD*2), y + L(22));
+		y = y + L(26);
+
+		section();
+		put(inp, x, y, x + L(W - PAD*2), y + L(30));
+		y = y + L(34);
+
+		section();
+		put(badge, x, y, x + L(26), y + L(18));
+		put(prog, x + L(34), y + L(5), x + L(W - PAD*2), y + L(13));
+		y = y + L(22);
+
+		section();
+		put(card, x, y, x + L(W - PAD*2), y + L(86));
+		y = y + L(92);
+
+		contentH = y;
+	}
+
+	// 滚轮滚动
+	self.board.onMouseWheel = function(delta, x, y, bd){
+		scroll = scroll - (delta / 120) * 60;
+		if(scroll < 0) scroll = 0;
+		var cr = bd.ctrl.getClientRect();
+		var vh = 0;
+		if(cr && cr.height) vh = cr.height();
+		var maxScroll = contentH - vh;
+		if(scroll > maxScroll) scroll = maxScroll;
+		self.invalidate();
+	}
+
+	return self;
+}
+
+}

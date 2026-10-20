@@ -1,0 +1,19 @@
+// components/demoWidget.aardio — 示例：用户自定义组件加入设计器。
+//
+// IDE 打开工程时会扫描 <工程目录>\components\，import 这里的每个模块；
+// 模块执行下面的 register 之后，组件就出现在工具箱「我的组件」分组里，
+// 可以拖到设计画布上，也能被 DSG 序列化。
+//
+// 真实项目里，把这个文件换成你自己的组件即可（不需要改 IDE 任何代码）。
+import nodio.designer.registry;
+
+nodio.designer.registry.register({
+	name = "演示按钮";
+	cls = "button";        // 真实控件类
+	drawAs = "button";     // 设计器里的替身类（画不出来的控件用替身代画）
+	category = "我的组件";
+	props = {
+		{"text"; "标题"; "string"};
+		{"enabled"; "可用"; "bool"};
+	};
+});

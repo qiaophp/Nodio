@@ -1,0 +1,242 @@
+// nodio.gui.theme — 语义主题（角色 → 色值）。
+//
+// 移植自 Zan.Gui 的 Styling/Theme.zan。Zan.Gui 的 Theme 是一张**语义角色表**：
+// 控件不直接写死颜色，只声明「我要 primary 色的按钮」，主题决定 primary 是哪支。
+// 皮肤（skin）改主题 → 所有控件跟着变，控件代码一行都不用动。
+//
+// 这里保留 Zan.Gui 的角色划分，并按 IDE 实际用到的部分裁剪：
+//   功能色   primary / info / success / warning / error（各带 hover/pressed）
+//   文字     textPrimary / Secondary / Tertiary / Disabled / Inverse
+//   背景     bgPrimary / Secondary / Tertiary / Hover / Active / Selected / Disabled
+//   描边     borderPrimary / Secondary / Hover / Focus，divider
+//   浮层     overlay / scrim / tooltip*
+//   滚动条   scrollbar / scrollbarHover
+//   度量     fontSize* / height* / padding* / gap* / radius* / borderWidth / iconSize*
+//
+// 单位：度量是**逻辑像素**，颜色是 0xAARRGGBB。
+namespace nodio.gui{
+
+// ---------- 深色（默认）----------
+// 基准是 VS Code Dark+ 的 IDE chrome（0xFF1E1E1E / 0xFF252526），
+// 和 nodio.ui.theme 之前用的配色一致 —— 换过来不会出现「新旧两套黑」。
+var themeDark = {
+	name = "dark";
+
+	// ---- 功能色 ----
+	primary        = 0xFF0F6CBD;   // 蓝：主操作
+	primaryHover   = 0xFF1A7ED0;
+	primaryPressed = 0xFF0A5A9E;
+	info           = 0xFF3B9BD9;
+	infoHover      = 0xFF2F8CC8;
+	infoPressed    = 0xFF2278AE;
+	success        = 0xFF89D185;
+	successHover   = 0xFF9BDC96;
+	successPressed = 0xFF6EB56B;
+	warning        = 0xFFCCA700;
+	warningHover   = 0xFFD9BC1D;
+	warningPressed = 0xFFAD8B00;
+	error          = 0xFFF14C4C;
+	errorHover     = 0xFFF45B5B;
+	errorPressed   = 0xFFD13B3B;
+
+	// ---- 文字 ----
+	textPrimary   = 0xFFD4D4D4;
+	textSecondary = 0xFF9D9D9D;
+	textTertiary  = 0xFF6E6E6E;
+	textDisabled  = 0xFF5A5A5A;
+	textInverse   = 0xFFFFFFFF;
+
+	// ---- 背景 ----
+	bgPrimary   = 0xFF1E1E1E;   // 窗体 / 编辑区
+	bgSecondary = 0xFF252526;   // 面板
+	bgTertiary  = 0xFF2D2D2D;   // 次级面板
+	bgHover     = 0xFF2A2D2E;   // 悬停
+	bgActive    = 0xFF37373D;   // 按下 / 激活
+	bgSelected  = 0xFF04395E;   // 选中行
+	bgDisabled  = 0xFF2A2A2A;
+
+	// ---- 描边 ----
+	borderPrimary   = 0xFF3C3C3C;
+	borderSecondary = 0xFF2F2F2F;
+	borderHover     = 0xFF4E4E4E;
+	borderFocus     = 0xFF0F6CBD;
+	divider         = 0xFF2F2F2F;
+
+	// ---- 浮层 ----
+	overlay = 0xCC000000;
+	scrim   = 0x99000000;
+
+	// ---- 滚动条 ----
+	scrollbar      = 0xFF424242;
+	scrollbarHover = 0xFF5A5A5A;
+
+	// ---- 提示 ----
+	tooltipBg     = 0xFF2B2B2B;
+	tooltipBorder = 0xFF454545;
+	tooltipText   = 0xFFE8E8E8;
+
+	// ---- 设计器 ----
+	canvasBg = 0xFF252526;   // 设计画布底色
+	grid     = 0xFF323232;   // 画布网格
+
+	// ---- 度量（逻辑像素）----
+	fontSizeTiny   = 11;
+	fontSizeSmall  = 12;
+	fontSizeMedium = 13;
+	fontSizeLarge  = 16;
+	fontSizeHuge   = 20;
+
+	heightTiny   = 24;
+	heightSmall  = 28;
+	heightMedium = 32;
+	heightLarge  = 40;
+
+	paddingTiny   = 4;
+	paddingSmall  = 8;
+	paddingMedium = 12;
+	paddingLarge  = 16;
+
+	gapSmall  = 4;
+	gapMedium = 8;
+	gapLarge  = 16;
+
+	radiusSmall  = 4;
+	radiusMedium = 6;
+	radiusLarge  = 8;
+
+	borderWidth = 1;
+
+	iconSizeSmall   = 12;
+	iconSizeMedium  = 16;
+	iconSizeLarge   = 20;
+	iconSizeCaption = 10;
+};
+
+// ---------- 浅色 ----------
+var themeLight = {
+	name = "light";
+
+	primary        = 0xFF0F6CBD;
+	primaryHover   = 0xFF1A7ED0;
+	primaryPressed = 0xFF0A5A9E;
+	info           = 0xFF3B9BD9;
+	infoHover      = 0xFF2F8CC8;
+	infoPressed    = 0xFF2278AE;
+	success        = 0xFF2E7D32;
+	successHover   = 0xFF3C9140;
+	successPressed = 0xFF256428;
+	warning        = 0xFF9A6700;
+	warningHover   = 0xFFB37C00;
+	warningPressed = 0xFF7A5300;
+	error          = 0xFFC9302C;
+	errorHover     = 0xFFD94548;
+	errorPressed   = 0xFFA61B1D;
+
+	textPrimary   = 0xFF1A1A1A;
+	textSecondary = 0xFF666666;
+	textTertiary  = 0xFF8A8A8A;
+	textDisabled  = 0xFFA0A0A0;
+	textInverse   = 0xFFFFFFFF;
+
+	bgPrimary   = 0xFFFFFFFF;
+	bgSecondary = 0xFFF3F3F3;
+	bgTertiary  = 0xFFEDEDED;
+	bgHover     = 0xFFE8E8E8;
+	bgActive    = 0xFFDDDDDD;
+	bgSelected  = 0xFFDCEBFA;
+	bgDisabled  = 0xFFF0F0F0;
+
+	borderPrimary   = 0xFFD0D0D0;
+	borderSecondary = 0xFFE4E4E4;
+	borderHover     = 0xFFBEBEBE;
+	borderFocus     = 0xFF0F6CBD;
+	divider         = 0xFFE0E0E0;
+
+	overlay = 0x33000000;
+	scrim   = 0x55000000;
+
+	scrollbar      = 0xFFC8C8C8;
+	scrollbarHover = 0xFFA0A0A0;
+
+	tooltipBg     = 0xFF333333;
+	tooltipBorder = 0xFF555555;
+	tooltipText   = 0xFFF0F0F0;
+
+	canvasBg = 0xFFF0F0F0;
+	grid     = 0xFFE0E0E0;
+
+	fontSizeTiny   = 11;
+	fontSizeSmall  = 12;
+	fontSizeMedium = 13;
+	fontSizeLarge  = 16;
+	fontSizeHuge   = 20;
+
+	heightTiny   = 24;
+	heightSmall  = 28;
+	heightMedium = 32;
+	heightLarge  = 40;
+
+	paddingTiny   = 4;
+	paddingSmall  = 8;
+	paddingMedium = 12;
+	paddingLarge  = 16;
+
+	gapSmall  = 4;
+	gapMedium = 8;
+	gapLarge  = 16;
+
+	radiusSmall  = 4;
+	radiusMedium = 6;
+	radiusLarge  = 8;
+
+	borderWidth = 1;
+
+	iconSizeSmall   = 12;
+	iconSizeMedium  = 16;
+	iconSizeLarge   = 20;
+	iconSizeCaption = 10;
+};
+
+// ---------- 当前主题 ----------
+var __theme = themeDark;
+var themes = { dark = themeDark; light = themeLight };
+
+// 取当前主题表
+theme = function(){
+	return __theme;
+}
+
+// 切换主题：themeSet("dark") / themeSet("light")
+themeSet = function(name){
+	var t = themes[name];
+	if(t) __theme = t;
+	return __theme;
+}
+
+// 按名字取主题表（不切换当前主题）：
+// 组件展厅用它做「预览另一套主题」，不用改动全局主题。
+themeByName = function(name){
+	return themes[name];
+}
+
+themeName = function(){
+	return __theme.name;
+}
+
+// 按角色取色：themeColor("primary")
+themeColor = function(role){
+	return __theme[role];
+}
+
+// ARGB(0xAARRGGBB) → COLORREF(0x00BBGGRR)
+// 原生控件（richedit / edit）要的是 COLORREF，不是 gdip 的 ARGB。
+themeRef = function(argb){
+	var v = tonumber(argb);
+	if(v === null) return 0;
+	var r = (v >> 16) & 0xFF;
+	var g = (v >> 8) & 0xFF;
+	var b = v & 0xFF;
+	return (b << 16) | (g << 8) | r;
+}
+
+}

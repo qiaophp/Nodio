@@ -1,0 +1,86 @@
+// nodio.ui.theme — 主题兼容层（旧字段名 → 新的语义主题）。
+//
+// 配色体系已经迁到 nodio.gui.theme（语义角色：primary / bgHover /
+// textSecondary / …，移植自 Zan.Gui 的 Theme.zan）。
+// 本模块保留**旧字段名**（bg / panel / tabBg / textDim / selBg …），
+// 把它们映射到新主题的语义角色上：
+//   · 旧组件（list / tree / tabstrip / toolbar …）一行不用改；
+//   · 换主题只改 nodio.gui.theme 一处。
+//
+// 目标外观：aar.chengxu.online/thread-903.htm 里那套现代 aardio IDE
+// （aardioX / QuickEditor4），深色为主、扁平、VS Code 风格。
+namespace nodio.ui{
+import nodio.gui.theme;
+
+// 语义角色 → 旧字段名
+var __legacy = function(){
+	var th = ..nodio.gui.theme();
+	return {
+		name = th.name;
+
+		bg       = th.bgPrimary;   // 窗体 / 编辑区底色
+		panel    = th.bgSecondary; // 面板底色（树、列表、问题面板）
+		tabBg    = th.bgPrimary;   // 标签条底色
+		tabHover = th.bgHover;     // 标签悬停
+		tabText  = th.textSecondary;   // 标签文字（未选中）
+		tabTextSel = th.textPrimary;   // 标签文字（选中）
+
+		border   = th.borderPrimary;   // 分隔线 / 描边
+		text     = th.textPrimary;     // 正文
+		textDim  = th.textSecondary;   // 次要文字（分组标题、列头）
+		textSel  = th.textPrimary;     // 选中态文字
+
+		accent   = th.primary;     // 强调色（选中标签描边、选中框、焦点）
+		selBg    = th.bgSelected;  // 选中行底色
+		hoverBg  = th.bgHover;     // 悬停行底色
+
+		err      = th.error;       // 错误
+		warn     = th.warning;     // 警告
+		ok       = th.success;     // 成功
+
+		grid     = th.grid;        // 设计画布网格
+		canvasBg = th.canvasBg;    // 设计画布底色
+		panel2   = th.bgTertiary;  // 次级面板（属性格分组头）
+	};
+}
+
+// 取当前主题（旧字段名）
+theme = function(){
+	return __legacy();
+}
+
+// 切换主题：themeSet("dark") / themeSet("light")
+themeSet = function(name){
+	..nodio.gui.themeSet(name);
+	return __legacy();
+}
+
+// 主题名
+themeName = function(){
+	return ..nodio.gui.themeName();
+}
+
+// ARGB(0xAARRGGBB) → COLORREF(0x00BBGGRR)
+// richedit 这类原生控件要的是 COLORREF，不是 gdip 的 ARGB。
+themeRef = function(argb){
+	return ..nodio.gui.themeRef(argb);
+}
+
+// 给原生 common control（treeview / listview）上深色 —— **当前不可用**。
+//
+// 结论（实测，别再踩）：common control 的配色消息在本机 comctl32 上不安全：
+//   TVM_SETTEXTCOLOR 0x1132 / LVM_SETTEXTCOLOR 0x1134
+//   传 lParam = COLORREF 给 SysTreeView32，comctl32 会把它当**指针**解引用
+//   （实测 AccessViolation: target=0x0D4D4E4 = COLORREF+0x10）→ 进程直接崩
+//   （0xC0000005，崩在 COMCTL32.dll）。
+// 另一条路 `::User32.SendMessageW` 是**动态绑定**，引擎猜不出签名会把
+// wParam/lParam 当指针传，同样不安全；要用必须像 nodio.ui.subclass 那样
+// raw.loadDll().api() 写显式签名。
+//
+// 这两类面板已经改成自绘（nodio.ui.list / nodio.ui.tree），
+// 原生配色只留给还没换掉的控件。
+themeNative = function(ctrl, kind, bgColor, textColor){
+	return false;
+}
+
+}

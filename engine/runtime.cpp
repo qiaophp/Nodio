@@ -2,13 +2,75 @@
 
 namespace NodioVM
 {
+
 thread_local Interp* g_interpCurrent = nullptr;   // M2: active interp for meta hooks
 thread_local int g_metaDispatchDepth = 0;   // metaProperty dispatch flag
 thread_local std::unordered_set<Table*> g_metaDispatchActive;
 thread_local Value s_currentOwner;
+bool g_nsTrace = false;   // NODIO_NS_TRACE=1 — namespace resolution diagnostics
 Interp* Interp::g_self = nullptr;    // M2: self for meta callbacks
 Value Interp::GetCurrentOwner() { return s_currentOwner; }
 void Interp::SetCurrentOwner(const Value& v) { s_currentOwner = v; }
+
+// ---- S-2: a runtime error owns its file ----
+//
+// Official aardio keeps 文件 / 错误行号 in a structured error report (the
+// field table lives in aardio.exe: 错误 / 文件 / 错误行号 / 字段 / 失败操作
+// …) and drops both when the project is published with debugging switched
+// off.  Nodio puts the location into the message itself, so console output,
+// the LSP and CI logs can attribute a failure to a file — a bare line
+// number is ambiguous once a library has been imported (that cost a whole
+// debugging round on autos.ui.memories, where "@ 行 85" really belonged to
+// string\markdown\_.aardio:85).
+//
+// Every frame carries the source file that owns the code running in it:
+// a module frame carries its own path, a call frame inherits it from the
+// DEFINING frame chain (a function of module A called from module B still
+// belongs to A).  Walking that chain gives the file the line number
+// really comes from.
+const wstring* SourceFilePtrOfEnv(Env* env)
+{
+    for (Env* e = env; e; e = e->parent.get())
+    {
+        if (!e->srcFile.empty()) return &e->srcFile;
+    }
+    return nullptr;
+}
+
+// S-2: the location marker is always the LAST "@ " of the message:
+//   "@ 行 <n>"      — a bare line number (no owning file known)
+//   "@ <file>:<n>"  — file and line
+bool HasErrorLocation(const wstring& msg)
+{
+    size_t at = msg.rfind(L" @ ");
+    if (at == wstring::npos) return false;
+    const wchar_t* p = msg.c_str() + at + 3;
+    if (p[0] == L'\u884C')   // 行
+    {
+        const wchar_t* q = p + 1;
+        while (*q == L' ') q++;
+        if (*q < L'0' || *q > L'9') return false;
+        while (*q >= L'0' && *q <= L'9') q++;
+        return true;
+    }
+    // "<file>:<n>" — the last colon must be followed by digits only
+    const wchar_t* colon = nullptr;
+    for (const wchar_t* q = p; *q; q++)
+        if (*q == L':') colon = q;
+    if (!colon || !colon[1]) return false;
+    const wchar_t* q = colon + 1;
+    while (*q >= L'0' && *q <= L'9') q++;
+    return *q == L'\0';
+}
+
+void AppendErrorLocation(wstring* msg, const wstring& file, int line)
+{
+    if (!msg) return;
+    if (file.empty())
+        (*msg) += L" @ 行 " + std::to_wstring(line);
+    else
+        (*msg) += L" @ " + file + L":" + std::to_wstring(line);
+}
 
 // ---- Eval ----
 Value Interp::Eval(const PNode& n, Env* env)
@@ -74,11 +136,15 @@ Value Interp::Eval(const PNode& n, Env* env)
             }
             case Node::Member:
             {
+                // the receiver lives in a C++ local while the metatable
+                // hook runs — keep it reachable for the collector
+                GcRootScope rs;
                 Value obj;
                 if (n->bRoot)
                     obj = Value();   // root namespace = globals table
                 else
                     obj = Eval(n->a, env);
+                rs.add(obj);
                 if (n->bSafe && obj.t == Value::Null)
                     return Value();   // '?.': null short-circuits
                 if (n->bMeta)
@@ -96,10 +162,13 @@ Value Interp::Eval(const PNode& n, Env* env)
             }
             case Node::Index:
             {
+                GcRootScope rs;
                 Value obj = Eval(n->a, env);
+                rs.add(obj);
                 if (n->bSafe && obj.t == Value::Null)
                     return Value();   // '?[': null short-circuits
                 Value idx = Eval(n->b, env);
+                rs.add(idx);
                 // byte-string model: s[i] reads the i-th BYTE
                 // (1-based) as a number — string indexing is
                 // built on this primitive. Byte-per-wchar strings (from
@@ -161,7 +230,9 @@ Value Interp::Eval(const PNode& n, Env* env)
             case Node::Bin: return EvalBin(n, env);
             case Node::Un:
             {
+                GcRootScope rs;
                 Value v = Eval(n->a, env);
+                rs.add(v);
                 if (n->str == L"-") return Value::Num_(-ToNum(v));
                 if (n->str == L"!" || n->str == L"not") return Value::Bool_(!v.Truthy());
                 if (n->str == L"~")
@@ -399,7 +470,7 @@ bool Interp::MetaGet(const Value& obj, const Value& keyVal,
                      Value* out, bool* pErr, wstring* pErrMsg,
                      int ownerCallMode)
         {
-            wstring key = keyVal.ToString();
+            wstring key = ObjectKeyOf(keyVal);
             *pErr = false;
             static thread_local int s_metaDepth = 0;
             if (s_metaDepth > 40)
@@ -473,7 +544,7 @@ bool Interp::MetaGetLayer(const Value& obj, const Value& mtv,
                           wstring* pErrMsg, int ownerCallMode, bool bInDispatch)
         {
             Table* mt = mtv.tab.get();
-            wstring key = keyVal.ToString();
+            wstring key = ObjectKeyOf(keyVal);
             // direct method/field entries in the meta table resolve first
             // (RECT._meta = { width = function(){...} } shape)
             auto idm = mt->map.find(key);
@@ -577,7 +648,7 @@ bool Interp::MetaSet(const Value& obj, const Value& keyVal,
                      const Value& val, bool* pErr, wstring* pErrMsg,
                      bool bOwnerAttr)
         {
-            wstring key = keyVal.ToString();
+            wstring key = ObjectKeyOf(keyVal);
             *pErr = false;
             if ((obj.t != Value::TableT && obj.t != Value::Class && obj.t != Value::Func && obj.t != Value::Pointer) || !obj.tab || key == L"_meta")
                 return false;
@@ -634,7 +705,7 @@ bool Interp::MetaSetLayer(const Value& obj, const Value& mtv,
                           bool* pErr, wstring* pErrMsg, bool bOwnerAttr)
         {
             Table* mt = mtv.tab.get();
-            wstring key = keyVal.ToString();
+            wstring key = ObjectKeyOf(keyVal);
             auto is = mt->map.find(L"_set");
             if (is == mt->map.end() || is->second.t == Value::Null)
                 return false;
@@ -762,6 +833,14 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;
             local->vars[L"owner"] = owner;
+            // the callee frame, the receiver and the call arguments live
+            // in C++ locals — the collector needs them as roots
+            gcFrames.push_back(local);
+            GcRootScope rs;
+            rs.add(f);
+            rs.add(owner);
+            rs.add(ths);
+            rs.addAll(args);
             if (f.thisVal)
                 local->vars[L"this"] = *f.thisVal;
             else
@@ -827,6 +906,9 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             nReturn = oldR; nBreak = oldB; nContinue = oldC;
             ret = old;
             s_currentOwner = oldOwner;
+            GcFrameCheck(gcFrames, local.get(), "callThisOwner");
+            gcFrames.pop_back();
+            CleanDeadEnv(local);
             return r;
         }
 
@@ -893,11 +975,35 @@ wstring Interp::ToStringM(const Value& v)
             return v.ToString();
         }
 
+// ---- ToStringMValue ----
+// Same as ToStringM but keeps the result as a Value, so a string returned
+// by a _tostring metamethod keeps its byte representation (official aardio
+// strings are byte arrays).
+Value Interp::ToStringMValue(const Value& v)
+        {
+            if (v.t == Value::TableT && v.tab)
+            {
+                auto im = v.tab->map.find(L"_meta");
+                if (im != v.tab->map.end() && im->second.t == Value::TableT &&
+                    im->second.tab)
+                {
+                    auto it = im->second.tab->map.find(L"_tostring");
+                    if (it != im->second.tab->map.end() &&
+                        (it->second.t == Value::Func || it->second.native))
+                    {
+                        vector<Value> noArgs;
+                        return CallOwner(it->second, v, noArgs);
+                    }
+                }
+            }
+            return v;
+        }
+
 // ---- GetMember ----
 Value Interp::GetMember(const Value& obj, const Value& keyVal,
                         bool bDirect, int ownerCallMode)
         {
-            wstring key = keyVal.ToString();
+            wstring key = ObjectKeyOf(keyVal);
             if (obj.t == Value::TableT || ((obj.t == Value::Func || obj.t == Value::Class || obj.t == Value::Pointer) && obj.tab))
             {
                 if (obj.tab)
@@ -907,7 +1013,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                     // table.assigns ALL attrs (items={}, checked=...) onto
                     // the ctrl, and later reads of e.g. combobox .items must
                     // still hit the live control, not the stale copied table
-                    if (!bDirect && (!obj.tab || g_metaDispatchActive.count(obj.tab.get()) == 0))
+                    if (!bDirect && obj.tab->bExplicitMeta && (!obj.tab || g_metaDispatchActive.count(obj.tab.get()) == 0))
                     {
                         auto im0 = obj.tab->map.find(L"_meta");
                         if (im0 != obj.tab->map.end() &&
@@ -1055,16 +1161,42 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                 if (ig != globals.vars.end())
                     return ig->second;
 
+                // bare :: system API (::SetWindowPointer, ::PostMessage, ...)
+                // official aardio resolves these across the system DLLs;
+                // without them the official win.ui control routing (which
+                // installs each control's window procedure with
+                // ::SetWindowPointer) never fires a single mouse event.
+                {
+                    Value api = ResolveSysApi(this, key);
+                    if (api.t != Value::Null)
+                        return api;
+                }
+
                 // On-demand load system / dynamic DLLs when accessed via ::DllName
                 if (!key.empty() && key[0] != L'.' && key[0] != L'_')
                 {
                     wstring dllName = key;
                     if (dllName.size() < 4 || _wcsicmp(dllName.c_str() + dllName.size() - 4, L".dll") != 0)
                         dllName += L".dll";
-                    HMODULE hMod = LoadLibraryW(dllName.c_str());
+
+                    static const std::unordered_set<wstring> s_sysDlls = {
+                        L"kernel32.dll", L"user32.dll", L"gdi32.dll", L"shell32.dll",
+                        L"ole32.dll", L"oleaut32.dll", L"advapi32.dll", L"comctl32.dll",
+                        L"shlwapi.dll", L"ntdll.dll", L"ws2_32.dll", L"wsock32.dll",
+                        L"wininet.dll", L"msimg32.dll", L"crypt32.dll", L"dwmapi.dll",
+                        L"uxtheme.dll", L"iphlpapi.dll", L"version.dll", L"psapi.dll",
+                        L"winspool.drv", L"imm32.dll", L"comdlg32.dll", L"winmm.dll",
+                        L"gdiplus.dll", L"msvfw32.dll", L"avicap32.dll", L"mpr.dll"
+                    };
+
+                    wstring lower = dllName;
+                    for (auto& c : lower) c = towlower(c);
+                    bool isSys = s_sysDlls.count(lower) > 0;
+
+                    HMODULE hMod = isSys ? LoadLibraryW(dllName.c_str()) : GetModuleHandleW(dllName.c_str());
                     if (hMod)
                     {
-                        FreeLibrary(hMod);
+                        if (isSys) FreeLibrary(hMod);
                         auto ir = roots.find(L"raw");
                         if (ir != roots.end() && ir->second.t == Value::TableT && ir->second.tab)
                         {
@@ -1158,9 +1290,16 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
             local->nsTable = inst;
             local->bNsInst = true;   // instance scope: never capture as nsClosure
             local->bInstInit = true;
+            local->instTable = inst.get();   // the instance under construction
             if (bMethod)
                 local->vars[L"owner"] = vThis;   // owner = dot-left
             local->vars[L"this"] = vInst;
+            // the instance frame is a GC root while the constructor runs
+            gcFrames.push_back(local);
+            GcRootScope rsInst;
+            rsInst.add(vInst);
+            rsInst.add(f);
+            rsInst.addAll(args);
 
             if (f.fn)
             {
@@ -1218,10 +1357,16 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 nReturn = oldR; nBreak = oldB; nContinue = oldC;
                 ret = oldRet;
                 local->bInstInit = false;
+                local->instTable = nullptr;
                 if (bCtorRet)
                 {
                     if (ctorRet.t == Value::Null)
+                    {
+                        GcFrameCheck(gcFrames, local.get(), "classNullCtor");
+                        gcFrames.pop_back();
+                        CleanDeadEnv(local);
                         return ctorRet;
+                    }
                     if (ctorRet.t == Value::TableT && ctorRet.tab && vInst.tab)
                     {
                         for (auto& kv : vInst.tab->map)
@@ -1230,6 +1375,9 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                                 ctorRet.tab->map[kv.first] = kv.second;
                         }
                     }
+                    GcFrameCheck(gcFrames, local.get(), "classCtor");
+                    gcFrames.pop_back();
+                    CleanDeadEnv(local);
                     return ctorRet;
                 }
                 auto itThis = local->vars.find(L"this");
@@ -1322,6 +1470,9 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                     itThis->second.t == Value::TableT)
                     vInst = itThis->second;
             }
+            GcFrameCheck(gcFrames, local.get(), "classBody");
+            gcFrames.pop_back();
+            CleanDeadEnv(local);
             return vInst;
         }
 
@@ -1332,11 +1483,13 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             if (n->a->k == Node::Member && n->a->str == L"print" &&
                 n->a->a->k == Node::Ident && n->a->a->str == L"io")
             {
-                wstring out;
+                // strings are byte arrays: write the bytes, not re-encoded
+                // text (a raw byte string must survive untouched).
+                std::string out;
                 for (auto& arg : n->list)
-                    out += ToStringM(Eval(arg, env));
-                out += L"\n";
-                WriteU8(stdout, out);
+                    out += ValueByteForm(ToStringMValue(Eval(arg, env)));
+                out += "\n";
+                fwrite(out.data(), 1, out.size(), stdout);
                 fflush(stdout);
                 return Value();
             }
@@ -1348,11 +1501,11 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 // Only take the global console print fast path if not shadowed by a local or namespace member
                 if (!vShadow || vShadow == pGlob)
                 {
-                    wstring out;
+                    std::string out;
                     for (auto& arg : n->list)
-                        out += ToStringM(Eval(arg, env));
-                    out += L"\n";
-                    WriteU8(stdout, out);
+                        out += ValueByteForm(ToStringMValue(Eval(arg, env)));
+                    out += "\n";
+                    fwrite(out.data(), 1, out.size(), stdout);
                     fflush(stdout);
                     return Value();
                 }
@@ -1376,6 +1529,9 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                         }
                     }
                 }
+                // A string is returned unchanged (official strings are byte
+                // arrays), so its byte representation survives the call.
+                if (v.t == Value::Str) return v;
                 return Value::Str_(ToStringM(v));
             }
             if (n->a->k == Node::Ident && n->a->str == L"tonumber" && n->list.size() == 1)
@@ -1385,15 +1541,14 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             if (n->a->k == Node::Ident && n->a->str == L"error")
             {
-                // error(): raise a runtime error message; annotate
-                // with the module file so library-raised errors are
-                // traceable to their source
+                // error(): raise a runtime error message.  The location is
+                // NOT baked into the message here: the report points (the
+                // try/catch handler and the top-level report) append it, so
+                // a message that already carries a location is never
+                // decorated twice.
                 Value vErr = n->list.empty() ? Value() : Eval(n->list[0], env);
                 wstring msg = n->list.empty() ? L"运行错误" :
                     L"运行错误: " + vErr.ToString();
-                msg += L" @ 行 " + std::to_wstring(n->line);
-                if (!g_curModuleFile.empty())
-                    msg += L" 模块: " + g_curModuleFile;
                 (*err) = msg;
                 return Value();
             }
@@ -1406,6 +1561,9 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             Value f;
             Value vThis;
             bool bMethod = false;
+            // the callee and its receiver live in C++ locals across the
+            // call — keep them reachable for the collector
+            GcRootScope rs;
             if (n->a->k == Node::Member)
             {
                 if (n->a->bRoot)
@@ -1430,6 +1588,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             {
                 f = Eval(n->a, env);
             }
+            rs.add(f);
+            rs.add(vThis);
             static thread_local int s_callDepth = 0;
             struct CallDepthGuard {
                 int& d;
@@ -1447,7 +1607,9 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 wstring fnName = f.fname;
                 if (fnName.empty() && n->a->k == Node::Member) fnName = n->a->str;
                 else if (fnName.empty() && n->a->k == Node::Ident) fnName = n->a->str;
-                (*err) = L"运行错误: 栈溢出 (超过最大调用深度) @ 行 " + std::to_wstring(n->line) + L" 函数: " + fnName;
+                // S-2: no location here — the report point appends the
+                // file and the line, so it is never written twice.
+                (*err) = L"运行错误: 栈溢出 (超过最大调用深度) 函数: " + fnName;
                 return Value();
             }
             {
@@ -1458,8 +1620,15 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                              n->line, (int)f.t, bMethod, (int)vThis.t, f.fname.c_str());
                 }
             }
-            auto evalCallArgs = [this, env](const vector<PNode>& exprs) {
+            auto evalCallArgs = [this, env, &rs](const vector<PNode>& exprs) {
                 vector<Value> res;
+                // every argument is rooted as soon as it is evaluated: a
+                // later argument may run statements, and the collector
+                // must not reclaim an earlier one
+                auto keep = [&res, &rs](const Value& v) {
+                    res.push_back(v);
+                    rs.add(res.back());
+                };
                 for (size_t ai = 0; ai < exprs.size(); ai++)
                 {
                     auto& a = exprs[ai];
@@ -1472,7 +1641,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                             {
                                 Value elem = item;
                                 elem.mrets = nullptr;
-                                res.push_back(elem);
+                                keep(elem);
                             }
                         }
                         else if (vDots.t == Value::TableT && vDots.tab)
@@ -1481,14 +1650,14 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                             {
                                 Value elem = item;
                                 elem.mrets = nullptr;
-                                res.push_back(elem);
+                                keep(elem);
                             }
                         }
                         else if (vDots.t != Value::Null)
                         {
                             Value elem = vDots;
                             elem.mrets = nullptr;
-                            res.push_back(elem);
+                            keep(elem);
                         }
                     }
                     else
@@ -1503,18 +1672,18 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                         {
                             auto mrets = v.mrets;
                             v.mrets = nullptr;
-                            res.push_back(v);
+                            keep(v);
                             for (auto& extra : *mrets)
                             {
                                 Value ex = extra;
                                 ex.mrets = nullptr;
-                                res.push_back(ex);
+                                keep(ex);
                             }
                         }
                         else
                         {
                             v.mrets = nullptr;
-                            res.push_back(v);
+                            keep(v);
                         }
                     }
                 }
@@ -1555,6 +1724,28 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                     }
                 }
             }
+            // M2: calling a native callback object (the official "cdata"
+            // returned by raw.tostdcall) -> metatable _call
+            if (f.t == Value::Pointer && f.tab)
+            {
+                auto ic = f.tab->map.find(L"_meta");
+                if (ic != f.tab->map.end() && ic->second.t == Value::TableT &&
+                    ic->second.tab)
+                {
+                    auto icl = ic->second.tab->map.find(L"_call");
+                    if (icl != ic->second.tab->map.end() &&
+                        (icl->second.t == Value::Func ||
+                         icl->second.native))
+                    {
+                        vector<Value> args = evalCallArgs(n->list);
+                        if (icl->second.native)
+                            args.insert(args.begin(), f); // native _call
+                                                          // receives the
+                                                          // cdata as a[0]
+                        return CallOwner(icl->second, f, args);
+                    }
+                }
+            }
             if (f.t != Value::Func)
             {
                 // name the callee: without it a missing builtin is an
@@ -1570,8 +1761,6 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 (*err) = L"运行错误: 尝试调用非函数值" +
                          (strCallee.empty() ? L""
                                             : (L" (" + strCallee + L")"));
-                if (!g_curModuleFile.empty())
-                    (*err) += L" 模块: " + g_curModuleFile;
                 return Value();
             }
             vector<Value> args = evalCallArgs(n->list);
@@ -1582,6 +1771,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             // functions capture their enclosing frame via envUp.
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;   // defining namespace stays in scope
+            // the callee frame is a GC root while the body runs
+            gcFrames.push_back(local);
             if (bMethod)
             {
                 if (f.thisVal)
@@ -1647,6 +1838,9 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR;
             ret = old;
+            GcFrameCheck(gcFrames, local.get(), "evalCall");
+            gcFrames.pop_back();
+            CleanDeadEnv(local);
             return r;
         }
 
@@ -1654,31 +1848,64 @@ Value Interp::EvalCall(const PNode& n, Env* env)
 Value Interp::EvalBin(const PNode& n, Env* env)
         {
             const wstring& op = n->str;
+            // operands live in C++ locals across the evaluation of the
+            // other side — keep them reachable for the collector
+            GcRootScope rs;
             if (op == L"?:")   // lazy ternary
                 return Eval(n->a, env).Truthy() ? Eval(n->b, env)
                                                 : Eval(n->c, env);
             if (op == L"?")    // guard: a ? b — a truthy ? b : false
             {
                 Value l = Eval(n->a, env);
+                rs.add(l);
                 return l.Truthy() ? Eval(n->b, env) : Value::Bool_(0);
             }
             if (op == L"&&")
             {
                 Value l = Eval(n->a, env);
+                rs.add(l);
                 return l.Truthy() ? Eval(n->b, env) : l;
             }
             if (op == L":")   // falsy coalescing: a:b returns b when
                              // a is falsy (null/false/0/""), else a
             {
                 Value l = Eval(n->a, env);
+                rs.add(l);
                 return l.Truthy() ? l : Eval(n->b, env);
             }
             if (op == L"||")
             {
                 Value l = Eval(n->a, env);
+                rs.add(l);
                 return l.Truthy() ? l : Eval(n->b, env);
             }
-            Value l = Eval(n->a, env), r = Eval(n->b, env);
+            Value l = Eval(n->a, env);
+            rs.add(l);
+            Value r = Eval(n->b, env);
+            rs.add(r);
+            if (l.t == Value::Num && r.t == Value::Num)
+            {
+                if (op == L"+") return Value::Num_(l.n + r.n);
+                if (op == L"-") return Value::Num_(l.n - r.n);
+                if (op == L"*") return Value::Num_(l.n * r.n);
+                if (op == L"/") return Value::Num_(r.n != 0 ? l.n / r.n : 0);
+                if (op == L"<") return Value::Bool_(l.n < r.n);
+                if (op == L"<=") return Value::Bool_(l.n <= r.n);
+                if (op == L">") return Value::Bool_(l.n > r.n);
+                if (op == L">=") return Value::Bool_(l.n >= r.n);
+                if (op == L"==" || op == L"===") return Value::Bool_(l.n == r.n);
+                if (op == L"!=" || op == L"!==") return Value::Bool_(l.n != r.n);
+                if (op == L"%" || op == L"%=") return Value::Num_(r.n != 0 ? fmod(l.n, r.n) : 0);
+                unsigned int ua = (unsigned int)(INT_PTR)(long long)l.n;
+                unsigned int ub = (unsigned int)(INT_PTR)(long long)r.n;
+                if (op == L"&") return Value::Num_((double)(int)(ua & ub));
+                if (op == L"|") return Value::Num_((double)(int)(ua | ub));
+                if (op == L"^") return Value::Num_((double)(int)(ua ^ ub));
+                if (op == L"<<") return Value::Num_((double)(int)(ua << (ub & 31)));
+                if (op == L">>") return Value::Num_((double)(int)(ua >> (ub & 31)));
+                if (op == L">>>") return Value::Num_((double)((long long)(ua >> (ub & 31))));
+                if (op == L"**") return Value::Num_(pow(l.n, r.n));
+            }
             if (op == L"===")
                 return Value::Bool_(ValuesEqual(l, r, true));
             if (op == L"!==")
@@ -1691,10 +1918,10 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             {
                 if (l.t == Value::TableT || r.t == Value::TableT)
                     return l;   // table concat quirk; keep simple
-                return Value::Str_(l.ToString() + r.ToString());
+                return ConcatStrings(l, r);
             }
             if (op == L"++")
-                return Value::Str_(ToStringM(l) + ToStringM(r));  // string concat
+                return ConcatStrings(l, r);  // string concat
             // '+' concatenates whenever either operand is a
             // non-numeric string, or a string meets a non-string.
             // A numeric string plus a number stays arithmetic ('1 + "2"' -> 3).
@@ -1716,7 +1943,7 @@ Value Interp::EvalBin(const PNode& n, Env* env)
                     bool bLNum = !bLStr || bLN;
                     bool bRNum = !bRStr || bRN;
                     if (!(bLNum && bRNum))
-                        return Value::Str_(ToStringM(l) + ToStringM(r));
+                        return ConcatStrings(l, r);
                 }
             }
             if (op == L"+" || op == L"-" || op == L"*" || op == L"/" || op == L"%" || op == L"%=" ||
@@ -1838,11 +2065,49 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             return Value();
         }
 
+// ---- ConcatStrings ----
+// Official aardio strings are byte arrays, so the concat operator joins
+// BYTES. Nodio keeps text as wide chars and raw file data as one byte per
+// wchar, so concatenating a raw byte string with text must not re-encode
+// the bytes. When both operands are plain text the result stays wide text
+// (the common case); when a raw byte string takes part, the result is a
+// raw byte string holding the joined bytes.
+Value Interp::ConcatStrings(const Value& l, const Value& r)
+        {
+            Value lv = ToStringMValue(l);
+            Value rv = ToStringMValue(r);
+            auto isRaw = [](const Value& v) {
+                return v.t == Value::Str && (v.bRawBytes || v.bUtf16);
+            };
+            if (!isRaw(lv) && !isRaw(rv))
+                return Value::Str_(lv.ToString() + rv.ToString());
+            std::string bytes = StrByteForm(lv.t == Value::Str ? lv
+                                                              : Value::Str_(lv.ToString()));
+            bytes += StrByteForm(rv.t == Value::Str ? rv
+                                                     : Value::Str_(rv.ToString()));
+            wstring out((size_t)bytes.size(), 0);
+            for (size_t i = 0; i < bytes.size(); i++)
+                out[i] = (wchar_t)(unsigned char)bytes[i];
+            Value ret = Value::Str_(out);
+            ret.bRawBytes = true;
+            return ret;
+        }
+
 // ---- CmpLess ----
 bool Interp::CmpLess(const Value& l, const Value& r)
         {
             if (l.t == Value::Str && r.t == Value::Str)
-                return l.s < r.s;
+            {
+                // Official aardio compares strings byte by byte
+                // (docs/language-reference/operator/comparison.md: "从第一个
+                // 字符开始比较字节码大小"). Nodio stores strings either as
+                // wide text or as one-byte-per-wchar raw bytes, so compare the
+                // canonical byte form — otherwise a literal and the same bytes
+                // read back from a file would not compare equal.
+                if (l.bRawBytes == r.bRawBytes && l.bUtf16 == r.bUtf16)
+                    return l.s < r.s;
+                return StrByteForm(l) < StrByteForm(r);
+            }
             if (l.t == Value::Num && r.t == Value::Num)
                 return l.n < r.n;
             return false;
@@ -1920,7 +2185,15 @@ bool Interp::ValuesEqual(const Value& l, const Value& r, bool strict)
             case Value::Pointer:
                 return l.ptr == r.ptr;
             case Value::Str:
-                return l.s == r.s;
+                // Official aardio strings are byte arrays, so two strings are
+                // equal when their byte content matches. Nodio keeps two
+                // internal representations (wide text / one-byte-per-wchar
+                // raw bytes), so compare the canonical byte form; otherwise a
+                // literal and the same bytes read back from a file would not
+                // be equal even though their bytes are identical.
+                if (l.bRawBytes == r.bRawBytes && l.bUtf16 == r.bUtf16)
+                    return l.s == r.s;
+                return StrByteForm(l) == StrByteForm(r);
             case Value::TableT:
             case Value::Class:
                 if (l.tab == r.tab) return true;
@@ -1957,9 +2230,9 @@ Value Interp::ApplyOp(const wstring& op, const Value& l, const Value& r)
             if (op == L"!=")
                 return Value::Bool_(!ValuesEqual(l, r, false));
             if (op == L"..")
-                return Value::Str_(l.ToString() + r.ToString());
+                return ConcatStrings(l, r);
             if (op == L"++")
-                return Value::Str_(ToStringM(l) + ToStringM(r));   // string concat
+                return ConcatStrings(l, r);   // string concat
             if (op == L"+" || op == L"-" || op == L"*" || op == L"/" || op == L"%" || op == L"%=" ||
                 op == L"<<" || op == L">>" || op == L"<" || op == L"<=" || op == L">" || op == L">=")
             {
@@ -2035,6 +2308,10 @@ Value Interp::ApplyOp(const wstring& op, const Value& l, const Value& r)
 void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                       const wstring& op)
         {
+            // the assigned value lives in a C++ local while a metatable
+            // _set hook may run — keep it reachable for the collector
+            GcRootScope rs;
+            rs.add(v);
             Value val = v;
             val.mrets = nullptr;
             if (op == L":=" || op == L"::=")
@@ -2268,23 +2545,38 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 }
                 else if (obj.t == Value::TableT && obj.tab)
                 {
+                    if (target->str == L"_meta")
+                    {
+                        obj.tab->bExplicitMeta = (val.t != Value::Null);
+                    }
+                    else if (!obj.tab->bExplicitMeta && obj.tab->map.find(L"_meta") == obj.tab->map.end())
+                    {
+                        if (val.t == Value::Null)
+                            obj.tab->map.erase(target->str);
+                        else
+                            obj.tab->map[target->str] = val;
+                        return;
+                    }
+                    else
+                    {
+                        obj.tab->bExplicitMeta = true;
+                    }
                     // ctor-body member initialization (`this.x = v` while
                     // the object is being constructed) writes the instance
                     // table directly — the metatable's read-only guards
-                    // only apply after construction
+                    // only apply after construction.
+                    // The write must land on the instance being constructed:
+                    // after `this = other` (official instance replacement)
+                    // the ctor writes to `other`, which is a finished
+                    // object and must go through the metatable's _set.
                     bool bInit = false;
                     for (Env* e = env; e; e = e->parent.get())
                     {
-                        if (e->bInstInit)
+                        if (e->bInstInit && e->instTable &&
+                            obj.tab.get() == e->instTable)
                         {
-                            auto itT = e->vars.find(L"this");
-                            if (itT != e->vars.end() &&
-                                itT->second.t == Value::TableT &&
-                                itT->second.tab == obj.tab)
-                            {
-                                bInit = true;
-                                break;
-                            }
+                            bInit = true;
+                            break;
                         }
                     }
                     bool bHasPropSetter = false;
@@ -2342,6 +2634,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
             {
                 Value obj = Eval(target->a, env);
                 Value idx = Eval(target->b, env);
+                wstring idxKey = ObjectKeyOf(idx);
                 if ((obj.t == Value::TableT || obj.t == Value::Func || obj.t == Value::Class) && obj.tab)
                 {
                     bool bHasMeta = false;
@@ -2381,37 +2674,37 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                     long long numIdx = -1;
                     if (idx.t == Value::Num && idx.n == (long long)idx.n && idx.n >= 1)
                         numIdx = (long long)idx.n;
-                    else if (!idx.ToString().empty() && idx.ToString().find_first_not_of(L"0123456789") == wstring::npos)
-                        numIdx = _wtoi64(idx.ToString().c_str());
+                    else if (!idxKey.empty() && idxKey.find_first_not_of(L"0123456789") == wstring::npos)
+                        numIdx = _wtoi64(idxKey.c_str());
 
                     if (numIdx >= 1)
                     {
                         if ((size_t)numIdx <= obj.tab->arr.size())
                         {
                             obj.tab->arr[(size_t)(numIdx - 1)] = val;
-                            obj.tab->map.erase(idx.ToString());
+                            obj.tab->map.erase(idxKey);
                         }
                         else if ((size_t)(numIdx - 1) == obj.tab->arr.size())
                         {
                             if (val.t != Value::Null)
                                 obj.tab->arr.push_back(val);
-                            obj.tab->map.erase(idx.ToString());
+                            obj.tab->map.erase(idxKey);
                         }
                         else
                         {
                             if (val.t == Value::Null)
-                                obj.tab->map.erase(idx.ToString());
+                                obj.tab->map.erase(idxKey);
                             else
-                                obj.tab->map[idx.ToString()] = val;
+                                obj.tab->map[idxKey] = val;
                         }
                     }
                     else
                     {
                         if (val.t == Value::Null)
-                            obj.tab->map.erase(idx.ToString());
+                            obj.tab->map.erase(idxKey);
                         else
                         {
-                            if (idx.ToString() == L"_struct" && val.t == Value::Str)
+                            if (idxKey == L"_struct" && val.t == Value::Str)
                             {
                                 auto itCur = obj.tab->map.find(L"_struct");
                                 if (itCur != obj.tab->map.end() && itCur->second.t == Value::Str)
@@ -2426,7 +2719,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                                     }
                                 }
                             }
-                            obj.tab->map[idx.ToString()] = val;
+                            obj.tab->map[idxKey] = val;
                         }
                     }
                 }
@@ -2451,19 +2744,146 @@ Value Interp::ExecBlockScoped(const PNode& blk, Env* env)
     // closure captures and namespace-member fallbacks must still see the
     // enclosing scope's namespace/module tables through Find()'s parent walk,
     // so they are intentionally NOT copied into the child frame.
-    return ExecBlock(blk, child.get());
+    GcFrameScope fs(*this, child);
+    Value res = ExecBlock(blk, child.get());
+    CleanDeadEnv(child);
+    return res;
 }
+
+// ---- GC ----
+void Interp::CollectGarbage(Env* env)
+        {
+            if (bInGC) return;
+            long before = g_liveTables + g_liveEnvs;
+            GcCollect(*this, env);
+            nGCRuns++;
+            nLastGCTick = g_gcAllocTick;
+            nGCFreed = before - (g_liveTables + g_liveEnvs);
+            // Pace the collector by the size of the live set: a sweep
+            // costs O(live objects), so it must not run more often than
+            // the live set grows. A sweep that frees nothing backs off.
+            //
+            // The floor matters a lot in a GUI: a repaint allocates
+            // hundreds of objects, so a 2000-allocation floor made the
+            // collector run 30 times a second - each sweep still pays the
+            // finalizer calls, which are far more expensive than the mark
+            // phase itself.
+            long live = g_liveTables + g_liveEnvs;
+            long want = live * 2;
+            if (want < 20000) want = 20000;
+            if (want > 400000) want = 400000;
+            if (nGCFreed <= 0)
+            {
+                nGCThreshold = want * 2;
+                if (nGCThreshold > 800000) nGCThreshold = 800000;
+            }
+            else
+            {
+                nGCThreshold = want;
+            }
+        }
+
+void Interp::MaybeCollectGC(Env* env)
+        {
+            if (bInGC)
+            {
+                static int s_nBusy = 0;
+                if (EnvFlag(L"NODIO_GC_TRACE") && s_nBusy++ < 5)
+                {
+                    fwprintf(stderr, L"[GC] skip: bInGC\n");
+                    fflush(stderr);
+                }
+                return;
+            }
+            // NODIO_GC_THRESHOLD=0 disables automatic collection (the
+            // explicit collectgarbage() call still works)
+            // -2 = not read yet, -1 = automatic (adaptive threshold),
+            //  0 = disabled, >0 = fixed allocation threshold.
+            // NOTE: the "not set" default must NOT be 0 — 0 means
+            // "disabled" below, and using it as the default silently
+            // turned the automatic collector off for every script.
+            static long s_fixed = -2;
+            if (s_fixed == -2)
+            {
+                s_fixed = -1;
+                wchar_t szThr[32] = L"";
+                if (GetEnvironmentVariableW(L"NODIO_GC_THRESHOLD", szThr, 32) > 0)
+                    s_fixed = _wtol(szThr);
+                if (s_fixed < 0) s_fixed = -1;
+            }
+            if (s_fixed == 0) return;
+            if (s_fixed > 0)
+            {
+                if (g_gcAllocTick - nLastGCTick < s_fixed) return;
+                CollectGarbage(env);
+                return;
+            }
+            if (g_gcAllocTick - nLastGCTick < nGCThreshold)
+            {
+                static int s_nSkip = 0;
+                if (EnvFlag(L"NODIO_GC_TRACE") && s_nSkip++ < 5)
+                {
+                    fwprintf(stderr, L"[GC] skip: threshold=%ld alloc=%ld last=%ld\n",
+                             nGCThreshold, (long)g_gcAllocTick.load(), nLastGCTick);
+                    fflush(stderr);
+                }
+                return;
+            }
+            CollectGarbage(env);
+        }
+
+    // A breakpoint (and a single step) belongs to the script the user
+    // asked to run. The official library is imported at runtime and its
+    // line numbers collide with the user's script - library line 3 is a
+    // namespace statement, and the builtins run hundreds of lines deep -
+    // so a bare line number must not stop inside an imported module.
+    // g_curModuleFile is empty while the main program (and the functions
+    // defined in it) run, and holds the module path while a library
+    // module executes.
+    static bool InUserScript()
+    {
+        return g_curModuleFile.empty();
+    }
 
 Value Interp::ExecBlock(const PNode& blk, Env* env)
         {
             Value last;
+            // The block result lives in a C++ local: the collector cannot
+            // see it, so it keeps a slot in the root stack for the whole
+            // block and refreshes it after every statement.
+            size_t lastRoot = g_gcRoots.size();
+            g_gcRoots.push_back(last);
             for (auto& st : blk->list)
             {
                 if (st->line > 0)
                     nErrLine = st->line;
-                if (bDebug && st->line > 0 &&
+                // S-2: remember the file that owns the statement being
+                // executed.  The report points (try/catch, top-level report)
+                // read it when they append " @ <file>:<line>", and by then
+                // the frames may already be gone — so the file is kept as a
+                // copy, refreshed whenever the executing frame changes.
+                {
+                    const wstring* pf = SourceFilePtrOfEnv(env);
+                    if (pf)
+                    {
+                        if (strErrFile != *pf) strErrFile = *pf;
+                    }
+                    else if (!strErrFile.empty())
+                    {
+                        strErrFile.clear();
+                    }
+                }
+                if (bDebug && st->line > 0 && InUserScript() &&
                     (bStep || breakpoints.count(st->line)))
+                {
+                    // "next"/"step" from a DAP session stops exactly once —
+                    // clear the one-shot flag before serving the stop so a
+                    // subsequent continue really continues
+                    bool bOnce = bStep;
+                    if (bOnce) bStep = false;
                     DebugStop(st->line, env);
+                    (void)bOnce;
+                }
                 if (!err->empty())
                     break;
                 static bool bDbg = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
@@ -2472,10 +2892,17 @@ Value Interp::ExecBlock(const PNode& blk, Env* env)
                     fwprintf(stderr, L"[RUN] %s:%d k=%d\n", g_curModuleFile.c_str(), st->line, (int)st->k);
                     fflush(stderr);
                 }
+                // statement boundary — the collector's safe point: no
+                // half-evaluated expression is live on the C++ stack here
+                g_gcEpochStack.push_back(++g_gcEpoch);
+                MaybeCollectGC(env);
                 last = Exec(st, env);
+                g_gcEpochStack.pop_back();
+                g_gcRoots[lastRoot] = last;
                 if (nBreak || nContinue || nReturn || !err->empty())
                     break;
             }
+            g_gcRoots.resize(lastRoot);
             return last;
         }
 
@@ -2506,6 +2933,7 @@ Value Interp::EvalClass(const PNode& n, Env* env)
             classEnv->nsTable = tb;
             classEnv->bNsBody = true;
             classEnv->vars[L"self"] = vClass;
+            GcFrameScope fsClass(*this, classEnv);
             for (auto& st : n->a->list)
             {
                 wstring prevErr = err ? *err : L"";
@@ -2557,9 +2985,23 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                 Env* eNs = env;
                 while (eNs && !eNs->nsTable) eNs = eNs->parent.get();
                 if (eNs && !n->bRoot)
+                {
+                    if (g_nsTrace)
+                    {
+                        fwprintf(stderr, L"[NS]   class '%s' -> nsTable=%p\n",
+                                 n->names[0].c_str(), (void*)eNs->nsTable.get());
+                        fflush(stderr);
+                    }
                     eNs->nsTable->map[n->names[0]] = vClass;
+                }
                 else
                 {
+                    if (g_nsTrace)
+                    {
+                        fwprintf(stderr, L"[NS]   class '%s' -> GLOBALS (no nsTable in env chain)\n",
+                                 n->names[0].c_str());
+                        fflush(stderr);
+                    }
                     globals.vars[n->names[0]] = vClass;
                     roots[n->names[0]] = vClass;
                 }
@@ -2821,6 +3263,15 @@ Value Interp::Exec(const PNode& n, Env* env)
             case Node::Namespace:
             {
                 Value ns = NsPath(n->names, env, n->bRoot);
+                if (g_nsTrace)
+                {
+                    wstring p;
+                    for (size_t i = 0; i < n->names.size(); i++)
+                        p += (i ? L"." : L"") + n->names[i];
+                    fwprintf(stderr, L"[NS] open '%s' root=%d -> tab=%p type=%d\n",
+                             p.c_str(), (int)n->bRoot, (void*)ns.tab.get(), (int)ns.t);
+                    fflush(stderr);
+                }
                 if (!ns.tab)
                     return Value();
                 ns.tab->map[L"self"] = ns;
@@ -2832,6 +3283,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 nsEnv->vars[L"self"] = ns;
                 for (auto& kv : ns.tab->scopeVars)
                     nsEnv->vars[kv.first] = kv.second;
+                GcFrameScope fsNs(*this, nsEnv);
                 Value r = ExecBlock(n->a, nsEnv.get());
                 for (auto& kv : nsEnv->vars)
                     ns.tab->scopeVars[kv.first] = kv.second;
@@ -2852,6 +3304,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 if (v.t == Value::TableT && v.tab)
                     local->nsTable = v.tab;
                 local->vars[L"owner"] = v;
+                GcFrameScope fs(*this, local);
                 return ExecBlock(n->b, local.get());
             }
             case Node::DoWhile:
@@ -2974,6 +3427,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 loopEnv->parent = env ? env->self : globals.self;
                 loopEnv->nsTable = env ? env->nsTable : nullptr;
                 loopEnv->modTable = env ? env->modTable : nullptr;
+                GcFrameScope fsLoop(*this, loopEnv);
 
                 // Loop variable is strictly local to the for loop.
                 // It does not mutate outer variables with the same name.
@@ -3033,6 +3487,22 @@ Value Interp::Exec(const PNode& n, Env* env)
                     dStep = -BNum(Eval(n->c->a->a, loopEnv.get()));
                     if (dStep < 0) nDir = -1;
                 }
+                // The loop variable must be looked up BY KEY on every access.
+                // `loopEnv->vars` is an unordered_map: a `var` declared inside
+                // the loop body inserts a new element, and the resulting
+                // rehash invalidates every node pointer. A cached
+                // `Value*` would then point at freed memory — the loop
+                // counter would read/write garbage and assignments made in
+                // the body would silently vanish. Re-resolving the slot
+                // keeps the counter correct no matter how the body mutates
+                // the environment.
+                auto findLoopVar = [&]() -> Value* {
+                    if (loopVarName.empty()) return nullptr;
+                    auto it = loopEnv->vars.find(loopVarName);
+                    return (it == loopEnv->vars.end()) ? nullptr : &it->second;
+                };
+                bool bConstLimit = bLimitForm && n->b && n->b->k == Node::Num;
+                double dConstLimit = bConstLimit ? n->b->num : 0;
                 // When step is omitted, default step is ALWAYS 1 (forward).
                 // Descending loops require an explicit negative step (e.g. `for(i=10;1;-1)`).
                 auto bContinue = [&]() -> bool {
@@ -3040,14 +3510,13 @@ Value Interp::Exec(const PNode& n, Env* env)
                         return true;        // empty condition slot: forever
                     if (!bLimitForm)
                         return Eval(n->b, loopEnv.get()).Truthy();
-                    if (!loopVarName.empty())
+                    Value* pLoopVar = findLoopVar();
+                    if (pLoopVar)
                     {
-                        Value* pv = loopEnv->Find(loopVarName);
-                        if (pv && pv->t == Value::Num)
+                        if (pLoopVar->t == Value::Num)
                         {
-                            Value lim = Eval(n->b, loopEnv.get());
-                            return nDir >= 0 ? pv->n <= BNum(lim)
-                                             : pv->n >= BNum(lim);
+                            double lim = bConstLimit ? dConstLimit : BNum(Eval(n->b, loopEnv.get()));
+                            return nDir >= 0 ? pLoopVar->n <= lim : pLoopVar->n >= lim;
                         }
                         return false;
                     }
@@ -3057,9 +3526,8 @@ Value Interp::Exec(const PNode& n, Env* env)
                         Value* pv = loopEnv->Find(n->a->a->str);
                         if (pv && pv->t == Value::Num)
                         {
-                            Value lim = Eval(n->b, loopEnv.get());
-                            return nDir >= 0 ? pv->n <= BNum(lim)
-                                             : pv->n >= BNum(lim);
+                            double lim = bConstLimit ? dConstLimit : BNum(Eval(n->b, loopEnv.get()));
+                            return nDir >= 0 ? pv->n <= lim : pv->n >= lim;
                         }
                         return false;
                     }
@@ -3085,18 +3553,18 @@ Value Interp::Exec(const PNode& n, Env* env)
                             Value vS = Eval(n->c->a, loopEnv.get());
                             if (vS.t == Value::Num) dStep = vS.n;
                         }
-                        if (!loopVarName.empty())
+                        Value* pLoopVar = findLoopVar();
+                        if (pLoopVar)
                         {
-                            Value* pv = loopEnv->Find(loopVarName);
-                            if (pv && pv->t == Value::Num)
-                                *pv = Value::Num_(pv->n + dStep);
+                            if (pLoopVar->t == Value::Num)
+                                pLoopVar->n += dStep;
                         }
                         else if (n->a && n->a->k == Node::Assign && n->a->a &&
                             n->a->a->k == Node::Ident)
                         {
                             Value* pv = loopEnv->Find(n->a->a->str);
                             if (pv && pv->t == Value::Num)
-                                *pv = Value::Num_(pv->n + dStep);
+                                pv->n += dStep;
                         }
                     }
                     else if (n->c)
@@ -3122,7 +3590,11 @@ Value Interp::Exec(const PNode& n, Env* env)
             }
             case Node::ForIn:
             {
+                // the iterator and the iteration result live in C++ locals
+                // across the loop body — keep them reachable
+                GcRootScope rs;
                 Value it = Eval(n->a, env);
+                rs.add(it);
                 // iterator function: official for-in calls it with no args
                 // until the primary return is null; extra returns bind to
                 // the second loop variable (`return k, v`). Iterator
@@ -3137,6 +3609,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                         // they have no AST body
                         Value r = it.native ? it.native(iterArgs)
                                             : CallVmFunc(it, iterArgs);
+                        rs.add(r);
                         if (r.t == Value::Null)
                             return Value();
                         auto iterEnv = std::make_shared<Env>();
@@ -3153,9 +3626,9 @@ Value Interp::Exec(const PNode& n, Env* env)
                             rm.mrets = nullptr;
                             iterEnv->vars[n->names[ni]] = rm;
                         }
+                        GcFrameScope fsIter(*this, iterEnv);
                         Value rb = ExecBlock(n->b, iterEnv.get());
-                        if (nBreak) { nBreak--; return Value(); }
-                        if (nContinue) { nContinue--; }
+                        if (nBreak) { nBreak--; return Value(); }                        if (nContinue) { nContinue--; }
                         if (nReturn) { ret = rb; return ret; }
                         iterArgs = { r0 };
                     }
@@ -3169,6 +3642,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     iterEnv->vars[n->names[0]] = Value::Str_(k);
                     if (n->names.size() > 1)
                         iterEnv->vars[n->names[1]] = v;
+                    GcFrameScope fsStep(*this, iterEnv);
                     Value r = ExecBlock(n->b, iterEnv.get());
                     if (nBreak) { nBreak--; return 1; }
                     if (nContinue) { nContinue--; return 0; }
@@ -3183,7 +3657,15 @@ Value Interp::Exec(const PNode& n, Env* env)
                 }
                 vector<wstring> keys;   // snapshot: body may mutate the map
                 for (auto& kv : it.tab->map)
+                {
+                    // The metatable is NOT a member in official aardio —
+                    // `t@` reaches it, but it never shows up when the
+                    // members are iterated (table.keys / json.stringify
+                    // iterate the members, and a visible "_meta" would
+                    // leak the metatable into the JSON output).
+                    if (kv.first == L"_meta") continue;
                     keys.push_back(kv.first);
+                }
                 for (auto& k : keys)
                 {
                     auto itv = it.tab->map.find(k);
@@ -3205,6 +3687,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                             iterEnv->vars[n->names[0]] = vk;
                             if (n->names.size() > 1)
                                 iterEnv->vars[n->names[1]] = v;
+                            GcFrameScope fsKey(*this, iterEnv);
                             Value r = ExecBlock(n->b, iterEnv.get());
                             if (nBreak) { nBreak--; return Value(); }
                             if (nContinue) { nContinue--; continue; }
@@ -3225,6 +3708,12 @@ Value Interp::Exec(const PNode& n, Env* env)
                 {
                     wstring msg = *err;
                     err->clear();
+                    // S-2: a caught error must carry its location too — the
+                    // catch block may print it, and the frames that raised
+                    // it are already unwinding.  strErrFile still holds the
+                    // file of the statement that failed.
+                    if (nErrLine > 0 && !HasErrorLocation(msg))
+                        AppendErrorLocation(&msg, strErrFile, nErrLine);
                     if (!n->b)
                         return Value();   // catch-less try{}: swallow
                     auto cEnv = std::make_shared<Env>();
@@ -3232,6 +3721,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     cEnv->parent = env ? env->self : globals.self;
                     if (!n->names.empty())
                         cEnv->vars[n->names[0]] = Value::Str_(msg);
+                    GcFrameScope fsCatch(*this, cEnv);
                     ExecBlock(n->b, cEnv.get());
                 }
                 return Value();
@@ -3294,6 +3784,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 auto inner = std::make_shared<Env>();
                 inner->self = inner;
                 inner->parent = env ? env->self : globals.self;
+                GcFrameScope fsInner(*this, inner);
                 return ExecBlock(n, inner.get());
             }
             default:
@@ -3334,6 +3825,15 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
             if (curNs)
             {
                 auto it = curNs->map.find(names[0]);
+                if (g_nsTrace)
+                {
+                    fwprintf(stderr, L"[NS]   resolve '%s' in curNs=%p -> %s\n",
+                             names[0].c_str(), (void*)curNs.get(),
+                             (it == curNs->map.end()) ? L"MISS(create)"
+                                 : (it->second.t == Value::TableT || it->second.t == Value::Class)
+                                   ? L"HIT" : L"HIT(other)");
+                    fflush(stderr);
+                }
                 if (it != curNs->map.end() && (it->second.t == Value::TableT || it->second.t == Value::Class) && it->second.tab)
                 {
                     ns = it->second;
@@ -3423,6 +3923,12 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;
             local->vars[L"owner"] = Value();   // native-side call: no owner
+            // the callee frame and the call arguments live in C++ locals
+            // — the collector needs them as roots
+            gcFrames.push_back(local);
+            GcRootScope rs;
+            rs.add(f);
+            rs.addAll(args);
             for (size_t i = 0; i < f.params.size(); i++)
             {
                 if (i < args.size() && args[i].t != Value::Null)
@@ -3467,6 +3973,9 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             nBreak = oldB;
             nContinue = oldC;
             ret = oldRet;
+            GcFrameCheck(gcFrames, local.get(), "callVmFunc");
+            gcFrames.pop_back();
+            CleanDeadEnv(local);
             return r;
         }
 }

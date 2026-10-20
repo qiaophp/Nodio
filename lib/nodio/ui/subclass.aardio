@@ -1,0 +1,97 @@
+// nodio.ui.subclass — 窗口子类化（标准库实现）。
+//
+// 为什么自己实现，不用官方 win.subclass：
+//   官方 win.subclass 走 `::SetWindowPointer` / `::CallWindowProc`，
+//   而 Nodio 引擎的 `::` 目前只解析引擎内置/已注册的符号
+//   （只有 raw.loadDll(...).api(name, sig) 能按签名调任意 API），
+//   所以官方那份在 Nodio 里直接报「尝试调用非函数值 (.SetWindowPointer)」。
+//
+// 为什么不用「每个窗口一个 trampoline」：
+//   引擎侧已经把原生回调改成官方契约的 cdata 对象（raw.tostdcall 返回
+//   cdata，脚本丢掉最后一个引用后 GC 会释放跳板与闭包，见引擎 E-11 修复），
+//   所以「每个窗口一个跳板」不再泄漏。但官方 win.subclass 的做法是每个
+//   窗口一个 trampoline + 一张 __wndproc_gc__ 持有表；这里让所有子类化
+//   窗口共用**一个** trampoline，按 hwnd 分发，窗口销毁时（WM_DESTROY）
+//   自动还原窗口过程并删除记录 —— 控件加多少都不增加跳板数量。
+//
+// 用法：
+//   var sub = nodio.ui.subclass(hwnd, function(hwnd,msg,wp,lp){ ... });
+//   sub.free();                       // 主动取消子类化
+//   // 回调返回 null 表示「没处理」，交给原来的窗口过程
+namespace nodio.ui{
+import raw;
+
+var __u32 = null;
+var __setWndProc = null;
+var __callWndProc = null;
+var __thunk = 0;
+var __subs = {};     // hwnd -> {proc=..; prev=..}
+
+__init = function(){
+	if(__u32) return true;
+	__u32 = ..raw.loadDll("user32.dll");
+	if(!__u32) return false;
+	// 64 位下窗口过程是 64 位指针，必须用 SetWindowLongPtrW；
+	// 32 位 user32 根本不导出 SetWindowLongPtrW（微软把它定义成
+	// SetWindowLong 的宏），只有 SetWindowLongW —— 按位数选。
+	// （api() 找不到导出时直接抛错，没法先试后回退。）
+	var arch = ..string.getenv("PROCESSOR_ARCHITECTURE");
+	if(arch == "AMD64"){
+		__setWndProc = __u32.api("SetWindowLongPtrW",
+			"addr(addr hwnd,int index,addr wndproc)");
+	}
+	else{
+		__setWndProc = __u32.api("SetWindowLongW",
+			"addr(addr hwnd,int index,addr wndproc)");
+	}
+	__callWndProc = __u32.api("CallWindowProcW",
+		"addr(addr prev,addr hwnd,int msg,addr wparam,addr lparam)");
+	if(!__setWndProc || !__callWndProc) return false;
+	// 共享 trampoline：所有子类化窗口共用，按 hwnd 分发
+	__thunk = ..raw.tostdcall(__dispatch,
+		"int64(addr hwnd,int msg,addr wparam,addr lparam)");
+	return __thunk != 0;
+}
+
+__restore = function(hwnd){
+	var s = __subs[hwnd];
+	if(!s) return;
+	__subs[hwnd] = null;      // 键是数字，不会钉住任何对象
+	if(__setWndProc && s.prev) __setWndProc(hwnd, -4, s.prev);
+}
+
+// 原生 trampoline 的脚本侧入口
+__dispatch = function(hwnd,msg,wp,lp){
+	var s = __subs[hwnd];
+	if(!s) return 0;
+	var r = null;
+	if(s.proc) r = s.proc(hwnd,msg,wp,lp);
+	if(msg == 0x2) __restore(hwnd);     // WM_DESTROY：还原窗口过程
+	if(r !== null) return r;
+	return __callWndProc(s.prev, hwnd, msg, wp, lp);
+}
+
+// subclass(hwnd, proc) -> {hwnd=..; free=..} ；失败返回 null
+subclass = function(hwnd, proc){
+	if(!__init()) return null;
+	hwnd = tonumber(hwnd);
+	if(!hwnd) return null;
+	if(__subs[hwnd]) return null;        // 已经子类化过了
+	var prev = __setWndProc(hwnd, -4, __thunk);
+	if(!prev) return null;
+	__subs[hwnd] = {proc=proc; prev=prev};
+	return {
+		hwnd = hwnd;
+		free = function(){
+			__restore(hwnd);
+		}
+	};
+}
+
+// 是否已经子类化
+isSubclassed = function(hwnd){
+	hwnd = tonumber(hwnd);
+	return __subs[hwnd] ? true : false;
+}
+
+}

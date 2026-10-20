@@ -1,0 +1,283 @@
+// nodio.ui.toolbar — 工具条（**自绘**：一排扁平文字/图标按钮）。
+//
+// 为什么不用原生 button 控件：
+//   目标外观（aar.chengxu.online/thread-903.htm 的现代 IDE）里工具条是
+//   深色底上的一排描边图标按钮，扁平、无边框、悬停才出底色 ——
+//   原生 button 控件做不出来（浅灰 3D 边框），所以整条自己画。
+//
+// 排列顺序必须自己记（items 是哈希表，遍历顺序不确定），否则按钮会随机排列。
+//
+// 坐标：物理像素。尺寸常量按逻辑像素写，用 nodio.ui.px() 换算 ——
+// 系统 150% 时工具条高度、按钮宽度、图标大小一起放大。
+//
+// 用法：
+//   tb = nodio.ui.toolbar(winform, {height=28; buttons={{text="新建";name="new";command=fn}}})
+//   tb.add({text="保存";name="save";command=fn})
+//   tb.setText("save", "全部保存")
+//   tb.layout(0,0,winWidth,28)
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.rect;
+import nodio.ui.theme;
+import nodio.ui.icons;
+import nodio.ui.dpi;
+
+var __tbSeq = 0;
+
+toolbar = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	// 设计常量（逻辑像素）
+	var PAD_L   = 4;    // 左侧留白
+	var GAP     = 2;    // 按钮之间的间距
+	var ICON_W  = 30;   // 纯图标按钮宽度
+	var TXT_W   = 72;   // 文字按钮宽度
+	var ICON    = 14;   // 图标边长
+	var SEP_W   = 9;    // 分隔线占位
+	var SEP_PAD = 3;    // 分隔线左右留白
+	var SEP_IN  = 6;    // 分隔线上下留白
+	var TXT_PAD = 8;    // 文字左留白
+	var self = {
+		winform = winform;
+		board = null;
+		height  = ..nodio.ui.px(opt.height : 28);
+		rect    = opt.rect;
+		items   = {};     // name → 按钮定义
+		buttons = {};     // name → 兼容旧接口的轻量包装
+		order   = {};     // 排列顺序 {kind="btn"/"sep"; name=..}
+		rects   = {};     // name → {left;right}
+		hover   = 0;      // 悬停的按钮名
+		pressed = 0;
+		onHover = null;   // function(name, text) — 悬停提示
+		// 配色
+		bgColor     = opt.bgColor : th.bg;
+		textColor   = opt.textColor : th.text;
+		dimColor    = opt.dimColor : th.textDim;
+		hoverColor  = opt.hoverColor : th.hoverBg;
+		pressedColor= opt.pressedColor : th.selBg;
+		lineColor   = opt.lineColor : th.border;
+		accentColor = opt.accentColor : th.accent;
+	};
+
+	__tbSeq = __tbSeq + 1;
+	var seq = __tbSeq;
+
+	// 兼容旧接口：返回一个带 getRect/hwnd 的轻量包装
+	var mkStub = function(self, name){
+		return {
+			name = name;
+			hwnd = self.board ? self.board.ctrl.hwnd : null;
+			getRect = function(){
+				var r = self.rects[name];
+				if(!r) return null;
+				return {left=r.left; top=self.rect.top; right=r.right; bottom=self.rect.bottom};
+			};
+			show = function(flag){};
+			enabled = true;
+		};
+	}
+
+	self.add = function(item){
+		var name = item.name : ("tb" + seq + "_" + (#self.items + 1));
+		self.items[name] = {
+			name = name;
+			text = item.text : "";
+			// 有图标就是纯图标按钮（对齐参考 IDE 的工具条）；没有图标才画文字
+			icon = item.icon;
+			width = ..nodio.ui.px(item.width : (item.icon ? ICON_W : TXT_W));
+			command = item.command;
+			enabled = item.enabled : true;
+			visible = true;
+		};
+		self.buttons[name] = mkStub(self, name);
+		..table.push(self.order, {kind="btn"; name=name});
+		self.layout();
+		return self.buttons[name];
+	}
+
+	// 加一条分隔线
+	self.addSeparator = function(){
+		..table.push(self.order, {kind="sep"});
+		self.layout();
+		return null;
+	}
+
+	self.setText = function(name, text){
+		var it = self.items[name];
+		if(!it) return;
+		it.text = text;
+		self.board.invalidate();
+	}
+
+	self.setEnabled = function(name, flag){
+		var it = self.items[name];
+		if(!it) return;
+		it.enabled = flag ? true : false;
+		self.board.invalidate();
+	}
+
+	self.setVisible = function(name, flag){
+		var it = self.items[name];
+		if(!it) return;
+		it.visible = flag ? true : false;
+		self.layout();
+	}
+
+	// 按顺序排布
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		if(!self.board) return;
+		self.board.layout(l, t, r, b);
+		var x = l + ..nodio.ui.px(PAD_L);
+		var h = b - t;
+		var pGap = ..nodio.ui.px(GAP);
+		var pSepW = ..nodio.ui.px(SEP_W);
+		var pSepPad = ..nodio.ui.px(SEP_PAD);
+		self.sepRects = {};
+		for(i=1;#self.order;1){
+			var e = self.order[i];
+			if(e.kind == "sep"){
+				self.sepRects[#self.sepRects + 1] = {x=x + pSepPad};
+				x = x + pSepW;
+				continue;
+			}
+			var it = self.items[e.name];
+			if(!it) continue;
+			if(!it.visible){
+				self.rects[e.name] = null;
+				continue;
+			}
+			var w = it.width;
+			self.rects[e.name] = {left=x; right=x + w};
+			x = x + w + pGap;
+		}
+		self.board.invalidate();
+	}
+
+	// 命中测试：x → 按钮名
+	self.__hit = function(x){
+		for(i=1;#self.order;1){
+			var e = self.order[i];
+			if(e.kind != "btn") continue;
+			var r = self.rects[e.name];
+			if(!r) continue;
+			if(x >= r.left && x < r.right) return e.name;
+		}
+		return null;
+	}
+
+	// 绘制
+	self.__draw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var h = rc.bottom - rc.top;
+		var pICON = ..nodio.ui.px(ICON);
+		var pSepIn = ..nodio.ui.px(SEP_IN);
+		var pTxtPad = ..nodio.ui.px(TXT_PAD);
+		var bg = ..gdip.solidBrush(self.bgColor);
+		graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, h);
+		bg.delete();
+		// 分隔线
+		if(self.sepRects){
+			var spen = ..gdip.pen(self.lineColor, 1);
+			for(i=1;#self.sepRects;1){
+				graphics.drawLine(spen, self.sepRects[i].x, rc.top + pSepIn,
+					self.sepRects[i].x, rc.bottom - pSepIn);
+			}
+			spen.delete();
+		}
+		for(i=1;#self.order;1){
+			var e = self.order[i];
+			if(e.kind == "sep") continue;
+			var it = self.items[e.name];
+			if(!it) continue;
+			var rr = self.rects[e.name];
+			if(!rr) continue;
+			if(e.name == self.pressed){
+				var pb = ..gdip.solidBrush(self.pressedColor);
+				graphics.fillRect(pb, rr.left, rc.top, rr.right - rr.left, h);
+				pb.delete();
+			}
+			elseif(e.name == self.hover){
+				var hb = ..gdip.solidBrush(self.hoverColor);
+				graphics.fillRect(hb, rr.left, rc.top, rr.right - rr.left, h);
+				hb.delete();
+			}
+			var brush = ..gdip.solidBrush(it.enabled ? self.textColor : self.dimColor);
+			if(it.icon){
+				// 纯图标按钮：图标居中
+				..nodio.ui.drawIcon(graphics, it.icon,
+					rr.left + (rr.right - rr.left) / 2 - pICON / 2,
+					rc.top + (h - pICON) / 2, ICON,
+					it.enabled ? self.textColor : self.dimColor);
+			}
+			else{
+				graphics.drawString(it.text, font,
+					::RECTF(rr.left + pTxtPad, rc.top, rr.right - rr.left - pTxtPad*2, h),
+					fmt, brush);
+			}
+			brush.delete();
+		}
+	}
+
+	// 画板
+	var r0 = opt.rect : {left=0; top=0; right=400; bottom=self.height};
+	self.board = nodio.ui.board(winform, {
+		left = r0.left; top = r0.top; right = r0.right; bottom = r0.bottom;
+		fontSize = opt.fontSize : 12;
+	});
+	self.ctrl = self.board.ctrl;
+	self.board.onDraw = function(graphics, rc, bd){
+		self.__draw(graphics, rc, bd);
+	}
+	self.board.onMouseMove = function(x, y, bd){
+		var n = self.__hit(x);
+		if(n != self.hover){
+			self.hover = n;
+			self.board.invalidate();
+			// 悬停时把按钮文字报给宿主（宿主可以显示到状态栏当提示）
+			if(self.onHover){
+				var it = self.items[n];
+				self.onHover(n, it ? it.text : null);
+			}
+		}
+	}
+	self.board.onMouseDown = function(x, y, bd){
+		var n = self.__hit(x);
+		self.pressed = n;
+		self.board.invalidate();
+	}
+	self.board.onMouseUp = function(x, y, bd){
+		var n = self.pressed;
+		self.pressed = 0;
+		self.board.invalidate();
+		if(n && n == self.__hit(x)){
+			var it = self.items[n];
+			if(it && it.enabled && it.command) it.command();
+		}
+	}
+	self.board.onMouseClick = function(x, y, bd){
+		// 点击已在 onMouseUp 里处理，这里只负责把 hover 复位
+		self.hover = 0;
+		self.board.invalidate();
+	}
+
+	// 初始按钮
+	var list = opt.buttons : {};
+	for(i=1;#list;1){
+		var it = list[i];
+		if(it.sep){
+			self.addSeparator();
+			continue;
+		}
+		self.add(it);
+	}
+	self.layout();
+	return self;
+}
+}

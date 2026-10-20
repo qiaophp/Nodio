@@ -1,0 +1,8 @@
+import process.vswhere;
+import console.int;
+console.open()
+
+process.vswhere.build(
+"~\lib\dotNet\.res\aardio.Interop.csproj"
+,,"Rebuild"
+)

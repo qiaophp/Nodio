@@ -1,0 +1,212 @@
+// nodio.ui.prompt — 通用输入提示条（标题 + 输入框 + 确定/取消）。
+//
+// IDE 里凡是「要用户输入一行」的场景都走它：
+//   · 转到行（Ctrl+G）
+//   · 以后接「重命名」「新建文件」「查找条件」也很自然
+//
+// 不用官方 win.inputBox：那套走 win.form 的 doModal/endModal，
+// 在 Nodio 上没验证过（模态 + 树遍历解释器很容易重入出问题）；
+// 自己画一条提示条则完全可控，风格也跟着深色主题走。
+//
+// 坐标：**物理像素**（与 nodio.ui.board 一致）。
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.rect;
+import nodio.ui.dpi;
+import nodio.ui.theme;
+import nodio.ui.subclass;
+import gdip;
+
+var __pmSeq = 0;
+
+prompt = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	var self = {
+		winform = winform;
+		board = null;
+		ed = null;
+		sub = null;
+		rect = opt.rect;
+		visible = false;
+		title = opt.title : "输入";
+		defText = opt.defText : "";
+		hover = 0;            // 0=无 1=确定 2=取消
+		onOk = null;          // function(text) —— 返回 false 表示不关闭
+		onCancel = null;
+	};
+
+	__pmSeq = __pmSeq + 1;
+	var W = 460, H = 34;    // 逻辑像素
+
+	self.board = nodio.ui.board(winform, {
+		left = 0; top = 0; right = W; bottom = H;
+		fontSize = 12;
+		z = 70;
+		// transparent：plus 控件默认把**父窗口背景**整块拷进自己的画板，
+		// 提示条是浮在 richedit 上面的 —— 父窗口背景在 richedit 之下，
+		// 自绘内容会被 richedit 盖住（提示条变成一片空白）。
+		transparent = true;
+	});
+	self.ed = ..nodio.ui.addCtrl(winform, "promptEd" ++ __pmSeq, {
+		cls="edit";left=0;top=0;right=200;bottom=24;
+	});
+
+	// 深色化输入框
+	try{ self.ed.color = ..nodio.ui.themeRef(th.text) }catch(e){};
+	try{
+		::SendMessage(self.ed.hwnd, 0x443/*_EM_SETBKGNDCOLOR*/, 0,
+			..nodio.ui.themeRef(th.bgSecondary));
+	}catch(e1){};
+
+	// 回车 = 确定，Esc = 取消
+	self.sub = ..nodio.ui.subclass(self.ed.hwnd, function(hwnd,msg,wp,lp){
+		if(msg == 0x100){
+			var vk = tonumber(wp);
+			if(vk == 0x0D){ self.__ok(); return 1 }
+			if(vk == 0x1B){ self.close(); return 1 }
+		}
+		return null;
+	});
+
+	// ---------- 几何 ----------
+	// 按钮矩形用**数组**存（每项 {name; left; right; top; bottom}）。
+	// ⚠ 两处 aardio/坐标坑：
+	//   1) `for(k,v in 表)` 只走表的**数组部分**，字符串键的表遍历不到；
+	//   2) 坐标必须是**客户区相对坐标**（画板绘制原点与鼠标命中测试
+	//      用的都是客户区坐标）—— 父窗口绝对坐标会把按钮画到画板外面。
+	self.__btnRects = function(){
+		var r = self.rect;
+		if(!r) return {};
+		var W = r.right - r.left;
+		var h = r.bottom - r.top;
+		var bw = ..nodio.ui.px(60);
+		var bh = h - 8;
+		var out = {};
+		..table.push(out, {name="ok";
+			left=W - bw - 6; right=W - 6; top=4; bottom=4+bh});
+		..table.push(out, {name="cancel";
+			left=W - bw*2 - 12; right=W - bw - 12; top=4; bottom=4+bh});
+		return out;
+	}
+	self.__hit = function(x,y){
+		var rs = self.__btnRects();
+		for(i=1;#rs;1){
+			var v = rs[i];
+			if(x >= v.left && x < v.right && y >= v.top && y < v.bottom) return v.name;
+		}
+		return 0;
+	}
+
+	// ---------- 绘制 ----------
+	self.board.onDraw = function(graphics, rc, bd){
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+		bg.delete();
+		var pen = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(pen, rc.left, rc.top, rc.right - rc.left - 1, rc.bottom - rc.top - 1);
+		pen.delete();
+		var font = bd.font;
+		var fmt = bd.format;
+		var brush = ..gdip.solidBrush(th.textDim);
+		graphics.drawString(self.title, font,
+			::RECTF(rc.left + 8, rc.top, ..nodio.ui.px(72), rc.bottom - rc.top), fmt, brush);
+		brush.delete();
+		var rs = self.__btnRects();
+		var labels = {ok="确定"; cancel="取消"};
+		for(i=1;#rs;1){
+			var v = rs[i];
+			if(self.hover == v.name){
+				var hb = ..gdip.solidBrush(th.hoverBg);
+				graphics.fillRect(hb, v.left, v.top, v.right - v.left, v.bottom - v.top);
+				hb.delete();
+			}
+			var b2 = ..gdip.solidBrush(th.text);
+			graphics.drawString(labels[v.name], font,
+				::RECTF(v.left, v.top, v.right - v.left, v.bottom - v.top), fmt, b2);
+			b2.delete();
+		}
+	}
+	self.board.onMouseMove = function(x,y,bd){
+		var h = self.__hit(x,y);
+		if(h != self.hover){
+			self.hover = h;
+			self.board.invalidate();
+		}
+	}
+	self.board.onMouseLeave = function(bd){
+		if(self.hover){
+			self.hover = 0;
+			self.board.invalidate();
+		}
+	}
+	self.board.onMouseDown = function(x,y,bd){
+		var b = self.__hit(x,y);
+		if(b == "ok") self.__ok();
+		elseif(b == "cancel") self.close();
+	}
+
+	// ---------- 行为 ----------
+	self.__ok = function(){
+		var t = self.ed.text;
+		if(t === null) t = "";
+		if(self.onOk){
+			if(self.onOk(t) === false) return;   // 校验没过：留在提示条里
+		}
+		self.close();
+	}
+	self.show = function(title, defText, onOk){
+		if(title) self.title = title;
+		self.onOk = onOk;
+		try{ self.ed.text = defText : self.defText }catch(e){}
+		self.visible = true;
+		self.board.show(true);
+		self.ed.show(true);
+		self.__layoutEdit();
+		try{ self.ed.setFocus() }catch(e1){}
+	}
+	self.close = function(){
+		self.visible = false;
+		self.board.show(false);
+		self.ed.show(false);
+		if(self.onCancel) self.onCancel();
+	}
+
+	// ---------- 布局 ----------
+	self.__layoutEdit = function(){
+		var r = self.rect;
+		if(!r) return;
+		var ex = r.left + ..nodio.ui.px(84);
+		var ew = r.right - ex - ..nodio.ui.px(140);
+		var eh = r.bottom - r.top - 8;
+		..nodio.ui.setRect(self.ed, ex, r.top + 4, ex + ew, r.top + 4 + eh);
+		try{
+			..win.setPos(self.ed.hwnd, ex, r.top + 4, ew, eh, 0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+		}catch(e2){}
+	}
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		self.board.layout(l, t, r, b);
+		self.__layoutEdit();
+	}
+	// 摆到父区域顶部居中
+	self.layoutCentered = function(pl, pt, pr, pb){
+		var w = ..nodio.ui.px(W);
+		var h = ..nodio.ui.px(H);
+		var x = pl + (pr - pl - w) / 2;
+		var y = pt + ..nodio.ui.px(16);
+		self.layout(x, y, x + w, y + h);
+	}
+
+	self.layout();
+	self.board.show(false);
+	self.ed.show(false);
+	return self;
+}
+
+}

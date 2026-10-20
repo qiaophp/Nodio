@@ -1,0 +1,3 @@
+import s2mod;
+io.print("before");
+s2mod.boom();

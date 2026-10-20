@@ -34,6 +34,8 @@
 #pragma comment(lib, "comctl32.lib")
 #include "engine/common.h"
 #include "engine/NodioVM.h"
+#include "engine/aardio_chunk.h"
+#include "engine/aardio_vm.h"
 #include "publish/payload.h"
 #include "publish/publish.h"
 #include <cstdio>
@@ -67,6 +69,27 @@ static std::wstring ReadFileUtf8ToWide(const wchar_t* szPath, bool* pOk)
                             wide.data(), w);
     *pOk = true;
     return std::wstring(wide.data(), (size_t)w);
+}
+
+// binary read (needed for the official "=aardio" precompiled chunks, which
+// are not UTF-8 text)
+static std::string ReadFileBytes(const wchar_t* szPath, bool* pOk)
+{
+    *pOk = false;
+    FILE* pf = nullptr;
+    if (_wfopen_s(&pf, szPath, L"rb") != 0 || !pf)
+        return std::string();
+    fseek(pf, 0, SEEK_END);
+    long cb = ftell(pf);
+    fseek(pf, 0, SEEK_SET);
+    if (cb < 0) { fclose(pf); return std::string(); }
+    std::string raw;
+    raw.resize((size_t)cb);
+    size_t rd = cb > 0 ? fread(&raw[0], 1, (size_t)cb, pf) : 0;
+    fclose(pf);
+    raw.resize(rd);
+    *pOk = true;
+    return raw;
 }
 
 // stderr plumbing takes UTF-8 bytes (pipes + the test harness decode UTF-8)
@@ -187,6 +210,143 @@ int wmain(int argc, wchar_t** argv)
         return nFail ? 1 : 0;
     }
 
+    // `-disasm <file>` — disassemble an official "=aardio" precompiled chunk.
+    // Official aardio can *execute* its own precompiled chunks but cannot
+    // inspect them; Nodio decodes the record stream with the official
+    // runtime layout (interpreter FUN_004C4BC0) and prints a disassembly.
+    if (argc > 2 && wcscmp(argv[1], L"-disasm") == 0)
+    {
+        bool bOk = false;
+        std::string data = ReadFileBytes(argv[2], &bOk);
+        if (!bOk)
+        {
+            WriteStderrUtf8(L"无法读取文件: " + std::wstring(argv[2]));
+            return 2;
+        }
+        NodioVM::AardioChunkNode root;
+        NodioVM::AardioChunkStats st;
+        std::wstring err;
+        if (!NodioVM::ParseAardioChunkTree(data, &root, &st, &err))
+        {
+            WriteStderrUtf8(L"解析失败: " + err);
+            return 1;
+        }
+        WriteStdoutUtf8(L"== 官方预编译块 =aardio 反汇编 ==");
+        WriteStdoutUtf8(L"文件: " + std::wstring(argv[2]) +
+            L"  字节: " + std::to_wstring((int)data.size()));
+        WriteStdoutUtf8(L"对象: " + std::to_wstring(st.objects) +
+            L"  记录: " + std::to_wstring(st.records) +
+            L"  常量: " + std::to_wstring(st.consts) +
+            L"（字符串 " + std::to_wstring(st.strings) +
+            L" / 数字 " + std::to_wstring(st.numbers) + L"）" +
+            L"  最大嵌套: " + std::to_wstring(st.maxDepth));
+        WriteStdoutUtf8(L"记录种类: 用到 " + std::to_wstring(st.kindsUsed) +
+            L"/61  非法种类: " + std::to_wstring(st.badKinds) +
+            L"  跳转: " + std::to_wstring(st.jumps) +
+            L"（可解引用 " + std::to_wstring(st.jumpsResolved) + L"）");
+        std::wstring hist;
+        for (int k = 0; k < 61; k++)
+        {
+            if (!st.kindCount[k]) continue;
+            if (!hist.empty()) hist += L"  ";
+            hist += std::wstring(NodioVM::AardioOpcodeName(k)) + L"=" +
+                std::to_wstring(st.kindCount[k]);
+        }
+        WriteStdoutUtf8(L"种类分布: " + hist);
+        // S-1b：官方校验器 FUN_004D4450 的等价实现 —— 官方只能执行、不能诊断，
+        // 这一节给出可定位到「对象 + 记录号」的结构化结论。
+        {
+            NodioVM::AardioValidateResult vres;
+            std::wstring vreport;
+            NodioVM::ValidateAardioChunkTree(root, &vres, &vreport);
+            std::wstring sec = NodioVM::AardioValidateSection(root, vres);
+            if (!vreport.empty())
+            {
+                sec += L"\n违规明细:";
+                sec += L"\n" + vreport;
+            }
+            size_t pos = 0;
+            while (pos < sec.size())
+            {
+                size_t nl = sec.find(L'\n', pos);
+                if (nl == std::wstring::npos) nl = sec.size();
+                WriteStdoutUtf8(sec.substr(pos, nl - pos));
+                pos = nl + 1;
+            }
+        }
+        // S-6：把「Nodio 还缺什么」量化到记录种类 —— 官方能执行自己的预编译块，
+        // Nodio 目前只能解释它，这一节直接列出还不能翻译/执行的记录种类。
+        {
+            std::wstring sec = NodioVM::AardioUnimplementedSection();
+            size_t pos = 0;
+            while (pos < sec.size())
+            {
+                size_t nl = sec.find(L'\n', pos);
+                if (nl == std::wstring::npos) nl = sec.size();
+                WriteStdoutUtf8(sec.substr(pos, nl - pos));
+                pos = nl + 1;
+            }
+        }
+        WriteStdoutUtf8(L"---");
+        std::wstring dis = NodioVM::DisassembleAardioTree(root, 200);
+        // stdout 一次写完整段（WriteStdoutUtf8 会补换行，这里拆行输出）
+        size_t pos = 0;
+        while (pos < dis.size())
+        {
+            size_t nl = dis.find(L'\n', pos);
+            if (nl == std::wstring::npos) nl = dis.size();
+            WriteStdoutUtf8(dis.substr(pos, nl - pos));
+            pos = nl + 1;
+        }
+        return 0;
+    }
+
+    // `-runchunk <file>` — 执行官方 "=aardio" 预编译块（记录 VM，S-1b 第二阶段）。
+    // 官方 aardio 只能执行自己编译出来的块，从不提供这种「执行一个预编译块并
+    // 打印结果」的入口；Nodio 的记录 VM 直接跑官方记录流。
+    if (argc > 2 && wcscmp(argv[1], L"-runchunk") == 0)
+    {
+        bool bOk = false;
+        std::string data = ReadFileBytes(argv[2], &bOk);
+        if (!bOk)
+        {
+            WriteStderrUtf8(L"无法读取文件: " + std::wstring(argv[2]));
+            return 2;
+        }
+        NodioVM::AardioChunkNode root;
+        NodioVM::AardioChunkStats st;
+        std::wstring err;
+        if (!NodioVM::ParseAardioChunkTree(data, &root, &st, &err))
+        {
+            WriteStderrUtf8(L"解析失败: " + err);
+            return 1;
+        }
+        WriteStdoutUtf8(L"== 记录 VM 执行 ==");
+        WriteStdoutUtf8(L"文件: " + std::wstring(argv[2]) +
+            L"  对象: " + std::to_wstring(st.objects) +
+            L"  记录: " + std::to_wstring(st.records));
+        NodioVM::AardioRunResult r = NodioVM::RunAardioChunk(root);
+        if (!r.ok)
+        {
+            WriteStdoutUtf8(L"执行失败: " + r.err);
+            if (r.pc >= 0)
+            {
+                std::wstring where = L"位置: 记录号 " + std::to_wstring(r.pc);
+                if (r.kind >= 0)
+                {
+                    wchar_t hex[8];
+                    swprintf_s(hex, L"%02X", r.kind);
+                    where += L"  种类 0x" + std::wstring(hex);
+                }
+                WriteStdoutUtf8(where);
+            }
+            return 1;
+        }
+        WriteStdoutUtf8(L"结果: " + r.value.ToString());
+        WriteStdoutUtf8(L"执行记录: " + std::to_wstring(r.steps));
+        return 0;
+    }
+
     // support `-e "code"` one-liner execution
     if (argc > 2 && wcscmp(argv[1], L"-e") == 0)
     {
@@ -253,8 +413,12 @@ int wmain(int argc, wchar_t** argv)
         }
 
         std::wstring strErr;
+        // S-2: the script's own path — a runtime error reports
+        // "<script>:<line>" instead of a bare line number.
+        std::wstring strScriptFile = szRunFile;
         NodioVM::RunSource(src, &strErr, &strDir, nullptr, bDbg,
-                            strBreaks.empty() ? nullptr : &strBreaks);
+                            strBreaks.empty() ? nullptr : &strBreaks,
+                            &strScriptFile);
         if (!strErr.empty())
             WriteStderrUtf8(strErr);
         fflush(stdout);
@@ -370,8 +534,10 @@ int wmain(int argc, wchar_t** argv)
             }
             std::wstring strErr;
             std::wstring strBase = L"";   // no disk base: embedded only
+            // S-2: the entry script's name inside the package is the file
+            // a runtime error belongs to.
             NodioVM::RunSource(wide[strEntry], &strErr, &strBase, &wide,
-                               false, nullptr);
+                               false, nullptr, &strEntry);
             if (!strErr.empty())
                 WriteStderrUtf8(strErr);
             wchar_t szPause[8];

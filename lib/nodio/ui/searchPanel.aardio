@@ -1,0 +1,268 @@
+// nodio.ui.searchPanel — 工程全文搜索面板（关键字输入 + 结果表 + 双击跳转）。
+//
+// 左栏「搜索」页：上面一条输入条（关键字输入框 + 「搜索」按钮），下面一张
+// 结果表（文件 / 行 / 内容）。双击结果 → 打开文件并跳到那一行。
+//
+// 为什么结果表用自绘（nodio.ui.list）而不是原生 listview：
+// 原生 listview 的配色消息在本机 comctl32 里会把 lParam 当指针解引用 →
+// 进程崩 0xC0000005（见 docs/capability-gap.md §1.11.4），深色主题做不了。
+//
+// 坐标：物理像素（见 nodio.ui.board 的说明）；设计常量按逻辑像素写，
+// 用 nodio.ui.px() 换算。
+//
+// 用法：
+//   sp = nodio.ui.searchPanel(winform, {left=0;top=0;right=272;bottom=600})
+//   sp.setScope(rootDir, files)     // files = {{path=相对路径; full=绝对路径};...}
+//   sp.onOpenFile = function(path, line){ ... }
+//   sp.search("function")
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.list;
+import nodio.ui.theme;
+import nodio.ui.dpi;
+import nodio.ui.subclass;
+import gdip;
+
+var __spSeq = 0;
+
+searchPanel = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+
+	// 设计常量（逻辑像素）
+	var HEAD_H = 34;    // 顶部输入条高
+	var IN_H   = 22;    // 输入框 / 按钮高
+	var BTN_W  = 56;    // 「搜索」按钮宽
+	var PAD    = 8;     // 左右留白
+	var MAX_HIT = 800;  // 结果条数上限（防止大工程把界面刷爆）
+
+	var self = {
+		winform = winform;
+		head = null;      // 顶部输入条画板
+		ed = null;        // 关键字输入框
+		list = null;      // 结果表
+		rect = opt.rect;
+		root = null;      // 工程根目录
+		files = {};       // 搜索范围：{path=相对路径; full=绝对路径}
+		texts = null;     // 可选：full → 文本（打开中的文档用内存版本）
+		visible = false;
+		hover = 0;        // 0=无 1=搜索按钮
+		hits = 0;
+		onOpenFile = null;// function(path, line)
+		onStatus = null;  // function(text)
+	};
+
+	__spSeq = __spSeq + 1;
+	var r = opt.rect : {left=0; top=0; right=272; bottom=400};
+
+	self.head = nodio.ui.board(winform, {
+		left = r.left; top = r.top; right = r.right;
+		bottom = r.top + ..nodio.ui.px(HEAD_H);
+		fontSize = 12;
+	});
+	self.ed = ..nodio.ui.addCtrl(winform, "searchEd" ++ __spSeq, {
+		cls="edit";left=0;top=0;right=200;bottom=24;
+	});
+	// 输入框深色化：edit 不吃 setCharformat，走 EM_SETBKGNDCOLOR + ctrl.color
+	try{ self.ed.color = ..nodio.ui.themeRef(th.text) }catch(e){};
+	try{
+		::SendMessage(self.ed.hwnd, 0x443/*_EM_SETBKGNDCOLOR*/, 0,
+			..nodio.ui.themeRef(th.bgSecondary));
+	}catch(e1){};
+
+	self.list = nodio.ui.list(winform, {
+		// 列宽是逻辑像素，加起来正好是左栏宽（272）：
+		// 「行」列要放得下 3 位数（列宽不够会把行号截掉一位）
+		columns = {{"文件";134};{"行";36};{"内容";102}};
+	});
+	self.list.onDoubleClick = function(row, index){
+		if(!row || !row.tag) return;
+		if(self.onOpenFile) self.onOpenFile(row.tag.full, row.tag.line);
+	}
+
+	// ---------- 几何 ----------
+	// 按钮矩形用**数组**存（客户区相对坐标）：
+	//   ① `for(k,v in 表)` 只走表的数组部分，字符串键的表遍历不到；
+	//   ② 画板绘制原点与鼠标命中测试用的都是**客户区坐标**。
+	self.__btnRect = function(){
+		var rc = self.rect;
+		if(!rc) return null;
+		var w = rc.right - rc.left;
+		var bw = ..nodio.ui.px(BTN_W);
+		var bh = ..nodio.ui.px(IN_H);
+		var by = ..nodio.ui.px((HEAD_H - IN_H) / 2);
+		return {
+			left = w - bw - ..nodio.ui.px(PAD);
+			right = w - ..nodio.ui.px(PAD);
+			top = by;
+			bottom = by + bh;
+		};
+	}
+	self.__hitBtn = function(x,y){
+		var b = self.__btnRect();
+		if(!b) return 0;
+		if(x >= b.left && x < b.right && y >= b.top && y < b.bottom) return 1;
+		return 0;
+	}
+
+	// ---------- 绘制 ----------
+	self.head.onDraw = function(graphics, rc, bd){
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+		bg.delete();
+		var pen = ..gdip.pen(th.border, 1);
+		graphics.drawLine(pen, rc.left, rc.bottom - 1, rc.right, rc.bottom - 1);
+		pen.delete();
+		var b = self.__btnRect();
+		if(!b) return;
+		if(self.hover == 1){
+			var hb = ..gdip.solidBrush(th.hoverBg);
+			graphics.fillRect(hb, b.left, b.top, b.right - b.left, b.bottom - b.top);
+			hb.delete();
+		}
+		var brush = ..gdip.solidBrush(th.text);
+		graphics.drawString("搜索", bd.font,
+			::RECTF(b.left, b.top, b.right - b.left, b.bottom - b.top), bd.format, brush);
+		brush.delete();
+	}
+	self.head.onMouseMove = function(x,y,bd){
+		var h = self.__hitBtn(x,y);
+		if(h != self.hover){
+			self.hover = h;
+			self.head.invalidate();
+		}
+	}
+	self.head.onMouseLeave = function(bd){
+		if(self.hover){
+			self.hover = 0;
+			self.head.invalidate();
+		}
+	}
+	self.head.onMouseDown = function(x,y,bd){
+		if(self.__hitBtn(x,y)) self.__run();
+	}
+
+	// 回车 = 搜索（官方控件的 oncommand 路由不通，自己子类化）
+	self.sub = ..nodio.ui.subclass(self.ed.hwnd, function(hwnd,msg,wp,lp){
+		if(msg == 0x100 && tonumber(wp) == 0x0D){
+			self.__run();
+			return 1;
+		}
+		return null;
+	});
+
+	// ---------- 搜索 ----------
+	self.setScope = function(root, files, texts){
+		self.root = root;
+		self.files = files : {};
+		self.texts = texts;
+	}
+
+	// 当前关键字（输入框里的文本）
+	self.keyword = function(){
+		try{ return self.ed.text : "" }catch(e){}
+		return "";
+	}
+
+	self.__run = function(){
+		self.search(self.keyword());
+	}
+
+	// 搜索：files 里逐个文件读文本，逐行找关键字（不区分大小写）
+	self.search = function(kw){
+		kw = (kw === null || kw === undefined) ? "" : tostring(kw);
+		var key = ..string.lower(..string.trim(kw));
+		if(key == ""){
+			self.list.clear();
+			self.hits = 0;
+			if(self.onStatus) self.onStatus("请输入关键字");
+			return 0;
+		}
+		if(!#self.files){
+			self.list.clear();
+			self.hits = 0;
+			if(self.onStatus) self.onStatus("没有可搜索的文件（先打开工程）");
+			return 0;
+		}
+		var rows = {};
+		var n = 0;
+		for(i=1;#self.files;1){
+			if(n >= MAX_HIT) break;
+			var f = self.files[i];
+			var text = null;
+			if(self.texts){
+				var t = self.texts[f.full];
+				if(t !== null && t !== undefined) text = t;
+			}
+			if(text === null) text = ..string.load(f.full);
+			if(text === null) continue;
+			var lines = ..string.split(text, '\n');
+			for(k=1;#lines;1){
+				if(n >= MAX_HIT) break;
+				var line = lines[k];
+				if(line === null) continue;
+				// 行尾的 \r 去掉（split 按 \n 切，CRLF 文件每行都带 \r）
+				if(..string.endsWith(line, '\r')){
+					line = ..string.sub(line, 1, #line - 1);
+				}
+				if(!..string.indexOf(..string.lower(line), key)) continue;
+				n = n + 1;
+				..table.push(rows, {
+					cells = {f.path; k; line};
+					tag = {full = f.full; line = k};
+				});
+			}
+		}
+		self.hits = n;
+		self.list.setRows(rows);
+		if(self.onStatus){
+			self.onStatus("找到 " ++ n ++ " 处（搜索 " ++ #self.files ++ " 个文件）");
+		}
+		return n;
+	}
+
+	// ---------- 布局 / 显隐 ----------
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		var hh = ..nodio.ui.px(HEAD_H);
+		self.head.layout(l, t, r, t + hh);
+		// 输入框摆在画板里（画板之上）
+		var bw = ..nodio.ui.px(BTN_W);
+		var ex = l + ..nodio.ui.px(PAD);
+		var ew = (r - l) - ..nodio.ui.px(PAD)*2 - bw - ..nodio.ui.px(6);
+		var eh = ..nodio.ui.px(IN_H);
+		var ey = t + ..nodio.ui.px((HEAD_H - IN_H) / 2);
+		..nodio.ui.setRect(self.ed, ex, ey, ex + ew, ey + eh);
+		// 结果表在下面
+		self.list.layout(l, t + hh, r, b);
+	}
+
+	// 三个控件一起显隐（页签切换时只有当前页可见）
+	self.show = function(flag){
+		self.visible = flag ? true : false;
+		self.head.show(flag);
+		self.ed.show(flag);
+		self.list.show(flag);
+	}
+
+	self.focus = function(){
+		try{ self.ed.setFocus() }catch(e){}
+	}
+
+	// dock 只认一个 ctrl；这里给一个「可见性代理」，
+	// 让页签切换时输入条 / 输入框 / 结果表一起显隐。
+	self.ctrl = {
+		show = function(flag){ self.show(flag) }
+	};
+
+	self.layout();
+	self.show(false);
+	return self;
+}
+
+}

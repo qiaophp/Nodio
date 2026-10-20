@@ -1,0 +1,19 @@
+// probe: why does a byte string read back from a file not equal the original?
+var s = "中文ABC";
+var p = ..io.fullpath("probe_eq.txt");
+..io.writeFile(p, s);
+var raw = ..io.readFile(p);
+io.print("#s   :", #s);
+io.print("#raw :", #raw);
+io.print("equal:", raw == s);
+io.print("type s   :", type(s));
+io.print("type raw :", type(raw));
+io.print("s   bytes:", ..string.hex(s));
+io.print("raw bytes:", ..string.hex(raw));
+io.print("s   as raw:", ..string.hex(s, ""));
+io.print("equal via tostring:", tostring(raw) == tostring(s));
+var f = ..io.file(p, "rb");
+var raw2 = f.read();
+io.print("file.read equal:", raw2 == s);
+io.print("#raw2:", #raw2);
+..io.remove(p);

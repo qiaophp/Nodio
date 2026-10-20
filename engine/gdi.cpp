@@ -250,7 +250,11 @@ namespace NodioVM
 
     bool RegisterFormClass()
     {
-        bool bDone = false;
+        // STATIC: the window class is registered once per process. A local
+        // flag would try to register it again on every win.form() call and
+        // RegisterClassExW then fails with ERROR_CLASS_ALREADY_EXISTS —
+        // so the SECOND form in a script could never be created.
+        static bool bDone = false;
         if (bDone)
             return true;
         WNDCLASSEXW wc = { sizeof(wc) };

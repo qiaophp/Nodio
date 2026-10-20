@@ -1,0 +1,13 @@
+// probe: what does a table with a metatable expose to iteration?
+var t = { @{ _type="object"; _readonly=false }; name="aardio"; n=43 };
+io.print("type      :", type(t));
+io.print("eachName  :", table.eachName(t));
+io.print("for-in    :");
+for(k,v in t) io.print("   ", k, " = ", v);
+io.print("meta _type:", t@._type);
+io.print("member _type:", t._type);
+io.print("--- json ---");
+import json;
+var obj = json.parse('{"name":"aardio","n":43,"arr":[1,2,3]}');
+io.print("eachName  :", table.eachName(obj));
+io.print("stringify :", json.stringify(obj));

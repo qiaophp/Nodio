@@ -1,0 +1,258 @@
+// nodio.gui.widget — 控件基类 + 事件宿主。
+//
+// 移植自 Zan.Gui 的 Gui/Core/Control.zan / Element.zan / Signal.zan：
+//   · 控件有**状态**（normal / hover / pressed / checked / disabled），
+//     状态决定用哪一份样式盒（Zan.Gui 的「状态变体」）；
+//   · 控件只负责「画自己」和「报事件」，不关心宿主怎么排版；
+//   · 事件用回调（onClick / onChange），Zan.Gui 是 Signal，这里等价。
+//
+// 坐标：控件矩形是**物理像素**，原点在宿主画板的客户区左上角
+// （画板 onDraw 收到的 rc 就是客户区，见 nodio.ui.board 的说明）。
+namespace nodio.gui{
+import nodio.ui.board;
+import nodio.ui.dpi;
+import nodio.gui.theme;
+import nodio.gui.style;
+import nodio.gui.ctx;
+
+// ---------- 控件基类 ----------
+widget = function(opt){
+	opt = opt : {};
+	var self = {
+		rect = {left=0; top=0; right=0; bottom=0};
+		enabled = true;
+		checked = false;
+		hover = false;
+		pressed = false;
+		visible = true;
+		style = opt.style;
+		text = opt.text;
+		icon = opt.icon;
+		host = null;
+		onClick = null;    // function(widget)
+		onChange = null;   // function(widget, checked)
+	};
+
+	// 摆放（物理像素）
+	self.setRect = function(l,t,r,b){
+		self.rect = {left=l; top=t; right=r; bottom=b};
+	}
+	self.width = function(){
+		return self.rect.right - self.rect.left;
+	}
+	self.height = function(){
+		return self.rect.bottom - self.rect.top;
+	}
+
+	// 当前状态（决定用哪份样式盒）
+	self.state = function(){
+		if(!self.enabled) return "disabled";
+		if(self.pressed) return "pressed";
+		if(self.checked) return "checked";
+		if(self.hover) return "hover";
+		return "normal";
+	}
+
+	// 解析当前状态的样式盒
+	self.box = function(theme){
+		return ..nodio.gui.styleResolve(self.style, self.state(), theme);
+	}
+
+	// 请求重绘
+	self.invalidate = function(){
+		if(self.host) self.host.invalidate();
+	}
+
+	// 命中测试（子类可覆盖）
+	self.hitTest = function(x,y){
+		return x >= self.rect.left && x < self.rect.right
+			&& y >= self.rect.top && y < self.rect.bottom;
+	}
+
+	// 绘制（子类覆盖）：g 是 nodio.gui.ctx，rc 是控件矩形
+	self.paint = function(g, rc){
+	}
+
+	// 事件（子类可覆盖）
+	self.onMouseDown = function(x,y){
+	}
+	self.onMouseMove = function(x,y){
+	}
+	self.onMouseUp = function(x,y){
+	}
+	self.onMouseEnter = function(){
+	}
+	self.onMouseLeave = function(){
+	}
+
+	// 触发点击
+	self.fireClick = function(){
+		if(self.onClick) self.onClick(self);
+	}
+	// 切换选中态
+	self.toggle = function(){
+		if(!self.enabled) return;
+		self.checked = !self.checked;
+		self.invalidate();
+		if(self.onChange) self.onChange(self, self.checked);
+	}
+	return self;
+};
+
+// ---------- 宿主：控件容器 ----------
+//
+// 一块画板 + 一组控件：负责绘制和鼠标事件路由。
+// 用法：
+//   h = nodio.gui.host(winform, {left=0;top=0;right=300;bottom=400})
+//   b = nodio.gui.button({text="确定"})
+//   h.add(b)
+//   h.setRect(0, 0, 300, 400)   // 控件用绝对坐标摆放
+host = function(winform, opt){
+	opt = opt : {};
+	var self = {
+		winform = winform;
+		board = null;
+		widgets = {};
+		hover = null;
+		pressed = null;
+		bgRole = opt.bg;         // 背景色（角色名或 0xAARRGGBB）
+		theme = opt.theme;
+		onBeforePaint = null;    // function(ctx, rc) —— 绘制前的排版钩子
+	};
+
+	var r = opt.rect : {left=0; top=0; right=300; bottom=400};
+	self.board = nodio.ui.board(winform, {
+		left = r.left; top = r.top; right = r.right; bottom = r.bottom;
+		fontSize = opt.fontSize : 12;
+	});
+	self.ctrl = self.board.ctrl;
+
+	// 加一个控件
+	self.add = function(w){
+		..table.push(self.widgets, w);
+		w.host = self;
+		self.invalidate();
+		return w;
+	}
+	// 清空
+	self.clear = function(){
+		self.widgets = {};
+		self.hover = null;
+		self.pressed = null;
+		self.invalidate();
+	}
+	self.invalidate = function(){
+		self.board.invalidate();
+	}
+
+	// 命中测试：从最上层（后加的）往下找
+	// 容器（panel）里的子控件也要能命中，所以递归往下找。
+	self.__hit = function(x,y){
+		for(i=#self.widgets;1;-1){
+			var w = self.widgets[i];
+			if(!w.visible) continue;
+			var r = self.__hitIn(w, x, y);
+			if(r) return r;
+		}
+		return null;
+	}
+
+	// 在一棵控件树里找命中项
+	self.__hitIn = function(w, x, y){
+		if(w.children){
+			for(i=#w.children;1;-1){
+				var c = w.children[i];
+				if(!c.visible) continue;
+				var r2 = self.__hitIn(c, x, y);
+				if(r2) return r2;
+			}
+		}
+		if(w.hitTest(x,y)) return w;
+		return null;
+	}
+
+	// ---------- 绘制 ----------
+	self.__draw = function(graphics, rc, bd){
+		var th = self.theme : ..nodio.gui.theme();
+		var g = ..nodio.gui.ctx(graphics, {theme = th});
+		if(self.bgRole){
+			var bg = th[self.bgRole];
+			if(bg === null || bg === undefined) bg = self.bgRole;
+			g.fill(bg, 0, 0, rc.right, rc.bottom);
+		}
+		if(self.onBeforePaint) self.onBeforePaint(g, rc);
+		for(i=1;#self.widgets;1){
+			var w = self.widgets[i];
+			if(!w.visible) continue;
+			w.paint(g, w.rect);
+		}
+	}
+
+	// ---------- 鼠标 ----------
+	self.__setHover = function(w){
+		if(self.hover == w) return;
+		if(self.hover){
+			self.hover.hover = false;
+			self.hover.onMouseLeave();
+			self.hover.invalidate();
+		}
+		self.hover = w;
+		if(w){
+			w.hover = true;
+			w.onMouseEnter();
+			w.invalidate();
+		}
+	}
+
+	self.board.onDraw = function(graphics, rc, bd){
+		self.__draw(graphics, rc, bd);
+	}
+	self.board.onMouseMove = function(x,y,bd){
+		var w = self.__hit(x,y);
+		self.__setHover(w);
+		if(self.pressed){
+			self.pressed.onMouseMove(x,y);
+			return;
+		}
+		if(w) w.onMouseMove(x,y);
+	}
+	self.board.onMouseDown = function(x,y,bd){
+		var w = self.__hit(x,y);
+		if(!w) return;
+		if(!w.enabled) return;
+		self.pressed = w;
+		w.pressed = true;
+		w.invalidate();
+		w.onMouseDown(x,y);
+	}
+	self.board.onMouseUp = function(x,y,bd){
+		var w = self.pressed;
+		self.pressed = null;
+		if(!w) return;
+		w.pressed = false;
+		w.onMouseUp(x,y);
+		var over = self.__hit(x,y);
+		if(over == w){
+			w.fireClick();
+		}
+		w.invalidate();
+	}
+	// 离开窗口时清掉悬停/按下状态
+	self.board.onMouseLeave = function(){
+		self.__setHover(null);
+		if(self.pressed){
+			self.pressed.pressed = false;
+			self.pressed.invalidate();
+			self.pressed = null;
+		}
+	}
+
+	// 重新摆放（dock 的自绘组件接口会调它）
+	self.layout = function(l,t,r,b){
+		self.board.layout(l,t,r,b);
+	}
+
+	return self;
+}
+
+}

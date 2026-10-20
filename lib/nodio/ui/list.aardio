@@ -1,0 +1,407 @@
+// nodio.ui.list — 自绘列表（多列 + 表头 + 滚动条）。
+//
+// 为什么不用原生 listview：
+//   ① 原生 treeview/listview 的配色消息（TVM/LVM_SETTEXTCOLOR 等）在本机
+//      comctl32 里会把 lParam 当指针解引用 → **进程崩 0xC0000005**
+//      （见 docs/capability-gap.md §1.11.4），深色主题做不了；
+//   ② 引擎原生控件表没有 listview 的 addItem/setItem，能力面本来就缺；
+//   ③ 参考 IDE（aar.chengxu.online/thread-903.htm）的列表是**纯色表**，
+//      没有系统 listview 的网格线和选中虚线框。
+//
+// 坐标：物理像素（见 nodio.ui.board 的说明）。
+// 尺寸常量按逻辑像素写，用 nodio.ui.px() 换算。
+//
+// 用法：
+//   lv = nodio.ui.list(winform, {columns={{"命名空间";110};{"说明";90}}})
+//   lv.setRows( { {"io","输入输出"}; {"util","工具函数"} } )
+//   lv.setRows( { {cells={"io","输入输出"}; icon="book"} } )
+//   lv.onSelect     = function(row, index){ ... }
+//   lv.onDoubleClick= function(row, index){ ... }
+//   lv.onContextMenu= function(x, y){ ... }   // x,y 是**屏幕坐标**
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.theme;
+import nodio.ui.icons;
+import nodio.ui.dpi;
+
+var __listSeq = 0;
+
+list = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	// 设计常量（逻辑像素）
+	var ROW_H  = 22;    // 行高
+	var HEAD_H = 24;    // 表头高
+	var SB_W   = 10;    // 滚动条宽
+	var ICON   = 14;    // 行图标边长
+	var PAD    = 6;     // 单元格左留白
+	var self = {
+		winform = winform;
+		board = null;
+		rect = opt.rect;
+		columns = opt.columns : {};  // {{title;width};...}  宽度是逻辑像素
+		rows = {};           // {cells={..}; icon=..; tag=..}
+		selIndex = 0;        // 选中的行（0=无）
+		hoverIndex = 0;
+		scroll = 0;          // 垂直滚动偏移（物理像素）
+		showHeader = opt.showHeader : true;
+		onSelect = null;        // function(row, index)
+		onDoubleClick = null;   // function(row, index)
+		onContextMenu = null;   // function(x, y) —— 屏幕坐标
+		// 配色
+		bgColor      = opt.bgColor : th.panel;
+		headColor    = opt.headColor : th.panel2;
+		headText     = opt.headText : th.textDim;
+		textColor    = opt.textColor : th.text;
+		dimColor     = opt.dimColor : th.textDim;
+		selColor     = opt.selColor : th.selBg;
+		hoverColor   = opt.hoverColor : th.hoverBg;
+		lineColor    = opt.lineColor : th.border;
+		scrollColor  = opt.scrollColor : th.border;
+		scrollThumb  = opt.scrollThumb : th.textDim;
+	};
+
+	__listSeq = __listSeq + 1;
+	var r = opt.rect : {left=0; top=0; right=240; bottom=300};
+
+	self.board = nodio.ui.board(winform, {
+		left = r.left; top = r.top; right = r.right; bottom = r.bottom;
+		fontSize = opt.fontSize : 12;
+	});
+	self.ctrl = self.board.ctrl;
+	self.board.onDraw = function(graphics, rc, bd){
+		self.__draw(graphics, rc, bd);
+	}
+
+	// ---------- 数据 ----------
+	// 行可以是 {cells={..}; icon=..; tag=..}，也可以直接给一维数组（单列）
+	self.setRows = function(rows){
+		self.rows = {};
+		if(rows){
+			for(i=1;#rows;1){
+				var it = rows[i];
+				if(type(it) == "table" && it.cells !== null && it.cells !== undefined){
+					..table.push(self.rows, it);
+				}
+				else{
+					..table.push(self.rows, {cells=it});
+				}
+			}
+		}
+		self.selIndex = 0;
+		self.scroll = 0;
+		self.board.invalidate();
+		return #self.rows;
+	}
+
+	self.addRow = function(row){
+		..table.push(self.rows, row);
+		self.board.invalidate();
+		return #self.rows;
+	}
+
+	self.clear = function(){
+		self.rows = {};
+		self.selIndex = 0;
+		self.scroll = 0;
+		self.board.invalidate();
+	}
+
+	// 行对象（按索引；0=无）
+	self.rowAt = function(index){
+		if(index < 1 || index > #self.rows) return null;
+		return self.rows[index];
+	}
+
+	// 某行的第 n 列文本
+	self.cellText = function(index, col){
+		var row = self.rowAt(index);
+		if(!row) return "";
+		var c = row.cells;
+		if(type(c) != "table") return col == 1 ? tostring(c : "") : "";
+		if(col < 1 || col > #c) return "";
+		return tostring(c[col] : "");
+	}
+
+	// 选中某行（0=取消）
+	self.select = function(index){
+		if(index < 0 || index > #self.rows) return;
+		if(self.selIndex != index){
+			self.selIndex = index;
+			self.board.invalidate();
+			if(self.onSelect) self.onSelect(self.rowAt(index), index);
+		}
+	}
+
+	self.selectedRow = function(){
+		return self.rowAt(self.selIndex);
+	}
+
+	// ---------- 几何 ----------
+	// 列定义两种写法都支持：{"标题";宽度}（位置）或 {title=..; width=..}
+	var __colTitle = function(col){
+		if(col.title !== null && col.title !== undefined) return tostring(col.title);
+		if(col[1] !== null && col[1] !== undefined) return tostring(col[1]);
+		return "";
+	}
+	var __colWidth = function(col){
+		var w = null;
+		if(col.width !== null && col.width !== undefined) w = tonumber(col.width);
+		if(w === null && col[2] !== null && col[2] !== undefined) w = tonumber(col[2]);
+		if(w === null || w <= 0) w = 100;
+		return w;
+	}
+
+	var __rowH = function(){ return ..nodio.ui.px(ROW_H) };
+	var __headH = function(){
+		if(!self.showHeader) return 0;
+		return ..nodio.ui.px(HEAD_H);
+	};
+	var __sbW = function(){ return ..nodio.ui.px(SB_W) };
+
+	// 内容总高
+	var __contentH = function(){
+		return #self.rows * __rowH();
+	}
+
+	// 可视高度（去掉表头和滚动条）
+	var __viewH = function(rc){
+		return rc.bottom - rc.top - __headH();
+	}
+
+	// 最大滚动量
+	var __maxScroll = function(rc){
+		var m = __contentH() - __viewH(rc);
+		if(m < 0) m = 0;
+		return m;
+	}
+
+	// 客户区 y → 行号（0=没命中）
+	self.__hitIndex = function(y, rc){
+		var rh = __rowH();
+		if(rh <= 0) return 0;
+		var top = rc.top + __headH();
+		if(y < top) return 0;
+		var idx = math.floor((y - top + self.scroll) / rh) + 1;
+		if(idx < 1 || idx > #self.rows) return 0;
+		return idx;
+	}
+
+	// 客户区 y → 滚动条滑块矩形
+	self.__thumbRect = function(rc){
+		var sbW = __sbW();
+		var viewH = __viewH(rc);
+		var maxS = __maxScroll(rc);
+		if(maxS <= 0) return null;
+		var contentH = __contentH();
+		var thumbH = math.max(..nodio.ui.px(24), viewH * viewH / contentH);
+		if(thumbH > viewH) thumbH = viewH;
+		var t = viewH * self.scroll / maxS;
+		return {x = rc.right - sbW; y = rc.top + __headH() + t;
+			w = sbW; h = thumbH};
+	}
+
+	// ---------- 交互 ----------
+	self.board.onMouseMove = function(x, y, bd){
+		if(self.__dragScroll){
+			var rc = self.__clientRect();
+			var tr = self.__thumbRect(rc);
+			if(tr){
+				var viewH = __viewH(rc);
+				var maxS = __maxScroll(rc);
+				var contentH = __contentH();
+				var thumbH = math.max(..nodio.ui.px(24), viewH * viewH / contentH);
+				if(thumbH > viewH) thumbH = viewH;
+				var t = (y - self.__dragScroll - rc.top - __headH()) - thumbH/2;
+				if(t < 0) t = 0;
+				var s = t * maxS / (viewH - thumbH);
+				if(s < 0) s = 0;
+				if(s > maxS) s = maxS;
+				self.scroll = s;
+				self.board.invalidate();
+			}
+			return;
+		}
+		var h = self.__hitIndex(y, self.__clientRect());
+		if(h != self.hoverIndex){
+			self.hoverIndex = h;
+			self.board.invalidate();
+		}
+	}
+
+	self.board.onMouseDown = function(x, y, bd){
+		var rc = self.__clientRect();
+		// 滚动条：点在滑块上 → 拖动；点在空白 → 翻页
+		if(x >= rc.right - __sbW()){
+			var tr = self.__thumbRect(rc);
+			if(tr && y >= tr.y && y <= tr.y + tr.h){
+				self.__dragScroll = y;
+			}
+			else{
+				var rh = __rowH();
+				self.scroll = self.scroll + (y < (tr ? tr.y : rc.top) ? -rh*3 : rh*3);
+				if(self.scroll < 0) self.scroll = 0;
+				var ms = __maxScroll(rc);
+				if(self.scroll > ms) self.scroll = ms;
+				self.board.invalidate();
+			}
+			return;
+		}
+	}
+
+	self.board.onMouseUp = function(x, y, bd){
+		self.__dragScroll = null;
+	}
+
+	self.board.onMouseClick = function(x, y, bd){
+		var rc = self.__clientRect();
+		var i = self.__hitIndex(y, rc);
+		if(!i) return;
+		self.select(i);
+	}
+
+	self.board.onDoubleClick = function(x, y, bd){
+		var rc = self.__clientRect();
+		var i = self.__hitIndex(y, rc);
+		if(!i) return;
+		if(self.onDoubleClick) self.onDoubleClick(self.rowAt(i), i);
+	}
+
+	// 滚轮：delta>0 向上
+	self.board.onMouseWheel = function(delta, x, y, bd){
+		var rc = self.__clientRect();
+		var rh = __rowH();
+		self.scroll = self.scroll - (delta / 120) * rh * 3;
+		if(self.scroll < 0) self.scroll = 0;
+		var ms = __maxScroll(rc);
+		if(self.scroll > ms) self.scroll = ms;
+		self.board.invalidate();
+	}
+
+	// ---------- 绘制 ----------
+	self.__draw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var rh = __rowH();
+		var headH = __headH();
+		var sbW = __sbW();
+		var pPad = ..nodio.ui.px(PAD);
+		var pIcon = ..nodio.ui.px(ICON);
+		// 背景
+		var bg = ..gdip.solidBrush(self.bgColor);
+		graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+		bg.delete();
+		// 表头
+		if(headH > 0){
+			var hb = ..gdip.solidBrush(self.headColor);
+			graphics.fillRect(hb, rc.left, rc.top, rc.right - rc.left - sbW, headH);
+			hb.delete();
+			var hbr = ..gdip.solidBrush(self.headText);
+			var x = rc.left;
+			for(i=1;#self.columns;1){
+				var col = self.columns[i];
+				var cw = ..nodio.ui.px(__colWidth(col));
+				graphics.drawString(__colTitle(col), font,
+					::RECTF(x + pPad, rc.top, cw - pPad*2, headH), fmt, hbr);
+				x = x + cw;
+			}
+			hbr.delete();
+			var lp = ..gdip.pen(self.lineColor, 1);
+			graphics.drawLine(lp, rc.left, rc.top + headH - 1, rc.right - sbW, rc.top + headH - 1);
+			lp.delete();
+		}
+		// 行
+		var viewTop = rc.top + headH;
+		var first = math.floor(self.scroll / rh) + 1;
+		if(first < 1) first = 1;
+		for(i=first;#self.rows;1){
+			var y = viewTop + (i - 1) * rh - self.scroll;
+			if(y >= rc.bottom) break;
+			if(i == self.selIndex){
+				var sb = ..gdip.solidBrush(self.selColor);
+				graphics.fillRect(sb, rc.left, y, rc.right - rc.left - sbW, rh);
+				sb.delete();
+			}
+			elseif(i == self.hoverIndex){
+				var hvb = ..gdip.solidBrush(self.hoverColor);
+				graphics.fillRect(hvb, rc.left, y, rc.right - rc.left - sbW, rh);
+				hvb.delete();
+			}
+			var row = self.rows[i];
+			var cx = rc.left;
+			// 行图标（画在第一列之前）
+			if(row.icon){
+				..nodio.ui.drawIcon(graphics, row.icon, cx + pPad, y + (rh - pIcon)/2, ICON,
+					i == self.selIndex ? self.textColor : self.dimColor);
+				cx = cx + pIcon + pPad;
+			}
+			// 各列
+			var brush = ..gdip.solidBrush(self.textColor);
+			for(k=1;#self.columns;1){
+				var col = self.columns[k];
+				var cw = ..nodio.ui.px(__colWidth(col));
+				graphics.drawString(self.cellText(i, k), font,
+					::RECTF(cx + pPad, y, cw - pPad*2, rh), fmt, brush);
+				cx = cx + cw;
+			}
+			brush.delete();
+		}
+		// 滚动条
+		self.__drawScroll(graphics, rc);
+	}
+
+	// 滚动条（滑块）
+	self.__drawScroll = function(graphics, rc){
+		var sbW = __sbW();
+		var tr = self.__thumbRect(rc);
+		if(!tr) return;
+		// 轨道
+		var tb = ..gdip.solidBrush(self.scrollColor);
+		graphics.fillRect(tb, rc.right - sbW, rc.top + __headH(), sbW, rc.bottom - rc.top - __headH());
+		tb.delete();
+		// 滑块
+		var kb = ..gdip.solidBrush(self.scrollThumb);
+		graphics.fillRect(kb, tr.x, tr.y, tr.w, tr.h);
+		kb.delete();
+	}
+
+	// 客户区矩形（画板自己的）
+	self.__clientRect = function(){
+		try{
+			var r2 = self.board.ctrl.getClientRect();
+			if(r2){
+				// 官方 rect 的 width/height 是**方法**
+				var w = r2.width ? r2.width() : 0;
+				var h = r2.height ? r2.height() : 0;
+				if(w && h) return {left=0; top=0; right=w; bottom=h};
+			}
+		}catch(e){}
+		return {left=0; top=0; right=200; bottom=100};
+	}
+
+	// 重新摆放
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		self.board.layout(l, t, r, b);
+	}
+
+	self.show = function(flag){
+		self.board.show(flag);
+	}
+
+	// 列
+	self.setColumns = function(cols){
+		self.columns = cols : {};
+		self.board.invalidate();
+	}
+
+	self.layout();
+	return self;
+}
+
+}

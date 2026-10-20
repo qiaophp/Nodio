@@ -1,0 +1,122 @@
+// IDE 层右键链路回归（第五轮）。
+//
+// 契约全部来自官方源码，无自造 API：
+//   · 官方 win.ui.tracker：0x7B → onContextMenu(x,y)，x,y 是**屏幕坐标**
+//     （D:\aardio\lib\win\ui\tracker.aardio:150-166）
+//   · 官方 win.ui.popmenu：popId() 不带坐标调用时取光标的屏幕坐标
+//     （D:\aardio\lib\win\ui\menu.aardio:457-521）
+//   · 官方 richedit：getSel/selText/setSel/getLength
+//     （D:\aardio\lib\win\ui\ctrl\richedit.aardio:305-322, 993-997）
+//   · 官方 treeview：hitTest(x,y,screen) / getSelection
+//     （D:\aardio\lib\win\ui\ctrl\treeview.aardio:453, 517-527）
+//
+// 覆盖四层：
+//   1) 编辑器命令（app.editor 的 cut/copy/paste/selectAll + tracker 接线）
+//   2) 自绘板 nodio.ui.board 的右键事件（屏幕坐标 / 客户区坐标）
+//   3) 工程树 nodio.ui.projectTree 的右键事件 + nodeAt / selectedNode
+//   4) 设计画布 nodio.designer.canvas 的右键事件
+//
+// 另含一条引擎级回归：装上官方 wndproc（tracker）之后，官方控件的
+// SendMessage 指针型返回值必须仍然是完整的 64 位（官方 win/api.aardio
+// 把 CallWindowProc 声明成 int 返回，64 位下会把句柄截断）。
+import win.ui;
+import nodio.ui.editor;
+import nodio.ui.board;
+import nodio.ui.projectTree;
+import nodio.designer.canvas;
+import nodio.designer.registry;
+global.import("D:/Nodio/ide/nodio/app/editor.nodio");
+
+var f = win.form(text="ide-ctx";right=900;bottom=620);
+f.add({
+	ed={cls="richedit";left=0;top=0;right=420;bottom=200;multiline=true}
+});
+
+var lp = 321 | (654 << 16);   // 屏幕坐标 321,654
+
+// ---------- 1) 编辑器命令（官方 richedit 公开 API + 引擎 win.clip） ----------
+var ed = f.ed;
+ed.text = "hello world";
+ed.setSel(1,5);
+io.print("EDIT-SEL " ++ tostring(ed.selText));
+// 剪贴板是**全局**系统资源：同机任何进程（QQ / 任务管理器 / 另一个测试）
+// 占着它时，OpenClipboard 会返回 0（ERROR_ACCESS_DENIED），win.clip 的
+// write/read 会按官方语义静默失败（返回 null）。这里先用 win.clip.formats()
+// 探测可用性（官方语义：OpenClipboard 失败即返回 null），不可用就跳过这组
+// 断言，避免共享桌面环境把与右键链路无关的断言打红。
+var clipOk = (win.clip.formats() != null);
+if(clipOk){
+	editor.copy(ed);
+	io.print("EDIT-CLIP " ++ tostring(win.clip.read()));
+	editor.cut(ed);
+	io.print("EDIT-CUT " ++ tostring(ed.text) ++ "|" ++ tostring(win.clip.read()));
+	win.clip.write("XYZ");
+	editor.paste(ed);
+	io.print("EDIT-PASTE " ++ tostring(ed.text));
+	editor.selectAll(ed);
+	io.print("EDIT-ALL " ++ tostring(ed.selText));
+}
+else{
+	io.print("EDIT-CLIP-SKIP");
+}
+
+// 右键接线：官方 tracker 装上后 ctrl.onContextMenu 是函数
+// app.editor.contextMenu 收的是**编辑器组件实例**（ide/nodio/app/shell.nopio:184
+// 传的就是 nodio.ui.editor 实例）：组件用 .control() 交出底层 richedit 句柄，
+// 右键菜单里的剪切/复制/粘贴再回到组件的 cut/copy/paste。
+var edComp = nodio.ui.editor(f, {
+	ctrl = ed;
+	fontSize = 11;
+	fontName = "Consolas";
+});
+var edCtrl = editor.contextMenu(f, edComp);
+io.print("EDIT-CTXWIRE " ++ tostring(edCtrl.onContextMenu ? 1 : 0));
+
+// ---------- 2) 自绘板：右键事件 ----------
+var board = nodio.ui.board(f, {left=430;top=0;right=880;bottom=200});
+var bctx = "none";
+// 只记第一条：WM_RBUTTONUP 之后系统会按标准 Win32 行为补发一条
+// WM_CONTEXTMENU（坐标取真实光标位置），那条不是确定值。
+board.onContextMenu = function(x,y,self){
+	if(bctx == "none") bctx = x ++ "," ++ y;
+}
+board.onRightMouseDown = function(x,y,self){ io.print("BOARD-RMBDOWN " ++ x ++ "," ++ y) };
+board.onRightMouseUp = function(x,y,self){ io.print("BOARD-RMBUP " ++ x ++ "," ++ y) };
+::User32.PostMessage(board.ctrl.hwnd, 0x7B, 0, lp);
+::User32.PostMessage(board.ctrl.hwnd, 0x204, 0, lp);
+::User32.PostMessage(board.ctrl.hwnd, 0x205, 0, lp);
+win.delay(200);
+io.print("BOARD-CTX " ++ tostring(bctx));
+
+// ---------- 3) 工程树：右键事件 + 命中定位 ----------
+var tree = nodio.ui.projectTree(f, {left=0;top=220;right=300;bottom=520});
+var tctx = "none";
+tree.onContextMenu = function(x,y){ if(tctx == "none") tctx = x ++ "," ++ y };
+var root = tree.addNode("工程", null, null);
+var node = tree.addNode("main.nodio", "D:\\x\\main.nodio", root);
+// 引擎级回归：装上官方 wndproc 之后，父子节点的句柄仍然完整
+io.print("TREE-INSERT " ++ tostring(node ? 1 : 0));
+io.print("TREE-PATH " ++ tostring(tree.pathOf(node)));
+::User32.PostMessage(tree.ctrl.hwnd, 0x7B, 0, lp);
+win.delay(200);
+io.print("TREE-CTX " ++ tostring(tctx));
+// nodeAt 走官方 hitTest(x,y,true)（屏幕坐标）
+var twr = win.getRect(tree.ctrl.hwnd, true);
+io.print("TREE-HIT " ++ tostring(tree.nodeAt(twr.left + 10, twr.top + 5) == root ? 1 : 0));
+io.print("TREE-MISS " ++ tostring(tree.nodeAt(twr.left + 10, twr.top + 400) ? 1 : 0));
+io.print("TREE-SEL " ++ tostring(tree.selectedNode() ? 1 : 0));
+
+// ---------- 4) 设计画布：右键事件（组件控件上的子类化） ----------
+var cv = nodio.designer.canvas(f, {left=320;top=220;right=880;bottom=600});
+var spec = nodio.designer.registry.register({name="按钮";cls="button";category="测试"});
+var item = cv.add(spec, {x=10;y=10;w=100;h=24});
+var cctx = "none";
+cv.onContextMenu = function(it,x,y){ cctx = tostring(it ? it.name : "null") ++ "@" ++ x ++ "," ++ y };
+cv.show(true);
+win.delay(120);
+::User32.PostMessage(item.ctrl.hwnd, 0x7B, 0, lp);
+win.delay(200);
+io.print("CANVAS-CTX " ++ tostring(cctx));
+io.print("CANVAS-DSG " ++ (cv.toDSG() ? 1 : 0));
+
+f.close();

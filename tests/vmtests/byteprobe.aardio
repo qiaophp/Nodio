@@ -1,0 +1,11 @@
+// probe: byte-string representation leakage
+var s = "中文ABC";
+var p = ..io.fullpath("probe_bytes.txt");
+..io.writeFile(p, s);
+var raw = ..io.readFile(p);
+io.print("raw print  :[", raw, "]");
+io.print("concat     :[", raw, "X", "]");
+io.print("raw==s     :", raw == s);
+io.print("#raw       :", #raw);
+io.print("len via str:", ..string.len(raw));
+..io.remove(p);

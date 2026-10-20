@@ -1,0 +1,66 @@
+// nodio.ui.dpi — DPI 缩放（逻辑像素 → 物理像素）。
+//
+// 背景（实测，系统 DPI 150%）：
+//   · 官方 win.ui 控件的矩形是**逻辑单位**（96dpi 基准）。官方库建控件时
+//     会乘以窗体的缩放系数：`form.add({left=240;top=58;right=980;bottom=560})`
+//     在 150% 下实际落在 359,86,1469,839（= 逻辑 × 1.5 - 边框 1px）。
+//   · 我们自绘的组件走的是 `win.setPos`（**物理像素**），官方不再缩放。
+//   两套单位混用 → 系统 150% 时，自绘的字体/图标/页签高度比原生控件小一圈，
+//   看上去「DPI 缩放有问题」。
+//
+// 约定（本组件层的统一规则）：
+//   ① **绘制与摆放一律用物理像素**。GDI+ 的文字度量（measureString）只在
+//      像素单位下自洽 —— 字体用 UnitPixel 创建时，量出来的宽度就是物理宽度，
+//      所以坐标空间必须是物理的，页签宽度、命中测试才对得上。
+//   ② **设计常量（字号、图标尺寸、行高、内边距…）按逻辑像素写**，
+//      使用时用 px() 乘以缩放系数换算成物理像素。
+//   ③ 外部传入的矩形（layout 的 l/t/r/b）也是物理像素 —— 与 win.setPos 一致。
+//
+// 用法：
+//   ..nodio.ui.dpiSetScaleFrom(winform)   // 从窗体读缩放系数（建好窗体后立刻调）
+//   ..nodio.ui.px(28)                     // 28 逻辑像素 → 物理像素
+//   ..nodio.ui.dpiScale()                 // 当前缩放系数（1.0 = 96dpi）
+//
+// 注意：aardio 里 `namespace nodio.ui{}` 是**绝对**声明（与文件所在目录无关），
+// 所以这些函数都在 `nodio.ui` 命名空间下；文件本身用 `import nodio.ui.dpi` 引入。
+namespace nodio.ui{
+import gdi;
+
+var __sc = 1;   // 全局缩放系数（96dpi 基准）
+
+// 从窗体读取 DPI 缩放系数并设为全局。
+// 优先用官方窗体的 dpiScaleX（官方控件就是按它缩放的，必须一致）；
+// 窗体还没显示时官方还没算出来，退回 gdi.getDpiScale（官方库同一个来源）。
+dpiSetScaleFrom = function(form){
+	if(!form) return __sc;
+	var s = null;
+	try{ s = form.dpiScaleX }catch(e){}
+	if(type(s) != "number" || !s || s <= 0){
+		s = null;
+		try{
+			var sx,sy = ..gdi.getDpiScale(, form.hwnd);
+			if(type(sx) == "number" && sx > 0) s = sx;
+		}catch(e2){}
+	}
+	if(type(s) != "number" || !s || s <= 0) s = 1;
+	__sc = s;
+	return s;
+}
+
+// 直接设缩放系数（窗口跨显示器 DPI 变化时用）
+dpiSetScale = function(s){
+	if(type(s) == "number" && s > 0) __sc = s;
+	return __sc;
+}
+
+// 当前缩放系数
+dpiScale = function(){
+	return __sc;
+}
+
+// 逻辑像素 → 物理像素
+px = function(v){
+	if(v === null || v === undefined) return v;
+	return math.round(v * __sc);
+}
+}

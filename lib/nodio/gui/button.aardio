@@ -1,0 +1,80 @@
+// nodio.gui.button — 按钮。
+//
+// 移植自 Zan.Gui 的 Gui/Widget/Button.zan：
+//   · **Class**（语义角色）：primary / info / success / warning / error / default
+//   · **Modifier**（修饰）：outline / text / ghost
+//   · **Size**（尺寸）：tiny / small / medium / large
+//   · 可带前置图标（Zan.Gui 的 Icon 前置/后置）
+//   · 可切换（Checked）
+//
+// 颜色的派生（hover 加亮 / pressed 加暗）由 style 里的角色名完成，
+// 按钮本身只管画。
+namespace nodio.gui{
+import nodio.gui.widget;
+import nodio.gui.style;
+import nodio.gui.theme;
+import nodio.gui.ctx;
+
+// 按钮
+button = function(opt){
+	opt = opt : {};
+	var self = ..nodio.gui.widget({
+		text = opt.text;
+		icon = opt.icon;
+		style = opt.style : ..nodio.gui.styleButton(
+			opt.cls : "default", opt.modifier : "", opt.size : "medium");
+	});
+	self.cls = opt.cls : "default";
+	self.modifier = opt.modifier : "";
+	self.size = opt.size : "medium";
+	self.iconSize = opt.iconSize : 14;     // 逻辑像素
+	self.iconAfter = opt.iconAfter;        // true = 图标在文字后面
+	self.checkable = opt.checkable;       // true = 可切换
+	self.onClick = opt.onClick;
+
+	self.paint = function(g, rc){
+		var th = g.theme;
+		var sb = self.box(th);
+		var x = rc.left;
+		var y = rc.top;
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var r = g.s(sb.radius);
+		// 底
+		g.round(sb.bg, x, y, w, h, r);
+		// 描边
+		var bw = g.s(sb.borderW);
+		if(bw > 0) g.roundLine(sb.borderColor, x, y, w, h, r, bw);
+		// 文字
+		var text = self.text;
+		if(self.checked && self.checkMark !== null && self.checkMark !== undefined){
+			text = self.checkMark;
+		}
+		var padL = g.s(sb.padL);
+		var padR = g.s(sb.padR);
+		var tx = x + padL;
+		var tw = w - padL - padR;
+		var iconSize = self.iconSize;
+		if(self.icon){
+			var isz = g.s(iconSize);
+			if(self.iconAfter){
+				var iw = g.measure(self.icon, iconSize);
+				var lblW = g.measure(text : "", sb.fontPx);
+				var total = iw + g.s(4) + lblW;
+				var startX = x + (w - total) / 2;
+				g.text(text, sb.fg, sb.fontPx, startX, y, lblW + 2, h,
+					{align=0; valign=1; ellipsis=1});
+				g.icon(self.icon, sb.fg, startX + lblW + g.s(4), y + (h - isz)/2, iconSize);
+				return;
+			}
+			g.icon(self.icon, sb.fg, tx, y + (h - isz)/2, iconSize);
+			tx = tx + isz + g.s(4);
+			tw = tw - isz - g.s(4);
+		}
+		g.text(text, sb.fg, sb.fontPx, tx, y, tw, h,
+			{align=1; valign=1; ellipsis=1});
+	}
+	return self;
+}
+
+}

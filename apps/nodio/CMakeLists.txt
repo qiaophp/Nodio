@@ -8,6 +8,13 @@ add_executable(nodio
 )
 target_link_libraries(nodio PRIVATE nodio_publish)
 
+# The publisher uses nodio-stub.exe as the runtime template of a published
+# app (see publish/publish.cpp). If the stub is not rebuilt together with the
+# engine, a published app runs an OLD engine — its embedded payload lookup,
+# its fixes, everything — so the stub is a hard build dependency of the host
+# that publishes.
+add_dependencies(nodio nodio-stub)
+
 # host.rc embeds the manifest + version info as real PE resources at the ids
 # the Windows loader reads. The VS generator also emits its own default
 # manifest and merges it at link time (CVT1100 duplicate on RT_MANIFEST id 1),

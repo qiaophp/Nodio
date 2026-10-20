@@ -1475,6 +1475,7 @@ namespace
         if (!s_meta)
         {
             s_meta = std::make_shared<Table>();
+            GcAddRootTable(s_meta);
             s_meta->map[L"_get"] = NF([](vector<Value>& a) -> Value {
                 if (a.size() < 3 || a[2].t != Value::TableT || !a[2].tab)
                     return Value();
@@ -1913,6 +1914,7 @@ namespace
         if (!s_meta)
         {
             s_meta = std::make_shared<Table>();
+            GcAddRootTable(s_meta);
 
             // _get(k, ownerCall, owner) — dynamic member read; returns a
             // bound-member wrapper (callable) for methods, the property
@@ -1957,63 +1959,96 @@ namespace
                 if (ipat != targetObj.tab->map.end() && ipat->second.t == Value::Num)
                     prefArrayType = (VARTYPE)ipat->second.n;
 
-                DISPID dispid;
-                OLECHAR* name = const_cast<OLECHAR*>(key.c_str());
-                if (FAILED(pd->GetIDsOfNames(IID_NULL, &name, 1,
-                                             LOCALE_USER_DEFAULT, &dispid)))
+                bool bOwnerCall = (a.size() >= 2 && a[1].t == Value::Bool && a[1].b);
+                DISPID dispid = DISPID_UNKNOWN;
+                if (targetObj.tab->comCache)
                 {
-                    // COM accessor dispatch: obj.getFoo / obj.setFoo gets the bound method
-                    // e.g. "getCompile" -> "Compile", "getReference" -> "Reference", "getInvokeObjectMember" -> "InvokeObjectMember"
-                    // Also parameterized property-put helper: obj.setFoo("key", val) maps to property put on "Foo"
-                    // Official aardio also accepts all-lowercase accessor prefixes
-                    // (doc: "在属性名字前加上get前缀、并以函数形式调用属性方法"),
-                    // e.g. IXMLDOMDocument.getxml() / setText() / getText()
-                    bool bAccessor = key.size() > 3 &&
-                        (key.rfind(L"get", 0) == 0 || key.rfind(L"set", 0) == 0) &&
-                        iswupper(key[3]);
-                    if (!bAccessor && key.size() > 4 &&
-                        (key.rfind(L"get", 0) == 0 || key.rfind(L"set", 0) == 0))
+                    auto it = targetObj.tab->comCache->find(key);
+                    if (it != targetObj.tab->comCache->end())
                     {
-                        // lowercase accessor: verify the stripped name exists
-                        wstring methodKey = key.substr(3);
-                        OLECHAR* mname = const_cast<OLECHAR*>(methodKey.c_str());
-                        DISPID idProbe;
-                        if (SUCCEEDED(pd->GetIDsOfNames(IID_NULL, &mname, 1,
-                                                        LOCALE_USER_DEFAULT, &idProbe)))
-                            bAccessor = true;
-                    }
-                    if (bAccessor)
-                    {
-                        wstring methodKey = key.substr(3);
-                        OLECHAR* mname = const_cast<OLECHAR*>(methodKey.c_str());
-                        if (SUCCEEDED(pd->GetIDsOfNames(IID_NULL, &mname, 1,
-                                                        LOCALE_USER_DEFAULT, &dispid)))
+                        if (bOwnerCall && it->second.boundMethod.t != Value::Null)
+                            return it->second.boundMethod;
+                        if (it->second.dispid != -1)
                         {
-                            bool bIsSet = (key.rfind(L"set", 0) == 0);
-                            auto w = std::make_shared<Table>();
-                            w->map[L"_boundDispatch"] = Value::Pointer_((void*)pd);
-                            w->map[L"_boundDispId"] = Value::Num_((double)dispid);
-                            w->map[L"_boundName"] = Value::Str_(key);
-                            if (bIsSet)
-                                w->map[L"_boundIsSet"] = Value::Bool_(true);
-                            if (prefArrayType != VT_EMPTY)
-                                w->map[L"_preferredArrayType"] = Value::Num_((double)prefArrayType);
-                            w->map[L"_meta"] = Value::Table_(
-                                std::shared_ptr<Table>(ComMeta(), [](Table*) {}));
-                            return Value::Table_(w);
+                            dispid = (DISPID)it->second.dispid;
+                            goto have_dispid;
                         }
                     }
-
-                    // Type library constants lookup: obj.adChar etc.
-                    Value vConst = LookupTypeLibConstant(pd, targetObj, key);
-                    if (vConst.t != Value::Null)
-                        return vConst;
-                    return Value();
                 }
-                bool bOwnerCall = (a.size() >= 2 && a[1].t == Value::Bool && a[1].b);
-                if (bOwnerCall)
-                    return WrapBoundMember(pd, dispid, key, prefArrayType);
 
+                {
+                    OLECHAR* name = const_cast<OLECHAR*>(key.c_str());
+                    if (FAILED(pd->GetIDsOfNames(IID_NULL, &name, 1,
+                                                 LOCALE_USER_DEFAULT, &dispid)))
+                    {
+                        // COM accessor dispatch: obj.getFoo / obj.setFoo gets the bound method
+                        // e.g. "getCompile" -> "Compile", "getReference" -> "Reference", "getInvokeObjectMember" -> "InvokeObjectMember"
+                        // Also parameterized property-put helper: obj.setFoo("key", val) maps to property put on "Foo"
+                        // Official aardio also accepts all-lowercase accessor prefixes
+                        // (doc: "在属性名字前加上get前缀、并以函数形式调用属性方法"),
+                        // e.g. IXMLDOMDocument.getxml() / setText() / getText()
+                        bool bAccessor = key.size() > 3 &&
+                            (key.rfind(L"get", 0) == 0 || key.rfind(L"set", 0) == 0) &&
+                            iswupper(key[3]);
+                        if (!bAccessor && key.size() > 4 &&
+                            (key.rfind(L"get", 0) == 0 || key.rfind(L"set", 0) == 0))
+                        {
+                            // lowercase accessor: verify the stripped name exists
+                            wstring methodKey = key.substr(3);
+                            OLECHAR* mname = const_cast<OLECHAR*>(methodKey.c_str());
+                            DISPID idProbe;
+                            if (SUCCEEDED(pd->GetIDsOfNames(IID_NULL, &mname, 1,
+                                                            LOCALE_USER_DEFAULT, &idProbe)))
+                                bAccessor = true;
+                        }
+                        if (bAccessor)
+                        {
+                            wstring methodKey = key.substr(3);
+                            OLECHAR* mname = const_cast<OLECHAR*>(methodKey.c_str());
+                            if (SUCCEEDED(pd->GetIDsOfNames(IID_NULL, &mname, 1,
+                                                            LOCALE_USER_DEFAULT, &dispid)))
+                            {
+                                bool bIsSet = (key.rfind(L"set", 0) == 0);
+                                auto w = std::make_shared<Table>();
+                                w->map[L"_boundDispatch"] = Value::Pointer_((void*)pd);
+                                w->map[L"_boundDispId"] = Value::Num_((double)dispid);
+                                w->map[L"_boundName"] = Value::Str_(key);
+                                if (bIsSet)
+                                    w->map[L"_boundIsSet"] = Value::Bool_(true);
+                                if (prefArrayType != VT_EMPTY)
+                                    w->map[L"_preferredArrayType"] = Value::Num_((double)prefArrayType);
+                                w->map[L"_meta"] = Value::Table_(
+                                    std::shared_ptr<Table>(ComMeta(), [](Table*) {}));
+                                Value bm = Value::Table_(w);
+                                if (!targetObj.tab->comCache)
+                                    targetObj.tab->comCache = std::make_shared<std::unordered_map<wstring, ComCacheEntry>>();
+                                auto& cEntry = (*targetObj.tab->comCache)[key];
+                                cEntry.dispid = (long)dispid;
+                                cEntry.boundMethod = bm;
+                                return bm;
+                            }
+                        }
+
+                        // Type library constants lookup: obj.adChar etc.
+                        Value vConst = LookupTypeLibConstant(pd, targetObj, key);
+                        if (vConst.t != Value::Null)
+                            return vConst;
+                        return Value();
+                    }
+                }
+
+                if (!targetObj.tab->comCache)
+                    targetObj.tab->comCache = std::make_shared<std::unordered_map<wstring, ComCacheEntry>>();
+                (*targetObj.tab->comCache)[key].dispid = (long)dispid;
+
+                if (bOwnerCall)
+                {
+                    Value bm = WrapBoundMember(pd, dispid, key, prefArrayType);
+                    (*targetObj.tab->comCache)[key].boundMethod = bm;
+                    return bm;
+                }
+
+have_dispid:
                 wstring err;
                 vector<Value> noArgs;
                 Value v = InvokeDisp(pd, dispid, DISPATCH_PROPERTYGET | DISPATCH_METHOD,
@@ -2033,7 +2068,10 @@ namespace
                     Value vConst = LookupTypeLibConstant(pd, targetObj, key);
                     if (vConst.t != Value::Null)
                         return vConst;
-                    return WrapBoundMember(pd, dispid, key, prefArrayType);
+                    Value bm = WrapBoundMember(pd, dispid, key, prefArrayType);
+                    if (targetObj.tab->comCache)
+                        (*targetObj.tab->comCache)[key].boundMethod = bm;
+                    return bm;
                 }
                 return v;
             });
@@ -2078,15 +2116,27 @@ namespace
                 if (!pd)
                     return Value();
                 wstring key = BStr(a[0]);
-                DISPID dispid;
-                OLECHAR* name = const_cast<OLECHAR*>(key.c_str());
-                if (FAILED(pd->GetIDsOfNames(IID_NULL, &name, 1,
-                                             LOCALE_USER_DEFAULT, &dispid)))
+                DISPID dispid = DISPID_UNKNOWN;
+                if (targetObj.tab->comCache)
                 {
-                    Interp* it = g_interpCurrent;
-                    if (it)
-                        *it->err = L"com: 成员不存在 " + key;
-                    return Value();
+                    auto it = targetObj.tab->comCache->find(key);
+                    if (it != targetObj.tab->comCache->end() && it->second.dispid != -1)
+                        dispid = (DISPID)it->second.dispid;
+                }
+                if (dispid == DISPID_UNKNOWN)
+                {
+                    OLECHAR* name = const_cast<OLECHAR*>(key.c_str());
+                    if (FAILED(pd->GetIDsOfNames(IID_NULL, &name, 1,
+                                                 LOCALE_USER_DEFAULT, &dispid)))
+                    {
+                        Interp* it = g_interpCurrent;
+                        if (it)
+                            *it->err = L"com: 成员不存在 " + key;
+                        return Value();
+                    }
+                    if (!targetObj.tab->comCache)
+                        targetObj.tab->comCache = std::make_shared<std::unordered_map<wstring, ComCacheEntry>>();
+                    (*targetObj.tab->comCache)[key].dispid = (long)dispid;
                 }
                 VARTYPE prefArrayType = VT_EMPTY;
                 auto ipat = targetObj.tab->map.find(L"_preferredArrayType");
@@ -2296,6 +2346,7 @@ namespace
         if (!s_meta)
         {
             s_meta = std::make_shared<Table>();
+            GcAddRootTable(s_meta);
 
             // _get(k, ownerCall, owner) — expose known members; unknown
             // members stay null so official optional checks keep working

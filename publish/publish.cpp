@@ -23,6 +23,7 @@
 #include <windows.h>
 #include "engine/common.h"
 #include "engine/NodioVM.h"
+#include "engine/compiler.h"
 #include "publish/publish.h"
 #include <string>
 #include <vector>
@@ -118,6 +119,28 @@ namespace NodioPublish
         wchar_t back = a.back();
         if (back == L'\\' || back == L'/') return a + b;
         return a + L"\\" + b;
+    }
+
+    static std::wstring GetOverlayLibDir()
+    {
+        wchar_t szEnv[MAX_PATH] = L"";
+        if (GetEnvironmentVariableW(L"NODIO_OVERLAY_LIBDIR", szEnv, MAX_PATH) > 0)
+            return std::wstring(szEnv);
+        wchar_t szExe[MAX_PATH] = L"";
+        if (GetModuleFileNameW(nullptr, szExe, MAX_PATH) > 0)
+        {
+            std::wstring exeDir = DirOf(szExe);
+            if (!exeDir.empty())
+            {
+                std::wstring c1 = JoinPath(exeDir, L"lib");
+                if (GetFileAttributesW(c1.c_str()) != INVALID_FILE_ATTRIBUTES) return c1;
+                std::wstring c2 = JoinPath(DirOf(exeDir), L"lib");
+                if (GetFileAttributesW(c2.c_str()) != INVALID_FILE_ATTRIBUTES) return c2;
+            }
+        }
+        if (GetFileAttributesW(L"D:\\Nodio\\lib") != INVALID_FILE_ATTRIBUTES)
+            return L"D:\\Nodio\\lib";
+        return L"";
     }
 
     // ---- .aproj ----------------------------------------------------------
@@ -685,6 +708,10 @@ namespace NodioPublish
                      (int)srcMain.size(), opt.strLibDir.c_str());
             fflush(stderr);
         }
+        // 64-bit native overlay library takes precedence over official libDir
+        std::wstring strOverlay = GetOverlayLibDir();
+        if (!strOverlay.empty())
+            CollectClosure(srcMain, strOverlay, colFiles, visited, 0);
         if (!opt.strLibDir.empty())
             CollectClosure(srcMain, opt.strLibDir, colFiles, visited, 0);
         // project-local lib: proj\lib\X == import X, resolved after the global lib root
@@ -708,19 +735,46 @@ namespace NodioPublish
             colFiles[key] = abs;
         }
 
-        // 3) payload: entry as "\0main"? keep entry under its file name
+        // 3) payload: compile scripts into binary bytecode; embed non-scripts as raw bytes
         std::map<std::wstring, std::string> payload;   // key -> bytes
         {
-            std::vector<char> bytes;
-            if (!ReadWholeFile(opt.strEntry, bytes)) { strErr = L"读取启动脚本失败"; return false; }
-            payload[BaseOf(opt.strEntry)] =
-                std::string(bytes.data(), bytes.size());
+            std::wstring entryKey = BaseOf(opt.strEntry);
+            if (NodioVM::HasScriptExtension(entryKey))
+            {
+                std::vector<uint8_t> bc;
+                std::wstring compErr;
+                std::wstring entryDir = DirOf(opt.strEntry);
+                if (!NodioVM::CompileScript(srcMain, bc, &compErr, &entryDir))
+                {
+                    strErr = L"编译启动脚本为字节码失败: " + compErr;
+                    return false;
+                }
+                payload[entryKey] = std::string((const char*)bc.data(), bc.size());
+            }
+            else
+            {
+                std::vector<char> bytes;
+                if (!ReadWholeFile(opt.strEntry, bytes)) { strErr = L"读取启动脚本失败"; return false; }
+                payload[entryKey] = std::string(bytes.data(), bytes.size());
+            }
         }
         for (auto& kv : colFiles)
         {
+            std::wstring key = kv.first;
+            if (NodioVM::HasScriptExtension(key))
+            {
+                std::wstring srcLib = ReadTextUtf8(kv.second);
+                std::vector<uint8_t> bc;
+                std::wstring compErr;
+                std::wstring libDir = DirOf(kv.second);
+                if (NodioVM::CompileScript(srcLib, bc, &compErr, &libDir))
+                {
+                    payload[key] = std::string((const char*)bc.data(), bc.size());
+                    continue;
+                }
+            }
             std::vector<char> bytes;
             if (!ReadWholeFile(kv.second, bytes)) continue;
-            std::wstring key = kv.first;
             payload[key] = std::string(bytes.data(), bytes.size());
         }
 
@@ -741,18 +795,32 @@ namespace NodioPublish
             payloadSize += kv.second.size();
         }
 
-        // 4) read the host exe, rewrite its manifest/version resources in
-        //    place, patch the subsystem, then append the payload.
-        //    Resources are patched in memory (not via UpdateResourceW,
-        //    which corrupts the section when replacing entries) and the
-        //    payload is appended last so nothing shifts afterwards.
+        // 4) read the runtime template exe (nodio-stub.exe preferred over host exe),
+        //    rewrite its manifest/version resources in place, patch the subsystem,
+        //    then append the bytecode payload.
         std::vector<char> exe;
         {
-            wchar_t szSelf[MAX_PATH] = L"";
-            GetModuleFileNameW(nullptr, szSelf, MAX_PATH);
-            if (!ReadWholeFile(szSelf, exe))
+            std::wstring stubPath;
+            wchar_t szEnvStub[MAX_PATH] = L"";
+            if (GetEnvironmentVariableW(L"NODIO_STUB", szEnvStub, MAX_PATH) > 0 &&
+                GetFileAttributesW(szEnvStub) != INVALID_FILE_ATTRIBUTES)
             {
-                strErr = L"读取宿主程序失败";
+                stubPath = szEnvStub;
+            }
+            else
+            {
+                wchar_t szSelf[MAX_PATH] = L"";
+                GetModuleFileNameW(nullptr, szSelf, MAX_PATH);
+                std::wstring selfDir = DirOf(szSelf);
+                std::wstring candStub = JoinPath(selfDir, L"nodio-stub.exe");
+                if (GetFileAttributesW(candStub.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    stubPath = candStub;
+                else
+                    stubPath = szSelf;
+            }
+            if (!ReadWholeFile(stubPath, exe))
+            {
+                strErr = L"读取运行时模板程序失败: " + stubPath;
                 return false;
             }
         }

@@ -1,0 +1,674 @@
+// nodio.ui.titlebar — 自绘标题栏（**菜单栏合并进标题栏一行**）。
+//
+// 为什么不用原生标题栏：IDE 的 chrome 已经整体深色自绘，Windows 那条浅色
+// 标题栏（以及它下面的系统菜单栏）跟整个界面根本不是一套东西。
+// 参考 IDE（aar.chengxu.online/thread-903.htm 的 aardioX / QuickEditor4）
+// 就是这么做的 —— **标题栏 = 菜单栏**，一行：
+//
+//   左：应用标记 + 菜单（文件 工程 编辑 选择 格式 转到 查找 显示 运行 视图 设置 帮助）
+//   中：当前文档 - 应用名（居中）
+//   右：最小化 / 最大化 / 关闭
+//
+// 实现要点：
+//   · 去掉窗口的 WS_CAPTION（win.modifyStyle）→ 客户区顶到窗口顶端；
+//     保留 WS_THICKFRAME/WS_SIZEBOX，窗口仍然能拖边改大小；
+//   · 再用 WM_NCCALCSIZE 把客户区**扩到整个窗口矩形**（满幅），
+//     这样窗口四周那圈 10 物理像素的可缩放边框（Windows 10+ 的 DWM 扩展边框，
+//     原本用系统画刷 COLOR_3DFACE 画，是浅灰色）也变成自绘区域 —
+//     深色界面里一条浅灰边框比原生标题栏还扎眼。
+//     最大化时**不接管** WM_NCCALCSIZE：此时系统提议的矩形就是工作区，
+//     接管会把内容顶出屏幕（这是自绘标题栏最经典的坑）。
+//   · WM_NCHITTEST：标题栏区域返回 HTCAPTION → 系统的拖动窗口 / 贴边最大化
+//     / 双击全屏全都照旧可用（不用自己实现拖动）；
+//     左右下边缘几个像素返回 HTLEFT/HTRIGHT/... → 保留拖边改大小；
+//     窗口按钮区域返回 HTCLIENT（自己处理点击）。
+//   · 菜单是**自绘**的：系统菜单栏属于非客户区，去掉 caption 后它会浮在
+//     客户区上面，深色界面里那条浅色菜单栏更难看；
+//   · 下拉菜单用一块独立画板（后建 → 天然在最上层），打开时捕获鼠标，
+//     点菜单外面就取消。
+//
+// 坐标：物理像素（与其它自绘组件一致，见 nodio.ui.board）。
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.subclass;
+import nodio.ui.rect;
+import nodio.ui.dpi;
+import nodio.ui.theme;
+import gdip;
+import raw;
+
+var __tbSeq = 0;
+
+// 标题栏
+titlebar = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	// 设计常量（逻辑像素）
+	var LOGO    = 16;   // 应用标记边长
+	var MENU_PAD = 10;   // 菜单标题左右留白
+	var BTN_W   = 46;   // 窗口按钮宽
+	var ITEM_H  = 24;   // 下拉菜单项高
+	var SEP_H   = 9;    // 分隔线高
+	var POP_PAD = 22;   // 下拉菜单左右留白
+	var Z_BAR   = 40;   // 标题栏层级
+	var Z_POP   = 60;   // 下拉菜单层级
+
+	var self = {
+		winform = winform;
+		board = null;
+		popup = null;
+		sub = null;          // 窗体子类化（NC 命中测试 / 客户区计算）
+		height = ..nodio.ui.px(opt.height : 32);
+		title = opt.title : "";
+		menus = opt.menus : {};      // { {"文件"; { {"新建";fn}; {"-";null}; … } } }
+		hoverMenu = 0;
+		openMenu = 0;
+		hoverBtn = 0;               // 1 最小 2 最大化 3 关闭
+		menuRects = {};
+		btnRects = {};
+		popRects = {};
+		popHover = 0;
+		popItems = {};
+		popHandled = false;         // 下拉菜单这一轮按下是否已经处理过
+		wcache = {};                // 菜单项文字宽度缓存
+	};
+
+	__tbSeq = __tbSeq + 1;
+	self.board = nodio.ui.board(winform, {
+		left = 0; top = 0; right = 800; bottom = self.height;
+		fontSize = opt.fontSize : 12;
+		z = Z_BAR;
+		// 按下时捕获鼠标：拖动窗口时鼠标要能移出标题栏
+		capture = true;
+		autoReleaseCapture = false;
+	});
+	self.ctrl = self.board.ctrl;
+	self.board.onDraw = function(graphics, rc, bd){
+		self.__draw(graphics, rc, bd);
+	}
+	self.board.onMouseMove = function(x,y,bd,lp){
+		if(self.__drag){ self.__doDrag(); return }
+		self.__hover(x, y);
+	}
+	self.board.onMouseDown = function(x,y,bd,lp){
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG tb.down x=" ++ x ++ " y=" ++ y);
+		}
+		self.__click(x, y, bd, lp);
+	}
+	self.board.onMouseUp = function(x,y,bd,lp){
+		if(self.__drag){
+			self.__drag = null;
+			self.board.setCapture(false);
+		}
+	}
+	self.board.onMouseClick = function(x,y,bd,lp){
+		// 双击标题栏空白处 = 最大化/还原
+		if(!bd.dblClick) return;
+		if(self.__hitBtn(x,y)) return;
+		if(self.__hitMenu(x,y)) return;
+		if(self.__isMaximized()) self.__sysCmd(0xF120);  // SC_RESTORE
+		else self.__sysCmd(0xF030);                       // SC_MAXIMIZE
+	}
+	self.board.onMouseLeave = function(){
+		if(self.hoverBtn){ self.hoverBtn = 0; self.board.invalidate() }
+		if(self.hoverMenu && !self.openMenu){ self.hoverMenu = 0; self.board.invalidate() }
+	}
+
+	// ---------- 画 ----------
+	self.__draw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		// 底
+		var bg = ..gdip.solidBrush(th.bg);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		// 底部分隔线
+		var lp = ..gdip.pen(th.border, 1);
+		graphics.drawLine(lp, rc.left, rc.bottom - 1, rc.right, rc.bottom - 1);
+		lp.delete();
+
+		// 量一遍下拉菜单项的文字宽度（绘制时才有 graphics）
+		self.__cacheItemW(graphics, font, fmt);
+
+		// ---- 左：应用标记 + 菜单标题 ----
+		var x = rc.left + ..nodio.ui.px(8);
+		var logoSize = ..nodio.ui.px(LOGO);
+		self.__drawLogo(graphics, x, rc.top + (h - logoSize)/2, logoSize);
+		x = x + logoSize + ..nodio.ui.px(10);
+		self.menuRects = {};
+		for(i=1;#self.menus;1){
+			var cap = self.menus[i][1];
+			var m = graphics.measureString(cap, font, ::RECTF(0,0,4000,4000), fmt);
+			var tw = m ? m.width : ..nodio.ui.px(40);
+			var pad = ..nodio.ui.px(MENU_PAD);
+			var rect = {left=x; right=x + tw + pad*2; top=rc.top; bottom=rc.bottom};
+			self.menuRects[i] = rect;
+			if(self.openMenu == i || self.hoverMenu == i){
+				var hb = ..gdip.solidBrush(th.hoverBg);
+				graphics.fillRect(hb, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+				hb.delete();
+			}
+			var brush = ..gdip.solidBrush((self.openMenu == i) ? th.textSel : th.text);
+			graphics.drawString(cap, font,
+				::RECTF(rect.left + pad, rect.top, tw + 2, rect.bottom - rect.top), fmt, brush);
+			brush.delete();
+			x = rect.right;
+		}
+		var menusRight = x;
+
+		// ---- 右：窗口按钮 ----
+		var bw = ..nodio.ui.px(BTN_W);
+		var bx = rc.right - bw*3;
+		self.btnRects = {};
+		var kinds = {"min"; "max"; "close"};
+		for(i=1;3;1){
+			var br = {left=bx + (i-1)*bw; right=bx + i*bw; top=rc.top; bottom=rc.bottom};
+			self.btnRects[i] = br;
+			if(self.hoverBtn == i){
+				var bgc = (i == 3) ? 0xFFC42B1C : th.hoverBg;
+				var hb2 = ..gdip.solidBrush(bgc);
+				graphics.fillRect(hb2, br.left, br.top, br.right - br.left, br.bottom - br.top);
+				hb2.delete();
+			}
+			self.__drawWinBtn(graphics, kinds[i], br, (self.hoverBtn == i) ? th.textSel : th.text);
+		}
+		var btnsLeft = bx;
+
+		// ---- 中：居中标题 ----
+		if(self.title){
+			var tm = graphics.measureString(self.title, font, ::RECTF(0,0,4000,4000), fmt);
+			var ttw = tm ? tm.width : 0;
+			var spaceL = menusRight;
+			var spaceR = btnsLeft;
+			var tx = spaceL + (spaceR - spaceL - ttw)/2;
+			if(tx < spaceL) tx = spaceL;
+			var tb = ..gdip.solidBrush(th.text);
+			graphics.drawString(self.title, font,
+				::RECTF(tx, rc.top, ttw + 2, rc.bottom - rc.top), fmt, tb);
+			tb.delete();
+		}
+	}
+
+	// 缓存下拉菜单项的文字宽度（绘制时才有 graphics）
+	self.__cacheItemW = function(graphics, font, fmt){
+		for(i=1;#self.menus;1){
+			var items = self.menus[i][2];
+			if(!items) continue;
+			for(j=1;#items;1){
+				var txt = tostring(items[j][1] : "");
+				if(txt == "-") continue;
+				if(self.wcache[txt] === null || self.wcache[txt] === undefined){
+					var m = graphics.measureString(txt, font, ::RECTF(0,0,4000,4000), fmt);
+					self.wcache[txt] = m ? m.width : 0;
+				}
+			}
+		}
+	}
+
+	// 应用标记：圆角方块 + 首字母
+	self.__drawLogo = function(graphics, x, y, size){
+		var r = size/4;
+		var b = ..gdip.solidBrush(th.accent);
+		graphics.fillRoundRect(b, x, y, size, size, r);
+		b.delete();
+		var font = ..nodio.ui.boardFont(12);
+		var fmt = ..nodio.ui.boardFormat();
+		var brush = ..gdip.solidBrush(0xFFFFFFFF);
+		graphics.drawString("N", font, ::RECTF(x, y, size, size), fmt, brush);
+		brush.delete();
+	}
+
+	// 窗口按钮图形
+	self.__drawWinBtn = function(graphics, kind, r, color){
+		var cx = (r.left + r.right)/2;
+		var cy = (r.top + r.bottom)/2;
+		var s = ..nodio.ui.px(9);
+		var pen = ..gdip.pen(color, 1);
+		if(kind == "min"){
+			graphics.drawLine(pen, cx - s/2, cy + s/2, cx + s/2, cy + s/2);
+		}
+		elseif(kind == "max"){
+			if(self.__isMaximized()){
+				// 还原：两个错位的方框
+				graphics.drawRectangle(pen, cx - s/2 + 2, cy - s/2, s - 2, s - 2);
+				graphics.drawLine(pen, cx - s/2, cy - s/2 + 2, cx + s/2 - 2, cy - s/2 + 2);
+				graphics.drawLine(pen, cx + s/2 - 2, cy - s/2, cx + s/2 - 2, cy + s/2 - 2);
+			}
+			else{
+				graphics.drawRectangle(pen, cx - s/2, cy - s/2, s, s);
+			}
+		}
+		else{
+			graphics.drawLine(pen, cx - s/2, cy - s/2, cx + s/2, cy + s/2);
+			graphics.drawLine(pen, cx + s/2, cy - s/2, cx - s/2, cy + s/2);
+		}
+		pen.delete();
+	}
+
+	// 窗口是否最大化（WS_MAXIMIZE = 0x01000000）
+	self.__isMaximized = function(){
+		try{
+			var st = ..win.getStyle(winform.hwnd, 0x01000000);
+			return st ? true : false;
+		}catch(e){
+			return false;
+		}
+	}
+
+	// ---------- 交互 ----------
+	// 命中的窗口按钮（0=没有）
+	self.__hitBtn = function(x, y){
+		for(i=1;3;1){
+			var r = self.btnRects[i];
+			if(!r) continue;
+			if(x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+		}
+		return 0;
+	}
+	// 命中的菜单标题（0=没有）
+	self.__hitMenu = function(x, y){
+		for(i=1;#self.menuRects;1){
+			var r = self.menuRects[i];
+			if(!r) continue;
+			if(x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+		}
+		return 0;
+	}
+
+	self.__hover = function(x, y){
+		var b = self.__hitBtn(x, y);
+		if(b != self.hoverBtn){
+			self.hoverBtn = b;
+			self.board.invalidate();
+		}
+		var m = self.__hitMenu(x, y);
+		// 菜单打开时，划过别的菜单标题就切换过去（跟原生菜单一样）
+		if(self.openMenu && m && m != self.openMenu){
+			self.__openMenu(m);
+			return;
+		}
+		if(m != self.hoverMenu){
+			self.hoverMenu = m;
+			self.board.invalidate();
+		}
+	}
+
+	// ---------- 拖动窗口 ----------
+	//
+	// 标题栏整条都算**客户区**（WM_NCHITTEST 返回 HTCLIENT），
+	// 这样菜单标题、窗口按钮才能收到鼠标消息 ——
+	// 如果返回 HTCAPTION，鼠标事件全进非客户区，子画板一条都收不到，
+	// 菜单就点不动了。
+	// 代价是拖动窗口要自己做：记录光标的**屏幕**位置和窗口位置，
+	// 移动时按增量 SetWindowPos。
+	//
+	// 增量必须用真实光标位置算：拖动时窗口跟着光标走，
+	// 画板内的客户区坐标是不变的，从画板坐标算增量永远是 0。
+	self.__drag = null;
+
+	// 移动窗口（只挪位置，不改大小）
+	self.__moveWindow = function(x, y){
+		try{
+			..win.setPos(winform.hwnd, x, y, 0, 0, 0,
+				0x1/*_SWP_NOSIZE*/ | 0x4/*_SWP_NOZORDER*/ | 0x10/*_SWP_NOACTIVATE*/);
+		}catch(e){}
+	}
+
+	self.__beginDrag = function(){
+		var cx,cy = ..win.getCursorPos();
+		var wr = ..win.getRect(winform.hwnd, true);
+		if(!wr) return;
+		// 最大化状态下拖动 = 先还原再拖（Windows 的习惯）
+		if(self.__isMaximized()){
+			var maxW = wr.right - wr.left;
+			var relX = cx - wr.left;
+			var relY = cy - wr.top;
+			var ratio = maxW > 0 ? relX / maxW : 0.5;
+			self.__sysCmd(0xF120);   // SC_RESTORE
+			var wr1 = ..win.getRect(winform.hwnd, true);
+			if(!wr1) return;
+			var nw = wr1.right - wr1.left;
+			// 让光标在标题栏里的相对位置保持不变
+			var nx = cx - math.round(nw * ratio);
+			var ny = cy - math.round(relY > 40 ? 20 : relY);
+			self.__moveWindow(nx, ny);
+			wr1 = ..win.getRect(winform.hwnd, true);
+			if(!wr1) return;
+			self.__drag = {sx=cx; sy=cy; wx=wr1.left; wy=wr1.top};
+			return;
+		}
+		self.__drag = {sx=cx; sy=cy; wx=wr.left; wy=wr.top};
+	}
+
+	self.__doDrag = function(){
+		var d = self.__drag;
+		if(!d) return;
+		var cx,cy = ..win.getCursorPos();
+		var dx = cx - d.sx;
+		var dy = cy - d.sy;
+		if(dx == 0 && dy == 0) return;
+		self.__moveWindow(d.wx + dx, d.wy + dy);
+	}
+
+	self.__click = function(x, y, bd, lp){
+		var b = self.__hitBtn(x, y);
+		if(b){
+			if(b == 1) self.__sysCmd(0xF020);      // SC_MINIMIZE
+			elseif(b == 2) self.__sysCmd(0xF030); // SC_MAXIMIZE
+			else self.__sysCmd(0xF060);            // SC_CLOSE
+			return;
+		}
+		var m = self.__hitMenu(x, y);
+		if(m){
+			// 鼠标按下后捕获移交给下拉菜单画板，这一轮按下不再算标题栏的
+			if(bd) bd.bDown = false;
+			if(self.openMenu == m) self.__closeMenu();
+			else self.__openMenu(m);
+			return;
+		}
+		// 空白处：开始拖动窗口
+		self.__closeMenu();
+		self.__beginDrag();
+	}
+
+	// 发 WM_SYSCOMMAND（最小化/最大化/关闭）
+	self.__sysCmd = function(cmd){
+		try{
+			::SendMessage(winform.hwnd, 0x112/*_WM_SYSCOMMAND*/, cmd, 0);
+		}catch(e){}
+	}
+
+	// ---------- 下拉菜单 ----------
+	self.__openMenu = function(idx){
+		var items = self.menus[idx][2];
+		if(!items) return;
+		self.openMenu = idx;
+		self.hoverMenu = idx;
+		self.popItems = items;
+		// 量尺寸
+		var maxW = 0;
+		for(i=1;#items;1){
+			var it = items[i];
+			var txt = tostring(it[1] : "");
+			if(txt == "-") continue;
+			var w = self.wcache[txt];
+			if(w === null || w === undefined) w = 0;
+			if(w > maxW) maxW = w;
+		}
+		var pad = ..nodio.ui.px(POP_PAD);
+		var itemH = ..nodio.ui.px(ITEM_H);
+		var sepH = ..nodio.ui.px(SEP_H);
+		var totalH = 0;
+		for(i=1;#items;1){
+			var it2 = items[i];
+			if(tostring(it2[1] : "") == "-") totalH = totalH + sepH;
+			else totalH = totalH + itemH;
+		}
+		var r = self.menuRects[idx];
+		if(!r) return;
+		var px2 = r.left;
+		var py = r.bottom;
+		var pw = maxW + pad;
+		// 别超出窗口右边
+		if(px2 + pw > self.board.rect.right) px2 = self.board.rect.right - pw;
+		self.__ensurePopup();
+		..nodio.ui.setRect(self.popup.ctrl, px2, py, px2 + pw, py + totalH);
+		// 下拉菜单也要在最前（官方 add 是按创建顺序排层次的）
+		try{
+			..win.setPos(self.popup.ctrl.hwnd, px2, py, pw, totalH,
+				0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+		}catch(e2){}
+		self.popup.show(true);
+		self.popRects = {};
+		var yy = py;
+		for(i=1;#items;1){
+			var it3 = items[i];
+			var txt3 = tostring(it3[1] : "");
+			if(txt3 == "-"){
+				self.popRects[i] = {left=px2; right=px2+pw; top=yy; bottom=yy+sepH; sep=true};
+				yy = yy + sepH;
+			}
+			else{
+				self.popRects[i] = {left=px2; right=px2+pw; top=yy; bottom=yy+itemH};
+				yy = yy + itemH;
+			}
+		}
+		self.popHover = 0;
+		self.popHandled = false;
+		self.popup.invalidate();
+		self.board.invalidate();
+		// 提到最前（画板是主窗体的子窗口，后建的在上）
+		try{ ::SetWindowPos(self.popup.ctrl.hwnd, 0, 0,0,0,0, 0x1|0x2|0x10) }catch(e){}
+		// 捕获鼠标：这样点菜单外面也能收到消息（点外面 = 取消菜单）
+		self.popup.setCapture(true);
+	}
+
+	// 下拉菜单画板（一次建好，平时隐藏）
+	self.__ensurePopup = function(){
+		if(self.popup) return;
+		self.popup = nodio.ui.board(winform, {
+			left = 0; top = 0; right = 200; bottom = 100;
+			fontSize = 12;
+			capture = true;
+			autoReleaseCapture = false;
+			z = Z_POP;
+		});
+		self.popup.onDraw = function(graphics, rc, bd){
+			self.__drawPopup(graphics, rc, bd);
+		}
+		self.popup.onMouseMove = function(x,y,bd){
+			var h = self.__hitPop(x, y);
+			if(h != self.popHover){
+				self.popHover = h;
+				self.popup.invalidate();
+			}
+		}
+		// 按下：命中就执行，没命中就当取消
+		self.popup.onMouseDown = function(x,y,bd){
+			self.popHandled = true;
+			var hit = self.__hitPop(x, y);
+			self.popup.setCapture(false);
+			self.__closeMenu();
+			if(hit){
+				var it = self.popItems[hit];
+				var fn = it[2];
+				if(fn) fn(hit);
+			}
+		}
+		// 抬起：如果这一轮按下没在菜单画板上（按下发生在标题栏），
+		// 就用抬起位置决定选不选菜单项（按下-拖动-松开的用法）
+		self.popup.onMouseUp = function(x,y,bd){
+			if(self.popHandled){ self.popHandled = false; return }
+			var hit = self.__hitPop(x, y);
+			self.popup.setCapture(false);
+			if(hit){
+				self.__closeMenu();
+				var it = self.popItems[hit];
+				var fn = it[2];
+				if(fn) fn(hit);
+			}
+		}
+		self.popup.show(false);
+	}
+
+	// 命中的下拉菜单项（0=没有）
+	self.__hitPop = function(x, y){
+		for(i=1;#self.popRects;1){
+			var r = self.popRects[i];
+			if(r.sep) continue;
+			if(x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+		}
+		return 0;
+	}
+
+	self.__drawPopup = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var pen = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(pen, rc.left, rc.top, w-1, h-1);
+		pen.delete();
+		for(i=1;#self.popRects;1){
+			var r = self.popRects[i];
+			if(r.sep){
+				var lp = ..gdip.pen(th.border, 1);
+				graphics.drawLine(lp, r.left + ..nodio.ui.px(8), (r.top + r.bottom)/2,
+					r.right - ..nodio.ui.px(8), (r.top + r.bottom)/2);
+				lp.delete();
+				continue;
+			}
+			if(self.popHover == i){
+				var hb = ..gdip.solidBrush(th.hoverBg);
+				graphics.fillRect(hb, r.left, r.top, r.right - r.left, r.bottom - r.top);
+				hb.delete();
+			}
+			var it = self.popItems[i];
+			var txt = tostring(it[1] : "");
+			var brush = ..gdip.solidBrush(th.text);
+			graphics.drawString(txt, font,
+				::RECTF(r.left + ..nodio.ui.px(11), r.top,
+					r.right - r.left - ..nodio.ui.px(16), r.bottom - r.top), fmt, brush);
+			brush.delete();
+		}
+	}
+
+	self.__closeMenu = function(){
+		if(self.popup){
+			self.popup.setCapture(false);
+			self.popup.show(false);
+		}
+		self.openMenu = 0;
+		self.hoverMenu = 0;
+		self.popHover = 0;
+		self.popHandled = false;
+		self.board.invalidate();
+	}
+
+	// ---------- 公开接口 ----------
+	// 改标题（居中）
+	self.setTitle = function(t){
+		if(self.title == t) return;
+		self.title = t;
+		self.board.invalidate();
+	}
+	// 换菜单表
+	self.setMenus = function(menus){
+		self.menus = menus : {};
+		self.__closeMenu();
+		self.board.invalidate();
+	}
+	// 重新摆放
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.board.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.board.layout(l, t, r, b);
+		// 显式提到 z 序最前。
+		// 官方 form.add 每次只加一个控件，控件之间的层次就等于**添加顺序**
+		// （谁先加谁在上面）；背景板是最早加的，会盖在标题栏上面，
+		// 标题栏就收不到鼠标事件了。这里主动提到最前，层次才是确定的。
+		if(!self.openMenu){
+			try{
+				..win.setPos(self.board.ctrl.hwnd, l, t, r - l, b - t,
+					0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+			}catch(e){}
+		}
+		// 最大化/还原会换掉按钮图标，必须重画
+		self.board.invalidate();
+	}
+	// 去掉原生标题栏（必须在窗口 show 之后调用）。
+	// 只摘 WS_CAPTION，保留 WS_THICKFRAME/WS_SIZEBOX：
+	// 客户区因此顶到窗口顶端，而窗口仍然可拖边改大小。
+	self.applyBorderless = function(){
+		try{
+			..win.modifyStyle(winform.hwnd, 0xC00000/*_WS_CAPTION*/, 0,
+				0x20/*_SWP_FRAMECHANGED*/);
+		}catch(e){}
+	}
+	// 供外部查询：标题栏高度（物理像素）
+	self.barH = function(){
+		return self.height;
+	}
+	// 供外部查询：窗口按钮区域（物理像素，客户区坐标）
+	self.buttonRects = function(){
+		return self.btnRects;
+	}
+
+	// ---------- 窗体子类化 ----------
+	// WM_NCCALCSIZE：把客户区扩到整个窗口矩形（满幅），
+	//   这样窗口四周那圈 10 物理像素的可缩放边框也变成自绘区域
+	//   （原本由系统画刷画，是浅灰色，深色界面里很扎眼）。
+	//   最大化时**不接管**：此时系统提议的矩形就是工作区，
+	//   接管会把内容顶出屏幕。
+	// WM_NCHITTEST：标题栏 → HTCAPTION（系统负责拖动/双击/贴边）；
+	//   左右下边缘 → HTLEFT/HTRIGHT/...（保留拖边改大小）。
+	self.sub = ..nodio.ui.subclass(winform.hwnd, function(hwnd, msg, wp, lp){
+		if(msg == 0x83){            // WM_NCCALCSIZE
+			if(self.__isMaximized()) return null;
+			var r = null;
+			try{ r = ..raw.convert(topointer(lp), ::RECT()) }catch(e){}
+			if(!r) return null;
+			var wr = ..win.getRect(hwnd, true);
+			if(!wr) return null;
+			r.left = wr.left;
+			r.top = wr.top;
+			r.right = wr.right;
+			r.bottom = wr.bottom;
+			try{ ..raw.copy(topointer(lp), r) }catch(e2){}
+			return 1;
+		}
+		if(msg == 0x84){            // WM_NCHITTEST
+			// lParam 是**屏幕**坐标 → 换算成客户区坐标
+			var sx = lp & 0xFFFF;
+			if(sx > 32767) sx = sx - 65536;
+			var sy = (lp >> 16) & 0xFFFF;
+			if(sy > 32767) sy = sy - 65536;
+			var cx,cy = ..win.toClient(hwnd, sx, sy);
+			// 客户区尺寸（满幅时 = 窗口尺寸）
+			var cw = 0; var chh = 0;
+			try{
+				var cr = winform.getClientRect();
+				if(cr){
+					cw = cr.width ? cr.width() : 0;
+					chh = cr.height ? cr.height() : 0;
+				}
+			}catch(e3){}
+			var e = ..nodio.ui.px(4);
+			// 边缘拖拽（保留改大小能力）：左右下三边
+			if(cx < e){
+				if(cy > chh - e) return 16;   // HTBOTTOMLEFT
+				return 10;                    // HTLEFT
+			}
+			if(cx > cw - e){
+				if(cy > chh - e) return 17;   // HTBOTTOMRIGHT
+				return 11;                    // HTRIGHT
+			}
+			if(cy > chh - e) return 15;       // HTBOTTOM
+			// 窗口按钮与菜单标题都在标题栏画板里，命中测试走画板自己的
+			// 坐标（客户区坐标），这里只要把标题栏整条交还给客户区，
+			// 子画板才收得到鼠标消息。
+			if(cy < self.barH()){
+				return 1;       // HTCLIENT（菜单/按钮/拖动都在画板里处理）
+			}
+			return 1;                      // HTCLIENT
+		}
+		if(msg == 0x86){            // WM_NCACTIVATE
+			return 1;               // 不让系统重绘非客户区（避免闪白）
+		}
+		return null;
+	});
+
+	self.layout(0, 0, 800, self.height);
+	return self;
+}
+
+}

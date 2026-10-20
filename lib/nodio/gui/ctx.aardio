@@ -1,0 +1,175 @@
+// nodio.gui.ctx — 绘制上下文。
+//
+// 控件不直接碰 GDI+：所有画笔、文字、图标都走这一层，
+// 于是「换主题」「换 DPI」「换圆角风格」只改 ctx / theme，控件不动。
+//
+// 移植自 Zan.Gui 的 Gui/Core/Ui.zan + Element.zan 的绘制职责：
+//   · 绘制原语统一（fill / round / line / ellipse / text / icon）
+//   · 画笔按颜色缓存（每次 new solidBrush 会漏 GDI 资源）
+//   · 文字按 (对齐, 垂直对齐, 省略) 缓存 StringFormat
+//
+// 单位：ctx 里的一切坐标都是**物理像素**；度量参数（fontPx、radius…）
+// 是**逻辑像素**，由 ctx.s() 按缩放系数换算。
+namespace nodio.gui{
+import gdip;
+import nodio.ui.board;
+import nodio.ui.icons;
+import nodio.ui.dpi;
+
+// ---------- 画笔 / 画笔缓存 ----------
+var __brushes = {};
+var __pens = {};
+var __formats = {};
+
+// 取实心画笔（按颜色缓存）
+var brushOf = function(color){
+	var b = __brushes[color];
+	if(b) return b;
+	b = ..gdip.solidBrush(color);
+	__brushes[color] = b;
+	return b;
+}
+
+// 取画笔（按颜色 + 线宽缓存）
+var penOf = function(color, width){
+	var key = color ++ "@" ++ width;
+	var p = __pens[key];
+	if(p) return p;
+	p = ..gdip.pen(color, width);
+	__pens[key] = p;
+	return p;
+}
+
+// 取文字格式：align(0左 1中 2右) / valign(0上 1中 2下) / ellipsis(0/1)
+var formatOf = function(align, valign, ellipsis){
+	var key = align ++ "_" ++ valign ++ "_" ++ ellipsis;
+	var f = __formats[key];
+	if(f) return f;
+	f = ..gdip.stringFormat();
+	f.align = align;
+	f.lineAlign = valign;
+	f.trimming = ellipsis ? 2 : 0;   // 2 = _StringTrimmingEllipsisCharacter
+	f.flags = 0x1000;                // _StringFormatFlagsNoWrap（不折行）
+	__formats[key] = f;
+	return f;
+}
+
+// 上下文
+ctx = function(graphics, opt){
+	opt = opt : {};
+	var self = {
+		g = graphics;
+		scale = opt.scale : ..nodio.ui.dpiScale();
+		theme = opt.theme;
+		fontName = opt.fontName;
+	};
+
+	// 逻辑像素 → 物理像素
+	self.s = function(v){
+		if(v === null || v === undefined) return 0;
+		return math.round(v * self.scale);
+	}
+
+	// 字体（逻辑字号）
+	self.font = function(px){
+		return ..nodio.ui.boardFont(px, self.fontName);
+	}
+
+	// ---------- 填充 ----------
+	self.fill = function(color, x,y,w,h){
+		if(!color) return;
+		if(w <= 0 || h <= 0) return;
+		self.g.fillRect(brushOf(color), x, y, w, h);
+	}
+
+	// 圆角填充
+	self.round = function(color, x,y,w,h, radius){
+		if(!color) return;
+		if(w <= 0 || h <= 0) return;
+		if(!radius){
+			self.g.fillRect(brushOf(color), x, y, w, h);
+			return;
+		}
+		self.g.fillRoundRect(brushOf(color), x, y, w, h, radius);
+	}
+
+	// 圆角描边
+	self.roundLine = function(color, x,y,w,h, radius, width){
+		if(!color || !width) return;
+		if(w <= 0 || h <= 0) return;
+		if(!radius){
+			self.g.drawRectangle(penOf(color, width), x, y, w, h);
+			return;
+		}
+		self.g.drawRoundRect(penOf(color, width), x, y, w, h, radius);
+	}
+
+	// 椭圆填充
+	self.ellipse = function(color, x,y,w,h){
+		if(!color) return;
+		if(w <= 0 || h <= 0) return;
+		self.g.fillEllipse(brushOf(color), x, y, w, h);
+	}
+
+	// 椭圆描边
+	self.ellipseLine = function(color, x,y,w,h, width){
+		if(!color || !width) return;
+		if(w <= 0 || h <= 0) return;
+		self.g.drawEllipse(penOf(color, width), x, y, w, h);
+	}
+
+	// 直线
+	self.line = function(color, x1,y1,x2,y2, width){
+		if(!color) return;
+		self.g.drawLine(penOf(color, width : 1), x1, y1, x2, y2);
+	}
+
+	// ---------- 文字 ----------
+	// str; color; fontPx(逻辑); x,y,w,h(物理); opt={align;valign;ellipsis}
+	self.text = function(str, color, fontPx, x,y,w,h, opt){
+		if(!str || !color) return;
+		opt = opt : {};
+		var al = opt.align;
+		if(al === null || al === undefined) al = 1;
+		var va = opt.valign;
+		if(va === null || va === undefined) va = 1;
+		var el = opt.ellipsis;
+		if(el === null || el === undefined) el = 1;
+		var fmt = formatOf(al, va, el);
+		self.g.drawString(str, self.font(fontPx), ::RECTF(x, y, w, h), fmt, brushOf(color));
+	}
+
+	// 量文字宽度（物理像素）
+	self.measure = function(str, fontPx){
+		if(!str) return 0;
+		var m = self.g.measureString(str, self.font(fontPx), ::RECTF(0,0,8000,8000), null);
+		if(!m) return 0;
+		return m.width;
+	}
+
+	// 量文字高度（物理像素）
+	self.measureH = function(fontPx){
+		var m = self.g.measureString("Ag", self.font(fontPx), ::RECTF(0,0,8000,8000), null);
+		if(!m) return self.s(fontPx);
+		return m.height;
+	}
+
+	// ---------- 图标 ----------
+	// 字体图标（FontAwesome），size 是逻辑像素
+	self.icon = function(name, color, x,y, size){
+		if(!name) return false;
+		return ..nodio.ui.drawIcon(self.g, name, x, y, size, color);
+	}
+
+	// ---------- 剪裁 ----------
+	self.clip = function(x,y,w,h){
+		self.g.setClipRect(x, y, w, h);
+	}
+	self.unclip = function(){
+		self.g.resetClip();
+	}
+
+	return self;
+}
+
+}

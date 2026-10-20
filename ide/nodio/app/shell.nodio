@@ -1,44 +1,868 @@
-// app/shell.nodio — the IDE main window.
+// app/shell.nodio — the IDE main window, laid out after the official
+// aardio IDE (target screenshot; mechanisms in docs/official-ide-reference.md):
 //
-// Owns the DSG layout (form + tree / editor / output / status controls) and
-// the menu + hotkeys. It exposes hooks (onOpen / onSave / onRun) that
-// main.nodio fills in, so this module knows nothing about the project model.
+//   ┌───────────────────────────────────────────────────────────────┐
+//   │ 自绘标题栏（应用标记 + 菜单 + 居中标题 + 窗口按钮）            │
+//   │ 工具栏                                                         │
+//   ├───────────┬───────────────────────────────┬───────────────────┤
+//   │ 工程 属性  │ 文档标签 + 编辑器 / 设计器        │ 控件 语法 标准库    │
+//   │ 搜索 大纲  │                                │ 范例 工具 AI 组件  │
+//   ├───────────┴───────────────────────────────┴───────────────────┤
+//   │ 问题 输出 调试 终端                                            │
+//   ├───────────────────────────────────────────────────────────────┤
+//   │ 状态栏                                                         │
+//   └───────────────────────────────────────────────────────────────┘
 //
-// Layout rule: declare controls with DSG (winform.add), never the direct
-// win.ui.ctrl.xxx(wf, …) constructor — that yields unrealized windows
-// (hwnd = null) whose .text silently no-ops.
+// 面板/工具条/状态栏/工程树全部来自标准库 overlay（nodio.ui.*），
+// 本模块只负责布局与接线。设计器（nodio.designer.*）由 main.nodio 接入：
+// 它把工具箱放进右栏「控件」页、属性格放进左栏「属性」页，
+// 画布是一张覆盖在编辑器之上的子窗体。
+//
+// 标题栏是**自绘**的（nodio.ui.titlebar）：原生标题栏是浅色的，跟整套深色
+// chrome 根本不是一回事；参考 IDE 的标题栏 = 菜单栏，一行。
 import win.ui;
 import win.ui.menu;
+import app.editor;
+import nodio.ui.dock;
+import nodio.ui.toolbar;
+import nodio.ui.statusbar;
+import nodio.ui.projectTree;
+import nodio.ui.searchPanel;
+import nodio.ui.tabstrip;
+import nodio.ui.board;
+import nodio.ui.list;
+import nodio.ui.tree;
+import nodio.ui.theme;
+import nodio.ui.dpi;
+import nodio.ui.titlebar;
+import nodio.ui.editor;
+import nodio.ui.filedlg;
+import nodio.ui.prompt;
+import nodio.gui.gallery;
+import gdip;
+
+// ---------- layout constants ----------
+// 这里是**逻辑像素**（96dpi 基准）。官方 win.ui 控件的矩形也是逻辑单位
+// （官方库建控件时自己乘 DPI 缩放系数），我们自绘的组件走 win.setPos
+// （物理像素）—— 两条路径用同一个缩放系数换算，系统 150% 时才一致。
+//
+// 左右栏宽度要放得下**页签条**：页签宽 = 左留白 + 文字 + 右留白（+ 图标），
+// 官方 tabstrip 组件是自绘的，放不下就会把后面的页签裁掉（原来右栏
+// 「工具 / AI」两个页签就被裁没了）。
+var TOOLBAR_H = 28;
+var STATUS_H  = 26;
+var LEFT_W    = 272;   // 工程/属性/搜索/大纲 4 个页签（带图标）
+var RIGHT_W   = 352;   // 控件/语法/标准库/范例/工具/AI/组件 7 个页签（纯文字）
+var BOTTOM_H  = 220;
+var DOCTAB_H  = 26;
+var TITLEBAR_H = 32;   // 自绘标题栏（菜单栏合并在里面）
+// 标题栏 + 工具条 = 顶部 chrome
+var TOP0 = TITLEBAR_H + TOOLBAR_H;
 
 /*DSG{{*/
-winform = win.form(text="Nodio IDE";right=960;bottom=640)
+winform = win.form(text="Nodio IDE";right=1280;bottom=820)
 winform.add(
-	tv={cls="treeview";left=8;top=8;right=228;bottom=590;z=1};
-	ed={cls="richedit";left=236;top=8;right=950;bottom=440;multiline=true;vscroll=true;hscroll=true;z=2};
-	out={cls="richedit";left=236;top=448;right=950;bottom=600;multiline=true;vscroll=true;readonly=true;z=3};
-	st={cls="static";text="就绪";left=236;top=606;right=950;bottom=626;z=4}
+	ed={cls="richedit";left=240;top=58;right=980;bottom=560;multiline=true;vscroll=true;hscroll=true;z=6}
 )
 /*}}*/
 
-// hooks filled by main.nodio
-onOpen = null;
-onSave = null;
-onRun = null;
+// DPI 缩放系数（建好窗体后立刻取；官方窗体的 dpiScaleX 在 show 之后才有值，
+// 这里退回 gdi.getDpiScale —— 官方库自己也是用这个来源）
+..nodio.ui.dpiSetScaleFrom(winform);
+// 逻辑像素 → 物理像素
+var S = function(v){ return ..nodio.ui.px(v) };
 
-setStatus = function(s){ winform.st.text = s }
+// ---------- 主题 ----------
+// 目标外观：aar.chengxu.online/thread-903.htm 那套现代深色 IDE。
+// 官方 win.form 的窗体底色是浅色系统背景，所以用一块铺满客户区的
+// 自绘板（z=0）把底色刷成主题色。
+var theme = ..nodio.ui.theme();
+var bgBoard = nodio.ui.board(winform, {
+	left = 0; top = 0; right = 1280; bottom = 820; z = 0;
+});
+bgBoard.onDraw = function(graphics, rc, bd){
+	var bg = ..gdip.solidBrush(theme.bg);
+	graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+	bg.delete();
+}
+// 背景板必须压在**所有**自绘板下面。
+// 官方 form.add 一次只加一个控件（控件之间的层次就等于添加顺序），
+// 背景板是最早加的，结果压在最上面 —— 它铺满整个客户区，
+// 于是所有自绘板（页签条、树、列表、标题栏）都收不到鼠标事件。
+// 这里显式把它压到 z 序最底。
+try{
+	..win.setPos(bgBoard.ctrl.hwnd, 0, 0, 1280, 820,
+		0x1/*_HWND_BOTTOM*/, 0x10/*_SWP_NOACTIVATE*/);
+}catch(e){}
+
+// 窗体本身的底色也刷成深色：去掉原生标题栏后，窗口四周那圈可缩放边框
+// （以及客户区外的残留）露出来的就是它，默认是系统浅色。
+try{ winform.background.setColor(theme.bg) }catch(e){}
+
+// ---------- 自绘标题栏（菜单栏合并进来）----------
+// 原生标题栏是浅色的，跟整套深色 chrome 不是一回事；参考 IDE 的标题栏
+// 就是「应用标记 + 菜单 + 居中标题 + 窗口按钮」一行。
+var titlebar = nodio.ui.titlebar(winform, {
+	height = TITLEBAR_H;
+	title = "Nodio IDE";
+});
+
+// 把官方 richedit 染成深色（文字色 + 文字背景色 + 控件背景色）
+// EM_SETBKGNDCOLOR(0x443) 用引擎 sysapi 表里的 ::SendMessage ——
+// 它有**显式签名**（"int64(addr hwnd,int msg,addr wparam,addr lparam)"），
+// 安全；不要用 ::User32.SendMessageW（动态绑定，签名靠猜会传错）。
+var darkenRichEdit = function(ctrl){
+	if(!ctrl) return;
+	try{
+		ctrl.setCharformat({
+			textColor = ..nodio.ui.themeRef(theme.text);
+			backColor = ..nodio.ui.themeRef(theme.bg);
+		}, 1);
+	}catch(e){};
+	try{ ctrl.bgcolor = ..nodio.ui.themeRef(theme.bg) }catch(e){};
+	try{
+		::SendMessage(ctrl.hwnd, 0x443/*_EM_SETBKGNDCOLOR*/, 0,
+			..nodio.ui.themeRef(theme.bg));
+	}catch(e){};
+}
+darkenRichEdit(winform.ed);
+
+// ---------- 编辑器组件（nodio.ui.editor）----------
+// 复用 DSG 里的 richedit（opt.ctrl），组件负责标准 IDE 该有的那一堆：
+// 行号栏、aardio 语法着色、当前行高亮、光标行列号回调、Tab/Shift+Tab 缩进、
+// Ctrl+/ 注释切换、查找替换浮条、撤销/重做、脏标记。
+// shell 只负责摆放它、把它的回调接到状态栏/页签上。
+var editor = nodio.ui.editor(winform, {
+	ctrl = winform.ed;
+	fontSize = 11;
+	fontName = "Consolas";
+});
+
+// ---------- 文件对话框 ----------
+var fileDlg = nodio.ui.filedlg(winform, {
+	owner = winform;
+	filter = '所有文件|*.*|aardio 源文件|*.aardio;*.nodio|';
+});
+
+// ---------- 输入提示条（转到行）----------
+var prompt = nodio.ui.prompt(winform, {title="转到行"});
+
+// 弹提示条：摆在编辑区顶部居中
+showPrompt = function(title, defText, onOk){
+	var er = editorRect();
+	prompt.layoutCentered(er.left, er.top, er.right, er.bottom);
+	prompt.show(title, defText, onOk);
+}
+
+// 转到行（Ctrl+G）：问行号
+gotoLinePrompt = function(){
+	showPrompt("转到行", "", function(t){
+		var n = tonumber(t);
+		if(!n || n < 1){
+			setStatus("行号无效: " ++ t);
+			return false;
+		}
+		editor.gotoLine(n);
+		return true;
+	});
+}
+editor.onGotoLine = function(){ gotoLinePrompt() };
+
+// 编辑框（搜索页）也染深色：edit 控件不吃 setCharformat，
+// 但 EM_SETBKGNDCOLOR 对 edit 一样有效，文字色走官方 ctrl.color
+var darkenEdit = function(ctrl){
+	if(!ctrl) return;
+	try{ ctrl.color = ..nodio.ui.themeRef(theme.text) }catch(e){};
+	try{
+		::SendMessage(ctrl.hwnd, 0x443/*_EM_SETBKGNDCOLOR*/, 0,
+			..nodio.ui.themeRef(theme.bg));
+	}catch(e){};
+};
+
+// ---------- 右键菜单 ----------
+// 编辑器：官方 win.ui.tracker 派发 0x7B → onContextMenu（屏幕坐标），
+// 官方 win.ui.popmenu 弹出；命令走编辑器组件（nodio.ui.editor）。
+app.editor.contextMenu(winform, editor);
+
+// ---------- hooks filled by main.nodio ----------
+onOpenProject = null;
+onOpenFile    = null;      // function(path) — 打开一个文件
+onNewFile     = null;      // function() — 新建文档
+onSave        = null;
+onSaveAs      = null;      // function()
+onSaveAll     = null;      // function()
+onCloseTab    = null;      // function(path) — 返回 true 才允许关闭
+onDocChange   = null;      // function(path, text) — 文档内容变了
+onRun         = null;
+onDebug       = null;
+onStopDebug   = null;
+onDesigner    = null;      // function() — open/close the designer
+onAfterLayout = null;      // function(editorRect) — 覆盖层（设计画布）跟随重排
+onTabChange   = null;      // function(path) — 当前文档切换（大纲等派生视图刷新）
+// 工程树文件操作（main.nodio 实现真正的磁盘操作）
+onProjNewFile = null;      // function(dirPath) — 在目录里新建文件
+onProjNewDir  = null;      // function(dirPath) — 在目录里新建子目录
+onProjRename  = null;      // function(path) — 重命名文件/目录
+onProjDelete  = null;      // function(path) — 删除文件/目录
+onProjSetStart = null;     // function(path) — 设为工程启动文件
+
+// ---------- left dock: 工程 / 属性 / 搜索 / 大纲 ----------
+var leftDock = nodio.ui.dock(winform, {
+	rect = {left=0; top=S(TOP0); right=S(LEFT_W); bottom=400};
+	tabs = {"工程"; "属性"; "搜索"; "大纲"};
+});
+// 工程页：工程树建在页里（页内容直接挂在 IDE 主窗体上）
+var projTree = nodio.ui.projectTree(leftDock.addTab("工程"), {
+	left = 0; top = 0; right = LEFT_W; bottom = 600;
+});
+leftDock.addTab("工程", projTree);
+// 搜索 / 大纲 页
+// 搜索页是**真能用的全文搜索**：关键字输入条 + 结果表 + 双击跳转
+// （nodio.ui.searchPanel，结果表走自绘 list —— 原生 listview 改不了色）。
+// 大纲用**自绘树**（原生 treeview 改不了色，改色消息在本机会崩进程）
+var searchPanel = nodio.ui.searchPanel(winform, {
+	rect = {left=0; top=0; right=LEFT_W; bottom=600};
+});
+leftDock.addTab("搜索", searchPanel, {icon="search"});
+
+// 切到左栏「搜索」页并聚焦关键字输入框
+showSearchPage = function(){
+	leftDock.setSelIndex(3);
+	searchPanel.focus();
+}
+var outlineTree = nodio.ui.tree(winform, {left=0;top=0;right=LEFT_W;bottom=600});
+leftDock.addTab("大纲", outlineTree, {icon="list"});
+// 「属性」页留给设计器的属性格（main.nodio 接入）
+
+// ---------- right dock: 控件 / 语法 / 标准库 / 范例 / 工具 / AI / 组件 ----------
+var rightDock = nodio.ui.dock(winform, {
+	rect = {left=1040; top=S(TOP0); right=1280; bottom=400};
+	tabs = {"控件"; "语法"; "标准库"; "范例"; "工具"; "AI"; "组件"};
+});
+// 语法 / 标准库：自绘多列列表（原生 listview 改不了色）
+// 列宽是逻辑像素，按右栏宽度（RIGHT_W）分配，别留一大截空白。
+var syntaxList = nodio.ui.list(winform, {columns={{"语法";300}}});
+rightDock.addTab("语法", syntaxList);
+var stdList = nodio.ui.list(winform, {columns={{"命名空间";130};{"说明";190}}});
+rightDock.addTab("标准库", stdList);
+// 范例 / 工具：自绘树
+var exTree = nodio.ui.tree(winform, {left=0;top=0;right=300;bottom=600});
+rightDock.addTab("范例", exTree);
+var toolTree = nodio.ui.tree(winform, {left=0;top=0;right=300;bottom=600});
+rightDock.addTab("工具", toolTree);
+rightDock.addTab("AI", "richedit", {multiline=true;vscroll=true});
+// 组件：nodio.gui 组件展厅（Theme → Style → StyleBox → Widget 的活文档）
+var compGallery = nodio.gui.gallery(winform, {
+	rect = {left=0; top=0; right=300; bottom=600};
+});
+rightDock.addTab("组件", compGallery);
+// 原生 treeview / listview 的深色暂时做不了：comctl32 的配色消息在本机会崩
+// （见 nodio.ui.theme 的注释）。这两类面板已经改成自绘（nodio.ui.list / tree）。
+// 「控件」页留给设计器的工具箱（main.nodio 接入）
+// 注：右栏页签**不画图标** —— 7 个页签带图标放不进 352 逻辑像素，
+// 后面的页签会被裁掉（参考 IDE 的右栏页签本来就是纯文字）。
+leftDock.setIcon(1, "folderOpen");
+leftDock.setIcon(2, "cog");
+
+// ---------- bottom dock: 问题 / 输出 / 调试 / 终端 ----------
+var bottomDock = nodio.ui.dock(winform, {
+	rect = {left=S(LEFT_W); top=400; right=1040; bottom=600};
+	tabs = {"问题"; "输出"; "调试"; "终端"};
+});
+var probList = nodio.ui.list(winform, {columns={{"行";40};{"级别";60};{"说明";400}}});
+var probLv = bottomDock.addTab("问题", probList, {icon="warning"});
+var outEd  = bottomDock.addTab("输出", "richedit", {multiline=true;vscroll=true;readonly=true; icon="comment"});
+var dbgEd  = bottomDock.addTab("调试", "richedit", {multiline=true;vscroll=true;readonly=true; icon="bug"});
+var termEd = bottomDock.addTab("终端", "richedit", {multiline=true;vscroll=true; icon="terminal"});
+darkenRichEdit(outEd);
+darkenRichEdit(dbgEd);
+darkenRichEdit(termEd);
+darkenRichEdit(rightDock.content(6));
+// 问题列表已改成自绘（nodio.ui.list），不再受原生 listview 的配色限制
+
+// ---------- toolbar ----------
+var toolbar = nodio.ui.toolbar(winform, {
+	height = TOOLBAR_H;
+	buttons = {
+		{text="新建";name="new";icon="file";command=function(){ if(onNewFile) onNewFile() }};
+		{text="打开";name="open";icon="folderOpen";command=function(){ if(onOpenFile) onOpenFile("") }};
+		{text="保存";name="save";icon="save";command=function(){ if(onSave) onSave() }};
+		{sep=true};
+		{text="运行";name="run";icon="bolt";command=function(){ if(onRun) onRun() }};
+		{text="调试";name="debug";icon="bug";command=function(){ if(onDebug) onDebug() }};
+		{text="设计器";name="designer";icon="desktop";command=function(){ if(onDesigner) onDesigner() }};
+		{sep=true};
+		{text="输出";name="output";icon="tasks";command=function(){ bottomDock.setSelIndex(2) }};
+		{text="终端";name="terminal";icon="terminal";command=function(){ bottomDock.setSelIndex(4) }};
+		{text="设置";name="settings";icon="settings";command=function(){}};
+	};
+});
+// 悬停提示显示到状态栏
+toolbar.onHover = function(name, text){
+	if(text) setStatus(text);
+};
+
+// ---------- status bar ----------
+var statusbar = nodio.ui.statusbar(winform, {
+	height = STATUS_H;
+	panels = { {"就绪";280}; {"行,列";90}; {"工程";240}; {"UTF-8";80}; {"CRLF";80} };
+});
+
+// ---------- status ----------
+// 按**分段名称**定位（序号会随分段增删错位：工程路径一度被写进了「行,列」）
+setStatus = function(s){ statusbar.setText("就绪",s) }
+setPosStatus = function(s){ statusbar.setText("行,列",s) }
+setProjectStatus = function(s){ statusbar.setText("工程",s) }
+
+outAppend = function(s){ outEd.text = outEd.text ++ s ++ '\r\n' }
+dbgAppend = function(s){ dbgEd.text = dbgEd.text ++ s ++ '\r\n' }
+dbgClear = function(){ dbgEd.text = "" }
+termAppend = function(s){ termEd.text = termEd.text ++ s ++ '\r\n' }
+outClear = function(){ outEd.text = "" }
+
+// ---------- document tab strip ----------
+// 原生 tab 控件做不出官方 IDE 的样子（扁平标签 + 强调下划线 + 关闭标记），
+// 所以文档页签用 nodio.ui.tabstrip 自绘。
+var docStrip = nodio.ui.tabstrip(winform, {
+	left = S(LEFT_W); top = S(TOP0); right = 900; bottom = S(TOP0 + DOCTAB_H);
+	closable = true;
+});
+
+// ---------- document tabs ----------
+// 文档模型：path -> {文本; 已保存的文本; 换行符}
+// 文本只有「当前页签」住在编辑器控件里，其余页签的文本存在 tabFiles 里。
+tabFiles = {};
+tabSaved = {};      // 「上次保存时」的文本 —— 脏标记由它推导
+tabEOL = {};
+tabOrder = {};
+curTab = null;
+
+tabFind = function(path){
+	for(i=1;#tabOrder;1){
+		if(tabOrder[i] == path) return i;
+	}
+	return null;
+}
+
+// 页签标题：文件名 + 扩展名
+tabTitle = function(path){
+	var pi = ..io.splitpath(path);
+	return pi.name ++ pi.ext;
+}
+
+// 页签上显示的文本（脏文档带 *）
+tabCaption = function(path){
+	var t = tabTitle(path);
+	if(tabIsDirty(path)) t = t ++ " *";
+	return t;
+}
+
+// 脏标记变了 → 刷新页签标题
+tabRefresh = function(path){
+	var i = tabFind(path);
+	if(i) docStrip.setCaption(i, tabCaption(path));
+	updateTitle();
+}
+
+// 页签图标：aardio 源码用 </> 图标，其它用普通文件图标
+tabIcon = function(path){
+	var pi = ..io.splitpath(path);
+	var ext = string.lower(pi.ext);
+	if(ext == ".aardio" || ext == ".nodio") return "fileCode";
+	return "file";
+}
+
+// 标题栏中间的标题：当前文档 - 应用名（参考 IDE 的写法）
+updateTitle = function(){
+	var app = "Nodio IDE";
+	if(curTab) app = tabTitle(curTab) ++ " - " ++ app;
+	titlebar.setTitle(app);
+}
+
+tabAdd = function(path, text){
+	var i = tabFind(path);
+	if(i === null){
+		..table.push(tabOrder, path);
+		i = #tabOrder;
+		docStrip.addTab(tabTitle(path), tabIcon(path));
+	}
+	// 文档文本统一用控件内部的形式（CRLF）：
+	// 脏标记是「当前文本 vs 保存时文本」逐字比较，两边必须同形，
+	// 否则 LF 文件一打开就被标成「已修改」。
+	var norm = editor.normalize(text);
+	tabFiles[path] = norm;
+	// 记下这个文档自己的换行符（保存时按原样还原）
+	var eol = '\r\n';
+	if(text && #text > 0 && ..string.indexOf(text, '\n')
+		&& !..string.indexOf(text, '\r\n')){
+		eol = '\n';
+	}
+	tabEOL[path] = eol;
+	tabSaved[path] = norm;
+	tabSel(path);
+	updateTitle();
+	if( ..string.getenv("NODIO_IDE_DIAG") ){
+		io.print("DIAG tabAdd i=" ++ tostring(i) ++ " cur=" ++ tostring(curTab)
+			++ " order=" ++ #tabOrder);
+	}
+}
+
+// 切换当前文档：把文本推进编辑器，脏标记跟着切换
+tabSel = function(path){
+	var i = tabFind(path);
+	if(i === null) return;
+	docStrip.setSelIndex(i);
+	curTab = path;
+	editor.setText(tabFiles[path] : "");
+	editor.setEOL(tabEOL[path] : '\r\n');
+	// 脏标记是**推导**出来的：当前文本 vs 这个文档上次保存时的文本
+	editor.setSavedText(tabSaved[path] : "");
+	updateTitle();
+}
+
+tabClose = function(path){
+	var i = tabFind(path);
+	if(i === null) return null;
+	..table.remove(tabOrder, i);
+	tabFiles[path] = null;
+	tabSaved[path] = null;
+	tabEOL[path] = null;
+	docStrip.removeTab(i);
+	if(#tabOrder == 0){
+		curTab = null;
+		editor.setText("");
+	}
+	elseif(curTab == path){
+		tabSel(tabOrder[#tabOrder]);
+	}
+	updateTitle();
+	return i;
+}
+
+tabCurPath = function(){
+	return curTab;
+}
+
+tabSetText = function(path, text){
+	if(path === null) return;
+	tabFiles[path] = text;
+	if(curTab == path) editor.setText(text);
+}
+
+tabGetText = function(path){
+	if(path === null) return editor.getText();
+	if(path == curTab) return editor.getText();
+	return tabFiles[path] : "";
+}
+
+// 保存用的文本：按该文档自己的换行符还原
+tabTextForSave = function(path){
+	if(path == curTab) return editor.getTextForSave();
+	var t = tabFiles[path] : "";
+	if((tabEOL[path] : '\r\n') == '\n'){
+		return ..string.replaceLiteral(t, '\r\n', '\n');
+	}
+	return t;
+}
+
+tabIsDirty = function(path){
+	// 当前文档问编辑器（它有「上次保存的文本」基准），其它页签自己比
+	if(path == curTab) return editor.isDirty();
+	return (tabFiles[path] : "") != (tabSaved[path] : "");
+}
+
+// 记为已保存（保存后调用）
+tabMarkSaved = function(path){
+	if(path === null) return;
+	// 当前页签的权威文本在编辑器控件里（轮询最多有 250ms 延迟，
+	// 刚打完字就保存时 tabFiles 可能是旧的）
+	var t = (path == curTab) ? editor.getText() : (tabFiles[path] : "");
+	tabFiles[path] = t;
+	tabSaved[path] = t;
+	if(path == curTab) editor.markSaved();
+	tabRefresh(path);
+}
+
+tabSetDirty = function(path, dirty){
+	if(path === null) return;
+	if(dirty){
+		// 让「基准」与内容不同 → 推导出来就是脏的
+		tabSaved[path] = null;
+	}
+	else{
+		tabSaved[path] = tabFiles[path] : "";
+	}
+	if(path == curTab) editor.setSavedText(tabSaved[path] : "");
+	tabRefresh(path);
+}
+
+// 另存为：换掉页签的 key（路径），文本/脏标记/换行符跟着搬过去
+tabRename = function(oldPath, newPath){
+	var i = tabFind(oldPath);
+	if(i === null) return false;
+	if(oldPath == newPath) return true;
+	if(tabFind(newPath) !== null) return false;   // 目标已经开着
+	tabFiles[newPath] = tabFiles[oldPath];
+	tabSaved[newPath] = tabSaved[oldPath];
+	tabEOL[newPath] = tabEOL[oldPath];
+	tabFiles[oldPath] = null;
+	tabSaved[oldPath] = null;
+	tabEOL[oldPath] = null;
+	tabOrder[i] = newPath;
+	docStrip.setCaption(i, tabCaption(newPath));
+	if(curTab == oldPath){
+		curTab = newPath;
+		editor.setEOL(tabEOL[newPath] : '\r\n');
+	}
+	updateTitle();
+	return true;
+}
+
+// 关掉某个目录下的所有文档（删目录时用）
+tabCloseUnder = function(dirPath){
+	if(!dirPath) return 0;
+	var list = {};
+	for(i=1;#tabOrder;1){
+		var p = tabOrder[i];
+		if(p && ..string.startsWith(p, dirPath, true)){
+			..table.push(list, p);
+		}
+	}
+	for(i=1;#list;1){
+		tabClose(list[i]);
+	}
+	return #list;
+}
+
+// ---------- 编辑器回调 → 状态栏 / 页签 / 外部 ----------
+editor.onCursor = function(line, col){
+	setPosStatus("行 " ++ line ++ ", 列 " ++ col);
+}
+editor.onChange = function(text){
+	var p = curTab;
+	if(p === null) return;
+	tabFiles[p] = text;
+	if(onDocChange) onDocChange(p, text);
+}
+// 脏标记是推导出来的（当前文本 vs 上次保存的文本），
+// 这里只需要把页签标题刷新一下
+editor.onDirty = function(dirty){
+	var p = curTab;
+	if(p === null) return;
+	tabRefresh(p);
+}
+
+// ---------- layout ----------
+// clientWH: the client area size of the main window
+clientWH = function(){
+	var rc = winform.getClientRect();
+	if(rc){
+		var w = rc.width ? rc.width() : 0;
+		var h = rc.height ? rc.height() : 0;
+		if(w && h) return w,h;
+	}
+	return 1240,780;
+}
+
+// 文档页签条高度（物理像素）—— 设计画布要盖在页签条下面
+docTabH = function(){
+	return S(DOCTAB_H);
+}
+
+// editorRect: the document area (tab strip + editor)
+// w,h 是**物理**像素（客户区尺寸），返回的矩形也是物理像素
+editorRect = function(w,h){
+	if(!w || !h){
+		var cw,ch = clientWH();
+		w = cw; h = ch;
+	}
+	return {
+		left  = S(LEFT_W);
+		top   = S(TOP0);
+		right = w - S(RIGHT_W);
+		bottom= h - S(STATUS_H) - S(BOTTOM_H);
+	};
+}
+
+layout = function(w,h){
+	if(!w || !h){
+		var cw,ch = clientWH();
+		w = cw; h = ch;
+	}
+	var er = editorRect(w,h);
+
+	// docks (left full height, right above the bottom dock, bottom across)
+	leftDock.rect   = {left=0; top=S(TOP0); right=S(LEFT_W); bottom=h - S(STATUS_H)};
+	rightDock.rect  = {left=w - S(RIGHT_W); top=S(TOP0); right=w; bottom=h - S(STATUS_H) - S(BOTTOM_H)};
+	bottomDock.rect = {left=S(LEFT_W); top=h - S(STATUS_H) - S(BOTTOM_H); right=w; bottom=h - S(STATUS_H)};
+	leftDock.layout();
+	rightDock.layout();
+	bottomDock.layout();
+
+	// 自绘标题栏（菜单栏在里面）
+	titlebar.layout(0, 0, w, S(TITLEBAR_H));
+
+	// toolbar + status bar span the full width
+	toolbar.layout(0, S(TITLEBAR_H), w, S(TOP0));
+	statusbar.layout(0, h - S(STATUS_H), w, h);
+
+	// 窗体底板（深色主题的背景）铺满客户区
+	bgBoard.layout(0,0,w,h);
+
+	// document tabs + editor
+	docStrip.layout(er.left, er.top, er.right, er.top + S(DOCTAB_H));
+	// 编辑器组件自己画行号栏（46 逻辑像素），所以内容区从行号栏右边开始
+	editor.layout(er.left, er.top + S(DOCTAB_H) + 2, er.right, er.bottom);
+
+	// 输入提示条（转到行）跟着编辑区走
+	prompt.layoutCentered(er.left, er.top, er.right, er.bottom);
+
+	// 覆盖层（设计画布）跟着走：它不在窗体的自动布局里。
+	// 注意：钩子放在模块全局里在官方 onSize 回调里取不到（跨作用域），
+	// 所以真正的重排由 main.nodio 的心跳驱动（见 main.nodio 的 relayout）。
+	if( ..string.getenv("NODIO_IDE_DIAG") ){
+		io.print("DIAG shell.layout w=" ++ w ++ " h=" ++ h
+			++ " er=" ++ er.left ++ "," ++ er.top ++ "," ++ er.right ++ "," ++ er.bottom);
+	}
+	if(onAfterLayout) onAfterLayout(er);
+}
+
+// ---------- install ----------
+// 去掉原生标题栏（必须**在窗口 show 之后**调用：
+// 官方 win.form 会在 show 时做 DPI 初始化并重排控件）。
+// 去掉之后客户区变大（原来标题栏占的那条），所以要立刻重排一次。
+applyBorderless = function(){
+	titlebar.applyBorderless();
+	layout();
+}
 
 install = function(){
-	// F5 accelerator (WM_HOTKEY dispatch)
-	winform.reghotkey(function(id,mod,vk){ if(onRun) onRun() },0,0x74/*_VK_F5*/);
+	// F5 run, F10 debug, Ctrl+F9 stop, Ctrl+S save — hotkeys + menu share hooks
+	//
+	// ⚠ 修饰键掩码是 Win32 的 MOD_*：ALT=0x1 / CONTROL=0x2 / SHIFT=0x4 / WIN=0x8。
+	// 官方 win.ui 的 reghotkey 直接把 mod 传给 RegisterHotKey（没有换算），
+	// 之前这里写成 0x8 / 0x11 —— 0x8 是 Win 键、0x10 压根不是合法标志位，
+	// 于是 Ctrl+S / Ctrl+N / Ctrl+O / Ctrl+W / Ctrl+F9 **一个都没注册上**
+	// （RegisterHotKey 直接失败）。这轮一并修好。
+	var MOD_ALT = 0x1, MOD_CTRL = 0x2, MOD_SHIFT = 0x4;
+	winform.reghotkey(function(id,mod,vk){
+		if(onRun) onRun();
+	}, 0, 0x74); // F5
+	winform.reghotkey(function(id,mod,vk){
+		if(onDebug) onDebug();
+	}, 0, 0x79); // F10
+	winform.reghotkey(function(id,mod,vk){
+		if(onStopDebug) onStopDebug();
+	}, MOD_CTRL, 0x78); // Ctrl+F9
+	winform.reghotkey(function(id,mod,vk){
+		if(onSave) onSave();
+	}, MOD_CTRL, 0x53); // Ctrl+S
+	winform.reghotkey(function(id,mod,vk){
+		if(onNewFile) onNewFile();
+	}, MOD_CTRL, 0x4E); // Ctrl+N
+	winform.reghotkey(function(id,mod,vk){
+		if(onOpenFile) onOpenFile("");
+	}, MOD_CTRL, 0x4F); // Ctrl+O
+	winform.reghotkey(function(id,mod,vk){
+		if(onCloseTab) onCloseTab(curTab);
+	}, MOD_CTRL, 0x57); // Ctrl+W
+	winform.reghotkey(function(id,mod,vk){
+		editor.showFind(false);
+	}, MOD_CTRL, 0x46); // Ctrl+F —— 查找浮条
+	winform.reghotkey(function(id,mod,vk){
+		editor.showFind(true);
+	}, MOD_CTRL, 0x48); // Ctrl+H —— 替换浮条
+	winform.reghotkey(function(id,mod,vk){
+		gotoLinePrompt();
+	}, MOD_CTRL, 0x47); // Ctrl+G —— 转到行
+	winform.reghotkey(function(id,mod,vk){
+		showSearchPage();
+	}, MOD_CTRL + MOD_SHIFT, 0x46); // Ctrl+Shift+F —— 工程内全文搜索
+	winform.reghotkey(function(id,mod,vk){
+		editor.toggleFold(editor.curLine);
+	}, MOD_CTRL + MOD_SHIFT, 0xDB); // Ctrl+Shift+[ —— 折叠/展开当前块
 
-	winform.menu = win.ui.menu(winform,{
+	// 菜单：自绘标题栏的一行（不再是原生系统菜单栏）。
+	// 表结构：{ {"标题"; { {"菜单项"; 函数}; {"-"; null} }} }
+	titlebar.setMenus({
 		{ "文件";{
-			{ "打开工程"; function(id){ if(onOpen) onOpen() } };
-			{ "保存"; function(id){ if(onSave) onSave() } };
+			{ "新建  Ctrl+N"; function(id){ if(onNewFile) onNewFile() } };
+			{ "打开文件...  Ctrl+O"; function(id){ if(onOpenFile) onOpenFile("") } };
+			{ "打开工程..."; function(id){ if(onOpenProject) onOpenProject() } };
+			{ "-"; null };
+			{ "保存  Ctrl+S"; function(id){ if(onSave) onSave() } };
+			{ "另存为..."; function(id){ if(onSaveAs) onSaveAs() } };
+			{ "全部保存"; function(id){ if(onSaveAll) onSaveAll() } };
+			{ "-"; null };
+			{ "关闭标签页  Ctrl+W"; function(id){ if(onCloseTab) onCloseTab(curTab) } };
+			{ "-"; null };
 			{ "退出"; function(id){ winform.close() } };
 		} };
+		{ "工程";{
+			{ "打开工程..."; function(id){ if(onOpenProject) onOpenProject() } };
+			{ "新建文件..."; function(id){ if(onProjNewFile) onProjNewFile(null) } };
+			{ "新建目录..."; function(id){ if(onProjNewDir) onProjNewDir(null) } };
+			{ "工程属性"; function(id){ setStatus("工程属性") } };
+			{ "-"; null };
+			{ "打开设计器"; function(id){ if(onDesigner) onDesigner() } };
+		} };
+		{ "编辑";{
+			{ "剪切  Ctrl+X"; function(id){ app.editor.cut(editor) } };
+			{ "复制  Ctrl+C"; function(id){ app.editor.copy(editor) } };
+			{ "粘贴  Ctrl+V"; function(id){ app.editor.paste(editor) } };
+			{ "全选  Ctrl+A"; function(id){ app.editor.selectAll(editor) } };
+			{ "-"; null };
+			{ "撤销  Ctrl+Z"; function(id){ editor.undo() } };
+			{ "重做  Ctrl+Y"; function(id){ editor.redo() } };
+			{ "-"; null };
+			{ "查找  Ctrl+F"; function(id){ editor.showFind(false) } };
+			{ "替换  Ctrl+H"; function(id){ editor.showFind(true) } };
+			{ "转到行  Ctrl+G"; function(id){ gotoLinePrompt() } };
+		} };
+		{ "选择";{
+			{ "工程树"; function(id){ leftDock.setSelIndex(1) } };
+			{ "属性"; function(id){ leftDock.setSelIndex(2) } };
+			{ "大纲"; function(id){ leftDock.setSelIndex(4) } };
+		} };
+		{ "格式";{
+			{ "增加缩进  Tab"; function(id){ editor.indent() } };
+			{ "减少缩进  Shift+Tab"; function(id){ editor.unindent() } };
+			{ "注释/取消注释  Ctrl+/"; function(id){ editor.toggleComment() } };
+			{ "-"; null };
+			{ "折叠/展开  Ctrl+Shift+["; function(id){ editor.toggleFold(editor.curLine) } };
+			{ "全部折叠"; function(id){
+				var n = editor.foldAll();
+				setStatus("已折叠 " ++ n ++ " 个区块");
+			} };
+			{ "全部展开"; function(id){
+				editor.unfoldAll();
+				setStatus("已展开全部区块");
+			} };
+		} };
+		{ "转到";{
+			{ "转到行  Ctrl+G"; function(id){ gotoLinePrompt() } };
+			{ "上一个问题"; function(id){ bottomDock.setSelIndex(1) } };
+			{ "下一个问题"; function(id){ bottomDock.setSelIndex(1) } };
+		} };
+		{ "查找";{
+			{ "查找  Ctrl+F"; function(id){ editor.showFind(false) } };
+			{ "替换  Ctrl+H"; function(id){ editor.showFind(true) } };
+			{ "查找下一个"; function(id){ editor.findNext(editor.findText(), true) } };
+			{ "查找上一个"; function(id){ editor.findPrev(editor.findText()) } };
+			{ "全部替换"; function(id){
+				var n = editor.replaceAll(editor.findText(), editor.replaceText());
+				setStatus("已替换 " ++ n ++ " 处");
+			} };
+			{ "-"; null };
+			{ "在工程中搜索  Ctrl+Shift+F"; function(id){ showSearchPage() } };
+		} };
+		{ "显示";{
+			{ "控件"; function(id){ rightDock.setSelIndex(1) } };
+			{ "语法"; function(id){ rightDock.setSelIndex(2) } };
+			{ "标准库"; function(id){ rightDock.setSelIndex(3) } };
+			{ "范例"; function(id){ rightDock.setSelIndex(4) } };
+			{ "工具"; function(id){ rightDock.setSelIndex(5) } };
+			{ "AI"; function(id){ rightDock.setSelIndex(6) } };
+			{ "组件"; function(id){ rightDock.setSelIndex(7) } };
+		} };
 		{ "运行";{
-			{ "运行脚本  F5"; function(id){ if(onRun) onRun() } };
+			{ "运行  F5"; function(id){ if(onRun) onRun() } };
+			{ "调试运行  F10"; function(id){ if(onDebug) onDebug() } };
+			{ "停止调试  Ctrl+F9"; function(id){ if(onStopDebug) onStopDebug() } };
+		} };
+		{ "视图";{
+			{ "属性格"; function(id){ leftDock.setSelIndex(2) } };
+			{ "问题"; function(id){ bottomDock.setSelIndex(1) } };
+			{ "输出"; function(id){ bottomDock.setSelIndex(2) } };
+			{ "调试"; function(id){ bottomDock.setSelIndex(3) } };
+			{ "终端"; function(id){ bottomDock.setSelIndex(4) } };
+		} };
+		{ "设置";{
+			{ "编辑器设置"; function(id){ setStatus("编辑器设置") } };
+		} };
+		{ "帮助";{
+			{ "关于"; function(id){ ..win.msgbox("Nodio IDE\n自托管 aardio 风格 IDE","Nodio") } };
 		} };
 	});
+
+	// tree double-click opens the file (main.onOpenFile resolves the node)
+	projTree.onOpen = function(path, node){
+		if(onOpenFile) onOpenFile(path);
+	}
+	projTree.onSelect = function(path, node){
+		if(path) setPosStatus(path);
+	}
+	// 工程树右键菜单：官方 win.ui.tracker 的 onContextMenu（屏幕坐标），
+	// 自绘树的 nodeAt 定位光标下的节点。
+	// 菜单项：打开 / 复制路径 / 新建文件 / 新建目录 / 重命名 / 删除 / 设为启动文件。
+	// 分隔线：add(null,null) —— 官方 menubase.add 见到空标题就插 MF_SEPARATOR。
+	var treeMenu = win.ui.popmenu(winform);
+	var idTreeOpen = treeMenu.add("打开", null);
+	var idTreeCopy = treeMenu.add("复制路径", null);
+	treeMenu.add(null, null);
+	var idTreeNewFile = treeMenu.add("新建文件...", null);
+	var idTreeNewDir = treeMenu.add("新建目录...", null);
+	treeMenu.add(null, null);
+	var idTreeRename = treeMenu.add("重命名...", null);
+	var idTreeDelete = treeMenu.add("删除", null);
+	treeMenu.add(null, null);
+	var idTreeStart = treeMenu.add("设为启动文件", null);
+	projTree.onContextMenu = function(x,y){
+		var node = projTree.nodeAt(x,y);
+		if(!node) node = projTree.selectedNode();
+		if(!node) return;
+		var path = projTree.pathOf(node);
+		if(!path) return;
+		var id = treeMenu.popId();
+		if(!id) return;
+		if(id == idTreeOpen){
+			if(onOpenFile) onOpenFile(path);
+		}
+		elseif(id == idTreeCopy){
+			win.clip.write(path);
+			setStatus("已复制路径: " ++ path);
+		}
+		elseif(id == idTreeNewFile){
+			// 新文件落在「光标节点的所在目录」：目录节点就是它自己，
+			// 文件节点是它的父目录（projTree.dirOf 统一处理）
+			if(onProjNewFile) onProjNewFile(projTree.dirOf(node));
+		}
+		elseif(id == idTreeNewDir){
+			if(onProjNewDir) onProjNewDir(projTree.dirOf(node));
+		}
+		elseif(id == idTreeRename){
+			if(onProjRename) onProjRename(path);
+		}
+		elseif(id == idTreeDelete){
+			if(onProjDelete) onProjDelete(path);
+		}
+		elseif(id == idTreeStart){
+			if(onProjSetStart) onProjSetStart(path);
+		}
+	}
+
+	// page switches
+	leftDock.onSelChange   = function(i, page){ setStatus("工程面板: " ++ i) }
+	rightDock.onSelChange  = function(i, page){ setStatus("工具面板: " ++ i) }
+	bottomDock.onSelChange = function(i, page){ setStatus("输出面板: " ++ i) }
+
+	// the editor tab strip drives the document model
+	docStrip.onSelect = function(idx){
+		if(idx >= 1 && idx <= #tabOrder){
+			tabSel(tabOrder[idx]);
+			// 大纲等派生视图跟着换文档
+			if(onTabChange) onTabChange(curTab);
+		}
+	}
+	// 点 × 关闭页签（脏文档要先经过 onCloseTab 的确认）
+	docStrip.onClick = function(idx, closeHit){
+		if(closeHit && idx >= 1 && idx <= #tabOrder){
+			if(onCloseTab) onCloseTab(tabOrder[idx]);
+			else tabClose(tabOrder[idx]);
+		}
+	}
+
+	// re-layout on resize
+	winform.onSize = function(w,h){ layout(w,h) }
+	layout();
 }

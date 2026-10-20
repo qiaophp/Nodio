@@ -1,0 +1,15 @@
+// probe: double-quoted strings must be RAW in aardio (no escape processing);
+// single-quoted strings are compile-time escaped (C-like).
+io.print("--- double-quoted (raw) ---");
+io.print("len \\r :", #"a\rb");
+io.print("has CR:", (indexOf("a\rb", "\r") || 0) > 0);
+io.print("--- single-quoted (escaped) ---");
+io.print("len '\\n' :", #'\n');
+io.print("len '\\r' :", #'\r');
+io.print("len '\\t' :", #'\t');
+io.print("--- path literal ---");
+var p = "~\res\hello.txt";
+io.print("path:", p);
+io.print("path len:", #p);
+io.print("--- raw backtick ---");
+io.print("len `a\\nb` :", #`a\nb`);

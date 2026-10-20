@@ -1,0 +1,10 @@
+import s2mod;
+
+try { error("main boom") }
+catch(e) { io.print("A=" ++ e) }
+
+try { s2mod.boom() }
+catch(e) { io.print("B=" ++ e) }
+
+try { s2mod.callBack(function() { error("cb boom") }) }
+catch(e) { io.print("C=" ++ e) }

@@ -14,33 +14,64 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <windows.h>
 
 namespace nodio
 {
     namespace rpc
     {
         // Read one framed message from stdin. Returns false on EOF/short read.
+        // Header lines and the body are read with raw ReadFile instead of
+        // the CRT's fgets/fread: a peer that writes the exact framed bytes
+        // without a trailing newline (e.g. an aardio popen host) never
+        // satisfies fgets' full-buffer refill on anonymous pipes, while
+        // ReadFile returns whatever has already arrived.
         inline bool ReadMessage(std::string& out)
         {
             out.clear();
             int nLen = -1;
+            HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+            auto rdByte = [&](char* c) -> bool
+            {
+                DWORD got = 0;
+                BOOL ok = ReadFile(hIn, c, 1, &got, nullptr);
+                return ok && got == 1;
+            };
             for (;;)
             {
-                char line[512];
-                if (!fgets(line, sizeof line, stdin)) return false;
-                std::string h(line);
-                while (!h.empty() &&
-                       (h.back() == '\n' || h.back() == '\r'))
-                    h.pop_back();
-                if (h.empty()) break;
+                std::string h;
+                for (;;)
+                {
+                    char c;
+                    if (!rdByte(&c)) return false;
+                    if (c == '\n') break;
+                    if (c != '\r') h += c;
+                    if (h.size() > 4096) return false;
+                }
+                if (h.empty())
+                {
+                    // blank line: end of headers — but tolerate stray
+                    // blank lines BETWEEN messages (clients may append a
+                    // newline after the body to flush pipe buffers)
+                    if (nLen < 0) continue;
+                    break;
+                }
                 static const char* kCL = "Content-Length:";
                 if (h.rfind(kCL, 0) == 0)
                     nLen = atoi(h.c_str() + strlen(kCL));
             }
             if (nLen < 0) return false;
             out.resize((size_t)nLen);
-            size_t got = fread(&out[0], 1, (size_t)nLen, stdin);
-            return got == (size_t)nLen;
+            DWORD got = 0;
+            size_t total = 0;
+            while (total < (size_t)nLen)
+            {
+                if (!ReadFile(hIn, &out[total], (DWORD)((size_t)nLen - total),
+                              &got, nullptr) || got == 0)
+                    return false;
+                total += got;
+            }
+            return true;
         }
 
         inline void WriteMessage(const std::string& body)

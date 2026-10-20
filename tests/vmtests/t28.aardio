@@ -1,3 +1,9 @@
+// round 43: thread handle wait.
+//
+// Official contract (D:\aardio\lib\builtin\thread.aardio, intellisense):
+//   thread.waitOne(...) = "成功返回值为完成的句柄在数组中的索引" — the 1-based
+//   index of the signalled handle, NOT a boolean. (thread.wait(handle,ms) is
+//   the one that returns true/false.)
 var h = thread.create(function(x) {
     thread.set("t28r", x * 2);
     return x * 2;

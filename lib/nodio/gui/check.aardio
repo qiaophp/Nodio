@@ -1,0 +1,120 @@
+// nodio.gui.checkbox / nodio.gui.radio — 复选框与单选框。
+//
+// 移植自 Zan.Gui 的 Gui/Widget/Checkbox.zan 与 Gui/Widget/Radio.zan：
+//   两者都是「标记 + 文字」结构，标记区固定 16×16（逻辑像素），
+//   文字在标记右侧，垂直居中；选中态由 checked 标记驱动。
+//   单选框是**互斥**的：同一组里选中一个会取消其它（由 group 参数指定）。
+namespace nodio.gui{
+import nodio.gui.widget;
+import nodio.gui.style;
+import nodio.gui.theme;
+import nodio.gui.ctx;
+
+// 复选框
+checkbox = function(opt){
+	opt = opt : {};
+	var self = ..nodio.gui.widget({
+		text = opt.text;
+		style = opt.style : ..nodio.gui.styleCheck(opt.size : "medium");
+	});
+	self.markSize = opt.markSize : 16;   // 逻辑像素
+	self.onChange = opt.onChange;
+	self.onClick = opt.onClick;
+
+	self.paint = function(g, rc){
+		var th = g.theme;
+		var sb = self.box(th);
+		var x = rc.left;
+		var y = rc.top;
+		var h = rc.bottom - rc.top;
+		var ms = g.s(self.markSize);
+		var my = y + (h - ms) / 2;
+		// 标记底
+		g.round(sb.bg, x, my, ms, ms, g.s(4));
+		var bw = g.s(sb.borderW);
+		if(bw > 0) g.roundLine(sb.borderColor, x, my, ms, ms, g.s(4), bw);
+		// 勾
+		if(self.checked){
+			var c = sb.fg;
+			var p = ms / 5;
+			g.line(c, x + ms*0.25, my + ms*0.52, x + ms*0.44, my + ms*0.72, g.s(2));
+			g.line(c, x + ms*0.44, my + ms*0.72, x + ms*0.78, my + ms*0.28, g.s(2));
+		}
+		// 文字
+		var tx = x + ms + g.s(8);
+		var tw = rc.right - tx;
+		g.text(self.text, sb.fg, sb.fontPx, tx, y, tw, h,
+			{align=0; valign=1; ellipsis=1});
+	}
+	return self;
+}
+
+// 单选框
+radio = function(opt){
+	opt = opt : {};
+	var self = ..nodio.gui.widget({
+		text = opt.text;
+		style = opt.style : ..nodio.gui.styleCheck(opt.size : "medium");
+	});
+	self.markSize = opt.markSize : 16;
+	self.group = opt.group;              // 同组互斥（用同一个 group 对象）
+	self.onChange = opt.onChange;
+	self.onClick = opt.onClick;
+
+	// 互斥：选中自己时把同组的其它项取消
+	self.__ungroup = function(){
+		if(!self.group) return;
+		var peers = self.group.__peers;
+		if(!peers) return;
+		for(i=1;#peers;1){
+			var p = peers[i];
+			if(p == self) continue;
+			if(p.checked){
+				p.checked = false;
+				p.invalidate();
+				if(p.onChange) p.onChange(p, false);
+			}
+		}
+	}
+	self.toggle = function(){
+		if(!self.enabled) return;
+		if(!self.checked) self.__ungroup();
+		self.checked = !self.checked;
+		self.invalidate();
+		if(self.onChange) self.onChange(self, self.checked);
+	}
+	self.paint = function(g, rc){
+		var th = g.theme;
+		var sb = self.box(th);
+		var x = rc.left;
+		var y = rc.top;
+		var h = rc.bottom - rc.top;
+		var ms = g.s(self.markSize);
+		var my = y + (h - ms) / 2;
+		g.ellipse(sb.bg, x, my, ms, ms);
+		var bw = g.s(sb.borderW);
+		if(bw > 0) g.ellipseLine(sb.borderColor, x, my, ms, ms, bw);
+		if(self.checked){
+			var d = ms * 0.5;
+			g.ellipse(sb.fg, x + (ms - d)/2, my + (ms - d)/2, d, d);
+		}
+		var tx = x + ms + g.s(8);
+		var tw = rc.right - tx;
+		g.text(self.text, sb.fg, sb.fontPx, tx, y, tw, h,
+			{align=0; valign=1; ellipsis=1});
+	}
+	return self;
+}
+
+// 建一个单选组（把 peer 串起来）
+radioGroup = function(){
+	var grp = {__peers = {}};
+	grp.add = function(r){
+		..table.push(grp.__peers, r);
+		r.group = grp;
+		return r;
+	}
+	return grp;
+}
+
+}

@@ -1,0 +1,241 @@
+import string.builder;
+
+namespace base64{
+
+	var Crypt32 = ..raw.loadDll("Crypt32.dll");
+	var CryptBinaryToString = Crypt32.api("CryptBinaryToStringA", "bool(ptr bin,INT size,INT flags,string& str,INT &cchStr)");
+	var CryptStringToBinary = Crypt32.api("CryptStringToBinaryA", "bool(ptr str,INT size,INT flags,string& bin,INT &cbBin,INT &skip,INT &pFlags)");
+
+	is = function(s){
+		return type.isString(s) && (#s % 4 == 0) && ..string.find(s,"^[\a\d/+]+={0,2}$");
+	}
+
+	encodeBuilder = function(data, inSize, flags){
+		if(inSize===null){
+			inSize = ..raw.len(data)
+			if(inSize===null) error("参数必须是字符串,buffer 或结构体之一",2);
+		}
+		
+		if(!inSize) return;
+
+		var ok,,cchStr = CryptBinaryToString(data, inSize, 0x40000001/*_CRYPT_STRING_BASE64 | _CRYPT_STRING_NOCRLF*/, 0, 0);
+		if(!ok || !cchStr) return;
+
+		var ok2, str, cchActual = CryptBinaryToString(data, inSize, 0x40000001/*_CRYPT_STRING_BASE64 | _CRYPT_STRING_NOCRLF*/, cchStr - 1, cchStr);
+		if(ok2 && str){
+			var ob = ..string.builder();
+			ob.write(str);
+			return ob;
+		}
+	}
+
+	encode = function(data, inSize){
+		if(inSize===null){
+			inSize = ..raw.len(data)
+			if(inSize===null) error("参数必须是字符串,buffer 或结构体之一",2);
+		}
+		
+		if(!inSize) return "";
+
+		var ok,,cchStr = CryptBinaryToString(data, inSize, 0x40000001/*_CRYPT_STRING_BASE64 | _CRYPT_STRING_NOCRLF*/, 0, 0);
+		if(!ok || !cchStr) return "";
+
+		var ok2, str, cchActual = CryptBinaryToString(data, inSize, 0x40000001/*_CRYPT_STRING_BASE64 | _CRYPT_STRING_NOCRLF*/, cchStr - 1, cchStr);
+		if(ok2 && str) return str;
+		return "";
+	}
+
+	decodeBuilder = function(data, flags){
+		if(type(data)!="string") error("参数必须是字符串",2);
+		if(!#data) return;
+
+		var srclen = #data;
+		var ok,,cbBin = CryptStringToBinary(data, srclen, 0x00000001/*_CRYPT_STRING_BASE64*/, 0, 0, 0, 0);
+		if(!ok || !cbBin){
+			return null, "解码失败：包含无效字符";
+		}
+
+		var ok2, bin, cbActual = CryptStringToBinary(data, srclen, 0x00000001/*_CRYPT_STRING_BASE64*/, cbBin, cbBin, 0, 0);
+		if(ok2 && bin){
+			var ob = ..string.builder();
+			ob.write(bin);
+			return ob;
+		}
+		return null, "解码失败：包含无效字符";
+	}
+
+	decode = function(data){
+		if(type(data)!="string") error("参数必须是字符串",2);
+		if(!#data) return;
+
+		var ob,err = decodeBuilder(data);
+		if(ob){
+			var result = ob.buffer();
+			ob.free();
+			return result;
+		}
+		return null, err;
+	}
+
+	decodeToFile = function(data,path){
+		if(type(data)!="string") error("参数必须是字符串",2);
+		if(!#data) return;
+
+		var file,e = ..io.file(path,"w+b");
+		if(!file) return null,e;
+
+		var ob,err = decodeBuilder(data);
+		if(ob){
+			var r,e = file.writeBuffer(ob.pointer(),ob.size());
+			ob.free();
+			file.close();
+			return r,e;
+		}
+		file.close();
+		return null,err;
+	}
+
+	encodeFromFile = function(path){
+		if(!path) error("参数 1 必须指定文件路径",2);
+
+		var ob,err = encodeBuilderFromFile(path);
+		if(ob){
+			var result = ob.string();
+			ob.free();
+			return result;
+		}
+		return null,err;
+	}
+
+	encodeBuilderFromFile = function(path){
+		if(!path) error("参数 1 必须指定文件路径",2);
+
+		var file,e = ..io.file(path,"rb");
+		if(!file) return null,e;
+
+		var inSize = file.size();
+		if(!inSize){
+			file.close();
+			return;
+		}
+
+		var ib = ..string.builder();
+		ib.reserve(inSize);
+		var readSize = file.readBuffer(ib.pointer(),inSize);
+		file.close();
+
+		if(inSize!=readSize){
+			ib.free();
+			return null,"读取文件内容失败";
+		}
+
+		var ob = encodeBuilder(ib, inSize);
+		ib.free();
+		return ob;
+	}
+
+	class encoder{
+		ctor(){
+			this.outBuilder = ..string.builder();
+			this.inBuffer = "";
+		};
+
+		write = function(data, inSize){
+			if(!inSize){
+				inSize = ..raw.len(data);
+				if(inSize===null) error("参数必须是字符串,buffer 或结构体之一",2);
+				if(!inSize) return this;
+			}
+
+			var s = type(data)=="string" ? data : ..raw.tostring(data, 1, inSize);
+			this.inBuffer = this.inBuffer ++ s;
+
+			var completeLen = ..math.floor(#this.inBuffer / 3) * 3;
+			if(completeLen > 0){
+				var toEnc = ..string.left(this.inBuffer, completeLen);
+				this.inBuffer = ..string.right(this.inBuffer, #this.inBuffer - completeLen);
+				var chunk = encode(toEnc);
+				this.outBuilder.write(chunk);
+			}
+			return this;
+		};
+
+		read = function(){
+			var r = this.outBuilder.string();
+			this.outBuilder.resize(0);
+			return r;
+		};
+
+		finalBuilder = function(){
+			if(this.outBuilder){
+				if(#this.inBuffer > 0){
+					var chunk = encode(this.inBuffer);
+					this.outBuilder.write(chunk);
+					this.inBuffer = "";
+				}
+				var builder = this.outBuilder;
+				this.outBuilder = null;
+				return builder;
+			}
+		};
+
+		final = function(){
+			var builder = this.finalBuilder();
+			if(builder){
+				var result = builder.string();
+				builder.free();
+				return result;
+			}
+		};
+	}
+
+	class decoder{
+		ctor(){
+			this.outBuilder = ..string.builder();
+			this.inBuffer = "";
+		};
+
+		write = function(data){
+			if(!#data) return this;
+			this.inBuffer = this.inBuffer ++ data;
+
+			var completeLen = ..math.floor(#this.inBuffer / 4) * 4;
+			if(completeLen > 0){
+				var toDec = ..string.left(this.inBuffer, completeLen);
+				this.inBuffer = ..string.right(this.inBuffer, #this.inBuffer - completeLen);
+				var ob, err = decodeBuilder(toDec);
+				if(!ob) error(err : "解码失败", 2);
+				this.outBuilder.write(ob.string());
+				ob.free();
+			}
+			return this;
+		};
+
+		read = function(){
+			var r = this.outBuilder.buffer();
+			this.outBuilder.resize(0);
+			return r;
+		};
+
+		finalBuilder = function(){
+			if(this.outBuilder){
+				if(#this.inBuffer > 0){
+					return null, "输入数据不完整";
+				}
+				var builder = this.outBuilder;
+				this.outBuilder = null;
+				return builder;
+			}
+		};
+
+		final = function(){
+			var builder, err = this.finalBuilder();
+			if(builder){
+				var result = builder.buffer();
+				builder.free();
+				return result;
+			}
+			return null, err;
+		};
+	}
+}

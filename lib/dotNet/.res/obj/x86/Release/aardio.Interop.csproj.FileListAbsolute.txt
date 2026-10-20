@@ -1,0 +1,4 @@
+D:\Nodio\lib\dotNet\.res\bin\Release\aardio.Interop.dll
+D:\Nodio\lib\dotNet\.res\obj\x86\Release\aardio.Interop.csproj.AssemblyReference.cache
+D:\Nodio\lib\dotNet\.res\obj\x86\Release\aardio.Interop.csproj.CoreCompileInputs.cache
+D:\Nodio\lib\dotNet\.res\obj\x86\Release\aardio.Interop.dll

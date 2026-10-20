@@ -1,0 +1,14 @@
+// probe: official contracts for time.date / time() / string.hex
+io.print("--- time ---");
+io.print("date()        :", type(..time.date()), tostring(..time.date()));
+io.print("date(y,m,d)   :", type(..time.date(2026,10,20)), tostring(..time.date(2026,10,20)));
+io.print("date('%Y')    :", type(..time.date("%Y")), tostring(..time.date("%Y")));
+io.print("time(garbage) :", type(..time("garbage")), tostring(..time("garbage")));
+io.print("time(0)       :", type(..time(0)), tostring(..time(0)));
+io.print("--- string.hex ---");
+io.print("hex('AB')     :", string.hex("AB"));
+io.print("hex('A')      :", string.hex("A"));
+io.print("unhex('4142') :", string.unhex("4142"));
+io.print("--- time.format on an object ---");
+var t = ..time.date(2026,10,20);
+if(t) io.print("format        :", t.format);

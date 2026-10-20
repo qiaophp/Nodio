@@ -1,0 +1,48 @@
+// nodio.gui.label — 文本标签。
+//
+// 移植自 Zan.Gui 的 Gui/Widget/Label.zan：
+//   纯文字，无边框；颜色走**语义角色**（textPrimary / textSecondary /
+//   textTertiary / textDisabled / 强调色），字号走尺寸档位；
+//   align（水平）与 valign（垂直）可配，超长省略。
+namespace nodio.gui{
+import nodio.gui.widget;
+import nodio.gui.style;
+import nodio.gui.theme;
+import nodio.gui.ctx;
+
+label = function(opt){
+	opt = opt : {};
+	var self = ..nodio.gui.widget({
+		text = opt.text;
+		icon = opt.icon;
+		style = opt.style : ..nodio.gui.styleLabel(
+			opt.role : "textPrimary", opt.size : "medium");
+	});
+	self.role = opt.role : "textPrimary";
+	self.size = opt.size : "medium";
+	self.align = opt.align : 0;       // 0 左 1 中 2 右
+	self.onClick = opt.onClick;
+
+	self.paint = function(g, rc){
+		var th = g.theme;
+		var sb = self.box(th);
+		var x = rc.left;
+		var y = rc.top;
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		if(sb.bg) g.round(sb.bg, x, y, w, h, g.s(sb.radius));
+		var tx = x + g.s(sb.padL);
+		var tw = w - g.s(sb.padL) - g.s(sb.padR);
+		if(self.icon){
+			var isz = g.s(14);
+			g.icon(self.icon, sb.fg, tx, y + (h - isz)/2, 14);
+			tx = tx + isz + g.s(4);
+			tw = tw - isz - g.s(4);
+		}
+		g.text(self.text, sb.fg, sb.fontPx, tx, y, tw, h,
+			{align=self.align; valign=1; ellipsis=1});
+	}
+	return self;
+}
+
+}

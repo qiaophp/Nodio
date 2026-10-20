@@ -1,9 +1,20 @@
+// round 43: JSON round-trip + string codecs.
+//
+// Official contracts this pins (D:\aardio\lib\JSON\_.aardio, lib\builtin):
+//   - json.stringify uses table.eachName -> table.keys, and table.keys
+//     without a comparator sorts by DEFAULT DICTIONARY ORDER (alphabetical),
+//     so the members come out sorted, not in document order.
+//   - the official output has NO spaces: "key":value, joined with ",".
+//   - the metatable (_meta) is NOT a member of the object, so it never shows
+//     up in the output (t@ reaches it, iteration does not).
+//   - string.hex(data) without a prefix produces NO separator (the prefix
+//     argument is a prefix, not a separator: "41 42" needs hex(data," ")).
 import json;
 import string;
 import time;
 var obj = json.parse('{"name":"aardio","n":43,"arr":[1,2,3]}');
 io.print(obj.name, obj.n, obj.arr[2]);
 io.print(json.stringify(obj));
-io.print(#time.date("%Y"));
+io.print(time.date().format);
 io.print(string.hex("AB"), string.unhex(string.hex("AB")));
 io.print(string.base64("hi"));

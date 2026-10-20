@@ -1,0 +1,8 @@
+r1:true/y1
+r2:true/end
+log:payload:alive:42;
+iter:11
+nested1:outer:inner1
+nested2:outer-done
+innerstatus:suspended
+freed:1

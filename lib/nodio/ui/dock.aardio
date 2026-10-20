@@ -1,0 +1,257 @@
+// nodio.ui.dock — 停靠面板（自绘标签条 + 内容区）。
+//
+// 官方 aardio IDE 的右栏（控件/语法/标准库/范例/工具/AI）与底栏
+// （问题/输出/调试/终端）都是这种结构，官方实现见
+// docs/official-ide-reference.md §2：
+//
+//   官方右侧栏的每一页是**独立 aardio 脚本**，以 `mode="child"` 子窗体
+//   形式挂在 IDE 里，页签标题 = 子窗体的 text。
+//
+// Nodio 的落地：
+//   · 标签条用 nodio.ui.tabstrip（**自绘**：扁平标签 + 选中反白 + 强调
+//     下划线 + 悬停底色），不是系统 tab 控件；
+//   · 页内容**直接建在主窗体上**（不是子窗体）：
+//     官方的子窗体是 `border="none"` 的**弹出窗口**（官方 win.form 里
+//     border="none" 会把 WS_CHILD 覆盖成 WS_POPUP），会浮在 IDE 上面、
+//     不受主窗体裁剪，截图回路也抓不到；
+//     直接挂主窗体则天然被裁剪、层级正确、打印/截图都能拿到。
+//
+// 用法：
+//   dock = nodio.ui.dock(winform, {rect={left;top;right;bottom}; tabs={"工程";"属性"}})
+//   ctrl = dock.addTab("属性", "listview", {columns={{"属性";90}};vscroll=true})
+//   page = dock.addTab("搜索")            // 返回页描述（可往里加控件）
+//   dock.setSelIndex(2)
+//   dock.onSelChange = function(idx, page){ ... }
+namespace nodio.ui{
+import nodio.ui.tabstrip;
+import nodio.ui.rect;
+import nodio.ui.dpi;
+
+var __dockSeq = 0;
+var __ctlSeq = 0;
+
+// 客户区尺寸
+var __clientSize = function(winform){
+	var rc = winform.getClientRect();
+	if(rc){
+		var w = rc.width ? rc.width() : 0;
+		var h = rc.height ? rc.height() : 0;
+		if(w && h) return w,h;
+	}
+	return 1200,760;
+}
+
+dock = function(winform, opt){
+	opt = opt : {};
+	var self = {
+		winform   = winform;
+		rect      = opt.rect;          // 显式矩形（可写，layout() 生效）
+		side      = opt.side : "right";
+		size      = ..nodio.ui.px(opt.size : 280);
+		tabs      = {};                // 页签标题
+		pages     = {};                // 页 {caption; ctrl; obj}
+		contents  = {};                // 页内容控件（兼容旧接口）
+		selIndex  = 1;
+		onSelChange = null;
+		stripH    = ..nodio.ui.px(opt.stripH : 26);   // 标签条高度
+	};
+
+	__dockSeq = __dockSeq + 1;
+	// 自绘标签条
+	self.strip = nodio.ui.tabstrip(winform, {
+		left = 0; top = 0; right = 200; bottom = self.stripH;
+	});
+	self.strip.onSelect = function(idx){
+		self.__select(idx);
+	}
+
+	// 内容区矩形（标签条下方）
+	self.__contentRect = function(){
+		var rc = self.rect : {left=0; top=0; right=0; bottom=0};
+		return {left=rc.left; top=rc.top + self.stripH; right=rc.right; bottom=rc.bottom};
+	}
+
+	// 页描述：给「先建页，再往页里放自绘组件」的用法
+	// （add 转发到主窗体，所以组件可以直接建在 IDE 主窗体上）
+	self.__mkPage = function(index){
+		return {
+			index = index;
+			form = self.winform;
+			hwnd = self.winform.hwnd;
+			add = function(tParam){ return self.winform.add(tParam) };
+			getClientRect = function(){ return self.winform.getClientRect() };
+		};
+	}
+
+	// 关联/创建页内容
+	//   cls = "listview"          → 在主窗体上新建一个该类控件
+	//   cls = {hwnd=..}           → 已建好的控件
+	//   cls = {ctrl=..; layout=fn} → 自绘组件（工具箱/属性格）
+	self.__setContent = function(idx, cls, tParam){
+		if(type(cls) == "table"){
+			if(cls.hwnd){
+				self.pages[idx].ctrl = cls;
+				self.pages[idx].obj = null;
+			}
+			elseif(cls.ctrl){
+				self.pages[idx].ctrl = cls.ctrl;
+				self.pages[idx].obj = cls;
+			}
+			else return null;
+		}
+		else{
+			__ctlSeq = __ctlSeq + 1;
+			var cname = "dockCtl" + __ctlSeq;
+			tParam = tParam : {};
+			tParam.cls = cls;
+			var cr = self.__contentRect();
+			tParam.left = tParam.left : cr.left;
+			tParam.top = tParam.top : cr.top;
+			tParam.right = tParam.right : cr.right;
+			tParam.bottom = tParam.bottom : cr.bottom;
+			tParam.anchors = tParam.anchors : {left=1; top=1; right=1; bottom=1};
+			self.pages[idx].ctrl = ..nodio.ui.addCtrl(self.winform, cname, tParam);
+			self.pages[idx].obj = null;
+		}
+		self.contents[idx] = self.pages[idx].ctrl;
+		// 新内容建好后要重算一次可见性：页内容是在**选中之后**才陆续建出来的，
+		// 不重算的话后建的页会盖在选中的页上面（面板看起来是空的/串页）。
+		self.__applyVisibility();
+		return self.pages[idx].ctrl;
+	}
+
+	// 新增一个页签；同名页签会被复用
+	// addTab(caption)                 → 空页（返回页描述）
+	// addTab(caption, cls, tParam)    → 在页里新建一个 cls 控件（返回控件）
+	// addTab(caption, ctrl)           → 关联一个已建好的控件
+	// 图标：tParam.icon 或第 4 个参数（nodio.ui.icons 的名字），也可事后 setIcon
+	self.addTab = function(caption, cls, tParam, icon){
+		var tIcon = icon;
+		if(!tIcon && tParam && tParam.icon) tIcon = tParam.icon;
+		var idx = 0;
+		for(i=1;#self.tabs;1){
+			if(self.tabs[i] == caption){ idx = i; break }
+		}
+		if(idx){
+			// 页签已存在：补内容 + 补图标
+			// （页签通常在 opt.tabs 里先建好，后来 addTab 补内容；
+			//   这里以前直接早返回，把 tParam.icon 丢掉了 —— 页签图标不显示的根因）
+			if(cls) self.__setContent(idx, cls, tParam);
+			if(tIcon) self.strip.setIcon(idx, tIcon);
+			return self.pages[idx].ctrl ? self.pages[idx].ctrl : self.__mkPage(idx);
+		}
+		..table.push(self.tabs, caption);
+		..table.push(self.pages, {caption=caption; ctrl=null; obj=null});
+		..table.push(self.contents, null);
+		idx = #self.tabs;
+		self.strip.addTab(caption, tIcon);
+		if(cls) return self.__setContent(idx, cls, tParam);
+		return self.__mkPage(idx);
+	}
+
+	// 改页签图标
+	self.setIcon = function(i, icon){
+		self.strip.setIcon(i, icon);
+	}
+
+	// 只显示选中页的内容
+	self.__applyVisibility = function(){
+		for(i=1;#self.pages;1){
+			var c = self.pages[i].ctrl;
+			if(!c) continue;
+			c.show(i == self.selIndex);
+		}
+	}
+
+	// 切换到某页（只显示选中的页内容）
+	self.__select = function(idx){
+		if(idx < 1 || idx > #self.pages) return;
+		self.selIndex = idx;
+		self.__applyVisibility();
+		self.strip.setSelIndex(idx);
+		if(self.onSelChange) self.onSelChange(idx, self.pages[idx]);
+	}
+
+	// 读/写当前页
+	self.setSelIndex = function(i){
+		self.__select(i);
+	}
+	self.getSelIndex = function(){
+		return self.selIndex;
+	}
+
+	// 某页的内容控件
+	self.content = function(i){
+		return self.contents[i];
+	}
+
+	// 改页签标题
+	self.setCaption = function(i, text){
+		if(i < 1 || i > #self.tabs) return;
+		self.tabs[i] = text;
+		self.strip.setCaption(i, text);
+	}
+
+	// 重新摆放整块面板
+	self.layout = function(){
+		var rc = self.rect;
+		if(!rc){
+			var w,h = __clientSize(self.winform);
+			rc = {left=0; top=0; right=w; bottom=h};
+			if(self.side == "right") rc.left = w - self.size;
+			elseif(self.side == "left") rc.right = self.size;
+			elseif(self.side == "bottom") rc.top = h - self.size;
+			elseif(self.side == "top") rc.bottom = self.size;
+		}
+		self.rect = rc;
+		// 标签条
+		self.strip.layout(rc.left, rc.top, rc.right, rc.top + self.stripH);
+		// 页内容铺满标签条下方的内容区
+		var cr = self.__contentRect();
+		for(i=1;#self.pages;1){
+			var p = self.pages[i];
+			if(!p.ctrl) continue;
+			if(p.obj && p.obj.layout){
+				// 自绘组件：让它自己摆（内部坐标也要跟着更新）
+				p.obj.layout(cr.left, cr.top, cr.right, cr.bottom);
+			}
+			else{
+				..nodio.ui.setRect(p.ctrl, cr.left, cr.top, cr.right, cr.bottom);
+			}
+		}
+	}
+
+	// 改厚度
+	self.setSize = function(px){
+		self.size = px;
+		self.rect = null;
+		self.layout();
+	}
+
+	// 显示/隐藏
+	self.show = function(flag){
+		self.strip.show(flag);
+		for(i=1;#self.pages;1){
+			var c = self.pages[i].ctrl;
+			if(!c) continue;
+			c.show(flag && (i == self.selIndex));
+		}
+	}
+
+	// 内容区矩形（标签条下方的客户区）
+	self.client = function(){
+		return self.__contentRect();
+	}
+
+	// 初始页签
+	var titles = opt.tabs : {};
+	for(i=1;#titles;1){
+		self.addTab(titles[i]);
+	}
+	// 选中第一页：否则所有页都是隐藏的，面板看起来是空的
+	if(#self.pages) self.__select(1);
+	self.layout();
+	return self;
+}
+
+}

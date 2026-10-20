@@ -1,0 +1,318 @@
+// nodio.ui.board — 画板（自绘控件）。
+//
+// 基于官方 plus 控件，但**鼠标事件走自己的窗口子类化**
+// （nodio.ui.subclass），不依赖官方 win.ui 的控件事件路由：
+//   · 官方路由靠 `::SetWindowPointer` 装窗口过程，在 Nodio 里装不上，
+//     控件能画但收不到任何鼠标消息；
+//   · 自己子类化还能拿到 WM_MOUSEMOVE（悬停/拖动都要用），官方 plus
+//     的事件表里也没有可靠的 mousemove。
+//
+// 坐标约定：**物理像素**。GDI+ 文字度量只在像素单位下自洽
+// （字体按物理像素创建，measureString 返回的就是物理宽度），
+// 所以绘制、摆放、命中测试一律用物理像素。
+// 设计常量（字号/行高/内边距）按逻辑像素写，用 nodio.ui.px() 换算。
+//
+// 用法：
+//   board = nodio.ui.board(winform, {left=..;top=..;right=..;bottom=..})
+//   board.onDraw       = function(graphics, rc, self){ ... }  // 完全自绘
+//   board.onMouseDown  = function(x, y, self){ ... }          // 客户区坐标
+//   board.onMouseMove  = function(x, y, self){ ... }
+//   board.onMouseUp    = function(x, y, self){ ... }
+//   board.onMouseClick = function(x, y, self){ ... }
+//   board.onContextMenu = function(x, y, self){ ... }  // 屏幕坐标
+//   board.invalidate()                                       // 重绘
+//
+// 绘制工具（来自官方 gdip）：
+//   var brush = ..gdip.solidBrush(0xFFE3E3E3); graphics.fillRect(brush,x,y,w,h); brush.delete();
+//   var pen = ..gdip.pen(0xFF808080,1); graphics.drawLine(pen,x1,y1,x2,y2); pen.delete();
+//   graphics.drawString(text, font, ::RECTF(x,y,w,h), null, brush);
+namespace nodio.ui{
+import win.ui.ctrl.plus;
+import nodio.ui.subclass;
+import nodio.ui.rect;
+import nodio.ui.dpi;
+import gdip;
+import raw;
+
+var __bdSeq = 0;
+
+// ---------- 鼠标移出跟踪（TrackMouseEvent）----------
+//
+// 没有它，鼠标移出画板后画板收不到任何消息，悬停态会一直挂着
+// （按钮一直是高亮的样子）。官方 win.ui.tracker 就是这么做的。
+// 官方写法是 `::User32.api("TrackMouseEvent", "bool(struct& lpEventTrack)")`，
+// 但 Nodio 的 `::` 只认引擎内置符号，所以这里走 raw.loadDll()。
+//
+// 结构体只建一次（每次鼠标移动都新建一张表会制造垃圾），
+// 靠 "struct&" 的**传址**语义改字段后复用。
+var __u32 = null;
+var __tme = null;
+var __tmeStruct = {
+	INT cbSize = 16;
+	INT dwFlags = 2;        // _TME_LEAVE
+	HWND hwndTrack = 0;
+	DWORD dwHoverTime = 0;
+};
+var __trackInit = function(){
+	if(__tme) return true;
+	__u32 = ..raw.loadDll("user32.dll");
+	if(!__u32) return false;
+	__tme = __u32.api("TrackMouseEvent", "bool(struct &tme)");
+	return __tme != null;
+}
+// 让系统在该窗口上跟踪鼠标，鼠标移出时发 WM_MOUSELEAVE
+var __trackLeave = function(hwnd){
+	if(!__trackInit()) return false;
+	__tmeStruct.hwndTrack = hwnd;
+	return __tme(__tmeStruct);
+}
+
+// ---------- 鼠标捕获（SetCapture）----------
+//
+// 弹出式菜单（标题栏的下拉）需要：点开菜单后，即使鼠标移到菜单外面，
+// 也要继续收到鼠标消息，直到用户点一下决定「选中还是取消」。
+// 没有捕获的话，菜单会一直挂着，点别处也没反应。
+var __capSet = null;
+var __capRelease = null;
+var __capInit = function(){
+	if(__capSet) return true;
+	__u32 = ..raw.loadDll("user32.dll");
+	if(!__u32) return false;
+	__capSet = __u32.api("SetCapture", "addr(addr hwnd)");
+	__capRelease = __u32.api("ReleaseCapture", "int()");
+	return __capSet != null;
+}
+var __setCapture = function(hwnd){
+	if(!__capInit()) return false;
+	return __capSet(hwnd);
+}
+var __releaseCapture = function(){
+	if(!__capRelease) return false;
+	return __capRelease();
+}
+
+// 板面默认字体。
+//
+// 字号按**物理像素**创建（96dpi 逻辑字号 × DPI 缩放系数）：
+// GDI+ 的 gdip.font 默认单位是 _GdipUnitPixel，不随 DPI 变 ——
+// 不乘缩放系数的话，系统 150% 时自绘文字会比原生控件小一圈。
+//
+// 缓存按「字体名 + 物理字号」分桶（原来只有一个全局字体，
+// 第一个板面创建后其它板面拿到的都是同一个字号，fontSize 选项形同虚设）。
+var __boardFonts = {};
+boardFont = function(size, name){
+	name = name : "Segoe UI";
+	var ps = ..nodio.ui.px(size);
+	var key = name ++ "@" ++ ps;
+	var f = __boardFonts[key];
+	if(f) return f;
+	f = ..gdip.font(name, ps);
+	__boardFonts[key] = f;
+	return f;
+}
+
+// 共用的文字格式：水平靠左 + **垂直居中** + 超长省略号截断。
+// 默认格式是「左上对齐」，字号放大后文字会贴着行顶，这里统一居中；
+// 状态栏这类固定宽度的格子遇到长路径会折行（撑破格子），所以开截断。
+var __boardFormat = null;
+boardFormat = function(){
+	if(__boardFormat) return __boardFormat;
+	__boardFormat = ..gdip.stringFormat();
+	__boardFormat.align = 0;      // _StringAlignmentNear
+	__boardFormat.lineAlign = 1;  // _StringAlignmentCenter
+	__boardFormat.trimming = 2;   // _StringTrimmingEllipsisCharacter
+	// 不折行：不加这个标志时 GDI+ 会把长文本折成多行，
+	// 固定行高的列表/树里会上下串行（标准库页的说明列就是这样糊成一团的）。
+	// 加上之后超长文本按 trimming 截断成一行 + 省略号。
+	__boardFormat.flags = 0x1000; // _StringFormatFlagsNoWrap
+	return __boardFormat;
+}
+
+board = function(winform, opt){
+	opt = opt : {};
+	var self = {
+		winform = winform;
+		ctrl = null;
+		sub = null;
+		rect = opt.rect;
+		font = null;
+		fontSize = opt.fontSize : 12;   // 逻辑字号
+		fontName = opt.fontName;
+		format = boardFormat();
+		downX = 0; downY = 0; bDown = false;
+		dblClick = false;       // 最近一次按下是不是双击
+		onDraw = null;          // function(graphics, rc, self)
+		onMouseDown = null;    // function(x, y, self)
+		onMouseMove = null;
+		onMouseUp = null;
+		onMouseClick = null;
+		onContextMenu = null;   // function(x, y, self) —— x,y 是**屏幕坐标**
+		onRightMouseDown = null;   // function(x, y, self) —— 客户区坐标
+		onRightMouseUp = null;     // function(x, y, self) —— 客户区坐标
+		onMouseWheel = null;       // function(delta, x, y, self) —— delta>0 向上滚
+		onMouseLeave = null;       // function(self) —— 鼠标移出画板
+		capture = opt.capture;     // true = 按下时捕获鼠标（弹出式菜单用）
+		// 鼠标抬起时是否自动释放捕获。弹出式菜单要「点外面 = 取消」，
+		// 捕获必须一直保持到用户在菜单上按下为止，所以关掉自动释放。
+		// 默认仍然是「抬起即释放」（与 capture 的原始语义一致）。
+		autoReleaseCapture = (opt.autoReleaseCapture === null) ? true : opt.autoReleaseCapture;
+	};
+
+	__bdSeq = __bdSeq + 1;
+	var bname = "board" + __bdSeq;
+	// 矩形：既接受 opt.rect，也接受扁平的 left/top/right/bottom
+	var r = opt.rect : {
+		left = opt.left : 0;
+		top = opt.top : 0;
+		right = opt.right : 200;
+		bottom = opt.bottom : 100;
+	};
+	self.ctrl = ..nodio.ui.addCtrl(winform, bname, {
+		cls="plus";left=r.left;top=r.top;right=r.right;bottom=r.bottom;
+		notify=1;transparent=opt.transparent;bgroup=false;z=opt.z : 15
+	});
+
+	// 完全自绘：取消 plus 的默认背景与文字绘制
+	self.ctrl.onDrawBackground = function(graphics, rc, bg, color){
+		// 每次重绘都重取字体：跨显示器 DPI 变了以后字号要跟着变
+		self.font = boardFont(self.fontSize, self.fontName);
+		if(self.onDraw){
+			try{
+				self.onDraw(graphics, rc, self);
+			}
+			catch(e){
+				// 绘制回调出错不能把整个 IDE 带崩（plus 会吞掉异常，
+				// 表现是「画板一片空白」，极难定位）—— 打出来。
+				io.print("BOARD-DRAW-ERR[" ++ (self.ctrl ? "?" : "?") ++ "]:" ++ tostring(e));
+			}
+		}
+		return true;
+	}
+	self.ctrl.onDrawString = function(graphics, text, font, rectf, strFormat, brush){
+		return true;    // 文字由 onDraw 自己画
+	}
+
+	// 鼠标：自己子类化（官方 win.ui 的控件路由在 Nodio 里装不上窗口过程）
+	self.sub = ..nodio.ui.subclass(self.ctrl.hwnd, function(hwnd, msg, wp, lp){
+		var x = lp & 0xFFFF;
+		var y = (lp >> 16) & 0xFFFF;
+		if(msg == 0x201){            // WM_LBUTTONDOWN
+			self.bDown = true;
+			self.dblClick = false;
+			self.downX = x; self.downY = y;
+			// 捕获鼠标：鼠标移出画板也要继续收到消息（弹出式菜单）
+			if(self.capture) __setCapture(self.ctrl.hwnd);
+			if(self.onMouseDown) self.onMouseDown(x, y, self, lp);
+		}
+		elseif(msg == 0x200){       // WM_MOUSEMOVE
+			// 跟踪鼠标移出（否则悬停态复位不了）
+			__trackLeave(self.ctrl.hwnd);
+			if(self.onMouseMove) self.onMouseMove(x, y, self, lp);
+		}
+		elseif(msg == 0x2A3){       // WM_MOUSELEAVE
+			if(self.onMouseLeave) self.onMouseLeave(self);
+		}
+		elseif(msg == 0x202){       // WM_LBUTTONUP
+			var wasDown = self.bDown;
+			self.bDown = false;
+			if(self.capture && self.autoReleaseCapture) __releaseCapture();
+			if(self.onMouseUp) self.onMouseUp(x, y, self, lp);
+			// 在同一位置按下并抬起 = 一次点击
+			if(wasDown && math.abs(x - self.downX) < 4 && math.abs(y - self.downY) < 4){
+				if(self.onMouseClick) self.onMouseClick(x, y, self, lp);
+			}
+		}
+		elseif(msg == 0x203){       // WM_LBUTTONDBLCLK
+			self.bDown = false;
+			self.dblClick = true;
+			if(self.onMouseClick) self.onMouseClick(x, y, self, lp);
+		}
+		elseif(msg == 0x7B){        // WM_CONTEXTMENU
+			// 右键 / 菜单键 / Shift+F10。lParam 里是**屏幕坐标**
+			// （与官方 win.ui.tracker 的 onContextMenu 语义一致）：
+			//   官方 tracker.aardio:162-166
+			//     var x,y = ..win.getMessagePos(lParam)
+			//     if(x==-1 && y==-1) x,y = ..win.getMessagePos()
+			// lParam == -1 表示不是鼠标位置（菜单键 / Shift+F10），
+			// 这时退回真实光标位置。
+			var cx,cy = ..win.getMessagePos(lp);
+			if(cx == -1 && cy == -1) cx,cy = ..win.getMessagePos();
+			if(self.onContextMenu) self.onContextMenu(cx, cy, self);
+		}
+		elseif(msg == 0x204){       // WM_RBUTTONDOWN（lParam 是客户区坐标）
+			if(self.onRightMouseDown) self.onRightMouseDown(x, y, self);
+		}
+		elseif(msg == 0x205){       // WM_RBUTTONUP（lParam 是客户区坐标）
+			if(self.onRightMouseUp) self.onRightMouseUp(x, y, self);
+		}
+		elseif(msg == 0x20A){       // WM_MOUSEWHEEL
+			// 注意：滚轮消息的 lParam 是**屏幕坐标**，不是客户区坐标。
+			// delta 在 wParam 的高 16 位（120 的倍数，正数=向上滚）。
+			var delta = (wp >> 16) & 0xFFFF;
+			if(delta > 32767) delta = delta - 65536;
+			if(self.onMouseWheel) self.onMouseWheel(delta, x, y, self);
+		}
+		return null;
+	});
+
+	// 重绘
+	self.invalidate = function(){
+		self.ctrl.invalidate();
+	}
+
+	// 强制**整块**重绘。
+	//
+	// invalidate() 只是置脏位，更新区域（rcPaint）可能是残缺的 ——
+	// 自绘内容会被 GDI+ 的裁剪区裁掉一部分。
+	// 官方 ctrl 没有可用的 redraw 成员（调用会抛「非函数值」），
+	// 这里用引擎 sysapi 的 InvalidateRect(整块) + UpdateWindow 强制重画。
+	self.redraw = function(){
+		try{
+			::InvalidateRect(self.ctrl.hwnd, 0, 1/*erase*/);
+			::UpdateWindow(self.ctrl.hwnd);
+		}
+		catch(e){
+			try{ self.ctrl.invalidate() }catch(e2){}
+		}
+	}
+
+	// 显示/隐藏
+	self.show = function(flag){
+		self.ctrl.show(flag);
+	}
+
+	// 显式捕获/释放鼠标。
+	// 弹出式菜单靠它做到「点菜单外面 = 取消」：
+	// 菜单打开时捕获，点击落在菜单画板外也算点到了菜单画板。
+	self.setCapture = function(on){
+		if(on) __setCapture(self.ctrl.hwnd);
+		else __releaseCapture();
+	}
+
+	// 重新摆放
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		// 官方 win.ui 控件的 setPos 是 (x,y,宽,高)，引擎原生控件是 (l,t,r,b)，
+		// 两套方言混用会让布局整体错乱 —— 统一走 win.setPos。
+		..nodio.ui.setRect(self.ctrl, l, t, r, b);
+	}
+
+	// 释放：解除子类化（否则子类化记录会钉住画板）
+	self.dispose = function(){
+		if(self.sub){
+			try{ self.sub.free() }catch(e){}
+			self.sub = null;
+		}
+		self.ctrl = null;
+	}
+
+	self.layout();
+	return self;
+}
+
+}

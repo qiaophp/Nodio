@@ -1,0 +1,15 @@
+// Memory leak regression test: 10,000 iterations of local table creation and closures
+function worker() {
+    var a = { 1, 2, 3, "hello" };
+    var f = function() { return a[1]; };
+    return f();
+}
+
+for (i = 1; 10000; 1) {
+    var v = worker();
+    if (v != 1) {
+        error("Unexpected value");
+    }
+}
+
+io.print("Memory leak regression test passed");
