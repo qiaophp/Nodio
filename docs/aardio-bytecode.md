@@ -1086,7 +1086,9 @@ NEW_CLOSURE total=96  violations=0
   共享同一份存储 → `STORE_UPVALUE` 的写入能透传；
 * 新增合成夹具 `call` / `params` / `upvalue`（`tools/aardio_make_chunk.py`），
   分别验证「闭包调用 = 10」「self + 参数1 = 7」「上值按引用改写外层局部
-  10 → 99」；回归 `tests/aardio_run_check.ps1` 45 → **55 项**。
+  10 → 99」；再加一个**递归闭包**夹具（闭包先存进模块命名空间、再用
+  `GET_MEMBER` 取回自己递归调用，`f(5) = 120`）；
+  回归 `tests/aardio_run_check.ps1` 45 → **58 项**。
 
 ### 7.6 解释器 helper 地图
 | 地址 | 作用 |
@@ -1333,8 +1335,10 @@ Nodio 现在能**读出**官方预编译块的结构，并在 import 阶段给�
    （记录 VM 改为**帧栈**，闭包与上值用 `RtClosure` / `RtCell` 建模），
    `-disasm` 的进度随之从 `可执行 46/61` 变成 **`可执行 52/61`**
    （剩 9 种：原生函数 / 导入成员 / 字符串拼接 / 复合赋值 / 多值调用）。
-   回归 `tests/aardio_run_check.ps1` 扩到 **55 项断言**：新增 `call`(10)、
-   `params`(7)、`upvalue`(99) 三个调用与闭包夹具。
+   回归 `tests/aardio_run_check.ps1` 扩到 **58 项断言**：新增 `call`(10)、
+   `params`(7)、`upvalue`(99) 三个调用与闭包夹具，以及 `recurse`(120)
+   ——闭包先存进模块命名空间、再用 `GET_MEMBER` 取回「自己」递归调用，
+   一次跑通「闭包进表 / 从表取回 / 属主命名空间对帧可见 / 嵌套帧」。
 7. **大**：完整支持 `.aau` / 预编译模块的加载、缓存与调试信息（行号表）。
    注：官方预编译块**自带源码行号区间**（chunk 头的两个 i32 = 首行/末行），
    这是官方给预编译模块做运行期行号定位的基础，Nodio 可以照做。

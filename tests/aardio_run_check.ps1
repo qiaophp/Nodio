@@ -114,7 +114,8 @@ foreach ($c in $member) {
 $call = @(
     @{ name = 'call';    want = '10' },   # NEW_CLOSURE + CALL：参数1 + 参数2
     @{ name = 'params';  want = '7'  },   # 被调帧槽 0 = self，槽 1.. = 显式参数
-    @{ name = 'upvalue'; want = '99' }    # 上值按引用：闭包改写外层局部 10 → 99
+    @{ name = 'upvalue'; want = '99' },   # 上值按引用：闭包改写外层局部 10 → 99
+    @{ name = 'recurse'; want = '120' }   # 递归闭包：f(n)=n*f(n-1)，f(5)=120
 )
 foreach ($c in $call) {
     $f = Join-Path $tmp ($c.name + '.aardio')

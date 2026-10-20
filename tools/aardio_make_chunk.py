@@ -115,6 +115,12 @@ class Chunk(object):
     def ret(self, a: int) -> int:
         return self.emit(rec(0x2C, a=a))
 
+    def jmp(self, target: int) -> int:
+        """0x22 JMP：位移在本条（偏置 0x1FFFE），落点 = 本条 pc + 位移。"""
+        pc = len(self.code)
+        self.emit(jump_word(target, pc))
+        return pc
+
     def cond(self, kind: int, a: int, left: int, right: int, target: int) -> int:
         """条件跳转 + 紧跟的 0x22（位移在下一条 u32）。
 
@@ -451,6 +457,46 @@ def build_upvalue():
     return c
 
 
+def build_recurse():
+    """递归闭包：f(n) = n * f(n-1)，f(5) = 120
+
+    闭包先存进**模块命名空间**（0x0C SET_MEMBER），函数体再用 0x05 GET_MEMBER
+    把「自己」取回来调用 —— 这条路径同时验证：
+      闭包能进表 / 能从表取回 / 闭包的属主命名空间对帧可见 / 嵌套帧。
+    """
+    body = Chunk(slots=8)
+    key = body.add_const("f")
+    # 被调帧：槽 0 = self，槽 1 = 参数 n，**局部变量从槽 2 起**
+    body.get_member(2, key)        # 槽2 = ns.f（自己）
+    body.local(3, 1)               # 槽3 = 帧槽1（参数 n）
+    body.load_int(4, 1)            # 槽4 = 1
+    # 注意：cond() 会连发**两条**记录（条件记录 + 一条 0x22），所以后面的
+    # 记录号要 +1：base = 13、end = 14。
+    body.cond(0x26, 1, 3, 4, 13)   # if (n <= 1) → base
+    body.local(4, 1)               # 槽4 = n
+    body.load_int(5, 1)            # 槽5 = 1
+    body.arith(0x19, 4, 4, 5)      # 槽4 = n - 1
+    body.local(5, 1)               # 槽5 = n
+    body.call(2, 5, 2)             # f(...)：实参 = 槽3..槽6；返回槽 = 槽7
+    body.local(6, 1)               # 槽6 = n
+    body.arith(0x1A, 7, 7, 6)      # 槽7 = 槽7 * 槽6
+    body.jmp(14)                   # → end
+    body.load_int(7, 1)            # base：槽7 = 1
+    body.ret(7)                    # end：返回槽7
+
+    c = Chunk(slots=8)
+    c.children.append(body)
+    ckey = c.add_const("f")
+    c.new_closure(0, 0)             # 槽0 = 闭包
+    c.set_member(0, ckey)           # ns.f = 闭包
+    c.get_member(2, ckey)           # 槽2 = ns.f
+    c.load_int(3, 0)                # 槽3 = self
+    c.load_int(4, 5)                # 槽4 = n = 5
+    c.call(2, 4, 2)                 # f(5)：实参 = 槽3..槽5；返回槽 = 槽6
+    c.ret(6)
+    return c
+
+
 def build_unsupported():
     """故意用一条尚未实现的记录（NEW_NATIVE 0x15）→ 记录 VM 必须明确报错
 
@@ -482,6 +528,7 @@ BUILDERS = {
     "call": build_call,
     "params": build_params,
     "upvalue": build_upvalue,
+    "recurse": build_recurse,
     "unsupported": build_unsupported,
 }
 
