@@ -448,14 +448,40 @@ namespace NodioVM
             }
         }
 
-        if (s_config.extensions.empty())
+        // 官方契约的扩展名与魔数是**引擎内置**的，不依赖 nodio.json：
+        //   .aardio  —— 官方标准库的唯一源码扩展名（lib\ 下 989 个文件）
+        //   =aardio  —— 官方预编译块（=aardio）魔数
+        // nodio.json 只是**追加**扩展名，不是替换：配置文件找不到
+        // （发布产物、自定义部署目录、CI 的临时工作目录）时，官方库
+        // 仍必须可用，否则整个标准库会静默失效。
+        // 查找顺序上 .nodio 优先于 .aardio：同名文件时 Nodio 自己的
+        // 源码优先。
         {
-            s_config.extensions.push_back(L".nodio");
-        }
-        if (s_config.magicHeaders.empty())
-        {
-            s_config.magicHeaders.push_back(L"=nodio");
-            s_config.magicHeaders.push_back(L"=bytecode");
+            static const std::vector<std::wstring> kBuiltinExt = {
+                L".nodio", L".aardio"
+            };
+            static const std::vector<std::wstring> kBuiltinMagic = {
+                L"=nodio", L"=bytecode", L"=aardio"
+            };
+            std::vector<std::wstring> exts = kBuiltinExt;
+            for (const auto& e : s_config.extensions)
+            {
+                bool bDup = false;
+                for (const auto& b : exts)
+                    if (_wcsicmp(b.c_str(), e.c_str()) == 0) { bDup = true; break; }
+                if (!bDup) exts.push_back(e);
+            }
+            s_config.extensions = exts;
+
+            std::vector<std::wstring> magic = kBuiltinMagic;
+            for (const auto& e : s_config.magicHeaders)
+            {
+                bool bDup = false;
+                for (const auto& b : magic)
+                    if (b == e) { bDup = true; break; }
+                if (!bDup) magic.push_back(e);
+            }
+            s_config.magicHeaders = magic;
         }
         if (s_config.defaultTitle.empty())
         {

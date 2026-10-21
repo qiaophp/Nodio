@@ -1162,7 +1162,17 @@ namespace NodioVM
                            bool bIsArray = false, bool bPtrArray = false);
     std::vector<StructFieldDef> ParseStructDef(const Value& vTab);
     int CalcStructTotalSize(const Value& vTab);
-    void* StructSerialize(const Value& vTab, int* pOutTotal = nullptr);
+    // cbSlack: extra zeroed bytes appended to the marshalling buffer.
+    // The declared layout stays authoritative (pOutTotal reports it); the
+    // slack only guarantees that a callee reading a wider platform layout
+    // stays inside the allocation.
+    void* StructSerialize(const Value& vTab, int* pOutTotal = nullptr,
+                          size_t cbSlack = 0);
+    // Zeroed slack a struct marshalling buffer must carry so a callee that
+    // uses a wider layout than the declared one (x64: ULONG_PTR = 8 bytes
+    // while the official library declares `int` = 4 bytes) cannot read past
+    // the allocation and hit an unmapped page.
+    size_t StructOverreadSlack(const Value& vTab);
     void StructDeserialize(Value& vTab, const void* pBuf);
 
     // memdll.cpp — memory DLL loading (raw.loadDll with in-memory bytes).

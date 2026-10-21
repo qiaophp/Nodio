@@ -975,7 +975,33 @@ namespace NodioVM
         return AlignOffset(total, maxA);
     }
 
-    void* StructSerialize(const Value& vTab, int* pOutTotal)
+    size_t StructOverreadSlack(const Value& vTab)
+    {
+        // The callee may use a wider platform layout than the one the
+        // library declared. The official library was written for 32-bit
+        // aardio, where `int` (4 bytes) and the Win32 `ULONG_PTR` are the
+        // same size; on x64 the real structure is twice as wide, e.g.
+        // gdip.core's GdiplusStartupInput (4 x `int` = 16 bytes) is read
+        // by GdiplusStartup as 4 x `ULONG_PTR` = 32 bytes. Handing the API
+        // a buffer that ends exactly at a page boundary then faults on the
+        // callee's over-read. Zeroed slack keeps the over-read inside the
+        // allocation and makes the extra fields read as 0.
+        auto fields = ParseStructDef(vTab);
+        size_t slack = 0;
+        for (auto& f : fields)
+        {
+            if (f.bIsArray || f.bPtrArray) continue;
+            wstring t = f.type;
+            for (auto& c : t) c = towlower(c);
+            if (t == L"struct" || t == L"union") continue;
+            int sz = GetStructFieldSize(f.type, 0, false, false);
+            int wide = (int)sizeof(void*) - sz;
+            if (wide > 0) slack += (size_t)wide;
+        }
+        return slack < 64 ? (size_t)64 : slack;
+    }
+
+    void* StructSerialize(const Value& vTab, int* pOutTotal, size_t cbSlack)
     {
         if ((vTab.t != Value::TableT && vTab.t != Value::Class) || !vTab.tab)
             return nullptr;
@@ -984,7 +1010,8 @@ namespace NodioVM
         int total = CalcStructTotalSize(vTab);
         if (total <= 0) return nullptr;
         if (pOutTotal) *pOutTotal = total;
-        char* buf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, total);
+        char* buf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                     (size_t)total + cbSlack);
         if (!buf) return nullptr;
         int off = 0;
         Value s_nullVal;
@@ -2052,7 +2079,11 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                             else
                             {
                                 int total = 0;
-                                void* pBuf = StructSerialize(v, &total);
+                                // zeroed slack, same reason as the static
+                                // FFI path: the callee may use a wider
+                                // platform layout than the declared one.
+                                void* pBuf = StructSerialize(
+                                    v, &total, StructOverreadSlack(v));
                                 if (pBuf)
                                 {
                                     // auto-maintains cbSize: when a struct's

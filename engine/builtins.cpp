@@ -5889,7 +5889,13 @@ void Interp::InitBuiltins()
                                     if (v.t == Value::TableT || v.t == Value::Class)
                                     {
                                         int total = 0;
-                                        void* pBuf = StructSerialize(v, &total);
+                                        // zeroed slack: the callee may use a
+                                        // wider platform layout than the
+                                        // declared one (x64 ULONG_PTR vs the
+                                        // library's `int`) and would read
+                                        // past the end of the buffer.
+                                        void* pBuf = StructSerialize(
+                                            v, &total, StructOverreadSlack(v));
                                         if (pBuf)
                                         {
                                             // auto-maintains cbSize:

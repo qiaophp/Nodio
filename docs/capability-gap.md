@@ -1883,3 +1883,193 @@ var DAP_EXE   = NODIO_DIR ++ "nodio-dap.exe";
 `tests/builtin_api_check.ps1` 新增**第 7 段**（`com.ImplInterface / 原始接口事件`）：
 3 参形式未知接口报错 + 三条路径的真实事件派发 + 事件名/参数值正确 + 解绑正常。
 双架构（x64 / x86）11 套既有回归全绿。
+
+
+## 1.24 第二十六轮：官方标准库可用性 —— 扩展名不应依赖外部配置文件
+
+### 1.24.1 缺陷（真实、非测试环境误报）
+
+`nodio.json` 找不到时，引擎的默认扩展名列表只剩 `.nodio`，
+官方标准库的唯一源码扩展名 **`.aardio` 直接消失** →
+**整个官方标准库静默失效**：`import win.ui` 不报错，但 `win.ui` 是 `null`，
+`win.form` 从官方的 `class` 退化成引擎内置的 `native function`。
+
+| 触发场景 | 说明 |
+|---|---|
+| **发布产物** | 自包含 exe，官方库编译进 payload，外部**没有** `nodio.json` |
+| 自定义部署目录 | exe 旁边没有 `nodio.json`（查找只上溯两级） |
+| CI 临时工作目录 | `tests/module_sweep.ps1` 把 `WorkingDirectory` 设成 `%TEMP%` |
+
+实测对照（同一个 exe、同一个官方库，只换工作目录）：
+
+| 工作目录 | `type(win.ui)` | `type(win.form)` |
+|---|---|---|
+| `D:\Nodio`（能找到 `nodio.json`） | `table` | `class` |
+| `%TEMP%` / 任意自定义目录 | **`null`** | **`native function`** |
+
+### 1.24.2 根因
+
+`engine/util.cpp` 的 `LoadConfigInternal()`：
+
+- 配置文件里的 `extensions` 数组**替换**默认列表；
+- 默认列表只有 `.nodio`（`.aardio` 只写在 `nodio.json` 里）；
+- 配置查找只上溯两级（exe 同目录 → 上一级 → 上两级），
+  找不到就只剩 `.nodio`。
+
+`magicHeaders` 同理：默认只有 `=nodio` / `=bytecode`，
+`=aardio`（官方预编译块魔数）也只在配置文件里。
+
+### 1.24.3 修法
+
+**官方契约固化进引擎内置默认**，配置文件降级为「追加」而非「替换」：
+
+- 默认 `extensions` = `.nodio` + `.aardio`（`.nodio` 在前：同名时 Nodio 自己的源码优先）；
+- 默认 `magicHeaders` = `=nodio` + `=bytecode` + `=aardio`；
+- 配置文件 / `NODIO_EXTENSIONS` 里列出的扩展名**追加**到内置列表（去重）。
+
+改法只影响**扩展名查找与后缀剥离**，不改变任何查找顺序或优先级规则。
+
+### 1.24.4 顺带澄清（非缺口）
+
+`::RECTF` / `::LOGFONT` / `::PAINTSTRUCT` / `::WNDCLASSEX` / `::MSG` 在
+「只 `import builtin.struct`」时是 `null` —— 这是**官方契约本身**：
+
+- `::RECTF` 定义在 `gdip/core.aardio:75`、`::LOGFONT` 在 `gdi/_.aardio:4`，
+  属于**按需导入**的包，不是 builtin；
+- `::PAINTSTRUCT` / `::WNDCLASSEX` / `::MSG` 官方 lib 里**根本没有** `class ::X` 定义
+  （`::MSG` 在 `builtin/_.aardio:49` 被官方**故意**设为 `null`，
+  `win` 包用的是另一个 `struct msg`）。
+
+### 1.24.5 回归
+
+新建 `tests/lib_availability_check.ps1`（4 段）：
+
+1. **无 `nodio.json` 时**官方标准库仍可用（`win.ui` 是 table、`::RECT` 是 class、
+   `::CopyMemory` 是 native function、`::HIWORD`/`::LOWORD`/`::MAKELONG`/`::MAKEWORD`
+   是 function，且函数语义与官方逐位一致）；
+2. **有 `nodio.json` 时**行为一致（不因修复而回归）；
+3. **配置里只写 `.nodio`** 时官方库仍可用（扩展名是追加，不是替换）；
+4. **配置缺失时** `=aardio` 魔数仍被内置识别。
+
+x64 / x86 双架构全绿；`builtin_api_check.ps1` 7 段双架构全绿。
+
+## 1.25 第二十六轮（续）：字节码序列化丢值 —— 发布产物的崩溃链
+
+### 1.25.1 缺陷（真实）
+
+发布产物（自包含 exe）一启动就崩，错误链有两级：
+
+1. `字节码读取错误: 越界的符号名索引 @ gdip\encoder.aardio:3`；
+2. 修掉上一条后：`time\performance.aardio:5` 在 ntdll 里访问冲突。
+
+**对照实验**（同一工程、同一台机器）：用**基线 exe**（`build-x64\Release\nodio.exe`，
+早于本轮全部改动）发布同一工程 → 两种宿主都报
+「运行错误: 载荷中没有可执行的启动脚本」；用本轮改动后的 exe 发布 →
+产物能正常跑起来。即：**本轮修复让发布产物从「完全不可用」变成「可用」**。
+
+### 1.25.2 根因
+
+两个独立缺陷，都在 `engine/compiler.cpp` 的字节码序列化上：
+
+**(a) 空字符串被跳过 → 写出越界哨兵**
+
+- 解析器**故意**会产出空名：`parser.h` 的缺位命名空间段、`...` 可变参数标记等；
+- `CollectStrings()` 的 `addStr` **跳过空字符串** → 这些名字不在字符串池里；
+- `WriteNode` 找不到名字时写出哨兵 `0xFFFFFFFF` → 反序列化判为越界 → 整个发布失败。
+
+**(b) `Node::Bool` 的值被丢弃**
+
+- 布尔字面量的值存在 `num` 字段，但序列化端**只为 `Node::Num` 写 double**；
+- 布尔字面量在字节码往返后一律变成 `false`；
+- 官方 `time/performance.aardio:4` 的 `..raw.long(0,true)` 因此变成 `raw.long(0,false)`
+  → 发布产物启动即在 ntdll 访问冲突。
+
+### 1.25.3 修法
+
+- `CollectStrings` 允许空串入池；新增 `EmptyStringIndex(strMap)` 辅助函数，
+  `WriteNode` 找不到名字时写池内空串的**有效索引**（不再写 `0xFFFFFFFF`）；
+- `ReadNode` 对 `0xFFFFFFFF` 宽容（读作空串）；
+- `Node::Bool` 与 `Node::Num` 一样写/读 double；
+- `SerializeNode` 拆出无自检的 `WriteBytecode()`，并新增**往返字节级自检**
+  （序列化 → 反序列化 → 再序列化 → 要求两次字节完全一致），
+  失败通过新增的 `wstring* err` 参数上报 —— 把「发布时才发现格式丢信息」
+  提前到编译期。
+
+### 1.25.4 回归锁
+
+`tests/publish_official_lib_check.ps1`（新建）：发布含 `import win.ui` /
+`import builtin.struct` / `import string.format` 的工程 → 复制到**隔离目录**
+（确定没有 `nodio.json`、不设 `NODIO_LIBDIR`）→ 断言
+`win.ui=table` / `RECT=class` / `HIWORD=4660`。
+x64 / x86 双架构全绿。
+
+## 1.26 第二十六轮（续）：结构体编组缓冲区缺少余量 —— callee 越界读
+
+### 1.26.1 缺陷（真实）
+
+发布产物**基名恰好是 `app`**（`APP` / `App` 同样）时，进程在
+`Gdiplus!GdiplusStartup` 里访问冲突（`exit=0xC0000005`）：
+
+- 同一份字节、同一目录、同一宿主（`nodio.exe` 与 `nodio-stub.exe` 宿主都复现）；
+- 20+ 个其它名字（`app2` / `apps` / `appx` / `xapp` / `main` / `qq` / `xyz` / `abc` …）全部正常；
+- 目录深度（4 种）、文件创建顺序、`NODIO_LIBDIR` 的 4 种写法都**不改变**这个结论；
+- 两次运行的 `import` 解析日志**逐行相同**（224 行，仅 exe 路径那一行不同），
+  结构体声明大小与 `_struct` 元数据**完全相同**（16B / 80B）→ 差异只在缓冲区落点。
+
+### 1.26.2 根因（cdb 实测）
+
+崩溃指令与现场：
+
+```
+Gdiplus!GdiplusStartup+0x30:
+00007fff`e31275c0 837a1000   cmp dword ptr [rdx+10h],0 ds:00000251`bec17000=????????
+00000215`461f2ff0  01 00 00 00 00 00 00 00-00 00 00 00 00 00 00 00  ................
+00000215`461f3000  ?? ?? ?? ?? ?? ?? ?? ??-?? ?? ?? ?? ?? ?? ?? ??  ????????????????
+```
+
+- `rdx` 指向引擎为 `struct&` 参数编组出来的缓冲区，内容是
+  `GdiplusVersion=1` + 3 个 0 —— 共 **16 字节**（4 × `int`）；
+- 这 16 字节**正好压在 64KB 页尾**，下一页未映射；
+- 崩溃指令读的是 `[rdx+0x10]` = **第 17 字节**，正好在缓冲区之外。
+
+为什么 callee 要读第 17 字节：**官方库是按 32 位 aardio 写的**。
+
+- 官方 `gdip/core.aardio:13` 声明
+  `GdiplusStartupInput = class{ int GdiplusVersion; int DebugEventCallback; int SuppressBackgroundThread; int SuppressExternalCodecs; }`
+  → 4 × `int` = **16 字节**；
+- Win32 的 `GdiplusStartupInput` 字段是 `ULONG_PTR`，**x64 下 8 字节** → 真实结构 **32 字节**；
+- 官方 aardio 本体是 **x86**（实测 `D:\aardio\aardio.exe` 的 PE machine = 0x014c），
+  x86 下 `ULONG_PTR` 也是 4 字节 → 官方声明与真实结构**完全吻合**，因此官方从不越界；
+- Nodio 同时提供 x64 与 x86：x86 无此问题，**x64 必然越界**。
+
+> 未完全定位：为什么偏偏是 `app` 这个名字能让这块 16 字节缓冲区落在页尾。
+> 已排除目录深度、文件创建顺序、`NODIO_LIBDIR` 写法、import 解析差异等变量；
+> 可确定的是崩溃点是 callee 对 16 字节声明结构的越界读，
+> 而余量修复后**所有名字**（含 `app`）都正常。
+
+### 1.26.3 修法
+
+**结构体编组缓冲区按零填充分配，并带一段余量**（`engine/ffi.cpp`）：
+
+- `StructSerialize()` 增加 `cbSlack` 参数，分配 `total + cbSlack`（`HEAP_ZERO_MEMORY`）；
+- 新增 `StructOverreadSlack(vTab)`：按字段逐个算「平台指针宽度 − 声明宽度」的差值求和，
+  下限 64 字节 —— 覆盖 x64 `ULONG_PTR` 展开带来的额外宽度；
+- 静态 FFI（`engine/builtins.cpp` 的 `struct` 参数分支）与动态 FFI
+  （`engine/ffi.cpp` 的 `CreateDirectApiWrapper`）都传这份余量。
+
+效果：callee 的越界读**落在分配内部**，读到的多出来字段是 0
+（`SuppressBackgroundThread=0` / `SuppressExternalCodecs=0`），
+与官方在 x86 上的行为一致；`pOutTotal` 仍报告**声明尺寸**，
+`cbSize` 自动戳值与 `StructDeserialize` 回读长度都不变。
+
+### 1.26.4 影响面
+
+- 官方库**不走** `raw.*` 结构体分配 API（实测全库只有 `raw.serializeDupHandle` 一类
+  句柄序列化），所以只需覆盖 FFI 路径；
+- x86 侧本来就不越界，加余量是无害的冗余。
+
+### 1.26.5 回归锁
+
+`tests/publish_official_lib_check.ps1` 的产物名**就用 `app.exe`**（曾崩的名字），
+并断言官方库在**隔离目录**里可用 —— 修前 FAIL（3 项 `<missing>`），修后 PASS。
+x64 / x86 双架构全绿。

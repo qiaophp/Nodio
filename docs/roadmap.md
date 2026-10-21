@@ -702,6 +702,50 @@ Fixed & closed in recent sessions:
    回归：`tests/builtin_api_check.ps1` 新增**第 7 段**（`com.ImplInterface / 原始接口事件`），
    11 套回归 x64 / x86 均绿。详见 `docs/aardio-stdlib-delivery.md` §12、
    `docs/capability-gap.md` §1.23
+8. [x] **官方标准库可用性 —— 扩展名不再依赖外部配置文件**（2026-10-21 第二十六轮）—
+   `nodio.json` 找不到时，默认扩展名列表只剩 `.nodio`，官方标准库的唯一源码
+   扩展名 `.aardio` 消失 → **整个官方标准库静默失效**（`import win.ui` 不报错，
+   但 `win.ui` 是 `null`；`win.form` 从官方 `class` 退化成引擎内置的
+   `native function`）。触发场景都是真实部署形态：发布产物（自包含 exe，
+   官方库编译进 payload，外部无 `nodio.json`）、自定义部署目录、CI 临时工作目录。
+   - **修法**：官方契约固化进引擎内置默认 —— 默认 `extensions` = `.nodio` + `.aardio`
+     （`.nodio` 在前，同名时 Nodio 自己的源码优先），默认 `magicHeaders` 追加 `=aardio`；
+     配置文件 / `NODIO_EXTENSIONS` 降级为**追加**而非**替换**。
+   - **回归**：新建 `tests/lib_availability_check.ps1`（4 段）——
+     无 `nodio.json` 时官方库可用 / 有配置时一致 / 配置只写 `.nodio` 时仍可用 /
+     配置缺失时 `=aardio` 魔数仍被识别。x64 / x86 双架构全绿。
+   详见 `docs/capability-gap.md` §1.24
+9. [x] **发布产物可用官方标准库 —— 字节码序列化与结构体编组余量**（2026-10-21 第二十六轮）—
+   发布产物（自包含 exe）此前**完全不可用**：用基线 exe 发布同一工程 → 两种宿主都报
+   「运行错误: 载荷中没有可执行的启动脚本」；本轮修复后产物可正常运行。
+   - **缺陷一（字节码序列化丢值）**：`CollectStrings()` 跳过空字符串，而解析器**故意**
+     产出空名（缺位命名空间段、`...` 可变参数标记）→ `WriteNode` 写出越界哨兵
+     `0xFFFFFFFF` → 发布时报「字节码读取错误: 越界的符号名索引」；且 `Node::Bool` 的值
+     存在 `num` 字段，却**只给 `Node::Num` 写 double** → 布尔字面量字节码往返后变 `false`
+     （官方 `time/performance.aardio:4` 的 `..raw.long(0,true)` → `raw.long(0,false)`）
+     → 产物启动即在 ntdll 访问冲突。
+     修法：空串入池 + 新增 `EmptyStringIndex()`（找不到名字时写有效索引）、
+     `ReadNode` 宽容 `0xFFFFFFFF`、`Node::Bool` 同样写/读 double，
+     并给 `SerializeNode` 加**往返字节级自检**
+     （序列化→反序列化→再序列化→两次字节必须完全一致），把格式丢信息提前到编译期。
+   - **缺陷二（结构体编组缓冲区没有余量）**：发布产物**基名恰好 `app`**（`APP`/`App` 同）
+     时在 `Gdiplus!GdiplusStartup` 访问冲突。cdb 实测：引擎为 `struct&` 参数编组出的
+     缓冲区是 **16 字节**（4 × `int`）且正好压在 64KB 页尾，崩溃指令读的是
+     `[rdx+0x10]`（第 17 字节，已在缓冲区之外）。根因是**官方库按 32 位 aardio 写的**：
+     官方 `gdip/core.aardio:13` 声明 `GdiplusStartupInput` = 4 × `int` = 16 字节，
+     而 Win32 该结构的字段是 `ULONG_PTR`，x64 下真实结构是 32 字节；官方 aardio 本体是
+     **x86**（PE machine = 0x014c），`ULONG_PTR` 同为 4 字节，官方因此从不越界，
+     Nodio 的 x64 必然越界（x86 无此问题）。
+     修法：`StructSerialize()` 增加 `cbSlack`（零填充余量），
+     新增 `StructOverreadSlack()`（按「平台指针宽度 − 声明宽度」求和，下限 64 字节），
+     静态 FFI 与动态 FFI 都传这份余量 → 越界读落在分配内部，多出来的字段读到 0，
+     与官方在 x86 上的行为一致。
+   - **回归**：新建 `tests/publish_official_lib_check.ps1` —— 发布含 `import win.ui` /
+     `import builtin.struct` / `import string.format` 的工程 → 复制到**隔离目录**
+     （确定无 `nodio.json`、不设 `NODIO_LIBDIR`）→ 断言 `win.ui=table` / `RECT=class` /
+     `HIWORD=4660`；产物名**就用 `app.exe`**（曾崩的名字）。修前 FAIL（3 项 `<missing>`），
+     修后 PASS，x64 / x86 双架构全绿。
+   详见 `docs/capability-gap.md` §1.25 / §1.26、`docs/aardio-stdlib-delivery.md` §14
 
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard

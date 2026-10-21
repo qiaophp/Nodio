@@ -53,8 +53,15 @@ namespace NodioVM
                                std::vector<wstring>& strPool)
     {
         if (!n) return;
+        // The empty string MUST be poolable: the parser emits an empty name
+        // on purpose in several places (a missing namespace segment, the
+        // `...` vararg marker, a hole in a dotted path). Skipping it here
+        // left those names out of the pool, and WriteNode then emitted the
+        // sentinel 0xFFFFFFFF — which the reader rejects as an out-of-range
+        // symbol index, so publishing any module that contains such a name
+        // failed with「越界的符号名索引」.
         auto addStr = [&](const wstring& s) {
-            if (!s.empty() && strMap.find(s) == strMap.end())
+            if (strMap.find(s) == strMap.end())
             {
                 uint32_t idx = (uint32_t)strPool.size();
                 strMap[s] = idx;
@@ -74,6 +81,15 @@ namespace NodioVM
             CollectStrings(item, strMap, strPool);
         for (const auto& item : n->defaults)
             CollectStrings(item, strMap, strPool);
+    }
+
+    // Index of the empty string in the pool, or 0 when it is absent.
+    // CollectStrings() always pools the empty string, so this is normally 0.
+    static inline uint32_t EmptyStringIndex(
+        const std::unordered_map<wstring, uint32_t>& strMap)
+    {
+        auto it = strMap.find(wstring());
+        return it != strMap.end() ? it->second : 0;
     }
 
     static void WriteNode(PNode n, std::vector<uint8_t>& out,
@@ -97,7 +113,11 @@ namespace NodioVM
 
         WriteU32(out, (uint32_t)n->line);
 
-        if (n->k == Node::Num)
+        // Num and Bool both carry their value in `num`. Writing the double
+        // for Bool as well is what keeps `raw.long(0,true)` alive across a
+        // bytecode round-trip: without it the boolean came back as false and
+        // the call silently changed meaning (it crashed in ntdll).
+        if (n->k == Node::Num || n->k == Node::Bool)
         {
             WriteDouble(out, n->num);
         }
@@ -116,7 +136,10 @@ namespace NodioVM
         if (mask & 1)
         {
             auto it = strMap.find(n->str);
-            WriteU32(out, it != strMap.end() ? it->second : 0xFFFFFFFF);
+            // Fall back to the pool's empty-string entry instead of the
+            // 0xFFFFFFFF sentinel: the reader rejects out-of-range indices,
+            // and a missing string must never abort a whole publish.
+            WriteU32(out, it != strMap.end() ? it->second : EmptyStringIndex(strMap));
         }
         if (mask & 2) WriteNode(n->a, out, strMap);
         if (mask & 4) WriteNode(n->b, out, strMap);
@@ -134,7 +157,7 @@ namespace NodioVM
             for (const auto& nm : n->names)
             {
                 auto it = strMap.find(nm);
-                WriteU32(out, it != strMap.end() ? it->second : 0xFFFFFFFF);
+                WriteU32(out, it != strMap.end() ? it->second : EmptyStringIndex(strMap));
             }
         }
         if (mask & 128)
@@ -145,7 +168,8 @@ namespace NodioVM
         }
     }
 
-    bool SerializeNode(PNode root, std::vector<uint8_t>& outBytecode)
+    // Writes the bytecode without any self-check — the raw encoder.
+    static void WriteBytecode(PNode root, std::vector<uint8_t>& outBytecode)
     {
         outBytecode.clear();
         for (int i = 0; i < 8; ++i)
@@ -176,6 +200,37 @@ namespace NodioVM
         }
 
         WriteNode(root, outBytecode, strMap);
+    }
+
+    bool SerializeNode(PNode root, std::vector<uint8_t>& outBytecode,
+                       wstring* err)
+    {
+        WriteBytecode(root, outBytecode);
+
+        // Round-trip self-check: read the bytes back, then write them out a
+        // second time and require the two byte streams to be IDENTICAL.
+        // A mismatch here means the format dropped something on the way
+        // through — which used to surface much later, as a publish failure
+        // or a crash inside one specific library, with a message that
+        // pointed at the wrong thing entirely.
+        {
+            wstring rtErr;
+            PNode back = DeserializeNode(outBytecode.data(), outBytecode.size(),
+                                         &rtErr);
+            if (!back || (!rtErr.empty() && rtErr != L"字节码损坏: 无法读取常量池大小"))
+            {
+                if (rtErr.empty()) rtErr = L"字节码自检失败: 反序列化结果为空";
+                if (err) *err = rtErr;
+                return false;
+            }
+            std::vector<uint8_t> again;
+            WriteBytecode(back, again);
+            if (again != outBytecode)
+            {
+                if (err) *err = L"字节码自检失败: 往返后字节不一致（格式丢失了信息）";
+                return false;
+            }
+        }
         return true;
     }
 
@@ -263,7 +318,7 @@ namespace NodioVM
         }
         n->line = (int)line;
 
-        if (n->k == Node::Num)
+        if (n->k == Node::Num || n->k == Node::Bool)
         {
             if (!r.ReadDouble(n->num))
             {
@@ -282,14 +337,23 @@ namespace NodioVM
         if (mask & 1)
         {
             uint32_t strIdx = 0;
-            if (!r.ReadU32(strIdx) || strIdx >= strPool.size())
+            if (!r.ReadU32(strIdx))
+            {
+                if (err) *err = L"字节码读取错误: 越界的字符串索引";
+                return nullptr;
+            }
+            // 0xFFFFFFFF is the legacy "missing string" sentinel: older
+            // payloads stored it for names the pool skipped. Read it as the
+            // empty string instead of rejecting the whole module.
+            if (strIdx == 0xFFFFFFFF)
+                strIdx = strPool.empty() ? 0 : 0;
+            if (strIdx >= strPool.size())
             {
                 if (err) *err = L"字节码读取错误: 越界的字符串索引";
                 return nullptr;
             }
             n->str = strPool[strIdx];
         }
-
         if (mask & 2) { n->a = ReadNode(r, strPool, err); if (err && !err->empty()) return nullptr; }
         if (mask & 4) { n->b = ReadNode(r, strPool, err); if (err && !err->empty()) return nullptr; }
         if (mask & 8) { n->c = ReadNode(r, strPool, err); if (err && !err->empty()) return nullptr; }
@@ -323,7 +387,16 @@ namespace NodioVM
             for (uint32_t i = 0; i < namesCount; ++i)
             {
                 uint32_t idx = 0;
-                if (!r.ReadU32(idx) || idx >= strPool.size())
+                if (!r.ReadU32(idx))
+                {
+                    if (err) *err = L"字节码读取错误: 越界的符号名索引";
+                    return nullptr;
+                }
+                // Legacy sentinel (see the string case above): a name the
+                // pool skipped reads back as the empty string.
+                if (idx == 0xFFFFFFFF)
+                    idx = 0;
+                if (idx >= strPool.size())
                 {
                     if (err) *err = L"字节码读取错误: 越界的符号名索引";
                     return nullptr;
@@ -430,6 +503,6 @@ namespace NodioVM
             return false;
         }
 
-        return SerializeNode(prog, outBytecode);
+        return SerializeNode(prog, outBytecode, err);
     }
 }
