@@ -84,6 +84,76 @@ namespace NodioVM
         return _fseeki64(st->f, p, SEEK_SET) == 0;
     }
 
+    // ---- io.lines 需要的文件状态访问（第二十三轮）----
+    //
+    // io.lines 官方契约（docs/library-guide/builtin/io/lines.md）：
+    //   io.lines(pathOrFile = io.stdin) —— 自动打开 @pathOrFile 指定的文件，
+    //   创建一个**迭代器**，在泛型 for 循环中逐行读取，读取完毕后**自动关闭**。
+    //   @pathOrFile 也可以是 io.file 打开的文件对象；省略则用 io.stdin。
+    //
+    // 文件对象的内部状态是 ioFileMake 的闭包捕获（shared_ptr），脚本层拿不到。
+    // 这里把状态包进一张隐藏表：闭包持有 shared_ptr 保证生命周期，
+    // 表里再放一个裸指针供取用。隐藏键用 \x01 前缀 —— 不是合法标识符，
+    // 不会和脚本里的成员名冲突。
+    static Value ioFileStateBox(const std::shared_ptr<IoFileState>& st)
+    {
+        auto box = std::make_shared<Table>();
+        box->map[L"\x01ptr"] = Value::Pointer_((void*)st.get());
+        box->map[L"\x01keep"] = NF([st](vector<Value>&) -> Value { return Value(); });
+        return Value::Table_(box);
+    }
+    static IoFileState* ioFileStateOf(const Value& fileObj)
+    {
+        if (fileObj.t != Value::TableT || !fileObj.tab) return nullptr;
+        auto sit = fileObj.tab->map.find(L"\x01state");
+        if (sit == fileObj.tab->map.end()) return nullptr;
+        if (sit->second.t != Value::TableT || !sit->second.tab) return nullptr;
+        auto pit = sit->second.tab->map.find(L"\x01ptr");
+        if (pit == sit->second.tab->map.end()) return nullptr;
+        if (pit->second.t != Value::Pointer) return nullptr;
+        return (IoFileState*)pit->second.ptr;
+    }
+    // 逐行读取（裸指针版）：返回 false = 已到末尾。行尾的 CR/LF 不计入结果。
+    static bool ioFileReadLineRaw(IoFileState* st, wstring& out)
+    {
+        out.clear();
+        if (!st || st->bClosed) return false;
+        if (st->bMem)
+        {
+            if (st->memPos >= st->mem.size()) return false;
+            size_t nl = st->mem.find('\n', st->memPos);
+            size_t end = (nl == std::string::npos) ? st->mem.size() : nl;
+            out.reserve(end - st->memPos);
+            for (size_t k = st->memPos; k < end; k++)
+                out.push_back((wchar_t)(unsigned char)st->mem[k]);
+            st->memPos = (nl == std::string::npos) ? st->mem.size() : nl + 1;
+            if (!out.empty() && out.back() == L'\r') out.pop_back();
+            return true;
+        }
+        if (!st->f) return false;
+        std::string line;
+        int c = 0;
+        bool any = false;
+        while ((c = fgetc(st->f)) != EOF)
+        {
+            any = true;
+            if (c == '\n') break;
+            line.push_back((char)c);
+        }
+        if (!any) return false;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        out.reserve(line.size());
+        for (char ch : line) out.push_back((wchar_t)(unsigned char)ch);
+        return true;
+    }
+    // 读完自动关闭（官方：读取完毕以后自动关闭文件对象）
+    static void ioFileCloseRaw(IoFileState* st)
+    {
+        if (!st || st->bClosed) return;
+        if (st->f) { fclose(st->f); st->f = nullptr; }
+        st->bClosed = true;
+    }
+
     // ---- fibers (纤程) ----
     // A fiber has its own stack and can be suspended and resumed, but it is not
     // a thread and fibers never run concurrently. Implemented on Win32 fibers.
@@ -1053,6 +1123,60 @@ Value CreateSize64(uint64_t val)
         }
     }
 
+// ---- string.split 系列的公共切分逻辑（第二十三轮）----
+//
+// 官方契约（官方 lib/builtin/string.aardio 的成员声明 + 官方库实际调用形态）：
+//   split(str)                       按 UTF-8 逐个拆分为字符数组
+//   split(str, anyBytes, maxCount)   anyBytes = 多个**单字节**分隔符（集合语义）
+//   split(str, '<sep>', maxCount)    <> 内的整词作为分隔符（等价 splitLiteral）
+//   splitLiteral(str, sep, maxCount) 按 sep 整词拆分
+//   maxCount 省略或 0 = 拆分全部；指定 = 结果元素数上限，剩余部分并入最后一个元素
+//
+// 引擎里的字符串是 **UTF-8 字节串**（一个 wchar 存一个字节），
+// 所以「逐字符」必须按 UTF-8 码点边界切，不能按 wchar 切。
+//
+// sepMode: 0 = 整词分隔符；1 = 单字节分隔符集合
+static void stringSplitRun(const std::shared_ptr<Table>& out, const wstring& s,
+    const wstring& sep, int sepMode, long long maxCount)
+{
+    if (sepMode == 0 && sep.empty())
+    {
+        // 空分隔符：官方未定义，退化为整体返回（避免死循环）
+        out->arr.push_back(Value::Str_(s));
+        return;
+    }
+    size_t pos = 0;
+    for (;;)
+    {
+        if (maxCount > 0 && (long long)out->arr.size() + 1 >= maxCount)
+        {
+            // 官方：指定 maxCount 时「保留剩余」——剩余部分并入最后一个元素
+            out->arr.push_back(Value::Str_(s.substr(pos)));
+            return;
+        }
+        size_t hit = wstring::npos;
+        if (sepMode == 0)
+        {
+            hit = s.find(sep, pos);
+        }
+        else
+        {
+            for (size_t i = pos; i < s.size(); i++)
+            {
+                if (sep.find(s[i]) != wstring::npos) { hit = i; break; }
+            }
+        }
+        if (hit == wstring::npos)
+        {
+            out->arr.push_back(Value::Str_(s.substr(pos)));
+            return;
+        }
+        out->arr.push_back(Value::Str_(s.substr(pos, hit - pos)));
+        pos = hit + (sepMode == 0 ? sep.size() : 1);
+        if (pos > s.size()) pos = s.size();
+    }
+}
+
 void Interp::InitBuiltins()
         {
             // ---- global call() builtin: call(fn, owner, ...)
@@ -1944,28 +2068,67 @@ void Interp::InitBuiltins()
                     vOut.mrets = ex;
                     return vOut;
                 });
-                tb->map[L"split"] = NF([](vector<Value>& a) {
-                    wstring s = BStr(a[0]), d = a.size() > 1 ? BStr(a[1]) : L",";
+                // string.split / string.splitLiteral
+                //
+                // 官方契约（lib/builtin/string.aardio 声明 + 官方库调用形态）：
+                //   split(str)                       -> 按 UTF-8 逐个拆分为字符数组
+                //   split(str, anyBytes, maxCount)   -> anyBytes = 多个**单字节**分隔符
+                //   split(str, '<sep>', maxCount)    -> <> 内的整词作为分隔符
+                //   splitLiteral(str, sep, maxCount) -> 按 sep 整词拆分
+                //   maxCount 省略或 0 = 拆分全部；指定 = 结果元素数上限，剩余并入最后一项
+                //
+                // 旧实现把第 2 参当成多字节字面量（官方语义是「单字节集合」），
+                // 1 参更是默认按 "," 拆 —— 官方库里 `string.split(s)`（逐字符）、
+                // `string.split(name,'/\\')`（'/' 或 '\'）这类调用全是坏的。
+                tb->map[L"split"] = NF([](vector<Value>& a) -> Value {
+                    wstring s = a.empty() ? wstring() : BStr(a[0]);
                     auto tb2 = std::make_shared<Table>();
+                    if (s.empty()) return Value::Table_(tb2); // 空串 -> 长度 0 的数组
+                    // 第 2 参省略或为 null -> 逐字符拆分（UTF-8 码点）
+                    if (a.size() < 2 || a[1].t == Value::Null)
+                    {
+                        size_t i = 0;
+                        while (i < s.size())
+                        {
+                            unsigned char c = (unsigned char)s[i];
+                            size_t n = 1;
+                            if (c >= 0xF0) n = 4;
+                            else if (c >= 0xE0) n = 3;
+                            else if (c >= 0xC0) n = 2;
+                            if (i + n > s.size()) n = 1;
+                            tb2->arr.push_back(Value::Str_(s.substr(i, n)));
+                            i += n;
+                        }
+                        return Value::Table_(tb2);
+                    }
+                    wstring d = BStr(a[1]);
+                    long long maxCount = 0;
+                    if (a.size() > 2 && a[2].t != Value::Null)
+                        maxCount = (long long)BNum(a[2]);
+                    // '<整词>' 形式：外层串值的首尾尖括号去掉，中间原样作分隔符
+                    // （官方源码里写成 '<\r\n>' / '<**>' 这种，转义已由外层字面量处理）
+                    if (d.size() >= 2 && d.front() == L'<' && d.back() == L'>')
+                    {
+                        stringSplitRun(tb2, s, d.substr(1, d.size() - 2), 0, maxCount);
+                        return Value::Table_(tb2);
+                    }
                     if (d.empty())
                     {
-                        for (auto& c : s) tb2->arr.push_back(Value::Str_(wstring(1, c)));
+                        tb2->arr.push_back(Value::Str_(s));
+                        return Value::Table_(tb2);
                     }
-                    else
-                    {
-                        size_t pos = 0;
-                        while (true)
-                        {
-                            size_t nx = s.find(d, pos);
-                            if (nx == wstring::npos)
-                            {
-                                tb2->arr.push_back(Value::Str_(s.substr(pos)));
-                                break;
-                            }
-                            tb2->arr.push_back(Value::Str_(s.substr(pos, nx - pos)));
-                            pos = nx + d.size();
-                        }
-                    }
+                    // 2 参形式：多个单字节分隔符（集合）
+                    stringSplitRun(tb2, s, d, 1, maxCount);
+                    return Value::Table_(tb2); });
+                tb->map[L"splitLiteral"] = NF([](vector<Value>& a) -> Value {
+                    wstring s = a.empty() ? wstring() : BStr(a[0]);
+                    auto tb2 = std::make_shared<Table>();
+                    if (s.empty()) return Value::Table_(tb2);
+                    wstring d = a.size() > 1 && a[1].t != Value::Null ? BStr(a[1]) : wstring();
+                    long long maxCount = 0;
+                    if (a.size() > 2 && a[2].t != Value::Null)
+                        maxCount = (long long)BNum(a[2]);
+                    stringSplitRun(tb2, s, d, 0, maxCount);
                     return Value::Table_(tb2); });
                 tb->map[L"count"] = NF([](vector<Value>& a) {
                     wstring s = BStr(a[0]), f = BStr(a[1]);
@@ -2654,6 +2817,25 @@ void Interp::InitBuiltins()
                     double hi = a.size() > 2 ? BNum(a[2]) : 255;
                     if (lo > hi) { double t = lo; lo = hi; hi = t; }
                     return Value::Num_(v < lo ? lo : (v > hi ? hi : v)); });
+                // math.fmod(x,y) —— 官方声明（lib/builtin/math.aardio）：
+                //   计算并返回浮点数除法 x/y 的余数，返回的余数**符号与被除数 x 相同**
+                //   （基于向零取整）。注意 aardio 的 `x % y` 余数符号与 **y** 相同
+                //   （基于向下取整）—— 两者语义不同，这里是 C 的 fmod。
+                tb->map[L"fmod"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value::Num_(0);
+                    double x = BNum(a[0]);
+                    double y = a.size() > 1 ? BNum(a[1]) : 0;
+                    if (y == 0) return Value::Num_(0);
+                    return Value::Num_(std::fmod(x, y)); });
+                // math.lerp(fromValue,toValue,t) —— 官方声明：
+                //   线性插值，返回 `fromValue + (toValue-fromValue) * t`。
+                //   参数 t 不会被限制在 0 到 1 之间，允许外插。
+                tb->map[L"lerp"] = NF([](vector<Value>& a) -> Value {
+                    if (a.empty()) return Value::Num_(0);
+                    double from = BNum(a[0]);
+                    double to = a.size() > 1 ? BNum(a[1]) : 0;
+                    double t = a.size() > 2 ? BNum(a[2]) : 0;
+                    return Value::Num_(from + (to - from) * t); });
                 tb->map[L"dist"] = NF([](vector<Value>& a) {
                     if (a.empty()) return Value::Num_(0);
                     if (a.size() >= 6)
@@ -2914,6 +3096,8 @@ void Interp::InitBuiltins()
                 auto ioFileMake = [ioFileBytesToValue, ioFileArgBytes,
                                    ioFileFail](shared_ptr<IoFileState> st) -> Value {
                     auto tb2 = std::make_shared<Table>();
+                    // 隐藏成员：io.lines 需要拿到文件对象的内部状态
+                    tb2->map[L"\x01state"] = ioFileStateBox(st);
                     // read(...) — no arg: one line (bytes, newline kept);
                     // n > 0: n bytes; n == -1: all remaining; struct arg:
                     // sizeof(struct) bytes deserialized into a copy;
@@ -3506,7 +3690,100 @@ void Interp::InitBuiltins()
                 };
                 tb->map[L"stdout"] = ioStdWrap(1, "wb");
                 tb->map[L"stderr"] = ioStdWrap(2, "wb");
-                tb->map[L"stdin"] = ioStdWrap(0, "rb");
+                Value vStdin = ioStdWrap(0, "rb");
+                tb->map[L"stdin"] = vStdin;
+                // io.lines(pathOrFile = io.stdin)
+                //
+                // 官方契约（docs/library-guide/builtin/io/lines.md）：
+                //   自动打开 @pathOrFile 指定的文件（文本模式，'\0'/'\x1A' 为终止符），
+                //   创建一个**迭代器**，在泛型 for 循环中逐行读取文件，
+                //   在读取完毕以后**自动关闭**文件对象。
+                //   @pathOrFile 也可以是 io.file 打开的文件对象；省略则用 io.stdin。
+                //
+                // 官方库的实际用法（lib/fsys/update/app.aardio、lib/debug/_.aardio、
+                // lib/fsys/cookies.aardio 等）都是 `for path in io.lines(文件路径)`，
+                // 每行是一个不含行尾的路径字符串。
+                // io.libpath(模块名) -> 库文件路径, 所在目录
+                //
+                // 官方用法（lib/autos/skills/_.aardio、lib/py2/.build/main.aardio、
+                // lib/ide/_.aardio、lib/ide/doc/library.aardio 等）：
+                //   var path,dir = ..io.libpath(libName);
+                //   path = 库文件的完整路径；dir = 该文件所在目录
+                //   官方也用 `if(..io.libpath(x))` 判存在 —— 找不到时返回 null。
+                //
+                // 解析走的是**与 import 完全同一套**查找顺序
+                // （Interp::ResolveModulePath），不另造一套。
+                tb->map[L"libpath"] = NF([](vector<Value>& a) -> Value {
+                    wstring name = a.empty() ? wstring() : BStr(a[0]);
+                    if (name.empty()) return Value();
+                    // 模块名按 '.' 拆成名字段
+                    vector<wstring> names;
+                    size_t pos = 0;
+                    for (;;)
+                    {
+                        size_t dot = name.find(L'.', pos);
+                        if (dot == wstring::npos)
+                        {
+                            names.push_back(name.substr(pos));
+                            break;
+                        }
+                        names.push_back(name.substr(pos, dot - pos));
+                        pos = dot + 1;
+                    }
+                    Interp* it = g_interpCurrent;
+                    if (!it) return Value();
+                    wstring file;
+                    if (!it->ResolveModulePath(names, &file)) return Value();
+                    // 目录 = 去掉最后的文件名
+                    wstring dir = file;
+                    size_t sl = dir.find_last_of(L"\\/");
+                    if (sl != wstring::npos) dir = dir.substr(0, sl);
+                    Value v = Value::Str_(file);
+                    auto ex = std::make_shared<vector<Value>>();
+                    ex->push_back(Value::Str_(dir));
+                    v.mrets = ex;
+                    return v; });
+                tb->map[L"lines"] = NF([ioFileCtor, vStdin](vector<Value>& a) -> Value {
+                    Value fileObj;
+                    if (a.empty() || a[0].t == Value::Null)
+                    {
+                        fileObj = vStdin;
+                    }
+                    else if (a[0].t == Value::TableT)
+                    {
+                        fileObj = a[0];
+                    }
+                    else
+                    {
+                        vector<Value> ca;
+                        ca.push_back(a[0]);
+                        ca.push_back(Value::Str_(L"rb"));
+                        fileObj = ioFileCtor.native(ca);
+                        if (fileObj.t != Value::TableT || !fileObj.tab)
+                        {
+                            Interp* it = g_interpCurrent;
+                            if (it) *it->err = L"运行错误: 无法打开文件 " + BStr(a[0]);
+                            return Value();
+                        }
+                    }
+                    if (!ioFileStateOf(fileObj))
+                    {
+                        Interp* it = g_interpCurrent;
+                        if (it) *it->err = L"运行错误: io.lines 需要文件路径或文件对象";
+                        return Value();
+                    }
+                    // 迭代器：每次返回一行（不含行尾 CR/LF），读完返回 null 结束 for
+                    return Value::Native_([fileObj](vector<Value>&) -> Value {
+                        IoFileState* st = ioFileStateOf(fileObj);
+                        wstring line;
+                        if (!ioFileReadLineRaw(st, line))
+                        {
+                            ioFileCloseRaw(st); // 官方：读取完毕以后自动关闭
+                            return Value();
+                        }
+                        return Value::Str_(line);
+                    });
+                });
                 // io.exist / io.remove keep their official contracts and
                 // are registered further down (exist returns the absolute
                 // path; remove deletes); not duplicated here.
@@ -7266,6 +7543,67 @@ void Interp::InitBuiltins()
                     if (a.empty()) return Value();
                     if (a.size() == 1) return a[0];
                     return this->GetMember(a[0], a[1], false, 0);
+                });
+                // table.setAttr(object,key,value) —— 官方声明
+                // （lib/builtin/table.aardio）：
+                //   调用成员（属性）操作符修改对象的键值。
+                //   如果对象实际包含 @key 指定的键值则**直接修改**；
+                //   否则调用 _set 元方法修改指定键的值，元方法第 3 个参数
+                //   （@ownerAttr）设为 **true**。
+                //   （用索引下标 [] 修改键值触发 _set 元方法时 ownerAttr 为 false。）
+                //
+                // 注意官方 intellisense 声明只列了 (object,key) 两个参数，
+                // 但「修改对象的键值」必须给出新值 —— 元方法签名是 (k,v,ownerAttr)，
+                // 所以值作为第 3 个参数传入。官方库内零调用点（只影响用户代码）。
+                tb->map[L"setAttr"] = NF([this](vector<Value>& a) -> Value {
+                    if (a.size() < 3) return Value();
+                    Value obj = a[0], keyVal = a[1], val = a[2];
+                    if (obj.t != Value::TableT || !obj.tab) return Value();
+                    wstring key = ObjectKeyOf(keyVal);
+                    // 对象实际包含该键 -> 直接修改
+                    if (obj.tab->map.count(key))
+                    {
+                        obj.tab->map[key] = val;
+                        return val;
+                    }
+                    // 1-based 数字下标命中数组部分 -> 直接修改（与 t[i]=v 一致）
+                    long long numIdx = -1;
+                    if (keyVal.t == Value::Num && keyVal.n == (long long)keyVal.n && keyVal.n >= 1)
+                        numIdx = (long long)keyVal.n;
+                    else if (!key.empty() && key.find_first_not_of(L"0123456789") == wstring::npos)
+                        numIdx = _wtoi64(key.c_str());
+                    if (numIdx >= 1 && (size_t)numIdx <= obj.tab->arr.size())
+                    {
+                        obj.tab->arr[(size_t)(numIdx - 1)] = val;
+                        obj.tab->map.erase(key);
+                        return val;
+                    }
+                    // 否则走 _set 元方法（ownerAttr = true）
+                    bool bErr = false;
+                    wstring errMsg;
+                    if (this->MetaSet(obj, keyVal, val, &bErr, &errMsg, true))
+                    {
+                        if (bErr)
+                        {
+                            Interp* it = g_interpCurrent;
+                            if (it && !errMsg.empty()) *it->err = errMsg;
+                        }
+                        return val;
+                    }
+                    // 没有 _set 元方法 -> 落回普通成员写入
+                    // （与 t[i]=v 相同：数组末尾追加，其余写进 map）
+                    if (numIdx >= 1 && (size_t)(numIdx - 1) == obj.tab->arr.size() &&
+                        val.t != Value::Null)
+                    {
+                        obj.tab->arr.push_back(val);
+                        obj.tab->map.erase(key);
+                        return val;
+                    }
+                    if (val.t == Value::Null)
+                        obj.tab->map.erase(key);
+                    else
+                        obj.tab->map[key] = val;
+                    return val;
                 });
                 tb->map[L"count"] = NF([](vector<Value>& a) {
                     if (a[0].t != Value::TableT || !a[0].tab) return Value::Num_(0);

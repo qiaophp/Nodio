@@ -9,6 +9,20 @@ namespace NodioVM
 {
     extern bool g_nsTrace;   // runtime.cpp — NODIO_NS_TRACE=1 diagnostics
 
+    // 官方取模语义（docs/language-reference/operator/arithmetic.md §mod）：
+    //   a % b == a - ⌊a/b⌋ * b，计算 ⌊a/b⌋ 时**向负无穷大取整**，
+    //   结果的符号与**右操作数 b** 相同（与 Python 一致）。
+    // C 的 fmod 是**向零取整**（符号随左操作数），两者不同 ——
+    // 官方为此专门提供了 math.fmod。
+    inline double AardioMod(double a, double b)
+    {
+        if (b == 0) return 0;
+        double r = std::fmod(a, b);
+        // 余数与除数异号时补一个除数，把余数拉到与 b 同号
+        if (r != 0 && ((r < 0) != (b < 0))) r += b;
+        return r;
+    }
+
     struct Interp
     {
         wstring* err = nullptr;
@@ -182,6 +196,8 @@ namespace NodioVM
         // ---- import.cpp (module loading) ----
         Value BindModule(const vector<wstring>& names, const Value& mod);
         Value DoImport(const PNode& n, Env* env);
+        // io.libpath 用：按 import 的同一套查找顺序解析模块名 -> 库文件完整路径
+        bool ResolveModulePath(const vector<wstring>& names, wstring* outFile) const;
 
         // ---- builtins.cpp (standard namespaces) ----
         void InitBuiltins();

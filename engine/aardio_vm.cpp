@@ -23,6 +23,7 @@
 //   0x31 CALL_NS / 0x3C CALL_N（至此 61/61 全部落地）
 // 其余种类一律明确报错（种类 + 记录号），不静默跳过。
 #include "aardio_vm.h"
+#include "engine/interp.h"   // AardioMod —— 官方取模语义
 
 namespace NodioVM
 {
@@ -756,7 +757,7 @@ namespace NodioVM
                     case 0x19: z = x - y; break;
                     case 0x1A: z = x * y; break;
                     case 0x1B: z = (y != 0) ? x / y : 0; break;
-                    case 0x1C: z = (y != 0) ? std::fmod(x, y) : 0; break;
+                    case 0x1C: z = AardioMod(x, y); break;
                     case 0x1D: z = std::pow(x, y); break;
                     }
                     out = Value::Num_(z);

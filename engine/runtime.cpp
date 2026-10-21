@@ -1895,7 +1895,7 @@ Value Interp::EvalBin(const PNode& n, Env* env)
                 if (op == L">=") return Value::Bool_(l.n >= r.n);
                 if (op == L"==" || op == L"===") return Value::Bool_(l.n == r.n);
                 if (op == L"!=" || op == L"!==") return Value::Bool_(l.n != r.n);
-                if (op == L"%" || op == L"%=") return Value::Num_(r.n != 0 ? fmod(l.n, r.n) : 0);
+                if (op == L"%" || op == L"%=") return Value::Num_(AardioMod(l.n, r.n));
                 unsigned int ua = (unsigned int)(INT_PTR)(long long)l.n;
                 unsigned int ub = (unsigned int)(INT_PTR)(long long)r.n;
                 if (op == L"&") return Value::Num_((double)(int)(ua & ub));
@@ -2046,7 +2046,7 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             if (op == L"-") return Value::Num_(a - b);
             if (op == L"*") return Value::Num_(a * b);
             if (op == L"/") return Value::Num_(b != 0 ? a / b : 0);
-            if (op == L"%" || op == L"%=") return Value::Num_(b != 0 ? fmod(a, b) : 0);
+            if (op == L"%" || op == L"%=") return Value::Num_(AardioMod(a, b));
             // bitwise (32-bit width, DWORD semantics)
             unsigned int ua = (unsigned int)(INT_PTR)(long long)a;
             unsigned int ub = (unsigned int)(INT_PTR)(long long)b;
@@ -2282,7 +2282,7 @@ Value Interp::ApplyOp(const wstring& op, const Value& l, const Value& r)
             if (op == L"-") return Value::Num_(a - b);
             if (op == L"*") return Value::Num_(a * b);
             if (op == L"/") return Value::Num_(b != 0 ? a / b : 0);
-            if (op == L"%" || op == L"%=") return Value::Num_(b != 0 ? fmod(a, b) : 0);
+            if (op == L"%" || op == L"%=") return Value::Num_(AardioMod(a, b));
             // ** is exponent, ^ is bitwise XOR (32-bit)
             if (op == L"**") return Value::Num_(pow(a, b));
             if (op == L"^") return Value::Num_((double)(int)(((int)(INT_PTR)(long long)a) ^ ((int)(INT_PTR)(long long)b)));

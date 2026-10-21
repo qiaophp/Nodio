@@ -48,6 +48,88 @@ namespace NodioVM
         return L"";
 #endif
     }
+
+    // 全局 lib 根目录：NODIO_LIBDIR > 配置 > D:\aardio\lib
+    // （import 与 io.libpath 共用，避免两处各写一份）
+    static const wstring& globalLibDir()
+    {
+        static const wstring dir = []
+        {
+            wchar_t szLib[MAX_PATH] = L"";
+            if (GetEnvironmentVariableW(L"NODIO_LIBDIR", szLib, MAX_PATH) > 0)
+                return wstring(szLib);
+            std::wstring cfg = GetNodioConfig().libDir;
+            if (!cfg.empty()) return cfg;
+            if (_waccess(L"D:\\aardio\\lib", 0) == 0) return std::wstring(L"D:\\aardio\\lib");
+            return std::wstring(L"");
+        }();
+        return dir;
+    }
+// ---- ResolveModulePath ----
+//
+// io.libpath(模块名) 用的模块解析：**与 import 完全同一套查找顺序**。
+//
+// 官方查找顺序（docs/library-guide/import.md）：
+//   ~\lib\a.b.c.aardio
+//   ~\lib\a\b.c.aardio
+//   ~\lib\a\b\c.aardio
+//   ~\lib\a\b\c\_.aardio
+// Nodio 额外先查 overlay lib 目录（D:\Nodio\lib），与 import 本身的顺序一致。
+//
+// 返回库文件的**完整路径**；找不到返回 false。
+bool Interp::ResolveModulePath(const vector<wstring>& names, wstring* outFile) const
+    {
+        if (names.empty() || !outFile) return false;
+        vector<wstring> relCands;
+        for (size_t p = 0; p < names.size(); ++p)
+        {
+            wstring cand;
+            for (size_t i = 0; i < p; ++i)
+            {
+                if (i > 0) cand += L"\\";
+                cand += names[i];
+            }
+            wstring filePart;
+            for (size_t i = p; i < names.size(); ++i)
+            {
+                if (i > p) filePart += L".";
+                filePart += names[i];
+            }
+            if (!cand.empty()) cand += L"\\";
+            cand += filePart;
+            relCands.push_back(cand);
+        }
+        {
+            wstring folderCand;
+            for (size_t i = 0; i < names.size(); ++i)
+            {
+                if (i > 0) folderCand += L"\\";
+                folderCand += names[i];
+            }
+            folderCand += L"\\_";
+            relCands.push_back(folderCand);
+        }
+        auto Exists = [](const wstring& p) -> bool
+        {
+            return !p.empty() && _waccess(p.c_str(), 0) == 0;
+        };
+        const wstring& overlay = GetOverlayLibDir();
+        const wstring& libdir = globalLibDir();
+        for (const wstring* root : { &overlay, &libdir })
+        {
+            if (root->empty()) continue;
+            for (const wstring& rc : relCands)
+            {
+                for (const wstring& ext : GetConfiguredExtensions())
+                {
+                    wstring cand = *root + L"\\" + rc + ext;
+                    if (Exists(cand)) { *outFile = cand; return true; }
+                }
+            }
+        }
+        return false;
+    }
+
 // ---- BindModule ----
 Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
         {
@@ -413,16 +495,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             // global lib root — enabled via NODIO_LIBDIR or configuration;
             // resolution order: overlay lib dir (D:\Nodio\lib) first, then strLibDir
             static const wstring strOverlayLibDir = GetOverlayLibDir();
-            static const wstring strLibDir = []
-            {
-                wchar_t szLib[MAX_PATH] = L"";
-                if (GetEnvironmentVariableW(L"NODIO_LIBDIR", szLib, MAX_PATH) > 0)
-                    return wstring(szLib);
-                std::wstring cfg = GetNodioConfig().libDir;
-                if (!cfg.empty()) return cfg;
-                if (_waccess(L"D:\\aardio\\lib", 0) == 0) return std::wstring(L"D:\\aardio\\lib");
-                return std::wstring(L"");
-            }();
+            static const wstring& strLibDir = globalLibDir();
             auto Exists = [](const wstring& p) -> bool
             {
                 return !p.empty() && _waccess(p.c_str(), 0) == 0;

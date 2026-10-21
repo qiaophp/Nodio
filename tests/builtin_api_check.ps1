@@ -1,0 +1,326 @@
+# 官方内建 API 契约回归（第二十三轮补齐的那批）
+#
+# 覆盖官方 lib/builtin/*.aardio 的 intellisense 声明里、而 Nodio 此前缺失的
+# 引擎原生函数，以及本轮修正的运算符/多返回值语义：
+#
+#   string.split / string.splitLiteral   —— 官方 4 种形式（1 参逐字符 / 2 参单字节集合
+#                                           / '<整词>' / maxCount）
+#   io.lines / io.libpath                 —— 官方库有真实调用点（lib/autos、lib/py2 等）
+#   math.fmod / math.lerp / table.setAttr —— 官方 builtin/math.aardio、table.aardio
+#   com.NewObject / NewControl / SafeArray / IsIUnknown / IsMember / GetPointer
+#                                           —— 官方只在 aardio.exe 里（引擎原生）
+#   `%` 运算符                            —— 官方是向下取整（floor）语义，符号跟除数
+#
+# 官方契约来源：
+#   D:\aardio\lib\builtin\string.aardio:389-391
+#   D:\aardio\lib\builtin\math.aardio:97,107
+#   D:\aardio\lib\builtin\table.aardio:508-511
+#   D:\aardio\lib\builtin\com.aardio:149-161,209-215
+#   D:\aardio\lib\com\activeX.aardio:159-180   （NewObject 三值返回形状）
+#   D:\aardio\docs\language-reference\operator\arithmetic.md:46  （% 的 floor 语义）
+#
+# 用法: powershell -File builtin_api_check.ps1 [-Exe <nodio.exe>]
+param($Exe = 'D:\Nodio\build-x64\Release\nodio.exe',
+      [string]$LibDir = 'D:\aardio\lib',
+      [string]$OverlayDir = 'D:\Nodio\lib')
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+if (-not (Test-Path $Exe)) { "EXE NOT FOUND: $Exe"; exit 2 }
+
+$tmp = Join-Path $env:TEMP ("builtin_api_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+New-Item -ItemType Directory -Path $tmp | Out-Null
+
+function Run-Script([string]$code) {
+    $f = Join-Path $tmp 'probe.aardio'
+    [IO.File]::WriteAllText($f, $code, (New-Object Text.UTF8Encoding($false)))
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = "`"$f`""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $psi.EnvironmentVariables['NODIO_LIBDIR'] = $LibDir
+    $psi.EnvironmentVariables['NODIO_OVERLAY_LIBDIR'] = $OverlayDir
+    $psi.EnvironmentVariables['NODIO_PAUSE'] = '0'
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $o = $p.StandardOutput.ReadToEndAsync()
+    $e = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(60000)) { $p.Kill(); $p.WaitForExit(3000) }
+    return (($o.Result + $e.Result) -replace "`r", '').Trim()
+}
+
+$fail = 0
+function Expect-Section([string]$code, [string]$label, [string]$okMark) {
+    $out = Run-Script $code
+    $hasFail = ($out -match '(?m)^\s*FAIL ')
+    if ($hasFail -or ($out -notlike "*$okMark*")) {
+        $script:fail++
+        Write-Host "FAIL $label"
+        ($out -split "`n") | ForEach-Object { if ($_ -ne '') { Write-Host "    $_" } }
+    } else {
+        Write-Host "PASS $label"
+    }
+}
+
+# ================================================================
+# 1) string.split / string.splitLiteral
+#    注意：aardio 里 **双引号 = 原样串**（不处理转义），**单引号 = 转义串**（C 风格转义）
+# ================================================================
+$splitCode = @'
+var fail = 0;
+function chk(name, got, want) {
+  var ok = true;
+  if (type(got) != type(want)) ok = false;
+  else if (type(got) == "table") {
+    if (#got != #want) ok = false;
+    else {
+      for (i = 1; #got; i++) {
+        if (got[i] !== want[i]) { ok = false; break; }
+      }
+    }
+  } else if (got !== want) ok = false;
+  if (ok) { io.print("PASS ", name); }
+  else {
+    fail++;
+    io.print("FAIL ", name);
+    if (type(got) == "table") {
+      io.print("   got:");  for (i = 1; #got; i++) io.print("     [", i, "]=", got[i]);
+      io.print("   want:"); for (i = 1; #want; i++) io.print("     [", i, "]=", want[i]);
+    } else { io.print("   got=", got, " want=", want); }
+  }
+}
+// 1 参：按 UTF-8 逐字符拆分
+chk("split/char", string.split("abc"), ["a","b","c"]);
+chk("split/char-utf8", string.split("中a"), ["中","a"]);
+chk("split/empty", string.split(""), []);
+// 2 参：多个单字节分隔符（集合语义）
+chk("split/byteset", string.split("a,b.c", ",."), ["a","b","c"]);
+chk("split/byteset-slash", string.split('a/b\\c', '/\\'), ["a","b","c"]);
+chk("split/single", string.split("a,b,c", ","), ["a","b","c"]);
+chk("split/tab-nl", string.split('a\nb\tc', '\n\t'), ["a","b","c"]);
+// '<整词>' 形式
+chk("split/literal", string.split("a.b.c", "<.>"), ["a","b","c"]);
+chk("split/literal-multi", string.split("a::b", "<::>"), ["a","b"]);
+chk("split/literal-crlf", string.split('a\r\n\r\nb', '<\r\n\r\n>'), ["a","b"]);
+chk("split/literal-raw-bs", string.split("a\\b", "<\\>"), ["a","b"]);
+// maxCount：结果元素数上限，剩余并入最后一项
+chk("split/maxcount", string.split("a b c d", " ", 2), ["a","b c d"]);
+chk("split/maxcount1", string.split("a b c", " ", 1), ["a b c"]);
+chk("split/maxcount3", string.split("a b c d", " ", 3), ["a","b","c d"]);
+chk("split/maxcount0", string.split("a b c", " ", 0), ["a","b","c"]);
+// splitLiteral：整词分隔
+chk("splitLiteral", string.splitLiteral("a.b.c", "."), ["a","b","c"]);
+chk("splitLiteral/multi", string.splitLiteral("a::b", "::"), ["a","b"]);
+chk("splitLiteral/empty", string.splitLiteral("", "."), []);
+chk("splitLiteral/maxcount", string.splitLiteral("a b c d", " ", 2), ["a","b c d"]);
+chk("splitLiteral/keepsep", string.splitLiteral("a..b", "."), ["a","","b"]);
+if (fail) { io.print("== SPLIT CHECK FAILED: ", fail); return 1; }
+io.print("== string.split contract OK ==");
+'@
+Expect-Section $splitCode 'string.split / splitLiteral' 'string.split contract OK'
+
+# ================================================================
+# 2) io.lines / io.libpath
+# ================================================================
+$ioCode = @'
+var fail = 0;
+function chk(name, ok, detail) {
+  if (ok) { io.print("PASS ", name); }
+  else { fail++; io.print("FAIL ", name, " ", detail); }
+}
+var tmp = io.appData("/nodio_test_lines.txt");
+io.writeFile(tmp, 'alpha\r\nbeta\r\ngamma');
+var n = 0;
+var last = "";
+for (line in io.lines(tmp)) { n++; last = line; }
+chk("lines/count", n == 3, "n=" + n);
+chk("lines/no-cr", last == "gamma", "last=" + last);
+var f = io.file(tmp);
+var m = 0;
+for (line in io.lines(f)) { m++; }
+chk("lines/fileobj", m == 3, "m=" + m);
+var tmp2 = io.appData("/nodio_test_lines2.txt");
+io.writeFile(tmp2, 'a\r\nb\r\n');
+var joined = "";
+for (p in io.lines(tmp2)) { joined = joined + "[" + p + "]"; }
+chk("lines/join", joined == "[a][b]", joined);
+var tmp3 = io.appData("/nodio_test_lines3.txt");
+io.writeFile(tmp3, '');
+var z = 0;
+for (line in io.lines(tmp3)) { z++; }
+chk("lines/empty", z == 0, "z=" + z);
+var p, d = io.libpath("py2");
+chk("libpath/py2-path", p != null && string.indexOf(p, "py2") > 0, "" + p);
+chk("libpath/py2-dir", d != null && string.indexOf(d, "py2") > 0, "" + d);
+var p2, d2 = io.libpath("builtin.math");
+chk("libpath/builtin-math", p2 != null && string.indexOf(p2, "math") > 0, "" + p2);
+var p3 = io.libpath("no.such.module.xyz");
+chk("libpath/missing", p3 == null, "" + p3);
+if (fail) { io.print("== IO CHECK FAILED: ", fail); return 1; }
+io.print("== io.lines / io.libpath OK ==");
+'@
+Expect-Section $ioCode 'io.lines / io.libpath' 'io.lines / io.libpath OK'
+
+# ================================================================
+# 3) math.fmod / math.lerp / table.setAttr
+#    官方 % 是 floor 语义（符号跟除数），math.fmod 是 C fmod（符号跟被除数）
+# ================================================================
+$mathCode = @'
+var fail = 0;
+function chk(name, got, want) {
+  var ok = (got === want);
+  if (ok) { io.print("PASS ", name); }
+  else { fail++; io.print("FAIL ", name, " got=", got, " want=", want); }
+}
+// math.fmod：C 的 fmod，余数符号与被除数 x 相同
+chk("fmod/pos", math.fmod(7.5, 2), 1.5);
+chk("fmod/neg-x", math.fmod(-7.5, 2), -1.5);
+chk("fmod/neg-y", math.fmod(7.5, -2), 1.5);
+chk("fmod/neg-both", math.fmod(-7.5, -2), -1.5);
+chk("fmod/zero", math.fmod(5, 0), 0);
+// 官方 % 是向下取整：余数符号跟除数 y
+chk("mod/pos", 7 % 2, 1);
+chk("mod/neg-x", -7 % 2, 1);
+chk("mod/neg-y", 7 % -2, -1);
+chk("mod/neg-both", -7 % -2, -1);
+chk("mod/frac", -7.5 % 2, 0.5);
+// math.lerp
+chk("lerp/mid", math.lerp(0, 10, 0.5), 5);
+chk("lerp/zero", math.lerp(0, 10, 0), 0);
+chk("lerp/one", math.lerp(0, 10, 1), 10);
+chk("lerp/extrap", math.lerp(0, 10, 2), 20);
+chk("lerp/neg", math.lerp(10, 0, 0.25), 7.5);
+// table.setAttr：已有键直改
+var t = { a = 1, b = 2 };
+table.setAttr(t, "a", 111);
+chk("setAttr/existing", t.a, 111);
+chk("setAttr/existing-other", t.b, 2);
+// 无 _set 元方法时落回普通成员写入
+table.setAttr(t, "c", 333);
+chk("setAttr/new", t.c, 333);
+// 走 _meta._set 元方法（官方元方法在 _meta 表里，签名 (k,v,ownerAttr)）
+var hit = { _meta = { _set = function(k, v, ownerAttr) {
+    this[k] = "set:" + k + "=" + v + ":" + ownerAttr;
+    return true;
+} } };
+table.setAttr(hit, "x", 9);
+chk("setAttr/meta", hit.x, "set:x=9:true");
+// 数字下标命中数组部分（1-based）
+var t5 = { "hello", "world" };
+table.setAttr(t5, 1, "WORLD");
+chk("setAttr/elem", t5[1], "WORLD");
+chk("setAttr/elem2", t5[2], "world");
+if (fail) { io.print("== MATH/TABLE CHECK FAILED: ", fail); return 1; }
+io.print("== math.fmod / math.lerp / table.setAttr OK ==");
+'@
+Expect-Section $mathCode 'math.fmod / math.lerp / table.setAttr / %' 'math.fmod / math.lerp / table.setAttr OK'
+
+# ================================================================
+# 4) com 官方引擎原生 API
+# ================================================================
+$comCode = @'
+var fail = 0;
+function chk(name, ok, detail) {
+  if (ok) { io.print("PASS ", name); }
+  else { fail++; io.print("FAIL ", name, " ", detail); }
+}
+// com.SafeArray(vt, ...) -> { _safearray = 元素表, _type = vt }
+var sa = com.SafeArray(0x11, 1, 2, 3);
+chk("SafeArray/type", type(sa) == "table", "" + type(sa));
+chk("SafeArray/count", #sa._safearray == 3, "" + #sa._safearray);
+chk("SafeArray/vt", sa._type == 0x11, "" + sa._type);
+chk("SafeArray/elem", sa._safearray[2] == 2, "" + sa._safearray[2]);
+// com.IsIUnknown
+chk("IsIUnknown/table", com.IsIUnknown({}) == false, "");
+chk("IsIUnknown/null", com.IsIUnknown(null) == false, "");
+// com.NewObject 失败路径：返回 (null, null, 错误信息)
+var obj, ev, err = com.NewObject(null, "no.such.progid.xyz");
+chk("NewObject/fail-obj", obj == null, "" + obj);
+chk("NewObject/fail-event", ev == null, "" + ev);
+chk("NewObject/fail-err", type(err) == "string", "" + type(err));
+chk("NewObject/fail-err-notempty", err != null && #err > 0, "" + err);
+var o0, e0, x0 = com.NewObject(null, "");
+chk("NewObject/no-progid", x0 != null && #x0 > 0, "" + x0);
+// com.NewControl 同形状
+var o2, e2, r2 = com.NewControl(null, "no.such.progid.xyz");
+chk("NewControl/fail-obj", o2 == null, "" + o2);
+chk("NewControl/fail-err", type(r2) == "string", "" + type(r2));
+// 成功路径：event 是锚点表，e = null
+var o4, e4, x4 = com.NewObject(null, "Scripting.FileSystemObject");
+if (o4 != null) {
+  chk("NewObject/ok-obj", o4 != null, "");
+  chk("NewObject/ok-event", type(e4) == "table", "" + type(e4));
+  chk("NewObject/ok-err", x4 == null, "" + x4);
+} else {
+  io.print("SKIP NewObject success path (COM 未注册: ", x4, ")");
+}
+// com.IsMember / com.GetPointer：非 COM 对象
+chk("IsMember/noncom", com.IsMember({}, "Foo") == false, "");
+chk("GetPointer/noncom", com.GetPointer({}) == null, "");
+// 多返回首值为 null 时 mrets 不能丢（回归护栏）
+function f3() { return null, "B", "C"; }
+var a5, b5, c5 = f3();
+chk("multi-return/null-first-a", a5 == null, "" + a5);
+chk("multi-return/null-first-b", b5 == "B", "" + b5);
+chk("multi-return/null-first-c", c5 == "C", "" + c5);
+if (fail) { io.print("== COM CHECK FAILED: ", fail); return 1; }
+io.print("== com official-native API OK ==");
+'@
+Expect-Section $comCode 'com official-native API' 'com official-native API OK'
+
+# ================================================================
+# 5) com.Connect / com.AddConnection / com.ReleaseConnection
+#    COM 事件接收器：官方 builtin/com.aardio 的 ConnectWeak / CreateEmbedEx
+#    都调用引擎原生的 Connect，所以必须由内核提供。
+# ================================================================
+$connCode = @'
+var fail = 0;
+function chk(name, ok, detail) {
+  if (ok) { io.print("PASS ", name); }
+  else { fail++; io.print("FAIL ", name, " ", detail); }
+}
+// 没有事件连接点的对象 -> 明确报错（不能静默失败）
+var fso = com.NewObject(null, "Scripting.FileSystemObject");
+if (fso != null) {
+  var errTxt = "";
+  try { com.Connect(fso, { OnEvent = function() {} }); }
+  catch (e) { errTxt = "" + e; }
+  chk("Connect/no-connection-point-err",
+      string.find(errTxt, "事件连接点") != null, errTxt);
+}
+// 有 dispinterface 事件连接点的对象（MSXML DOMDocument）
+var doc = com.NewObject(null, "MSXML2.DOMDocument.6.0");
+if (doc == null) {
+  io.print("SKIP Connect roundtrip (MSXML2.DOMDocument 未注册)");
+} else {
+  var fired = 0;
+  var sinkTbl = { onreadystatechange = function(a, b) { fired++; } };
+  var sink, cookie = com.Connect(doc, sinkTbl);
+  chk("Connect/sink-is-table", type(sink) == "table", "" + type(sink));
+  chk("Connect/cookie", cookie != null && cookie > 0, "" + cookie);
+  // 通过 sink 自身的 IDispatch 走一遍
+  // GetIDsOfNames -> Invoke -> DISPID -> 事件名 -> aardio 处理函数
+  sink.onreadystatechange(1, 2);
+  chk("Connect/event-dispatch", fired == 1, "fired=" + fired);
+  // 官方 ConnectWeak（aardio 源码，内部调用引擎原生的 Connect）
+  var fired2 = 0;
+  var realSink = { onreadystatechange = function(a, b) { fired2++; } };
+  var sink2, cookie2 = com.ConnectWeak(doc, realSink);
+  chk("ConnectWeak/cookie", cookie2 != null && cookie2 > 0, "" + cookie2);
+  sink2.onreadystatechange(1, 2);
+  chk("ConnectWeak/event-dispatch", fired2 == 1, "fired2=" + fired2);
+  // 释放连接
+  chk("ReleaseConnection/count", com.ReleaseConnection(doc) >= 1, "");
+  chk("ReleaseConnection/again", com.ReleaseConnection(doc) == 0, "");
+}
+if (fail) { io.print("== COM CONNECT CHECK FAILED: ", fail); return 1; }
+io.print("== com.Connect / ReleaseConnection OK ==");
+'@
+Expect-Section $connCode 'com.Connect / ReleaseConnection' 'com.Connect / ReleaseConnection OK'
+
+Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+if ($fail -gt 0) { "== builtin api FAILED ($fail) =="; exit 1 }
+"== builtin api OK =="
+exit 0

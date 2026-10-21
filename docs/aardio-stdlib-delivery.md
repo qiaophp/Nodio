@@ -10,9 +10,16 @@ title: aardio 标准库「全量可用」交付说明
 > 官方唯一样本 `lib/ide/aifix.aardio`（`=aardio` 预编译块）**已被真正执行跑完**。
 >
 > ⚠️ **口径提醒**：上面这句只覆盖 **import 层面**（模块能不能导进来）。
-> **函数 API 层面**另有 **17 个真缺口**（官方内建库 156 个成员里缺 15 个 +
+> **函数 API 层面**原先有 **17 个真缺口**（官方内建库 156 个成员里缺 15 个 +
 > 2 个未声明但被官方库调用的引擎原生），其中 **8 个有官方库实际调用点** ——
 > 详见 **§8**。
+>
+> ✅ **第二十三轮已把这 17 个缺口收口到 1 个**（详见 **§10**）：
+> 官方内建库 **149 / 150 个成员被覆盖（99.3%）**，剩 1 个
+> `com.ImplInterfaceFromTypelib` 需要「按 ITypeInfo 动态构造原始接口 vtable」
+> 的设施（官方库零调用点）。
+> 另有一处**能力边界**：COM 事件接收器只支持 **dispinterface 型连接点**
+> （原始接口连接点同样卡在 vtable 设施上）。
 
 本文是**验收口径**的落点；逐条取证见 `docs/aardio-bytecode.md`（§7 语义、§7.5.10
 调用约定定案）与 `docs/capability-gap.md`（§3 现状、§7 归因）。
@@ -194,6 +201,9 @@ D:\Nodio\build-x64\Release\nodio.exe <枚举脚本>
 
 ## 9. 变更记录
 
+* **第二十三轮**：§8 量出的 **17 个真缺口收口到 1 个**，3 处 **命名不兼容**
+  全部按官方名补齐；顺带修正 `%` 运算符的 floor 语义与 `string.split` 的官方契约。
+  详见 **§10**。
 * **第二十二轮**：把「全量可用」的验收从 **import 层面**扩到 **函数 API 层面**，
   量出官方内建库 **17 个真缺口**（其中 8 个有官方库实际调用点）与 3 处
   **命名不兼容**（`com.NewObject` / `com.SafeArray` / `com.ReleaseConnection`）。
@@ -202,3 +212,120 @@ D:\Nodio\build-x64\Release\nodio.exe <枚举脚本>
   语义取证 `docs/aardio-bytecode.md` §7.5.10。
 * **第二十轮**：`0x2F` / `0x30` / `0x31` / `0x3C` 四种动态调用变体落地，
   记录 VM 收口 **61/61**。
+
+## 10. 第二十三轮：官方内建 API 缺口收口
+
+### 10.1 收口结果
+
+| 项 | 第二十二轮 | 第二十三轮 |
+|---|---:|---:|
+| 官方内建成员覆盖 | 141 / 156 | **149 / 150（99.3%）** |
+| 真缺口（函数不存在） | 17 | **1** |
+| 命名不兼容（官方名不存在） | 3 | **0** |
+
+> 两个口径的分母不同（156 / 150）：§8 的抽取把若干**嵌套表成员**
+> （`thread._serialize`、`thread.release`、`raw._json` …）也计进了成员数，
+> 第二十三轮的核对脚本按官方源码逐条核对了这些噪声并剔除。
+> **可复现的核对脚本**：`tests/builtin_api_coverage.ps1`
+> （官方成员清单固化为 `tests/official_builtin_members.json`；
+>   **已知缺口白名单** = `com.ImplInterfaceFromTypelib`，出现新缺口即失败 ——
+>   它同时是回归闸门）：
+>
+> ```powershell
+> pwsh -NoProfile -File D:\Nodio\tests\builtin_api_coverage.ps1
+> # 官方内建成员 150 个，Nodio 覆盖 149 个（99.3%），缺 1 个
+> #   MISSING com.ImplInterfaceFromTypelib
+> ```
+
+逐个落地情况：
+
+| 官方 API | 落点 | 备注 |
+|---|---|---|
+| `string.split` | `engine/builtins.cpp` | **重写为官方 4 种形式**：1 参按 UTF-8 码点逐字符；2 参是**多个单字节分隔符的集合**；`'<整词>'` 形式按整词切；第 3 参 `maxCount` 是结果元素数上限（剩余并入最后一项） |
+| `string.splitLiteral` | `engine/builtins.cpp` | 新增，整词分隔 |
+| `io.lines(pathOrFile)` | `engine/builtins.cpp` | 原生迭代器（`Value::Native_`），逐行读、去 CR/LF、EOF 自动关闭；支持路径与文件对象 |
+| `io.libpath(name)` | `engine/builtins.cpp` + `engine/import.cpp` | 返回**（库文件完整路径, 所在目录）**，找不到返回 null；**复用 import 的解析**（`Interp::ResolveModulePath`），不另造一套查找规则 |
+| `math.fmod(x,y)` | `engine/builtins.cpp` | C `fmod`，余数符号随**被除数 x** |
+| `math.lerp(from,to,t)` | `engine/builtins.cpp` | `from+(to-from)*t`，`t` 不夹取 |
+| `table.setAttr(obj,key,value)` | `engine/builtins.cpp` | 对象含该键则直改；否则走 `_meta._set` 元方法（`ownerAttr=true`）；数字下标命中数组部分 |
+| `com.NewObject(tab,progId[,tlb])` | `engine/com.cpp` | 官方**三值返回** `(appObject, event, e)`；失败时 `e` 是错误信息 |
+| `com.NewControl(tab,progId)` | `engine/com.cpp` | 同上三值形状 |
+| `com.SafeArray(vt,...)` | `engine/com.cpp` | `{_safearray=元素表, _type=vt}`，与官方 `com.toSafeArray` 同形态 |
+| `com.IsIUnknown(v)` / `com.IsMember(obj,name)` / `com.GetPointer(obj[,guid])` | `engine/com.cpp` | `IsMember` 走 ITypeInfo 枚举 func/var desc，名称不区分大小写 |
+| `com.DoObjectVerb(obj,verb)` | `engine/com.cpp` | `IOleObject::DoVerb` |
+| `com.Connect` / `com.AddConnection` / `com.ReleaseConnection` | `engine/com.cpp` | COM 事件接收器，见 §10.2 |
+
+### 10.2 COM 事件接收器（官方 `builtin/com.aardio` 的硬依赖）
+
+官方 `builtin/com.aardio` 里的 `ConnectWeak` / `CreateEmbedEx` 都是 **aardio 源码**，
+但它们都调用**引擎原生**的 `Connect` —— 所以 `Connect` 必须由内核提供，
+否则官方这批 aardio 源码在 Nodio 里会直接「尝试调用非函数值」。
+
+实现（`engine/com.cpp`）：
+
+* `com.Connect(comObject, 事件监听表)` → `(sink, cookie)`；
+  `com.AddConnection(comObject, 事件接收器)` → `cookie`；
+  `com.ReleaseConnection(comObject[, sink, cookie])`。
+* 连接点通过 `IConnectionPointContainer` 取得，**只取 dispinterface 型**
+  （`IID_IDispatch`，或枚举连接点后取源接口是 `TKIND_DISPATCH` 的那个）；
+  源接口的类型信息从**类型库**里反查（连接点只给 IID）。
+* 事件接收器是一个 `IDispatch` 实现：COM 服务端用源接口的 DISPID 回调，
+  引擎用源接口类型信息把 DISPID 还原成**事件名**，再到 aardio 事件表里取同名成员
+  调用（官方 `ConnectWeak` 的接收表正是用 `_meta._get` 转发的）。
+* 连接点与 cookie 登记在 COM 对象包装表的隐藏成员上，供 `com.ReleaseConnection` 解绑。
+
+**实测**（`tests/builtin_api_check.ps1` 第 5 段）：
+
+* `MSXML2.DOMDocument.6.0`、`Shell.Explorer` —— 连接成功（`cookie>0`），
+  `sink.onreadystatechange(1,2)` 走通 `GetIDsOfNames → Invoke → DISPID → 事件名 →
+  aardio 处理函数` 全链路，事件**触发 1 次**；
+* 官方 `com.ConnectWeak`（aardio 源码，内部调用引擎原生的 `Connect`）同样可用；
+* `com.ReleaseConnection` 解绑计数正确，重复调用静默返回 0；
+* 没有连接点的对象（`Scripting.FileSystemObject`）→ **明确报错**，不静默失败。
+
+### 10.3 顺带修正的契约偏差
+
+* **`%` 运算符**：官方是**向下取整（floor）**语义，余数符号跟**除数 y**
+  （`docs/language-reference/operator/arithmetic.md:46`）。
+  Nodio 原先用 C `fmod`（符号跟被除数）—— `engine/runtime.cpp` 3 处 +
+  `engine/aardio_vm.cpp` 0x1C 1 处改为 `AardioMod()`。
+  实测：`-7%2=1`、`7%-2=-1`、`-7%-2=-1`、`-7.5%2=0.5`。
+  注意官方 `math.fmod` 是 **C fmod**（符号跟被除数），两者语义**不同**，都已落地。
+* **`com.NewObject` 失败路径的错误信息丢失**：多返回值的 `mrets` 里**首值之外的
+  附加值**才进 `mrets`，失败分支把首值重复塞进 `mrets` 导致 `e` 取到 null ——
+  已修（`engine/com.cpp`）。
+* **Nodio 自有代码跟着官方契约走**：`ide/nodio/main.nodio` 的 3 处
+  `string.split(line, "= function")` 之类**多字节字面量**必须改用 `<>` 形式
+  （官方 2 参是单字节集合语义）—— 本轮改了，但该文件属并发会话，**未提交**。
+
+### 10.4 仍未闭合的两项（诚实记账）
+
+| 项 | 状态 | 原因 |
+|---|---|---|
+| `com.ImplInterfaceFromTypelib(implTable, typelibPath, interfaceName, coclassName)` | **未实现** | 需要「按 ITypeInfo **动态构造原始接口 vtable**」的设施（官方 `com.interface` 的机制）。**官方库零调用点**，只影响用户按官方风格写的代码 |
+| 原始（非 IDispatch）事件连接点 | **不支持** | 同上：`com.wmi` 的 `SWbemSink`（`IWbemObjectSink`）、`WMPlayer.OCX` 的默认源接口都是**原始接口**，需要按 ITypeInfo 生成 vtable。实测 `WMPlayer.OCX` 返回 `hr=0x80040202`（`EVENT_E_ALL_SUBSCRIBERS_FAILED`）——连接点找到了，但接收器不被接受 |
+
+> **下一轮的方向**：原始接口 vtable 设施一旦落地，这两项一起闭合。
+> 在此之前，`com.Connect` 对 **dispinterface 型连接点**（HTML / ActiveX / OCX 默认
+> 事件接口）已经可用。
+
+### 10.5 回归锁
+
+本轮全部断言固化在 **`tests/builtin_api_check.ps1`**（5 段）：
+
+| 段 | 覆盖 |
+|---|---|
+| 1 | `string.split` / `string.splitLiteral` 官方 4 种形式（20 项断言） |
+| 2 | `io.lines` / `io.libpath`（10 项） |
+| 3 | `math.fmod` / `math.lerp` / `table.setAttr` / `%` floor 语义（15 项） |
+| 4 | `com.NewObject` / `NewControl` / `SafeArray` / `IsIUnknown` / `IsMember` / `GetPointer` + 多返回 null 首值护栏（14 项） |
+| 5 | `com.Connect` / `ConnectWeak` / `ReleaseConnection` 事件链路（9 项） |
+
+```powershell
+pwsh -NoProfile -File D:\Nodio\tests\builtin_api_check.ps1
+pwsh -NoProfile -File D:\Nodio\tests\builtin_api_check.ps1 -Exe D:\Nodio\build-x86\Release\nodio.exe
+```
+
+x64 / x86 **两套构建均全绿**；既有 7 套回归（`aardio_run_check` /
+`aardio_chunk_check` / `run_vm_tests` 90 passed / `run_stdlib_tests` /
+`import_contract_check` / `sysapi_check` / `s2_error_location_check`）全绿。

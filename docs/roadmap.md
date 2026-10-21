@@ -657,6 +657,17 @@ Fixed & closed in recent sessions:
 2. [x] `thread.getMainId` primitive (`import ide` unlocked on both arch, t69)
 3. [x] `string.trimRight`/`string.trimLeft` primitives (x86 py2/py3 unlock, t68)
 4. [x] CLR host for `System` and `dotNet.import`: CCW vtable mapping, `dotNet.createCompiler("C#")` dynamic compilation, `System.Collections.ArrayList`, `System.DateTime`, `System.IO.FileStream`, `System.Windows.Forms` full chain verified.
+5. [x] **官方内建 API 缺口收口（函数 API 层面 17 → 1）**（2026-10-21 第二十三轮）—
+   `string.split`（官方 4 种形式）/`splitLiteral`、`io.lines`、`io.libpath`、
+   `math.fmod`/`lerp`、`table.setAttr`、`com.NewObject`/`NewControl`/`SafeArray`/
+   `IsIUnknown`/`IsMember`/`GetPointer`/`DoObjectVerb`，以及 COM 事件接收器
+   `com.Connect`/`AddConnection`/`ReleaseConnection`（dispinterface 型连接点，
+   实测 `MSXML2.DOMDocument` / `Shell.Explorer` 事件链路打通）；另修 `%` 运算符的
+   floor 语义与 `com.NewObject` 失败路径的错误信息丢失。实测官方内建成员
+   **149 / 150 覆盖（99.3%）**，唯一缺口 `com.ImplInterfaceFromTypelib`
+   （需按 ITypeInfo 动态构造原始接口 vtable，官方库零调用点）。
+   回归：`tests/builtin_api_check.ps1`（5 段断言）+ `tests/builtin_api_coverage.ps1`
+   （覆盖率核对），x64 / x86 均绿。详见 `docs/aardio-stdlib-delivery.md` §10
 
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard

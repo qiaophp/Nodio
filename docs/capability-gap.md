@@ -1682,3 +1682,102 @@ var DAP_EXE   = NODIO_DIR ++ "nodio-dap.exe";
 - `tests/editor_fold_probe.aardio`：`PROBE-OK`
   （11 行 → 折叠后 5 行、文本保留、折叠中 `gotoLine(9)` 仍定位到文档第 9 行）
 - VM / IDE 冒烟见本轮记录
+### 1.21 第二十三轮：官方内建 API 缺口收口（函数 API 层面 17 → 1）
+
+> 标记：**第二十三轮**（本节由本会话写入，与并发会话的 IDE 条目互不重叠）
+
+第二十二轮把「全量可用」的验收从 **import 层面**扩到 **函数 API 层面**，
+量出官方内建库 **17 个真缺口**（8 个有官方库实际调用点）+ 3 处 **命名不兼容**。
+本轮把这 17 个全部落地，**剩 1 个**。
+
+#### 1.21.1 落地清单（官方声明 → 官方契约 → Nodio 实现）
+
+| 官方 API | 官方契约（出处） | 落点 |
+|---|---|---|
+| `string.split` | 4 种形式：1 参逐 UTF-8 字符 / 2 参**单字节分隔符集合** / `'<整词>'` / 第 3 参 `maxCount` 是结果元素数上限 | `engine/builtins.cpp`（重写） |
+| `string.splitLiteral` | 整词分隔 | `engine/builtins.cpp`（新增） |
+| `io.lines(pathOrFile)` | 逐行迭代，EOF 自动关闭 | `engine/builtins.cpp`（原生迭代器） |
+| `io.libpath(name)` | 返回**（库文件路径, 所在目录）**，找不到 null | `engine/builtins.cpp` + `engine/import.cpp`（复用 import 解析） |
+| `math.fmod(x,y)` | C `fmod`，符号随**被除数 x** | `engine/builtins.cpp` |
+| `math.lerp(from,to,t)` | `from+(to-from)*t`，`t` 不夹取 | `engine/builtins.cpp` |
+| `table.setAttr(obj,key,value)` | 含该键直改，否则走 `_meta._set`（`ownerAttr=true`） | `engine/builtins.cpp` |
+| `com.NewObject(tab,progId[,tlb])` | 三值返回 `(appObject, event, e)` | `engine/com.cpp` |
+| `com.NewControl(tab,progId)` | 同上三值形状 | `engine/com.cpp` |
+| `com.SafeArray(vt,...)` | `{_safearray=元素表, _type=vt}` | `engine/com.cpp` |
+| `com.IsIUnknown` / `com.IsMember` / `com.GetPointer` | 见官方 `builtin/com.aardio:192,209` | `engine/com.cpp` |
+| `com.DoObjectVerb(obj,verb)` | `IOleObject::DoVerb` | `engine/com.cpp` |
+| `com.Connect` / `com.AddConnection` / `com.ReleaseConnection` | 事件接收器（见 §1.21.3） | `engine/com.cpp` |
+
+3 处**命名不兼容**（官方名不存在）随之全部按官方名补齐：
+`com.NewObject`（官方第 1 参是接收结果的表，与 Nodio 自有的 `com.CreateObject`
+签名不同，两者并存）、`com.SafeArray`、`com.ReleaseConnection`。
+
+#### 1.21.2 顺带修正的契约偏差
+
+* **`%` 运算符**：官方是**向下取整（floor）**，余数符号跟**除数 y**
+  （`D:\aardio\docs\language-reference\operator\arithmetic.md:46`）。
+  Nodio 原先用 C `fmod`（符号跟被除数）—— `engine/runtime.cpp` 3 处 +
+  `engine/aardio_vm.cpp` 0x1C 1 处改为 `AardioMod()`。
+  实测 `-7%2=1` / `7%-2=-1` / `-7%-2=-1` / `-7.5%2=0.5`。
+  官方 `math.fmod` 恰恰是 C `fmod`（符号跟被除数），两者语义**不同**，都已落地。
+* **`string.split` 的 2 参语义**：此前 Nodio 按「多字节字面量」切，官方是
+  **单字节分隔符集合**；多字节字面量必须用 `'<整词>'`。
+  官方库 `builtin.string` 大量 1 参调用此前全是坏的，现已逐字符正确。
+* **`com.NewObject` 失败路径的错误信息丢失**：多返回值的 `mrets` 只装**首值之外的
+  附加值**，失败分支把首值重复塞进 `mrets`，导致 `e` 取到 null —— 已修。
+
+#### 1.21.3 COM 事件接收器（官方 `builtin/com.aardio` 的硬依赖）
+
+官方 `builtin/com.aardio` 的 `ConnectWeak` / `CreateEmbedEx` 是 **aardio 源码**，
+但都调用**引擎原生**的 `Connect` —— 不补这个，官方这批 aardio 源码在 Nodio 里
+直接「尝试调用非函数值」。
+
+实现（`engine/com.cpp`）：
+
+* `com.Connect(comObject, 事件监听表)` → `(sink, cookie)`；
+  `com.AddConnection(comObject, 事件接收器)` → `cookie`；
+  `com.ReleaseConnection(comObject[, sink, cookie])`。
+* 连接点走 `IConnectionPointContainer`，**只取 dispinterface 型**
+  （`IID_IDispatch`，或枚举连接点后取源接口是 `TKIND_DISPATCH` 的）；
+  源接口类型信息从**类型库**反查（连接点只给 IID）。
+* 接收器是一个 `IDispatch` 实现：服务端用源接口 DISPID 回调，引擎用源接口类型
+  信息把 DISPID 还原成**事件名**，再到 aardio 事件表取同名成员调用
+  （官方 `ConnectWeak` 的接收表正是用 `_meta._get` 转发的）。
+* 连接点与 cookie 登记在 COM 对象包装表的隐藏成员上，供 `ReleaseConnection` 解绑。
+
+**实测**（`tests/builtin_api_check.ps1` 第 5 段）：
+
+* `MSXML2.DOMDocument.6.0`、`Shell.Explorer` 连接成功（`cookie>0`），
+  `sink.onreadystatechange(1,2)` 走通
+  `GetIDsOfNames → Invoke → DISPID → 事件名 → aardio 处理函数`，事件**触发 1 次**；
+* 官方 `com.ConnectWeak` 同样可用；
+* `com.ReleaseConnection` 解绑计数正确，重复调用静默返回 0；
+* 没有连接点的对象（`Scripting.FileSystemObject`）→ **明确报错**，不静默失败。
+
+> 踩过的坑：连接成功后**不能**再 `Release` 那个 `IConnectionPoint`
+> —— 登记表里存的是它，重复释放会让 `ReleaseConnection` 拿到**悬垂指针**
+> 并在 COM DLL 里触发访问违例（实测 `msxml6.dll` 0xC0000005）。
+
+#### 1.21.4 仍未闭合（诚实记账）
+
+| 项 | 状态 | 原因 |
+|---|---|---|
+| `com.ImplInterfaceFromTypelib(implTable,typelibPath,interfaceName,coclassName)` | **未实现** | 需要「按 ITypeInfo **动态构造原始接口 vtable**」（官方 `com.interface` 的机制）。**官方库零调用点** |
+| 原始（非 IDispatch）事件连接点 | **不支持** | 同上：`com.wmi` 的 `SWbemSink`（`IWbemObjectSink`）、`WMPlayer.OCX` 默认源接口都是原始接口；实测 `WMPlayer.OCX` 返回 `hr=0x80040202`（`EVENT_E_ALL_SUBSCRIBERS_FAILED`）—— 连接点找到了，但接收器不被接受 |
+
+#### 1.21.5 回归
+
+* `tests/builtin_api_check.ps1`（**5 段**）：`string.split`/`splitLiteral`（20 项）、
+  `io.lines`/`io.libpath`（10 项）、`math.fmod`/`lerp`/`table.setAttr`/`%`（15 项）、
+  `com.*` 原生 API（14 项）、`com.Connect` 事件链路（9 项）；
+* `tests/builtin_api_coverage.ps1`：官方内建成员覆盖率核对
+  （官方清单固化为 `tests/official_builtin_members.json`）；
+* x64 / x86 **两套构建均全绿**；既有 7 套回归（`aardio_run_check` /
+  `aardio_chunk_check` / `run_vm_tests` 90 passed / `run_stdlib_tests` /
+  `import_contract_check` / `sysapi_check` / `s2_error_location_check`）全绿。
+
+> 实测口径：**官方内建成员 150 个，Nodio 覆盖 149 个（99.3%）**，
+> 唯一缺口 `com.ImplInterfaceFromTypelib`。
+> （§1.21 与第二十二轮 §8 的分母 156 不同：后者把 `thread._serialize`、
+> `thread.release`、`raw._json` 这类**嵌套表成员**也计进了成员数。）
+

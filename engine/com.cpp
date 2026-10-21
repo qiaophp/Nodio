@@ -934,6 +934,305 @@ namespace
         }
     };
 
+    // ---------- COM 事件接收器（com.Connect / com.AddConnection / com.ReleaseConnection）----------
+    //
+    // 官方契约（D:\aardio\lib\builtin\com.aardio:197-216）：
+    //   com.Connect(COM对象, 事件监听表) -> sink, cookie
+    //     把 @2 的表对象转换为 COM 对象的**默认事件监听器**并实现默认事件接口；
+    //     返回 sink（事件接收器）与 cookie（连接点标识）。
+    //   com.AddConnection(COM对象, 事件接收器) -> cookie
+    //     事件接收器可以是 com.ImplInterface 创建的动态事件接口（已是 COM 对象）。
+    //   com.ReleaseConnection(COM对象[, 事件接收器, cookie])
+    //
+    // 官方 builtin/com.aardio 的 ConnectWeak / CreateEmbedEx 都是 aardio 源码，
+    // 但都调用引擎原生的 Connect —— 所以 Connect 必须由内核提供。
+    //
+    // 实现范围（实测边界）：
+    //   支持 **IDispatch 型连接点**（IConnectionPointContainer + IID_IDispatch，
+    //   即 HTML / ActiveX / OCX 控件的默认事件接口，官方 web.form、
+    //   win.ui.ctrl.metaProperty 走的就是这条）。
+    //   原始（非 IDispatch）接口的连接点需要按 ITypeInfo 动态构造 vtable，
+    //   本轮不实现（官方 com.wmi 的 SWbemSink 属于这一类）。
+
+    // 从 aardio 值取 COM 的 IUnknown 指针（COM 对象包装表 / 绑定成员 / 裸指针）
+    static IUnknown* ComUnknownPtr(const Value& v)
+    {
+        if (v.t == Value::Pointer && v.ptr)
+            return reinterpret_cast<IUnknown*>(v.ptr);
+        if (v.t == Value::TableT && v.tab)
+        {
+            auto io = v.tab->map.find(L"_object");
+            if (io != v.tab->map.end() && io->second.t == Value::Pointer && io->second.ptr)
+                return reinterpret_cast<IUnknown*>(io->second.ptr);
+            auto ib = v.tab->map.find(L"_boundDispatch");
+            if (ib != v.tab->map.end() && ib->second.t == Value::Pointer && ib->second.ptr)
+                return reinterpret_cast<IUnknown*>(ib->second.ptr);
+        }
+        return nullptr;
+    }
+
+    // 事件接收器：把 COM 事件（源接口的 DISPID）转发到 aardio 事件表的同名成员
+    class NodioEventSink : public IDispatch
+    {
+        LONG m_ref{ 1 };
+        Value m_sink;                // aardio 事件监听表
+        ITypeInfo* m_srcTI{ nullptr };// 源（事件）接口类型信息
+
+    public:
+        NodioEventSink(const Value& sink, ITypeInfo* srcTI) : m_sink(sink)
+        {
+            m_srcTI = srcTI;
+            if (m_srcTI) m_srcTI->AddRef();
+        }
+        ~NodioEventSink()
+        {
+            if (m_srcTI) m_srcTI->Release();
+        }
+
+        // DISPID -> 事件名（用源接口的类型信息反查）
+        wstring DispIdName(DISPID id)
+        {
+            if (!m_srcTI || id == DISPID_UNKNOWN) return wstring();
+            TYPEATTR* pAttr = nullptr;
+            if (FAILED(m_srcTI->GetTypeAttr(&pAttr)) || !pAttr) return wstring();
+            wstring name;
+            for (int i = 0; i < pAttr->cFuncs; i++)
+            {
+                FUNCDESC* fd = nullptr;
+                if (FAILED(m_srcTI->GetFuncDesc(i, &fd)) || !fd) continue;
+                if (fd->memid == id)
+                {
+                    BSTR bName = nullptr;
+                    if (SUCCEEDED(m_srcTI->GetDocumentation(fd->memid, &bName,
+                                                           nullptr, nullptr, nullptr)) &&
+                        bName)
+                        name = bName;
+                    if (bName) SysFreeString(bName);
+                }
+                m_srcTI->ReleaseFuncDesc(fd);
+                if (!name.empty()) break;
+            }
+            m_srcTI->ReleaseTypeAttr(pAttr);
+            return name;
+        }
+
+        STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
+        {
+            if (!ppv) return E_POINTER;
+            if (riid == IID_IUnknown || riid == IID_IDispatch)
+            {
+                *ppv = static_cast<IDispatch*>(this);
+                AddRef();
+                return S_OK;
+            }
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+        STDMETHODIMP_(ULONG) AddRef() override
+        {
+            return InterlockedIncrement(&m_ref);
+        }
+        STDMETHODIMP_(ULONG) Release() override
+        {
+            ULONG r = InterlockedDecrement(&m_ref);
+            if (r == 0) delete this;
+            return r;
+        }
+        STDMETHODIMP GetTypeInfoCount(UINT* pctinfo) override
+        {
+            if (pctinfo) *pctinfo = 0;
+            return S_OK;
+        }
+        STDMETHODIMP GetTypeInfo(UINT, LCID, ITypeInfo** ppti) override
+        {
+            if (ppti) *ppti = nullptr;
+            return E_NOTIMPL;
+        }
+        STDMETHODIMP GetIDsOfNames(REFIID, LPOLESTR* rgszNames, UINT cNames,
+                                  LCID, DISPID* prgdispids) override
+        {
+            if (!rgszNames || !prgdispids || cNames == 0) return E_INVALIDARG;
+            for (UINT i = 0; i < cNames; i++)
+            {
+                DISPID id = DISPID_UNKNOWN;
+                if (m_srcTI)
+                {
+                    LPOLESTR nm = rgszNames[i];
+                    LPOLESTR* pnm = &nm;
+                    MEMBERID* pmid = &id;
+                    if (FAILED(m_srcTI->GetIDsOfNames(pnm, 1, pmid)))
+                        id = DISPID_UNKNOWN;
+                }
+                if (id == DISPID_UNKNOWN) return DISP_E_UNKNOWNNAME;
+                prgdispids[i] = id;
+            }
+            return S_OK;
+        }
+        STDMETHODIMP Invoke(DISPID dispIdMember, REFIID, LCID, WORD wFlags,
+                            DISPPARAMS* pDispParams, VARIANT* pVarResult,
+                            EXCEPINFO*, UINT*) override
+        {
+            Interp* it = g_interpCurrent;
+            if (!it) return E_FAIL;
+            wstring name = DispIdName(dispIdMember);
+            if (name.empty()) return S_OK;
+            // 事件名 -> aardio 事件表成员（走 _meta._get，官方 ConnectWeak 的
+            // 接收表就是用 _get 转发的）
+            Value memberVal = it->GetMember(m_sink, Value::Str_(name), false, 1);
+            if (memberVal.t != Value::Func && !memberVal.native)
+                return S_OK;   // 没挂处理函数的事件：静默忽略
+            // 零参 + PROPERTYGET 是 Nodio 读取成员时的「探测」调用
+            // （comMeta._get 会先探一次再决定是否返回可调用的绑定成员）：
+            // 这种调用不能触发事件，只把事件处理函数本身交回去。
+            bool bZeroArg = (pDispParams == nullptr || pDispParams->cArgs == 0);
+            bool bProbe = bZeroArg && (wFlags & DISPATCH_PROPERTYGET);
+            if (bProbe)
+            {
+                if (pVarResult)
+                {
+                    VariantInit(pVarResult);
+                    pVarResult->vt = VT_DISPATCH;
+                    pVarResult->pdispVal = new NodioCallbackDispatch(memberVal);
+                }
+                return S_OK;
+            }
+            std::vector<Value> args;
+            if (pDispParams && pDispParams->cArgs > 0)
+            {
+                args.resize(pDispParams->cArgs);
+                for (UINT i = 0; i < pDispParams->cArgs; i++)
+                {
+                    VARIANT& v = pDispParams->rgvarg[pDispParams->cArgs - 1 - i];
+                    wstring err;
+                    args[i] = VariantToValue(v, &err);
+                }
+            }
+            Value ret = it->CallOwner(memberVal, m_sink, args);
+            if (pVarResult)
+            {
+                wstring err;
+                VariantFromValue(ret, *pVarResult, &err);
+            }
+            return S_OK;
+        }
+    };
+
+    // 连接点登记表：挂在 COM 对象包装表的隐藏成员上，供 ReleaseConnection 找到
+    // cookie -> (连接点, 接收器)
+    static Table* ComConnStoreOf(const Value& obj, bool bCreate)
+    {
+        if (obj.t != Value::TableT || !obj.tab) return nullptr;
+        auto it = obj.tab->map.find(L"\x01comConn");
+        if (it != obj.tab->map.end() && it->second.t == Value::TableT && it->second.tab)
+            return it->second.tab.get();
+        if (!bCreate) return nullptr;
+        auto store = std::make_shared<Table>();
+        obj.tab->map[L"\x01comConn"] = Value::Table_(store);
+        return store.get();
+    }
+
+    static void ComConnStoreAdd(Table* store, DWORD cookie,
+                                IConnectionPoint* cp, IUnknown* sink)
+    {
+        if (!store) return;
+        auto rec = std::make_shared<Table>();
+        rec->map[L"cookie"] = Value::Num_((double)(unsigned long)cookie);
+        rec->map[L"cp"] = Value::Pointer_((void*)cp);
+        rec->map[L"sink"] = Value::Pointer_((void*)sink);
+        store->map[std::to_wstring((unsigned long)cookie)] = Value::Table_(rec);
+    }
+
+    // 找 COM 对象的默认事件连接点（只取 dispinterface 型）
+    // 连接点只暴露源接口 IID，源接口的类型信息要从类型库里找
+    // （源接口在类型库里注册为 dispinterface，只能枚举类型库）。
+    static ITypeInfo* FindSourceTypeInfo(IUnknown* pUnk, REFIID srcIid)
+    {
+        if (!pUnk) return nullptr;
+        IProvideClassInfo* pPCI = nullptr;
+        if (FAILED(pUnk->QueryInterface(IID_IProvideClassInfo, (void**)&pPCI)) || !pPCI)
+            return nullptr;
+        ITypeInfo* result = nullptr;
+        ITypeInfo* clsTI = nullptr;
+        if (SUCCEEDED(pPCI->GetClassInfo(&clsTI)) && clsTI)
+        {
+            ITypeLib* pTL = nullptr;
+            UINT tlIndex = 0;
+            if (SUCCEEDED(clsTI->GetContainingTypeLib(&pTL, &tlIndex)) && pTL)
+            {
+                UINT n = pTL->GetTypeInfoCount();
+                for (UINT i = 0; i < n && !result; i++)
+                {
+                    ITypeInfo* ti = nullptr;
+                    if (SUCCEEDED(pTL->GetTypeInfo(i, &ti)) && ti)
+                    {
+                        TYPEATTR* attr = nullptr;
+                        bool match = false;
+                        if (SUCCEEDED(ti->GetTypeAttr(&attr)) && attr)
+                        {
+                            match = (IsEqualGUID(attr->guid, srcIid) &&
+                                     attr->typekind == TKIND_DISPATCH);
+                            ti->ReleaseTypeAttr(attr);
+                        }
+                        if (match) result = ti;
+                        else ti->Release();
+                    }
+                }
+                pTL->Release();
+            }
+            clsTI->Release();
+        }
+        pPCI->Release();
+        return result;
+    }
+
+    // 找默认事件连接点，同时给出源（事件）接口的类型信息
+    static IConnectionPoint* FindEventConnectionPoint(IUnknown* pUnk, ITypeInfo** ppSrcTI)
+    {
+        *ppSrcTI = nullptr;
+        IConnectionPointContainer* pCpc = nullptr;
+        if (!pUnk || FAILED(pUnk->QueryInterface(IID_IConnectionPointContainer, (void**)&pCpc)) || !pCpc)
+            return nullptr;
+        // 1) 优先 IID_IDispatch 连接点
+        IConnectionPoint* pCp = nullptr;
+        if (SUCCEEDED(pCpc->FindConnectionPoint(IID_IDispatch, &pCp)) && pCp)
+        {
+            ITypeInfo* ti = FindSourceTypeInfo(pUnk, IID_IDispatch);
+            if (ti)
+            {
+                *ppSrcTI = ti;
+                pCpc->Release();
+                return pCp;
+            }
+            pCp->Release();
+            pCp = nullptr;
+        }
+        // 2) 枚举连接点：取源接口是 dispinterface 的那个
+        IEnumConnectionPoints* pEnum = nullptr;
+        if (SUCCEEDED(pCpc->EnumConnectionPoints(&pEnum)) && pEnum)
+        {
+            IConnectionPoint* pTmp = nullptr;
+            ULONG fetched = 0;
+            while (pEnum->Next(1, &pTmp, &fetched) == S_OK && pTmp)
+            {
+                IID iid{};
+                if (SUCCEEDED(pTmp->GetConnectionInterface(&iid)))
+                {
+                    ITypeInfo* ti = FindSourceTypeInfo(pUnk, iid);
+                    if (ti)
+                    {
+                        *ppSrcTI = ti;
+                        pCp = pTmp;
+                        break;
+                    }
+                }
+                pTmp->Release();
+            }
+            pEnum->Release();
+        }
+        pCpc->Release();
+        return pCp;
+    }
+
     static void VariantFromValue(const Value& v, VARIANT& out, wstring* pErr, VARTYPE forcedArrayVt)
     {
         VariantInit(&out);
@@ -2668,6 +2967,317 @@ void Interp::RegisterComKernel(Env& globalsEnv)
             a[0].tab->map.count(L"_boundDispatch"));
     });
 
+    // ---- 官方引擎原生 API（第二十三轮补齐）----
+    //
+    // 官方 com 命名空间里有一批**引擎原生**函数：官方 lib/builtin/com.aardio
+    // 只写 intellisense 声明（`NewObject(.(tab,progId) = ...`），实现藏在
+    // aardio.exe 里。官方库的真实用法（lib/com/activeX.aardio）：
+    //   appObject, event, e = ..com.NewObject(this._object, this.ProgID, this.TypeLib)
+    //   if(!appObject) error("NewObject failed: " ++ e)
+    //   this._object.externalEvent = event
+    // 下面实现可以忠实落地的那几个（COM 事件接收器那一族需要连接点
+    // IConnectionPoint 基础设施，暂缺，见 docs/aardio-stdlib-delivery.md §8）。
+
+    // com.NewObject(tab, progId [, typeLibPath]) -> appObject, event, e
+    // com.NewControl(tab, progId)               -> appObject, event, e
+    auto comNewObject = [](vector<Value>& a, const wchar_t* apiName) -> Value {
+        wstring prog = a.size() > 1 ? BStr(a[1]) : wstring();
+        auto fail = [&](const wstring& msg) -> Value {
+            Value r;                            // appObject = null（首值）
+            auto ex = std::make_shared<vector<Value>>();
+            ex->push_back(Value());            // event = null（mrets 只装首值之后的附加值）
+            ex->push_back(Value::Str_(msg));   // e = 错误信息
+            r.mrets = ex;
+            return r;
+        };
+        if (prog.empty())
+            return fail(wstring(apiName) + L": 缺少 ProgID 参数");
+        CLSID clsid;
+        if (FAILED(CLSIDFromProgID(prog.c_str(), &clsid)))
+            return fail(wstring(apiName) + L": 无效 ProgID " + prog);
+        IDispatch* pd = nullptr;
+        HRESULT hr = CoCreateInstance(clsid, nullptr, CLSCTX_ALL, IID_IDispatch,
+                                      (void**)&pd);
+        if (FAILED(hr) || !pd)
+        {
+            wchar_t buf[16];
+            swprintf(buf, 16, L"%08lX", (unsigned long)hr);
+            return fail(wstring(apiName) + L": 创建失败 hr=0x" + buf);
+        }
+        Value obj = WrapDispatch(pd);
+        // event：官方用它持有 COM 事件连接（外部事件对象）。
+        // Nodio 的 COM 宿主还没有连接点设施，这里给出同形态的锚点对象，
+        // 保证官方「三值返回」的形状一致。
+        auto ev = std::make_shared<Table>();
+        ev->map[L"_isComEvent"] = Value::Bool_(true);
+        Value r = obj;
+        auto ex = std::make_shared<vector<Value>>();
+        ex->push_back(Value::Table_(ev));  // event
+        ex->push_back(Value());            // e = null（无错误）
+        r.mrets = ex;
+        return r;
+    };
+    com->map[L"NewObject"] = NF([comNewObject](vector<Value>& a) -> Value {
+        return comNewObject(a, L"com.NewObject");
+    });
+    com->map[L"NewControl"] = NF([comNewObject](vector<Value>& a) -> Value {
+        return comNewObject(a, L"com.NewControl");
+    });
+
+    // com.Connect(COM对象, 事件监听表) -> sink, cookie
+    // com.AddConnection(COM对象, 事件接收器) -> cookie
+    // 官方 builtin/com.aardio 的 ConnectWeak / CreateEmbedEx 都调用引擎原生的
+    // Connect，所以这两个函数必须由内核提供。
+    auto comConnect = [](vector<Value>& a, bool bAddOnly) -> Value {
+        Interp* it = g_interpCurrent;
+        auto fail = [&](const wstring& msg) -> Value {
+            if (it) *it->err = L"运行错误: " + msg;
+            return Value();
+        };
+        if (a.size() < 2) return fail(L"com.Connect: 缺少参数");
+        IUnknown* pUnk = ComUnknownPtr(a[0]);
+        if (!pUnk) return fail(L"com.Connect: 参数不是 COM 对象");
+        ITypeInfo* pSrcTI = nullptr;
+        IConnectionPoint* pCp = FindEventConnectionPoint(pUnk, &pSrcTI);
+        if (!pCp)
+            return fail(L"com.Connect: 对象没有可用的 dispinterface 事件连接点"
+                       L"（原始接口的连接点本版本暂不支持）");
+        // 事件接收器：已是 COM 对象（com.ImplInterface 的结果）就直接用，
+        // 否则把 aardio 事件表包装成事件接收器
+        IUnknown* pGiven = ComUnknownPtr(a[1]);
+        NodioEventSink* pOwn = nullptr;
+        IUnknown* pSink = nullptr;
+        if (pGiven)
+        {
+            pSink = pGiven;
+            pSink->AddRef();
+        }
+        else
+        {
+            pOwn = new NodioEventSink(a[1], pSrcTI);
+            pSink = pOwn;
+        }
+        if (pSrcTI) pSrcTI->Release();
+        DWORD cookie = 0;
+        HRESULT hr = pCp->Advise(pSink, &cookie);
+        if (FAILED(hr))
+        {
+            pSink->Release();
+            pCp->Release();
+            wchar_t buf[16];
+            swprintf(buf, 16, L"%08lX", (unsigned long)hr);
+            return fail(wstring(L"com.Connect: 注册事件接收器失败 hr=0x") + buf);
+        }
+        // 登记连接点，供 com.ReleaseConnection 解绑
+        // （连接点的所有权交给登记表：这里**不能**再 Release，
+        //   否则 ReleaseConnection 会拿到悬垂指针）
+        Table* store = ComConnStoreOf(a[0], true);
+        ComConnStoreAdd(store, cookie, pCp, pSink);
+        // 返回值：sink（事件接收器）, cookie
+        IDispatch* pDisp = nullptr;
+        if (SUCCEEDED(pSink->QueryInterface(IID_IDispatch, (void**)&pDisp)) && pDisp)
+        {
+            Value r = WrapDispatch(pDisp);
+            pDisp->Release();
+            if (bAddOnly)
+                return Value::Num_((double)(unsigned long)cookie);
+            auto ex = std::make_shared<vector<Value>>();
+            ex->push_back(Value::Num_((double)(unsigned long)cookie));
+            r.mrets = ex;
+            return r;
+        }
+        if (bAddOnly)
+            return Value::Num_((double)(unsigned long)cookie);
+        Value r;
+        auto ex = std::make_shared<vector<Value>>();
+        ex->push_back(Value::Num_((double)(unsigned long)cookie));
+        r.mrets = ex;
+        return r;
+    };
+    com->map[L"Connect"] = NF([comConnect](vector<Value>& a) -> Value {
+        return comConnect(a, false);
+    });
+    com->map[L"AddConnection"] = NF([comConnect](vector<Value>& a) -> Value {
+        return comConnect(a, true);
+    });
+    // com.ReleaseConnection(COM对象[, 事件接收器, cookie])
+    com->map[L"ReleaseConnection"] = NF([](vector<Value>& a) -> Value {
+        Interp* it = g_interpCurrent;
+        if (a.empty()) return Value::Num_(0);
+        Table* store = ComConnStoreOf(a[0], false);
+        if (!store) return Value::Num_(0);
+        long long wantCookie = -1;
+        if (a.size() >= 3 && a[2].t == Value::Num)
+            wantCookie = (long long)a[2].n;
+        vector<wstring> keys;
+        for (auto& kv : store->map)
+            keys.push_back(kv.first);
+        int n = 0;
+        for (auto& key : keys)
+        {
+            auto it = store->map.find(key);
+            if (it == store->map.end() || it->second.t != Value::TableT || !it->second.tab)
+                continue;
+            Table* rec = it->second.tab.get();
+            auto ic = rec->map.find(L"cookie");
+            long long cookie = (ic != rec->map.end() && ic->second.t == Value::Num)
+                ? (long long)ic->second.n : -1;
+            if (wantCookie >= 0 && cookie != wantCookie) continue;
+            auto icp = rec->map.find(L"cp");
+            auto isk = rec->map.find(L"sink");
+            if (icp != rec->map.end() && icp->second.t == Value::Pointer && icp->second.ptr)
+            {
+                auto* cp = reinterpret_cast<IConnectionPoint*>(icp->second.ptr);
+                cp->Unadvise((DWORD)(unsigned long)cookie);
+                cp->Release();
+            }
+            if (isk != rec->map.end() && isk->second.t == Value::Pointer && isk->second.ptr)
+                reinterpret_cast<IUnknown*>(isk->second.ptr)->Release();
+            store->map.erase(key);
+            n++;
+        }
+        // 没有可释放的连接时静默返回 0（官方清理路径可能重复调用）
+        return Value::Num_(n);
+    });
+
+    // com.SafeArray(variantType, ...) —— 官方声明（lib/builtin/com.aardio）：
+    //   SafeArray(.(variantType,->->->) = 创建 COM 安全数组（SAFEARRAY）。
+    //   在 aardio 中 COM 数组默认存为纯数组对象，但数组元表的 _safearray_type
+    //   声明了 COM 数组类型。
+    // 脚本层沿用官方 com.toSafeArray 的同一形态：{ _safearray = 元素表, _type = VARTYPE }
+    com->map[L"SafeArray"] = NF([](vector<Value>& a) -> Value {
+        if (a.empty()) return Value();
+        VARTYPE vt = (VARTYPE)(int)BNum(a[0]);
+        auto arr = std::make_shared<Table>();
+        for (size_t i = 1; i < a.size(); i++) arr->arr.push_back(a[i]);
+        auto tb = std::make_shared<Table>();
+        tb->map[L"_safearray"] = Value::Table_(arr);
+        tb->map[L"_type"] = Value::Num_((double)vt);
+        return Value::Table_(tb);
+    });
+
+    // com.IsIUnknown(any) —— 官方声明：
+    //   检测参数是否一个托管 com.IUnknown 指针
+    com->map[L"IsIUnknown"] = NF([](vector<Value>& a) -> Value {
+        if (a.empty()) return Value::Bool_(false);
+        if (a[0].t == Value::Pointer) return Value::Bool_(a[0].ptr != nullptr);
+        if (a[0].t != Value::TableT || !a[0].tab) return Value::Bool_(false);
+        return Value::Bool_(
+            a[0].tab->map.count(L"_object") ||
+            a[0].tab->map.count(L"_boundDispatch"));
+    });
+
+    // com.GetPointer(comObj [, guid]) —— 官方声明：
+    //   获取 IDispatch 指针。该指针返回前已调用 AddRef 增加 COM 引用计数，
+    //   不再使用时必须及时调用 com.Release 释放。
+    //   使用 GUID 指定接口时取该接口的原生指针。
+    com->map[L"GetPointer"] = NF([](vector<Value>& a) -> Value {
+        if (a.empty()) return Value();
+        IUnknown* punk = nullptr;
+        bool bOwnRef = false;   // punk 由本次调用 AddRef 而来
+        if (a[0].t == Value::Pointer)
+        {
+            punk = reinterpret_cast<IUnknown*>(a[0].ptr);
+        }
+        else if (a[0].t == Value::TableT && a[0].tab)
+        {
+            auto io = a[0].tab->map.find(L"_object");
+            if (io != a[0].tab->map.end() && io->second.t == Value::Pointer)
+                punk = reinterpret_cast<IUnknown*>(io->second.ptr);
+            else
+            {
+                auto ib = a[0].tab->map.find(L"_boundDispatch");
+                if (ib != a[0].tab->map.end() && ib->second.t == Value::Pointer)
+                    punk = reinterpret_cast<IUnknown*>(ib->second.ptr);
+            }
+        }
+        if (!punk) return Value();
+        void* p = nullptr;
+        if (a.size() >= 2 && a[1].t == Value::Str && !a[1].s.empty())
+        {
+            CLSID clsid;
+            if (FAILED(CLSIDFromString(a[1].s.c_str(), &clsid)))
+                return Value();
+            if (FAILED(punk->QueryInterface(clsid, &p)) || !p)
+                return Value();
+        }
+        else
+        {
+            // IDispatch 指针：返回前 AddRef（调用方负责 com.Release）
+            p = punk;
+            punk->AddRef();
+        }
+        (void)bOwnRef;
+        return Value::Pointer_(p);
+    });
+
+    // com.IsMember(comObj, memberName) —— 官方声明：
+    //   返回参数 @memberName 指定的名字是否 @comObject 参数指定 COM 对象的成员。
+    com->map[L"IsMember"] = NF([](vector<Value>& a) -> Value {
+        if (a.size() < 2) return Value::Bool_(false);
+        wstring name = BStr(a[1]);
+        if (name.empty()) return Value::Bool_(false);
+        IDispatch* pd = nullptr;
+        if (a[0].t == Value::Pointer)
+            pd = reinterpret_cast<IDispatch*>(a[0].ptr);
+        else if (a[0].t == Value::TableT && a[0].tab)
+        {
+            auto io = a[0].tab->map.find(L"_object");
+            if (io != a[0].tab->map.end() && io->second.t == Value::Pointer)
+                pd = reinterpret_cast<IDispatch*>(io->second.ptr);
+            else
+            {
+                auto ib = a[0].tab->map.find(L"_boundDispatch");
+                if (ib != a[0].tab->map.end() && ib->second.t == Value::Pointer)
+                    pd = reinterpret_cast<IDispatch*>(ib->second.ptr);
+            }
+        }
+        if (!pd) return Value::Bool_(false);
+        ITypeInfo* pTI = nullptr;
+        if (FAILED(pd->GetTypeInfo(0, LOCALE_USER_DEFAULT, &pTI)) || !pTI)
+            return Value::Bool_(false);
+        bool found = false;
+        TYPEATTR* pTA = nullptr;
+        if (SUCCEEDED(pTI->GetTypeAttr(&pTA)) && pTA)
+        {
+            for (LONG i = 0; i < pTA->cFuncs && !found; i++)
+            {
+                FUNCDESC* pFD = nullptr;
+                if (SUCCEEDED(pTI->GetFuncDesc(i, &pFD)) && pFD)
+                {
+                    BSTR bName = nullptr;
+                    if (SUCCEEDED(pTI->GetDocumentation(pFD->memid, &bName, nullptr,
+                                                       nullptr, nullptr)) &&
+                        bName)
+                    {
+                        if (_wcsicmp(bName, name.c_str()) == 0) found = true;
+                        SysFreeString(bName);
+                    }
+                    pTI->ReleaseFuncDesc(pFD);
+                }
+            }
+            for (LONG i = 0; i < pTA->cVars && !found; i++)
+            {
+                VARDESC* pVD = nullptr;
+                if (SUCCEEDED(pTI->GetVarDesc(i, &pVD)) && pVD)
+                {
+                    BSTR bName = nullptr;
+                    if (SUCCEEDED(pTI->GetDocumentation(pVD->memid, &bName, nullptr,
+                                                       nullptr, nullptr)) &&
+                        bName)
+                    {
+                        if (_wcsicmp(bName, name.c_str()) == 0) found = true;
+                        SysFreeString(bName);
+                    }
+                    pTI->ReleaseVarDesc(pVD);
+                }
+            }
+            pTI->ReleaseTypeAttr(pTA);
+        }
+        pTI->Release();
+        return Value::Bool_(found);
+    });
+
     // com.CreateEmbed(embedObject, formOrCtrl, progId, pik)
     // official kernel API used by win.ui.ctrl metaProperty's createEmbed:
     // create the COM control, store it in the container table as
@@ -3136,6 +3746,23 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         else
             pDisp = new NodioTableDispatch(v);
         return WrapDispatch(pDisp);
+    });
+
+    // com.DoObjectVerb(OLE对象, verb) —— 官方声明（lib/builtin/com.aardio）：
+    //   执行 OLE 对象的动作，参数 2 可使用 _OLEIVERB_ 前缀常量。
+    com->map[L"DoObjectVerb"] = NF([](vector<Value>& a) -> Value {
+        if (a.size() < 2) return Value();
+        IUnknown* pUnk = ComUnknownPtr(a[0]);
+        if (!pUnk) return Value();
+        IOleObject* pOle = nullptr;
+        if (FAILED(pUnk->QueryInterface(IID_IOleObject, (void**)&pOle)) || !pOle)
+            return Value();
+        DWORD verb = (DWORD)(long long)BNum(a[1]);
+        HRESULT hr = pOle->DoVerb((LONG)verb, nullptr, nullptr, 0,
+                                  nullptr, nullptr);
+        pOle->Release();
+        if (FAILED(hr)) return Value();
+        return Value::Num_((double)(long long)hr);
     });
 
     // com.SetPreferredInvokeKind(comObject, preferredInvokeKind)
