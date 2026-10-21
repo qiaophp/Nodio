@@ -1,0 +1,6 @@
+#include <windows.h>
+__declspec(dllexport)  void copyAlpha(char *p,char *s,int len){
+	for( int i = 0;i< len;i+=4,p+=4,s+=4){ 
+		*(p+3) = *(s+3);  
+	}
+}

@@ -778,6 +778,29 @@ Fixed & closed in recent sessions:
       **新增失败 0 项**。
     详见 `docs/capability-gap.md` §1.28
 
+12. [x] **按官方同名路径补 Nodio 自己的 x64 库（6 个模块 / 10 项失败）**（2026-10-22 第二十八轮续）—
+    x64 上「官方库只带 32 位 PE」有两层：引擎层的浮点 ABI（第十一项已修）与
+    库层的 PE 本身装不下。库层走 Nodio 的 overlay 机制 ——
+    `engine/import.cpp` 的 `GetOverlayLibDir()` 把 `D:\Nodio\lib` 放在官方库
+    **之前**查找且**相对路径完全一致**，把 Nodio 的模块放成官方同名同路径，
+    官方代码 `import xxx` 自动命中 Nodio 版本，**调用方零改动**。
+    - **官方随库发布了 C 源码的 6 个模块**：用 MSVC 把同一份 C 源码重编成
+      x64（`/MT` 静态 CRT），overlay 模块是官方模块的**逐字副本**，只把 DLL
+      来源换成 `io.libpath()` 定位的同目录 x64 DLL：
+      `av.audio.dsp`（`.res/dsp.c`）、`win.region.png` / `win.region.bitmap`
+      （`.res/build.aardio` 内嵌 C）、`gdip.feather`（`build-feather.aardio`）、
+      `raw.argsPointer`（`build.aardio`）、`sys.audioVolume`（`volumeCtrl2.cpp`）。
+    - **验证**：6 个模块 x64 全部导入成功；dsp 的 x64 overlay 版与 x86 官方版
+      数值**逐项一致**；`PngDataScan0ToRegion` 返回有效 HRGN。
+    - **回归**：新建 `tests/x64_overlay_check.ps1`（9 项断言，x64/x86 双绿）；
+      x64 / x86 各 17 套既有回归全绿；x64 全量 sweep
+      **ok=899 → 909 / fail=70 → 60**（-10，新增失败 0 项）。
+    - **剩余 60 项 x64 失败里没有一项是 Nodio 引擎缺陷**：24 项官方只带 32 位
+      DLL 且未发源码、13 项 32 位 Python 宿主、6 项官方「先导入父命名空间」
+      守卫、6 项自带安装器超时、3 项官方库缺失、1 项官方断言、2 项官方同款
+      导入顺序、1 项清单伪条目。
+    详见 `docs/capability-gap.md` §1.29
+
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard
 2. console.log string-encoding primitive layer (isUtf16/getUtf/toUtf16 semantics), `.join`/`.getMessage` gaps

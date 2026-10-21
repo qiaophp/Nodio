@@ -2255,3 +2255,174 @@ x64 上「32 位 DLL 装不下」只是**表层**原因；同一批库里还叠�
 sevenZip.lzma 这些「全 double API」的模块在 x64 上一个都跑不起来。
 ABI 层修好之后，剩下的就只剩「官方那份 32 位 PE 本身装不下」这一件事 ——
 那才是需要**按官方路径补 Nodio 自己版本**的部分。
+
+---
+
+## 1.29 第二十九轮：GUI 层六个根因（按钮不可点 / 组件不显示 / 还原黑屏）
+
+这一轮修的六件事有一个共同点：**每一个都是一行源码或文档里写着的事实**，
+但它们当时都表现为「看起来像玄学」。这一节把根因、证据和修法记下来，
+下次遇到同类症状先查契约，别再写探针。
+
+### 1.29.1 根因表
+
+| # | 症状 | 根因 | 证据位置 |
+|---|------|------|----------|
+| 1 | 工具条/页签/树点不动 | 引擎 `win.setPos` 的 `after` **只认指针型**，数值 `1`(HWND_BOTTOM) 被吞成 nullptr=TOP，背景板反而压到最上面 | `engine/builtins.cpp` `a[5].t == Value::Pointer` |
+| 2 | 右上角窗口按钮点了没反应 | 官方 `win.form` 的窗口过程把 `wParam >= 0xF000` 的 WM_SYSCOMMAND **直接吞掉**，SC_CLOSE/SC_MAXIMIZE 到不了 DefWindowProc | `win/ui/_.aardio:726` |
+| 3 | 改个窗口大小就再也不重绘 | 官方 WM_TIMER 在回调返回值「既不是 null 也不是 true」且转数字为 0 时 **`clearInterval` 静默移除定时器** | `win/ui/_.aardio:342` |
+| 4 | 组件半天不显示（>30 秒） | 官方 plus 的 WM_PAINT **只画 `rcPaint`**（本次失效区），首次更新区为空 = 什么都没画 | `win/ui/ctrl/plus.aardio:833` |
+| 5 | 取客户区尺寸全错 | aardio 的 `::RECT.width/height` 是**属性（数值）**，不是方法；`rc.width()` 是在拿数字当函数调用 → 抛异常 → 被 try/catch 吞掉 → 回落到官方**缓存**值 | `aardio/lib/builtin/struct.aardio:212` |
+| 6 | 最大化/还原后黑屏 | **WM_NCCALCSIZE 阶段窗口矩形还没更新**，里面调 `::GetWindowRect` 拿到的是**旧**（最大化时）的矩形；把它写进 lParam → 客户区被钉在屏幕左上角 | Win32 契约 |
+
+### 1.29.2 第 6 条的实测链条
+
+窗口矩形 1943×1287、`GetClientRect` 却报 3860×2180 —— 客户区比窗口还大，
+因为窗口过程**真的**把那个尺寸设成了客户区。
+
+```
+t=  13ms  zoomed=True   winRect=-10,-10,3850,2170   client=3840x2160
+t=1226ms  >>> 点「最大化/还原」
+t=1554ms  zoomed=False  winRect=947,405,2890,1692    client=3860x2180   ← 客户区跑到屏幕左上角
+```
+
+修法：改用 **WM_WINDOWPOSCHANGING(0x46) 缓存「即将生效」的新窗口矩形**，
+WM_NCCALCSIZE 直接用它 —— WINDOWPOS 里 x,y,cx,cy 是偏移 16 起的连续 4 个 int，
+用 `::RECT()` 一次读 16 字节正好对上：
+
+```aardio
+var pr = ..raw.convert(topointer(lp) + 16, ::RECT());   // left=x top=y right=cx bottom=cy
+```
+
+「是不是最大化」也改用**新尺寸 vs 屏幕尺寸**判断，不能用当前样式
+（最大化/还原过程中 WS_MAXIMIZE 什么时候清掉并不确定）。
+
+### 1.29.3 修法清单
+
+* `lib/nodio/ui/rect.aardio`：新增 `sendToBack(ctrl)` / `bringToFront(ctrl)`
+  （内部 `topointer(1)` + flag `0x13`）。
+* `lib/nodio/ui/board.aardio`：新增画板登记表 + `nodio.ui.redrawAll()`；
+  `layout()` 尺寸变化时整块重画。
+* `lib/nodio/ui/titlebar.aardio`：窗口按钮改走 `::User32.ShowWindow` /
+  `::PostMessage(WM_CLOSE)`；按钮矩形按当前画板宽度实时重算；
+  **WM_NCCALCSIZE 改用 WINDOWPOS 缓存的新矩形**。
+* `ide/nodio/app/shell.nodio`：`clientWH()` 改用实时 `::GetClientRect`；
+  背景板创建时和每次 `layout()` 后 `sendToBack`；`layout()` 末尾 `redrawAll()`。
+* `ide/nodio/main.nodio`：启动改**分阶段**（先渲染后加载）；
+  所有 `setInterval` 回调显式 `return null`（官方会按返回值移除定时器）。
+
+### 1.29.4 验证
+
+* 还原后截图非黑像素 **0 → 123474**，标题栏/工具条/左右页签/工程树/编辑器/状态栏全部正常。
+* 客户区尺寸序列 `3840x2160 → 1943x1287`（修复前是 `→ 3860x2180`）。
+* 全量回归：VM 89 passed / EDITOR / INPUT / SMOKE / NAV / STDLIB 全绿。
+
+### 1.29.5 教训（这才是这一轮真正的产出）
+
+六个根因**全部**是「grep 一下官方库/引擎源码就能拿到的一行事实」，
+但当时是**一个症状一个症状地用黑盒探针反推**出来的 ——
+13 个诊断脚本 / 1675 行，换 6 行根因。
+
+**产出比 1:280。** 效率低的根源不是问题难，是**先写探针、后读契约**。
+
+以后的顺序应该是：
+
+1. 异常行为 → 先 grep 同名消息在官方库/引擎里的处理分支；
+2. 再查 aardio 的**类型契约**（`::RECT` 这类结构体的字段是属性还是方法）；
+3. 再查 Win32 消息契约（发消息时窗口状态是否已更新）；
+4. 三步都排除，**才**写探针。
+
+## 1.29 第二十八轮（续）：按官方同名路径补 Nodio 自己的 x64 库（6 个模块）
+
+### 1.29.1 路线
+
+x64 上「官方库只带 32 位 PE」其实是**两层**问题：
+
+1. **引擎层**（§1.28 已解决）：x64 的浮点 ABI 全错 —— 修掉。
+2. **库层**（本节）：官方那份 32 位 PE 本身装不进 x64 进程 —— 按官方
+   **同名路径**在 Nodio 侧提供自己的 x64 版本。
+
+Nodio 的 overlay 机制正好支持第 2 条：`engine/import.cpp` 的
+`GetOverlayLibDir()` 把 `D:\Nodio\lib` 放在官方库**之前**查找，且**相对路径
+完全一致** —— 于是把 Nodio 的模块放成官方同名同路径，官方代码 `import xxx`
+时自动命中 Nodio 的版本，**不需要改任何调用方**。
+
+（x86 构建不命中 overlay —— 32 位构建直接用 aardio 官方 32 位标准库，
+行为与官方完全一致。）
+
+### 1.29.2 官方随库发布 C 源码的 6 个模块
+
+官方这 6 个模块的 DLL 是用 `$` 内嵌进源码再内存加载的，而官方**同时把
+C 源码放在了 `.res` 目录**（官方自己的 `build.aardio` 就是用它 + tcc/MSVC
+重建 DLL 的）。Nodio 侧用 MSVC 把**同一份 C 源码**重新编译成 x64：
+
+| 官方模块 | 官方 C 源码 | Nodio x64 产物 | 导出 |
+|---|---|---|---|
+| `av.audio.dsp` | `.res/dsp.c` | `.res/dsp64.dll` | 38 个 `a_*` |
+| `win.region.png` | `.res/build.aardio` 内嵌 C | `.res/c64.dll` | `PngDataScan0ToRegion` |
+| `win.region.bitmap` | `.res/build.aardio` 内嵌 C | `.res/c64.dll` | `BitmapToRegion` |
+| `gdip.feather` | `.res/build-feather.aardio` 内嵌 C | `.res/feather64.dll` | `copyAlpha` |
+| `raw.argsPointer` | `.res/build.aardio` 内嵌 C + `.def` | `.res/argsPointer64.dll` | `getArgsPointer` |
+| `sys.audioVolume` | `.res/volumeCtrl2.cpp` / `.h` | `.res/volumeCtrl64.dll` | `CreateVolumeCtrl` 等 6 个 |
+
+编译口径：x64、`/MT` 静态 CRT（不依赖外部运行库）、`/O2`；region 两兄弟
+还要 `/link gdi32.lib user32.lib`，audioVolume 的 COM 要
+`/link ole32.lib winmm.lib uuid.lib`。
+
+> `sys.audioVolume` 的官方头文件里有一处**类内限定名**声明
+> （`IAudioMeterInformation * CVolumeCtrl2::GetMeterInfomation();`），
+> MSVC 拒绝 —— 重建时去掉限定名即可，行为不变。
+
+overlay 模块本身是官方模块的**逐字副本**，只把 DLL 的来源换成
+`io.splitpath(io.libpath("<模块名>")).dir + ".res\<x64 dll>"`：
+
+```aardio
+// 官方：var dll = ..raw.loadDll( $"~/lib/win/region/png/.res/c.dll","win.region.png.dll" );
+var dll = ..raw.loadDll( io.splitpath(io.libpath("win.region.png")).dir + ".res\\c64.dll","win.region.png.dll" );
+```
+
+用 `io.libpath()` 定位自身目录（与 import 同一套查找顺序），部署到任何位置
+都能找到同目录的 x64 DLL。
+
+### 1.29.3 验证
+
+* **导入**：6 个模块在 x64 上全部导入成功（此前 5 个因 32 位 DLL 直接失败）。
+* **数值一致**：`av.audio.dsp` 的 x64 overlay 版与 x86 官方版对同一组输入
+  给出**逐项相同**的结果；`win.region.png.PngDataScan0ToRegion` 在假扫描
+  数据上返回有效 HRGN（`type == "pointer"`）。
+* **回归锁**：新建 `tests/x64_overlay_check.ps1`（9 项断言，x64 / x86 双绿）——
+  6 个模块的导入 + 导出函数可调用 + dsp 数值 + region 返回值。
+* **全量**：x64 / x86 各 17 套既有回归全绿；x64 全量模块 sweep
+  **ok=899 → 909 / fail=70 → 60**（**-10**，失败集合**只减不增**，新增失败 0 项）。
+
+修复的 10 项：`av.audio` / `av.audio.dsp` / `av.audio.mixer` / `av.audio.music` /
+`av.audio.sfx` / `gdip.feather` / `raw.argsPointer` / `sys.audioVolume` /
+`win.region.bitmap` / `win.region.png`。
+
+### 1.29.4 剩下的 60 项 x64 失败（分类）
+
+| 类别 | 项数 | 说明 |
+|---|---:|---|
+| 官方只带 32 位 DLL（**无源码**） | 24 | `av.video.kernel` 族 4、`web.view` 族 4、`string.markdown` 族 8、`sevenZip.lzma` 族 4、`raw.fasm` 1、`string.keywords` 1、`web.layout` 1、`com.autoComplete` 1 |
+| Python 宿主 32 位（`python27.dll` / `python3.dll`） | 13 | `py2.*` / `py3.*`（x86 下 `import py2` 可用） |
+| 官方契约：必须先导入父命名空间 | 6 | `sqlite.base` / `sqlite.backup` / `web.form.query` / `web.acme.httpClient` / `web.view.dev` / `winex.accObject.element` |
+| 官方库自带安装器 / 下载器（超时） | 6 | `fastcgi.iisInstall` / `java.*` 3 / `process.php.*` 2 |
+| 官方库依赖的官方库缺失 | 3 | `crypt.jwt.algorithm.EdDSA` / `process.ruby` 2 |
+| 官方库自身断言失败 | 1 | `web.layout.event`（HTMLayout 未装的连带） |
+| 官方同款导入顺序限制 | 2 | `win.ui.ctrl.splitter` / `win.ui.ctrl.thread`（官方同样要求先 `import win;`，见 E-8） |
+| sweep 清单伪条目 | 1 | `win.#DEFINE`（官方文件名带 `#`，不能出现在 import 名里） |
+
+**没有一项是 Nodio 自身的引擎缺陷。**
+
+### 1.29.5 下一批的可行路径（官方没发源码的那 24 项）
+
+| 模块 | 可行方案 |
+|---|---|
+| `string.markdown` 族（8 项） | sundown 是公开的 CommonMark 风格 C 库，官方未随库发源码 → **在 Nodio 侧用 aardio 源码重写** markdown 渲染器，API 面按官方 `sd_markdown_*` / `sdhtml_*` 对齐 |
+| `string.keywords`（1 项） | 纯算法（关键词抽取）→ Nodio 侧自写 |
+| `web.layout`（1 项） | HTMLayout 有 64 位商业版，需许可证；或换用 WebView2 重写（工作量极大） |
+| `web.view` 族（4 项） | 同上，依赖 `webview.dll` |
+| `av.video.kernel` 族（4 项） | 体量大、依赖专有视频 SDK → x64 上明确标注不支持 |
+| `sevenZip.lzma` 族（4 项） | 7-Zip SDK（LGPL）可换 64 位版；但 Nodio 已有 `lib/zlib` 方案，需评估 API 兼容性 |
+| `raw.fasm`（1 项） | FASM 源码公开（GPL），可换 64 位构建 |
+| `com.autoComplete`（1 项） | 依赖外部安装的 `autoComplete.dll`（`%LOCALAPPDATA%\aardio\std\com\`），属环境缺件 |
