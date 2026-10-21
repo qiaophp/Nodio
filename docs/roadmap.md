@@ -757,6 +757,27 @@ Fixed & closed in recent sessions:
     详见 `docs/capability-gap.md` §1.27
 
 
+11. [x] **x64 浮点 ABI 修复 + 按官方路径补 Nodio 自己的 x64 库**（2026-10-22 第二十八轮）—
+    x64 上「官方库只带 32 位 PE」一直只是表层原因；顺着补版往下挖出一个
+    **引擎级**缺陷：x64 的调用分派写成 `bStub = stub && !sig.bCdecl`，
+    于是**带 cdecl 的调用绕开了 ABI 正确的调用桩**，退回把每个实参当整数类
+    传的 `InvokeCdl` —— double/float 实参根本进不了 XMM0..3。
+    - **实测**：`msvcrt pow(2.0,10.0)` 返回 **1**（期望 1024）；
+      `av.audio.dsp` 的 `a_fill` 写不进缓冲区、`a_peak` 恒为 0；
+      探针 DLL 显示被调方收到 `a=2.5, b=0`（第二个实参占了第一个位置）。
+    - **修法**：MS x64 ABI 只有一套调用约定（编译器忽略 __cdecl/__stdcall），
+      x64 一律走按签名逐字节发射的调用桩（位置相关的 XMM 分配本来就是对的）；
+      x86 行为不变。
+    - **补版**：`lib/av/audio/dsp.aardio` —— 按**官方同名路径**在 Nodio 侧
+      提供 x64 版本：`.res/dsp64.dll` 由官方同目录 `.res/dsp.c` 用 MSVC 重新
+      编译（x64 / 静态 CRT，38 个导出与官方逐个一致），模块改用
+      `io.libpath()` 定位自身目录加载它；x86 构建不命中 overlay，行为与官方一致。
+    - **回归**：新建 `tests/ffi_double_check.ps1`（9 项断言，x64/x86 双绿）；
+      x64 / x86 各 17 套既有回归全绿；x64 全量 sweep
+      **ok=899 → 904 / fail=70 → 65**，修复 `av.audio` 家族 5 项，
+      **新增失败 0 项**。
+    详见 `docs/capability-gap.md` §1.28
+
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard
 2. console.log string-encoding primitive layer (isUtf16/getUtf/toUtf16 semantics), `.join`/`.getMessage` gaps

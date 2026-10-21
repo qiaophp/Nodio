@@ -6139,7 +6139,15 @@ void Interp::InitBuiltins()
                             // ABI; a float/double return arrives bit-cast
                             // in RAX (stub epilogue) and is re-decoded.
 #if defined(_WIN64)
-                            bool bStub = stub && !sig.bCdecl;
+                            // x64 只有一套调用约定（MS x64 ABI）：编译器忽略
+                            // __cdecl / __stdcall 的区别，float/double 实参必须
+                            // 走 XMM0..3。而 InvokeCdl / InvokeStd 的定型指针
+                            // 把**每个**实参都当成整数类（RCX/RDX/R8/R9），所以
+                            // 带 "cdecl" 的调用会让被调方读到垃圾而不是那个
+                            // double —— 实测：msvcrt pow(2.0,10.0) 返回 1、
+                            // av.audio.dsp 的 a_fill 写不进缓冲区。
+                            // => x64 一律走 ABI 正确的调用桩。
+                            bool bStub = (stub != nullptr);
 #else
                             bool bStub = false;
 #endif

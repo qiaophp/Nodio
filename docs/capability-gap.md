@@ -2157,3 +2157,101 @@ nodio+0x596b9        <- 引擎内 EnvFlag()
 > 官方语义是「静默失败」，而本测试只在**开始时**判定一次 `CLIP-OK`，
 > 中途被占用就会有一条往返断言失配。这条回归锁本身需要改成
 > 「每次断言前重新探测可用性」。
+## 1.28 第二十八轮：x64 浮点 ABI 缺陷（cdecl 绕过 XMM0..3）+ av.audio.dsp x64 补版
+
+### 1.28.1 起因：补 x64 版本时挖出一个引擎级根因
+
+x64 全量模块 sweep 的 70 项失败里有 34 项是「无法加载 DLL」，归因于官方库
+只带 32 位 PE。补版路线（**按官方同名路径在 Nodio 侧提供自己的版本**）
+落地时，`av.audio.dsp` 编出 x64 DLL 后**数值全是 0** —— 顺着这条线挖出一个
+**引擎级**根因缺陷，影响面远大于 dsp 一个库。
+
+### 1.28.2 实测：x64 的 double 实参根本没送到被调方
+
+用「回读参数」探针 DLL（`double t_geta(double a,double b)` 返回它看到的 a）
+在**独立进程**里逐个测：
+
+| 调用 | 结果 | 期望 |
+|---|---|---|
+| `raw.loadDll(path,name)`（无 cdecl）+ `api("p2","double(double,double)")` | 1502.5 | 1502.5 |
+| `raw.loadDll(path,name,"cdecl")` + 同一 api | **2500** | 1502.5 |
+| `raw.loadDll("msvcrt.dll",,"cdecl").api("pow","double(double,double)")(2.0,10.0)` | **1** | 1024 |
+| `api(..., "stdcall")`（覆盖 dll 级 cdecl 标记） | 1502.5 | 1502.5 |
+
+规律：**只要这一调走 cdecl 分支，double 实参就被换成垃圾**。
+`p2(1.5,2.5)` 被调方收到的是 `a=2.5, b=0`（第二个实参落到了第一个位置，
+第一个位置是空的）—— 典型的「实参没进 XMM 寄存器」特征。
+`p3(1,2,3)` 收到 `a=3, b=1, c=1`、`p4(1,2,3,4)` 收到 `a=4, b=1, c=2, d=0`。
+
+### 1.28.3 根因
+
+`engine/builtins.cpp` 的调用分派：
+
+```cpp
+bool bStub = stub && !sig.bCdecl;   // x64
+```
+
+MS x64 ABI 只有**一套**调用约定：编译器忽略 `__cdecl` / `__stdcall` 的区别，
+float/double 实参必须走 XMM0..XMM3。而 `InvokeCdl` / `InvokeStd` 的定型函数
+指针把**每个**实参都声明成整数类（`SlotT = unsigned __int64`），编译器于是把
+double 的位模式塞进 RCX/RDX/R8/R9 —— 被调方在 XMM0 读到的是垃圾。
+
+按签名逐字节发射的调用桩（`engine/ffi.cpp` 的 `EmitX64CallStub`）本来就是
+对的：它按**参数位置**把浮点实参 `movsd` 进对应的 XMM 寄存器，位置相关的
+分配也正确（位置 2 的 double 进 xmm1，位置 3 的整数仍进 r8）。
+**只是 cdecl 分支绕开了它。**
+
+### 1.28.4 修法
+
+x64 只有一套调用约定 ⇒ cdecl / stdcall 的区分在 x64 上没有意义：
+
+```cpp
+#if defined(_WIN64)
+bool bStub = (stub != nullptr);   // x64 一律走 ABI 正确的调用桩
+#else
+bool bStub = false;
+#endif
+```
+
+x86 行为不变（x86 上 `bStub` 本来就是 false）。
+
+### 1.28.5 av.audio.dsp：按官方路径补 Nodio 自己的 x64 版本
+
+官方 `lib/av/audio/dsp.aardio` 把 32 位 `dsp.dll` 用 `$` 内嵌进源码再内存加载，
+x64 进程装不下该 PE。官方**同目录 `.res/dsp.c`** 就是这份 DLL 的 C 源码
+（官方自己的 `build.aardio` 就是用它 + tcc 重建 32 位 DLL 的）。
+
+Nodio 侧的补版（**同名路径覆盖**，overlay 目录优先于官方库）：
+
+* `lib/av/audio/.res/dsp64.dll` —— 由官方 `.res/dsp.c` 用 MSVC 重新编译
+  （x64，/MT 静态 CRT，不依赖外部运行库），**38 个导出函数与官方 32 位 DLL
+  逐个一致**（`dumpbin /exports` 核对）；
+* `lib/av/audio/dsp.aardio` —— 与官方同名同路径的 overlay 模块，
+  API 面（函数名 + 原型）逐条相同，差别只在 DLL 来源：
+  官方用 `$"..."` 内嵌 32 位 DLL，本版用 `io.libpath()` 定位自身目录后
+  加载同目录的 x64 DLL。
+
+> x86 构建不会命中 overlay（`engine/import.cpp` 的 `GetOverlayLibDir`：
+> 32 位构建直接用 aardio 官方 32 位标准库），行为与官方完全一致。
+
+### 1.28.6 验证
+
+* **数值一致**：x64 overlay 版与 x86 官方版对同一组输入给出**逐项相同**的结果
+  （fill 1.5 → peak 1.5；scale ×2 → peak 3 / sum 12 / sumsq 36；
+  ramp 1→4 → peak 12；countOver 4 / firstOver 0 / lastOver 3），
+  38 个导出函数全部可调用。
+* **回归锁**：新建 `tests/ffi_double_check.ps1`（9 项断言，x64 / x86 双绿）——
+  用 msvcrt 的 `pow` / `floor` / `sqrt` / `fmod` / `atan2` / `ldexp`
+  锁住「cdecl + double」的 ABI，再断言 dsp overlay 的三项数值。
+* **全量**：x64 / x86 各 17 套既有回归全绿；x64 全量模块 sweep
+  **ok=899 → 904 / fail=70 → 65**，失败集合**只减不增**：
+  修复的正是 `av.audio` / `av.audio.dsp` / `av.audio.mixer` / `av.audio.music` /
+  `av.audio.sfx` 五项，**新增失败 0 项**。
+
+### 1.28.7 顺带的结构性结论
+
+x64 上「32 位 DLL 装不下」只是**表层**原因；同一批库里还叠着**浮点 ABI 全错**
+这一层。两者叠加导致 gdip / av.audio / av.video.kernel / string.markdown /
+sevenZip.lzma 这些「全 double API」的模块在 x64 上一个都跑不起来。
+ABI 层修好之后，剩下的就只剩「官方那份 32 位 PE 本身装不下」这一件事 ——
+那才是需要**按官方路径补 Nodio 自己版本**的部分。

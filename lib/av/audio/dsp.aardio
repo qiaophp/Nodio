@@ -1,0 +1,72 @@
+//dsp 音频算法 —— Nodio x64 版
+//
+// 官方版本把 32 位 dsp.dll 用 $ 内嵌进源码再内存加载，x64 进程装不下该 PE，
+// 导致 av.audio / av.audio.dsp / av.audio.mixer / av.audio.music / av.audio.sfx
+// 五个模块在 x64 上全部导入失败（"无法加载 DLL: (内嵌的内存映像)"）。
+//
+// 本文件按**官方同名路径**提供 Nodio 自己的版本：
+//   同目录 .res/dsp64.dll —— 由官方同目录 .res/dsp.c 用 MSVC 重新编译
+//   （x64，/MT 静态 CRT，不依赖外部运行库），导出函数与官方 32 位 DLL 完全一致。
+// API 面（函数名 + 原型）与官方逐条相同，调用方（av.audio.clip）无需任何改动。
+//
+// x86 构建不会命中本 overlay（见 engine/import.cpp 的 GetOverlayLibDir：
+// 32 位构建直接用 aardio 官方 32 位标准库），行为与官方完全一致。
+namespace av.audio.dsp;
+
+//用 io.libpath 定位本模块自身所在目录（与 import 同一套查找顺序：
+//overlay 优先），从而在任意部署位置都能找到同目录的 x64 DLL。
+var _selfDir = io.splitpath(io.libpath("av.audio.dsp")).dir;
+var _dllPath = _selfDir + ".res\\dsp64.dll";
+
+//多线程共享同一个 DLL 模块（C 函数没有可写的全局变量）
+_dll = ..raw.loadDll(_dllPath,"av.audio.dsp.dll","cdecl");
+if(!_dll) error("av.audio.dsp 缺少 x64 DLL：" + _dllPath,2);
+
+//原型必须与 dsp.c 里的 C 签名逐条一致：类型写错会直接崩溃
+var api = function(name,proto){
+	var f = _dll.api(name,proto);
+	if(!f) error("av.audio.dsp 缺少函数：" + name,2);
+	return f;
+}
+fill = api("a_fill","void(ptr x,int n,double v)");
+scale = api("a_scale","void(ptr x,int n,double g)");
+ramp = api("a_ramp","void(ptr x,int n,double g0,double g1)");
+mix = api("a_mix","void(ptr dst,ptr src,int n,double g)");
+mul = api("a_mul","void(ptr x,ptr m,int n)");
+copy = api("a_copy","void(ptr dst,ptr src,int n)");
+reverse = api("a_reverse","void(ptr x,int n)");
+peak = api("a_peak","double(ptr x,int n)");
+sumsq = api("a_sumsq","double(ptr x,int n)");
+sum = api("a_sum","double(ptr x,int n)");
+countOver = api("a_count_over","int(ptr x,int n,double lim)");
+firstOver = api("a_first_over","int(ptr x,int n,double lim)");
+lastOver = api("a_last_over","int(ptr x,int n,double lim)");
+hopSumsq = api("a_hop_sumsq","void(ptr x,int n,int hop,ptr out,int nb)");
+curve = api("a_curve","void(ptr out,int n,ptr pts,int npts,double sr,double t0)");
+interp = api("a_interp","void(ptr out,int n,ptr ctl,int nctl,int step)");
+osc = api("a_osc","double(ptr out,int n,int wave,double f0,ptr fbuf,double fmul,double phase,double pw,double amp,ptr abuf,double sr)");
+fm = api("a_fm","void(ptr out,int n,double f0,ptr fbuf,double ratio,double index,ptr ibuf,double fb,double amp,ptr abuf,double sr)");
+noise = api("a_noise","void(ptr out,int n,int color,int seed,double amp,ptr abuf)");
+dust = api("a_dust","void(ptr out,int n,double density,int seed,double amp,double sr)");
+pluck = api("a_pluck","void(ptr out,int n,double freq,double decay,double bright,int seed,double amp,double sr)");
+modal = api("a_modal","void(ptr out,int n,ptr modes,int count,double amp,double sr)");
+svf = api("a_svf","void(ptr x,int n,int mode,double fc,ptr fbuf,double q,double gainDb,double sr)");
+biquad = api("a_biquad","void(ptr x,int n,double b0,double b1,double b2,double a1,double a2)");
+shape = api("a_shape","void(ptr x,int n,int type,double drive,double mix)");
+crush = api("a_crush","void(ptr x,int n,double bits,int hold)");
+panMix = api("a_pan_mix","void(ptr dL,ptr dR,ptr src,int n,double pan,ptr pbuf,double gain)");
+width = api("a_width","void(ptr L,ptr R,int n,double w)");
+delay = api("a_delay","int(ptr L,ptr R,int n,int d,double fb,double wet,double damp,int pingpong)");
+freeverb = api("a_freeverb","int(ptr L,ptr R,int n,double room,double damp,double wet,double dry,double width,double sr)");
+chorus = api("a_chorus","int(ptr L,ptr R,int n,double rate,double depthMs,double baseMs,double mix,double sr)");
+compress = api("a_compress","double(ptr L,ptr R,int n,ptr sL,ptr sR,double thr,double ratio,double knee,double att,double rel,double makeup,double sr)");
+duck = api("a_duck","double(ptr L,ptr R,int n,ptr sL,ptr sR,double thr,double range,double amount,double att,double rel,double sr)");
+tpEnv = api("a_tp_env","void(ptr L,ptr R,int n,ptr out,ptr coef,int taps,double skipBelow)");
+limit = api("a_limit","double(ptr L,ptr R,int n,ptr det,double ceiling,int la,double rel,double sr)");
+toPcm16 = api("a_to_pcm16","void(ptr L,ptr R,int n,ptr out,int ch,int dither,int seed)");
+toF32 = api("a_to_f32","void(ptr L,ptr R,int n,ptr out,int ch)");
+fromPcm = api("a_from_pcm","void(ptr src,int n,int ch,int fmt,ptr L,ptr R)");
+
+/**intellisense()
+av.audio.dsp = av.audio 库的 DSP 内核（C 函数，处理 float32 平面缓冲区），一般通过 av.audio.clip 使用
+end intellisense**/
