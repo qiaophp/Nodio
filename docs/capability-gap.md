@@ -1760,6 +1760,9 @@ var DAP_EXE   = NODIO_DIR ++ "nodio-dap.exe";
 
 #### 1.21.4 仍未闭合（诚实记账）
 
+> **状态更新（第二十五轮）**：本节两项缺口已闭合，详见 §1.23。
+> 下表保留为当时的记账快照。
+
 | 项 | 状态 | 原因 |
 |---|---|---|
 | `com.ImplInterfaceFromTypelib(implTable,typelibPath,interfaceName,coclassName)` | **未实现** | 需要「按 ITypeInfo **动态构造原始接口 vtable**」（官方 `com.interface` 的机制）。**官方库零调用点** |
@@ -1776,8 +1779,9 @@ var DAP_EXE   = NODIO_DIR ++ "nodio-dap.exe";
   `aardio_chunk_check` / `run_vm_tests` 90 passed / `run_stdlib_tests` /
   `import_contract_check` / `sysapi_check` / `s2_error_location_check`）全绿。
 
-> 实测口径：**官方内建成员 150 个，Nodio 覆盖 149 个（99.3%）**，
+> 实测口径（第二十四轮）：**官方内建成员 150 个，Nodio 覆盖 149 个（99.3%）**，
 > 唯一缺口 `com.ImplInterfaceFromTypelib`。
+> **第二十五轮已补齐该缺口，覆盖率升至 150 / 150（100%）**，见 §1.23。
 > （§1.21 与第二十二轮 §8 的分母 156 不同：后者把 `thread._serialize`、
 > `thread.release`、`raw._json` 这类**嵌套表成员**也计进了成员数。）
 
@@ -1835,3 +1839,47 @@ var DAP_EXE   = NODIO_DIR ++ "nodio-dap.exe";
 连接点」（`WMPlayer.OCX` 的 `_WMPOCXEvents`）同根因。本轮补齐的类型信息设施
 是它的前置条件，vtable 生成器本身尚未实现。官方内建成员覆盖仍是
 **149 / 150（99.3%）**，唯一缺口不变。
+
+> **状态更新（第二十五轮）**：vtable 生成器已实现，该缺口闭合，
+> 覆盖率升至 **150 / 150（100%）**，见 §1.23。
+
+
+## 1.23 第二十五轮：com.ImplInterface / 原始接口事件连接点闭合
+
+### 1.23.1 已闭合项
+
+| 项 | 状态 | 实测 |
+|---|---|---|
+| `com.ImplInterface(implTable,progID,interfaceName)`（3 参） | **已实现** | 官方文档示例 `com.ImplInterface(ocxEvents2,"WMPlayer.OCX.7","_WMPOCXEvents")` 端到端跑通，`com.AddConnection` 返回 cookie=1 |
+| `com.ImplInterfaceFromTypelib(implTable,typelibPath,interfaceName,coclassName)` | **已实现** | `com.ImplInterfaceFromTypelib(events,"C:\\Windows\\System32\\wmp.dll","_WMPOCXEvents","WindowsMediaPlayer")` 收到 11 次真实事件 |
+| 原始（非 IDispatch）事件连接点 Advise | **已实现** | WMP 事件真实送达 aardio 处理函数：`OpenStateChange(1)` / `StatusChange` / `PlayStateChange(9)` … |
+| `com.Connect` 自动路径 | **已实现** | 源接口 IID 非 `IID_IDispatch` 时自动改用原始 vtable 接收器，收到 9 次事件 |
+
+### 1.23.2 三个关键实测结论
+
+1. **服务器按「源接口 IID」查 sink，不是按 IID_IDispatch**。
+   WMP 的 `_WMPOCXEvents` 在类型库里登记为 dispinterface，但连接点的源接口 IID
+   是 `{6BF52A51-394A-11D3-B153-00C04F79FAA6}` —— 纯 IDispatch 接收器会被拒绝，
+   返回 `0x80040202 EVENT_E_ALL_SUBSCRIBERS_FAILED`。
+   这修正了 §1.21.4 对该返回码的解读：**不是「连接点找不到」，而是「接收器不被接受」**。
+2. **事件由 `IDispatch::Invoke` 派发**（服务器命中 vtable 的第 7 个槽，index 6）。
+   所以 vtable 里**必须**包含 IDispatch 的四个槽位，少一个就崩。
+3. **dispinterface 的 `cImplTypes` 在不同类型库副本里可能不一致**：
+   有的副本登记了 IDispatch 基接口（vtable 自带四槽），有的为空。
+   因此对 `TKIND_DISPATCH` 无条件补齐 IDispatch 四槽，不能依赖类型信息。
+
+### 1.23.3 实现要点
+
+- **vtable 生成器**（`engine/com.cpp` `BuildRawSink`）：按 ITypeInfo 递归收集继承链，
+  槽位顺序 = IUnknown(3) + 继承接口 + 自身方法（`GetFuncDesc` 下标顺序）；
+  每槽一个 stdcall 跳板，参数按 ELEMDESC 转换，方法按名字转发到 aardio 同名成员。
+- **接口指针 vs 结构体指针**：`VT_PTR|VT_USERDEFINED` 靠 typekind 判定
+  （只有 `TKIND_INTERFACE` / `TKIND_DISPATCH` 才是接口指针）。
+- **IDispatch 四方法的参数码硬编码**：`Invoke` 的 `pVarResult` 是 `VARIANT*` 出参，
+  按类型信息推导会被误判成「按值 VARIANT」而读到未初始化内存（→ `AddRef` 崩溃）。
+
+### 1.23.4 回归
+
+`tests/builtin_api_check.ps1` 新增**第 7 段**（`com.ImplInterface / 原始接口事件`）：
+3 参形式未知接口报错 + 三条路径的真实事件派发 + 事件名/参数值正确 + 解绑正常。
+双架构（x64 / x86）11 套既有回归全绿。

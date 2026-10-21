@@ -1,4 +1,5 @@
 #include "engine/interp.h"
+#include "engine/comsig.h"
 #include <deque>
 
 namespace NodioVM
@@ -60,6 +61,20 @@ namespace NodioVM
         return -1;
     }
 
+    // COM 专用参数类型的分派（转换实现见 engine/com.cpp）
+    static Value ComArgOf(int pt, void* p)
+    {
+        switch (pt)
+        {
+        case kComBstr:     return ComArgFromBstr(p);
+        case kComDispatch: return ComArgFromDispatch(p);
+        case kComUnknown:  return ComArgFromUnknown(p);
+        case kComVariant:  return ComArgFromVariant(p);
+        case kComIface:    return ComArgFromIface(p);
+        default:           return Value();
+        }
+    }
+
 #if defined(_M_IX86)
     __int64 __fastcall CallbackShim(CbCtx* ctx, unsigned char* stack)
 #else
@@ -70,6 +85,8 @@ namespace NodioVM
         // pack declared params from the caller's frame
         vector<Value> args;
         size_t nSlots = ctx->sig.params.size();
+        ComRawTrace(L"[comraw] shim enter ctx=%p slots=%d code=%p\n",
+                    (void*)ctx, (int)nSlots, ctx->code);
 #if defined(_M_IX86)
         unsigned char* pArg = stack + 4;   // past return address
         for (size_t i = 0; i < nSlots; i++)
@@ -91,6 +108,13 @@ namespace NodioVM
             {
                 unsigned int v = *(unsigned int*)pArg;
                 args.push_back(Value::Num_((double)v));
+                pArg += 4;
+            }
+            else if (pt >= kComBstr && pt <= kComIface)
+            {
+                // COM 专用参数（BSTR / VARIANT / 接口指针…）
+                void* p = *(void**)pArg;
+                args.push_back(ComArgOf(pt, p));
                 pArg += 4;
             }
             else if (pt == 4)
@@ -130,6 +154,7 @@ namespace NodioVM
         for (size_t i = 0; i < nSlots; i++)
         {
             int pt = ctx->sig.params[i] & 0xFF;
+            ComRawTrace(L"[comraw] shim arg %d pt=%d\n", (int)i, pt);
             if (pt == 9)          // float — XMM low 32 bits, bit pattern
             {
                 unsigned int u = i < 4
@@ -161,6 +186,13 @@ namespace NodioVM
                 if (i >= 4) pArg += 8;
                 args.push_back(Value::Bool_(v != 0));
             }
+            else if (pt >= kComBstr && pt <= kComIface)
+            {
+                // COM 专用参数（BSTR / VARIANT / 接口指针…）
+                unsigned __int64 v = (i < 4) ? regs[i] : *(unsigned __int64*)pArg;
+                if (i >= 4) pArg += 8;
+                args.push_back(ComArgOf(pt, (void*)(INT_PTR)v));
+            }
             else                  // integer class (int/ptr/str...)
             {
                 unsigned __int64 v;
@@ -175,6 +207,7 @@ namespace NodioVM
             }
         }
 #endif
+        ComRawTrace(L"[comraw] shim packed argc=%d\n", (int)args.size());
         // interp methods are not declared yet at this point — dispatch
         // through a function pointer installed at InitBuiltins time
         if (!g_cbDispatch || !ctx || ctx->released)

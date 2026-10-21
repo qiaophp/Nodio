@@ -412,6 +412,113 @@ io.print("== comTypeInfo / 类型库 OK ==");
 '@
 Expect-Section $tlbCode 'comTypeInfo / 官方类型库消费者' 'comTypeInfo / 类型库 OK'
 
+# ================================================================
+# 7) com.ImplInterface(3 参) / com.ImplInterfaceFromTypelib /
+#    原始（非 IDispatch）接口的事件连接点 Advise
+#
+#    官方契约来源：
+#      D:\aardio\lib\builtin\com.aardio:206-207
+#        ImplInterface(.(implTable,progID,interfaceName)
+#          例如：com.ImplInterface( flash.callevent ,"ShockwaveFlash.ShockwaveFlash","_IShockwaveFlashEvents")
+#        ImplInterfaceFromTypelib(.(implTable,typelibPath,interfaceName,coclassNname)
+#      D:\aardio\docs\library-guide\builtin\com\ImplInterface.md:19-24
+#        var ocxEvents2 = { MediaChange = function(item){...} }
+#        var eventSink = com.ImplInterface(ocxEvents2,"WMPlayer.OCX.7","_WMPOCXEvents")
+#
+#    实测要点（Windows Media Player 的 _WMPOCXEvents 在类型库里是
+#    dispinterface，但服务器的连接点源接口 IID 不是 IID_IDispatch）：
+#      - 服务器按**源接口 IID** 查 sink，纯 IDispatch 接收器会被拒
+#        （0x80040202 EVENT_E_ALL_SUBSCRIBERS_FAILED）
+#      - 服务器随后用 IDispatch::Invoke 派发事件
+#      - IDispatch::Invoke 的 pVarResult 是 VARIANT* 出参，按类型信息
+#        推导会被误判成「按值 VARIANT」而读到未初始化内存 —— 必须硬编码
+# ================================================================
+$implCode = @'
+var fail = 0;
+function chk(name, ok, detail) {
+  if (ok) { io.print("PASS ", name); }
+  else { fail++; io.print("FAIL ", name, " ", detail); }
+}
+import com;
+
+// ---- 3 参形式：官方文档示例的接口名不存在时必须报错 ----
+var errTxt = "";
+try { com.ImplInterface({ X = function(){} }, "WMPlayer.OCX.7", "_NoSuchEventsIface"); }
+catch (e) { errTxt = "" + e; }
+chk("ImplInterface/unknown-interface-err",
+    string.find(errTxt, "没有接口") != null, errTxt);
+
+// ---- 真实事件链路：Windows Media Player 的 _WMPOCXEvents ----
+// WMP 的源接口 IID 不是 IID_IDispatch：接收器必须是原始 vtable，
+// 服务器用 IDispatch::Invoke 派发事件。
+var wmp = com.CreateObject("WMPlayer.OCX");
+if (wmp == null) {
+  io.print("SKIP ImplInterface event chain (WMPlayer.OCX 未注册)");
+} else {
+  var fired = {};
+  var events = {
+    OpenStateChange = function(newState){
+      fired[#fired + 1] = "OpenStateChange:" ++ newState;
+    };
+    PlayStateChange = function(newState){
+      fired[#fired + 1] = "PlayStateChange:" ++ newState;
+    };
+    StatusChange = function(){
+      fired[#fired + 1] = "StatusChange";
+    };
+  };
+
+  // A) com.ImplInterface(implTable, progID, interfaceName)
+  var sink = com.ImplInterface(events, "WMPlayer.OCX.7", "_WMPOCXEvents");
+  chk("ImplInterface/3arg-sink", type(sink) == "table", "" + type(sink));
+  var cookie = com.AddConnection(wmp, sink);
+  chk("ImplInterface/3arg-cookie", cookie != null && cookie > 0, "" + cookie);
+
+  // B) com.ImplInterfaceFromTypelib(implTable, typelibPath, interfaceName, coclassName)
+  var fired2 = {};
+  var events2 = {
+    OpenStateChange = function(s){ fired2[#fired2 + 1] = "OpenStateChange:" ++ s; };
+    StatusChange = function(){ fired2[#fired2 + 1] = "StatusChange"; };
+  };
+  var sink2 = com.ImplInterfaceFromTypelib(events2,
+        "C:\\Windows\\System32\\wmp.dll", "_WMPOCXEvents", "WindowsMediaPlayer");
+  chk("ImplInterfaceFromTypelib/sink", type(sink2) == "table", "" + type(sink2));
+  var cookie2 = com.AddConnection(wmp, sink2);
+  chk("ImplInterfaceFromTypelib/cookie", cookie2 != null && cookie2 > 0, "" + cookie2);
+
+  // C) com.Connect 自动路径（默认事件接口）
+  var fired3 = {};
+  var events3 = {
+    OpenStateChange = function(s){ fired3[#fired3 + 1] = "OpenStateChange:" ++ s; };
+    StatusChange = function(){ fired3[#fired3 + 1] = "StatusChange"; };
+  };
+  var sink3, cookie3 = com.Connect(wmp, events3);
+  chk("Connect/auto-sink", type(sink3) == "table", "" + type(sink3));
+  chk("Connect/auto-cookie", cookie3 != null && cookie3 > 0, "" + cookie3);
+
+  // 触发事件：设置 url 会让 WMP 连续派发 OpenStateChange/StatusChange/PlayStateChange
+  wmp.url = "C:\\Windows\\Media\\ding.wav";
+  sleep(1500);
+
+  chk("ImplInterface/3arg-event-fired", #fired > 0, "fired=" + #fired);
+  chk("ImplInterface/3arg-event-name",
+      #fired > 0 && string.find(fired[1], "OpenStateChange") == 1, "" + (fired[1] || ""));
+  chk("ImplInterfaceFromTypelib/event-fired", #fired2 > 0, "fired2=" + #fired2);
+  chk("Connect/auto-event-fired", #fired3 > 0, "fired3=" + #fired3);
+  // 参数值正确（OpenStateChange 的 newState 是整数）
+  chk("ImplInterface/3arg-event-arg",
+      #fired > 0 && string.find(fired[1], ":") != null, "" + (fired[1] || ""));
+
+  com.ReleaseConnection(wmp, sink, cookie);
+  com.ReleaseConnection(wmp, sink2, cookie2);
+  com.ReleaseConnection(wmp);
+}
+
+if (fail) { io.print("== IMPLINTERFACE CHECK FAILED: ", fail); return 1; }
+io.print("== com.ImplInterface / 原始接口事件 OK ==");
+'@
+Expect-Section $implCode 'com.ImplInterface / 原始接口事件' 'com.ImplInterface / 原始接口事件 OK'
+
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 if ($fail -gt 0) { "== builtin api FAILED ($fail) =="; exit 1 }
 "== builtin api OK =="

@@ -668,6 +668,7 @@ Fixed & closed in recent sessions:
    （需按 ITypeInfo 动态构造原始接口 vtable，官方库零调用点）。
    回归：`tests/builtin_api_check.ps1`（5 段断言）+ `tests/builtin_api_coverage.ps1`
    （覆盖率核对），x64 / x86 均绿。详见 `docs/aardio-stdlib-delivery.md` §10
+   （该缺口已于第二十五轮闭合，见第 7 项）
 6. [x] **comTypeInfo 类型信息契约补齐 + 杀软误报代码层根治**（2026-10-21 第二十四轮）—
    `GetTypeAttr()` / `GetFuncDesc(i)` / `GetVarDesc(i)` / `GetImplType(i)` /
    `GetImplTypeFlags(i)` 按官方 `!comTypeAttr` / `!comTypeFunc` / `!comTypeParameter`
@@ -681,6 +682,26 @@ Fixed & closed in recent sessions:
    x64 / x86 复测均 CLEAN。回归：`tests/builtin_api_check.ps1` 新增第 6 段（32 条断言）、
    新增 `tests/av_heuristic_check.ps1`（源码级闸门），11 套回归 x64 / x86 均绿。
    详见 `docs/aardio-stdlib-delivery.md` §11、§12
+7. [x] **com.ImplInterface / 原始接口事件连接点闭合 —— 官方内建成员覆盖 150 / 150（100%）**（2026-10-21 第二十五轮）—
+   `com.ImplInterface(implTable,progID,interfaceName)`（3 参）与
+   `com.ImplInterfaceFromTypelib(implTable,typelibPath,interfaceName,coclassName)` 实现，
+   连同依赖它们的「原始（非 IDispatch）接口事件连接点 Advise」一并打通。
+   - **vtable 生成器**：按 ITypeInfo 递归收集继承链，槽位 = IUnknown(3) + 继承接口 +
+     自身方法；每槽一个 stdcall 跳板，参数按 ELEMDESC 转换，方法按名字转发到 aardio 同名成员。
+   - 官方文档示例 `com.ImplInterface(ocxEvents2,"WMPlayer.OCX.7","_WMPOCXEvents")`
+     **端到端跑通**：`com.AddConnection` 返回 cookie=1，服务器真实派发事件，
+     aardio 处理函数收到 `OpenStateChange(1)` / `StatusChange` / `PlayStateChange(9)` … 共 11 次；
+     `com.ImplInterfaceFromTypelib` 与 `com.Connect` 自动路径同样收到事件。
+   - 三个与直觉相反的实测结论：
+     ① 服务器按**源接口 IID** 查 sink（不是 `IID_IDispatch`）—— 纯 IDispatch 接收器会被拒
+     （`0x80040202`）；② 事件由 `IDispatch::Invoke` 派发，命中 vtable 第 7 槽，
+     所以 IDispatch 四槽**必须**齐备；③ dispinterface 的 `cImplTypes` 在不同类型库副本里
+     可能不一致，对 `TKIND_DISPATCH` 需无条件补齐 IDispatch 四槽。
+   - `IDispatch::Invoke` 的 `pVarResult` 是 `VARIANT*` 出参，参数码必须硬编码
+     （按类型信息推导会读未初始化内存 → `AddRef` 崩溃）。
+   回归：`tests/builtin_api_check.ps1` 新增**第 7 段**（`com.ImplInterface / 原始接口事件`），
+   11 套回归 x64 / x86 均绿。详见 `docs/aardio-stdlib-delivery.md` §12、
+   `docs/capability-gap.md` §1.23
 
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard

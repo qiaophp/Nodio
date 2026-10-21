@@ -476,15 +476,64 @@ x64 / x86 **两套构建均全绿**；既有 7 套回归（`aardio_run_check` /
   可实例化。官方 `com.interface` 命名空间由此从「只有手写声明类」扩展到
   「可从任意类型库动态生成」。
 
-### 12.5 仍未闭合
+### 12.5 `com.ImplInterface` / `com.ImplInterfaceFromTypelib` 与原始接口事件连接点（本轮闭合）
 
-`com.ImplInterfaceFromTypelib` / `com.ImplInterface`（3 参形式）**仍未实现**：
-它要求按 ITypeInfo **动态构造原始（非 IDispatch）接口的 vtable**，
-与「原始接口事件连接点」（如 `WMPlayer.OCX` 的 `_WMPOCXEvents`）是同一根因。
-本轮补齐的类型信息设施是它的前置条件，但 vtable 生成器本身还没做 —— 如实记账，不虚报。
+上一轮记为「仍未实现」的两项现已补齐：`com.ImplInterface(implTable, progID, interfaceName)`
+（3 参形式）与 `com.ImplInterfaceFromTypelib(implTable, typelibPath, interfaceName, coclassName)`，
+连同它们依赖的「原始（非 IDispatch）接口事件连接点 Advise」一并打通。
+
+#### 实现要点
+
+- **vtable 生成器**（`engine/com.cpp` `BuildRawSink`）：按 ITypeInfo 递归收集
+  继承链的方法，槽位顺序 = IUnknown(3) + 继承接口 + 自身方法（`GetFuncDesc` 下标顺序，
+  与官方 `com.interface.loadTypelibrary` 生成声明类的顺序一致）；
+  每个槽位一个 stdcall 跳板，参数按 ELEMDESC 转换（BSTR / VARIANT / 接口指针…），
+  方法按名字转发到 aardio 事件表的同名成员。
+- **接口指针 vs 结构体指针的区分**：`VT_PTR|VT_USERDEFINED` 既可能是接口指针
+  （要转成 COM 对象），也可能只是指向结构体（例如 REFIID 就是 GUID 结构体的指针）。
+  靠类型信息的 typekind 判定：只有 `TKIND_INTERFACE` / `TKIND_DISPATCH` 才是接口。
+- **IDispatch 四方法的参数码必须硬编码**：`IDispatch::Invoke` 的 `pVarResult`
+  是 `VARIANT*` **出参**，按类型信息推导会被判成「按值 VARIANT」而读到未初始化内存
+  （`VT_DISPATCH` + 垃圾指针 → `AddRef` 崩溃）。因此 IDispatch 的四个方法
+  按真实签名写死参数码。
+
+#### 实测证据（Windows Media Player）
+
+官方文档示例 `com.ImplInterface(ocxEvents2,"WMPlayer.OCX.7","_WMPOCXEvents")`
+（`D:\aardio\docs\library-guide\builtin\com\ImplInterface.md:19-24`）端到端跑通：
+
+- `com.AddConnection(wmp, sink)` 返回 cookie=1（Advise 成功）；
+- 服务器真实派发事件，aardio 处理函数被调用：
+  `OpenStateChange(1)` / `StatusChange` / `PlayStateChange(9)` / `OpenStateChange(7)` … 共 11 次；
+- `com.ImplInterfaceFromTypelib(events,"C:\\Windows\\System32\\wmp.dll",
+  "_WMPOCXEvents","WindowsMediaPlayer")` 同样收到 11 次事件；
+- `com.Connect(wmp, events)` 自动路径同样收到 9 次事件。
+
+#### 三个关键实测结论（与直觉相反，值得记住）
+
+1. **服务器按「源接口 IID」查 sink，不是按 IID_IDispatch**。
+   WMP 的 `_WMPOCXEvents` 在类型库里登记为 dispinterface，但连接点的源接口 IID
+   是 `{6BF52A51-394A-11D3-B153-00C04F79FAA6}` —— 纯 IDispatch 接收器会被服务器拒绝，
+   返回 `0x80040202 EVENT_E_ALL_SUBSCRIBERS_FAILED`。
+   因此 `com.Connect` 自动路径必须判断源接口 IID：不是 `IID_IDispatch` 时
+   改用原始 vtable 接收器（其 QI 同时回答源接口 IID 与 `IID_IDispatch`）。
+2. **事件由 `IDispatch::Invoke` 派发**，服务器命中的是 vtable 的第 7 个槽
+   （index 6）。所以 vtable 里**必须**包含 IDispatch 的四个槽位，少一个就崩。
+3. **dispinterface 的 `cImplTypes` 在不同类型库副本里可能不一致**：
+   有的副本登记了 IDispatch 基接口（vtable 自带四槽），有的为空。
+   因此对 `TKIND_DISPATCH` 无条件补齐 IDispatch 四槽，不能依赖类型信息。
+
+#### 未闭合
+
+`com.ImplInterface` 的 **1 参形式**（把 aardio 对象转成 IDispatch 接口对象）此前已实现，
+本轮未改动；`com.interface` 命名空间下的**静态**接口声明类路径（`com.interface` +
+`raw.interface`）也维持原状 —— 官方 `raw.interface` 依赖 struct 字段顺序声明，
+与本轮「按 ITypeInfo 动态生成 vtable」的路线互补而非替代。
 
 ### 12.6 回归锁
 
-`tests/builtin_api_check.ps1` 新增第 6 段（`comTypeInfo / 官方类型库消费者`），
-共 32 条断言，覆盖 `GetTypeAttr` / `GetFuncDesc` / `GetVarDesc` / `GetImplType` /
-`GetImplTypeFlags` 的字段形状，以及三个官方库消费者的真实调用结果。
+`tests/builtin_api_check.ps1` 新增第 7 段（`com.ImplInterface / 原始接口事件`），
+覆盖：3 参形式的未知接口报错、`com.ImplInterface` / `com.ImplInterfaceFromTypelib` /
+`com.Connect` 三条路径的真实事件派发、事件名与参数值正确、解绑正常。
+本段与第 6 段（`comTypeInfo / 官方类型库消费者`，32 条断言）一起构成回归锁，
+双架构（x64 / x86）11 套既有回归全绿。

@@ -7,6 +7,7 @@
 #include <ole2.h>
 #include <ocidl.h>
 #include "interp.h"
+#include "engine/comsig.h"
 
 namespace NodioVM
 {
@@ -20,6 +21,13 @@ namespace
     static Table* ComMeta();
 
     static Value WrapRawThunk(IUnknown* punk);
+
+    // ComGuidString 定义在类型信息那一段（后面），这里先声明
+    static wstring ComGuidString(const GUID& g);
+
+    // 源接口类型信息（定义在事件接收器那一段，后面）
+    static ITypeInfo* FindSourceTypeInfo(IUnknown* pUnk, REFIID srcIid,
+                                         bool bAllowRaw);
 
     static Value WrapDispatch(IDispatch* pd)
     {
@@ -967,6 +975,10 @@ namespace
             auto ib = v.tab->map.find(L"_boundDispatch");
             if (ib != v.tab->map.end() && ib->second.t == Value::Pointer && ib->second.ptr)
                 return reinterpret_cast<IUnknown*>(ib->second.ptr);
+            // 原始接口接收器（com.ImplInterface 的结果）
+            auto ir = v.tab->map.find(L"_rawSink");
+            if (ir != v.tab->map.end() && ir->second.t == Value::Pointer && ir->second.ptr)
+                return reinterpret_cast<IUnknown*>(ir->second.ptr);
         }
         return nullptr;
     }
@@ -1117,6 +1129,817 @@ namespace
         }
     };
 
+    // ---------- 原始（非 IDispatch）接口事件接收器 ----------
+    //
+    // 官方契约（D:\aardio\lib\builtin\com.aardio:205-207）：
+    //   com.ImplInterface(implTable, progID, interfaceName)
+    //     例：com.ImplInterface(ocxEvents2,"WMPlayer.OCX.7","_WMPOCXEvents")
+    //   com.ImplInterfaceFromTypelib(implTable, typelibPath, interfaceName, coclassName)
+    //     用类型库实现 com 接口
+    // 两者的结果都是一个「实现了指定接口」的 COM 对象，交给 com.AddConnection
+    // 挂到目标对象的连接点上（官方 com.md / event.md 的用法）。
+    //
+    // 实现方式：按 ITypeInfo 动态生成 vtable。
+    //   槽位顺序 = IUnknown 的 3 个方法 + 继承接口的方法 + 本接口的方法；
+    //   本接口内部按 GetFuncDesc 的下标顺序 —— 这正是官方
+    //   com.interface.loadTypelibrary 生成接口声明类时用的顺序
+    //   （D:\aardio\lib\com\interface\_.aardio:143-168）。
+    //   每个槽位一个 stdcall 跳板（engine/ffi.cpp 的回调机制），
+    //   参数按 ELEMDESC 转换（BSTR / VARIANT / 接口指针…），
+    //   本接口的方法按名字转发到 aardio 事件表的同名成员。
+
+    // vtable 里的一个方法
+    struct ComMethodInfo
+    {
+        wstring name;
+        std::vector<int> params;   // 回调跳板的参数类型码
+        int kind = 0;              // 0=本接口 1=IUnknown 2=IDispatch 3=其它继承接口
+    };
+
+    // 接收器的共享状态：事件表 + 每个方法的跳板
+    struct RawSinkState
+    {
+        Value impl;                              // aardio 事件表
+        IID  iid{};                              // 目标接口 IID
+        ITypeInfo* ti{ nullptr };                 // 接口类型信息（DISPID -> 事件名）
+        std::vector<std::shared_ptr<CbCtx>> cbs; // 方法跳板
+        bool hasDispatch = false;                // vtable 里是否含 IDispatch 的四个槽位
+        ~RawSinkState()
+        {
+            if (ti) ti->Release();
+        }
+    };
+
+    // DISPID -> 接口成员名（用源接口的类型信息反查）
+    static wstring ComDispIdToName(ITypeInfo* pTI, DISPID id)
+    {
+        if (!pTI || id == DISPID_UNKNOWN) return wstring();
+        TYPEATTR* attr = nullptr;
+        if (FAILED(pTI->GetTypeAttr(&attr)) || !attr) return wstring();
+        wstring name;
+        for (int i = 0; i < attr->cFuncs && name.empty(); i++)
+        {
+            FUNCDESC* fd = nullptr;
+            if (FAILED(pTI->GetFuncDesc(i, &fd)) || !fd) continue;
+            if (fd->memid == id)
+            {
+                BSTR bn = nullptr;
+                if (SUCCEEDED(pTI->GetDocumentation(fd->memid, &bn, nullptr,
+                                                  nullptr, nullptr)) && bn)
+                    name = bn;
+                if (bn) SysFreeString(bn);
+            }
+            pTI->ReleaseFuncDesc(fd);
+        }
+        pTI->ReleaseTypeAttr(attr);
+        return name;
+    }
+
+    // COM 要求 vtable 指针位于对象首地址
+    struct RawSinkObj
+    {
+        void** vtbl = nullptr;
+        LONG   ref = 1;
+        std::shared_ptr<RawSinkState> st;
+        ~RawSinkObj()
+        {
+            for (auto& ctx : st->cbs)
+                if (ctx) ReleaseCallback(ctx.get());
+            st->cbs.clear();
+            delete[] vtbl;
+        }
+    };
+
+    // 引用计数归零的接收器延迟销毁：Release 跳板正在执行时不能销毁自己
+    // （销毁会把跳板所在的页重写 neutralizing 掉）。
+    static std::vector<RawSinkObj*> g_rawSinkPending;
+
+    static void ComReapRawSinks()
+    {
+        if (g_rawSinkPending.empty()) return;
+        std::vector<RawSinkObj*> dead;
+        dead.swap(g_rawSinkPending);
+        for (auto* p : dead) delete p;
+    }
+
+    // 用户定义类型（hreftype）：接口类型 -> 接口指针码，其它 -> 原始指针
+    static int ComUserTypeCode(ITypeInfo* pTI, HREFTYPE hr);
+
+    // 参数类型码：ELEMDESC -> 回调跳板的参数类型
+    //
+    // 关键区分：VT_PTR|VT_USERDEFINED 既可能是**接口指针**（要转成 COM 对象），
+    // 也可能只是指向一个结构体（例如 REFIID 就是一个 GUID 结构体的指针）。
+    // 靠类型信息的 typekind 判定：TKIND_INTERFACE / TKIND_DISPATCH 才是接口。
+    static int ComParamCodeOf(ITypeInfo* pTI, const ELEMDESC* ed)
+    {
+        if (!ed) return 5;
+        VARTYPE vt = ed->tdesc.vt;
+        if (vt == VT_PTR)
+        {
+            // 指针参数：看被指向的类型
+            const TYPEDESC* pt = ed->tdesc.lptdesc;
+            VARTYPE bvt = pt ? pt->vt : VT_EMPTY;
+            if (bvt == VT_USERDEFINED)
+                return ComUserTypeCode(pTI, pt ? pt->hreftype : 0);
+            switch (bvt)
+            {
+            case VT_BSTR:        return kComBstr;
+            case VT_VARIANT:     return kComVariant;
+            case VT_DISPATCH:    return kComDispatch;
+            case VT_UNKNOWN:     return kComUnknown;
+            default:             return 5;           // 其它指针按原始指针传
+            }
+        }
+        if (vt == VT_USERDEFINED)
+            return ComUserTypeCode(pTI, ed->tdesc.hreftype);
+        switch (vt)
+        {
+        case VT_BSTR:     return kComBstr;
+        case VT_VARIANT:  return kComVariant;
+        case VT_DISPATCH: return kComDispatch;
+        case VT_UNKNOWN:  return kComUnknown;
+        case VT_I8: case VT_UI8: return 1;           // int64（占 8 字节）
+        case VT_R4:       return 9;                  // float
+        case VT_R8:
+#if defined(_M_IX86)
+            return 1;                               // x86 上双精度占 8 字节（栈平衡）
+#else
+            return 10;
+#endif
+        case VT_BOOL:     return 4;
+        case VT_CY: case VT_DECIMAL: case VT_DATE: return 10;
+        default:          return 0;                  // 整数（含 VT_CLSID 等）
+        }
+    }
+
+    // 用户定义类型（hreftype）：接口类型 -> 接口指针码，其它 -> 原始指针
+    static int ComUserTypeCode(ITypeInfo* pTI, HREFTYPE hr)
+    {
+        if (!pTI || !hr) return 5;
+        ITypeInfo* pt = nullptr;
+        if (FAILED(pTI->GetRefTypeInfo(hr, &pt)) || !pt) return 5;
+        int code = 5;
+        TYPEATTR* a = nullptr;
+        if (SUCCEEDED(pt->GetTypeAttr(&a)) && a)
+        {
+            if (a->typekind == TKIND_INTERFACE || a->typekind == TKIND_DISPATCH)
+                code = kComIface;
+            pt->ReleaseTypeAttr(a);
+        }
+        pt->Release();
+        return code;
+    }
+
+    // 收集接口（含继承）的全部方法，顺序即 vtable 顺序
+    //
+    // bIncludeDispatchBase：基接口里如果继承了 IDispatch，是否把 IDispatch 的
+    // 四个方法也放进 vtable。
+    //   原始接口（TKIND_INTERFACE）按 COM 规则：继承 IDispatch 的接口，
+    //     vtable = IUnknown(3) + IDispatch(4) + 自己的方法。
+    //   dispinterface（TKIND_DISPATCH）被控件当作**原始接口**实现时
+    //     （典型：Windows Media Player 的 _WMPOCXEvents），
+    //     vtable = IUnknown(3) + 声明的成员方法，没有 IDispatch 的四个槽位
+    //     —— 这一点是实测出来的：WMP 的服务器按接口 IID 查 sink，
+    //     再直接调用 vtable 槽位。
+    static void ComCollectMethods(ITypeInfo* pTI, std::vector<ComMethodInfo>& out,
+                                  int kind, bool bIncludeDispatchBase,
+                                  int depth = 0)
+    {
+        if (!pTI || depth > 8) return;
+        TYPEATTR* attr = nullptr;
+        if (FAILED(pTI->GetTypeAttr(&attr)) || !attr) return;
+        for (int i = 0; i < attr->cImplTypes; i++)
+        {
+            HREFTYPE hr = 0;
+            if (SUCCEEDED(pTI->GetRefTypeOfImplType(i, &hr)))
+            {
+                ITypeInfo* base = nullptr;
+                if (SUCCEEDED(pTI->GetRefTypeInfo(hr, &base)) && base)
+                {
+                    int bkind = 3;
+                    TYPEATTR* ba = nullptr;
+                    if (SUCCEEDED(base->GetTypeAttr(&ba)) && ba)
+                    {
+                        if (IsEqualGUID(ba->guid, IID_IUnknown)) bkind = 1;
+                        else if (IsEqualGUID(ba->guid, IID_IDispatch)) bkind = 2;
+                        base->ReleaseTypeAttr(ba);
+                    }
+                    if (bkind != 2 || bIncludeDispatchBase)
+                        ComCollectMethods(base, out, bkind, bIncludeDispatchBase, depth + 1);
+                    base->Release();
+                }
+            }
+        }
+        for (int i = 0; i < attr->cFuncs; i++)
+        {
+            FUNCDESC* fd = nullptr;
+            if (FAILED(pTI->GetFuncDesc(i, &fd)) || !fd) continue;
+            ComMethodInfo mi;
+            mi.kind = kind;
+            BSTR bn = nullptr;
+            if (SUCCEEDED(pTI->GetDocumentation(fd->memid, &bn, nullptr, nullptr, nullptr)) && bn)
+                mi.name = bn;
+            if (bn) SysFreeString(bn);
+            for (int k = 0; k < fd->cParams; k++)
+                mi.params.push_back(ComParamCodeOf(pTI, &fd->lprgelemdescParam[k]));
+            out.push_back(mi);
+            pTI->ReleaseFuncDesc(fd);
+        }
+        pTI->ReleaseTypeAttr(attr);
+    }
+
+    // vtable 的前 3 槽必须是 IUnknown 的 QI/AddRef/Release
+    static void ComEnsureIUnknownSlots(std::vector<ComMethodInfo>& v)
+    {
+        if (!v.empty() && v[0].kind == 1) return;
+        ComMethodInfo qi; qi.name = L"QueryInterface"; qi.kind = 1;
+        qi.params = { 5, 5 };
+        ComMethodInfo ar; ar.name = L"AddRef"; ar.kind = 1;
+        ComMethodInfo rl; rl.name = L"Release"; rl.kind = 1;
+        v.insert(v.begin(), { qi, ar, rl });
+    }
+
+    // dispinterface（TKIND_DISPATCH）必须补齐 IDispatch 的四个槽位
+    //
+    // 实测：同一个接口在不同的类型库副本里 cImplTypes 可能不同 ——
+    // 有的副本登记了 IDispatch 基接口（vtable 自带四个槽），有的副本
+    // cImplTypes 为空（dispinterface 的成员本来就不占 vtable 槽）。
+    // 缺了这四个槽，服务器按 IDispatch 派发事件时命中的就是自身方法槽
+    // —— 实测会崩。所以这里无条件补齐。
+    static void ComEnsureDispatchSlots(std::vector<ComMethodInfo>& v)
+    {
+        for (const auto& m : v)
+            if (m.kind == 2) return;           // 已经有了
+        ComMethodInfo gtc; gtc.name = L"GetTypeInfoCount"; gtc.kind = 2;
+        ComMethodInfo gti; gti.name = L"GetTypeInfo"; gti.kind = 2;
+        ComMethodInfo gion; gion.name = L"GetIDsOfNames"; gion.kind = 2;
+        ComMethodInfo inv; inv.name = L"Invoke"; inv.kind = 2;
+        // 插到 IUnknown 三槽之后
+        size_t pos = 3;
+        if (v.size() < pos) pos = v.size();
+        v.insert(v.begin() + pos, { gtc, gti, gion, inv });
+    }
+
+    // IDispatch 四个方法的参数类型码（**硬编码**，不能用类型信息推导）
+    //
+    // 实测：服务器把我们的原始接口接收器当成 IDispatch 使用，
+    // 直接调用 vtable 里 IDispatch 的四个槽位（Invoke 在 slot 6）。
+    // IDispatch::Invoke 的 pVarResult 是 VARIANT* **出参**，
+    // 按类型信息推导会被误判成 kComVariant（按值读 VARIANT），
+    // 服务器传进来的是未初始化的 VARIANT 指针 —— 读它会拿到
+    // 垃圾 vt（例如 VT_DISPATCH + 垃圾指针）再 AddRef，直接崩溃。
+    // 所以这里按 IDispatch 的真实签名写死。
+    static std::vector<int> ComDispatchParams(const wstring& name)
+    {
+        if (name == L"GetTypeInfoCount") return { 5 };                              // UINT*
+        if (name == L"GetTypeInfo")      return { 0, 0, 5 };                        // UINT,LCID,ITypeInfo**
+        if (name == L"GetIDsOfNames")    return { 5, 5, 0, 0, 5 };                  // REFIID,LPOLESTR*,UINT,LCID,DISPID*
+        if (name == L"Invoke")           return { 0, 5, 0, 0, 5, 5, 5, 5 };        // DISPID,REFIID,LCID,WORD,DISPARAMS*,VARIANT*,EXCEPINFO*,UINT*
+        return {};
+    }
+
+    // VARIANT 参数 -> aardio 值（处理 Automation 常见的按引用嵌套）
+    static Value ComVariantArgToValue(const VARIANT& v)
+    {
+        // VT_VARIANT / VT_VARIANT|VT_BYREF 里存的是指向另一个 VARIANT 的指针
+        if ((v.vt == VT_VARIANT || v.vt == (VT_VARIANT | VT_BYREF)) && v.pvarVal)
+            return ComVariantArgToValue(*v.pvarVal);
+        wstring err;
+        return VariantToValue(v, &err);
+    }
+
+    // 生成一个方法的 stdcall 跳板
+    static void* ComMakeStub(const std::shared_ptr<RawSinkState>& st,
+                             const ComMethodInfo& mi, Interp* it)
+    {
+        auto spCtx = std::make_shared<CbCtx>();
+        CbCtx* ctx = spCtx.get();
+        ctx->sig.ret = ARInt;          // COM 方法一律按 HRESULT 返回
+        ctx->sig.params.push_back(5);   // this
+        if (mi.kind == 2)
+        {
+            // IDispatch 四个方法：参数码硬编码（见 ComDispatchParams 的说明）
+            for (int c : ComDispatchParams(mi.name)) ctx->sig.params.push_back(c);
+        }
+        else
+        {
+            for (int c : mi.params) ctx->sig.params.push_back(c);
+        }
+        ctx->interp = it;
+        ctx->owner = st->impl;         // 事件表由接收器持有
+        ctx->rooted = true;            // 事件表不能被回收（GC 标记 ctx->owner）
+
+        const wstring name = mi.name;
+        if (mi.kind == 1 && name == L"QueryInterface")
+        {
+            ctx->fn = NF([st](vector<Value>& a) -> Value {
+                ComRawTrace(L"[comraw] QI argc=%d\n", (int)a.size());
+                if (a.size() < 3) return Value::Num_((double)(long long)E_POINTER);
+                void* self = (a[0].t == Value::Pointer) ? a[0].ptr : nullptr;
+                void* riidp = (a[1].t == Value::Pointer) ? a[1].ptr : nullptr;
+                void** ppv = (a[2].t == Value::Pointer) ? (void**)a[2].ptr : nullptr;
+                if (!self || !ppv) return Value::Num_((double)(long long)E_POINTER);
+                IID riid{};
+                if (riidp) memcpy(&riid, riidp, sizeof(IID));
+                ComRawTrace(L"[comraw] QI self=%p riid=%08X target=%08X\n",
+                            self, (unsigned long)riid.Data1,
+                            (unsigned long)st->iid.Data1);
+                // vtable 布局是 IUnknown(3) + IDispatch(4) + 自身方法时，
+                // IDispatch 指针与 IUnknown 指针相同（IDispatch 继承 IUnknown，
+                // 派生接口的第一个接口共用同一个 vtable 头）。
+                if (IsEqualGUID(riid, IID_IUnknown) ||
+                    (st->hasDispatch && IsEqualGUID(riid, IID_IDispatch)) ||
+                    IsEqualGUID(riid, st->iid))
+                {
+                    *ppv = self;
+                    InterlockedIncrement(&((RawSinkObj*)self)->ref);
+                    return Value::Num_(0);          // S_OK
+                }
+                *ppv = nullptr;
+                return Value::Num_((double)(long long)E_NOINTERFACE);
+            });
+        }
+        else if (mi.kind == 1 && (name == L"AddRef" || name == L"Release"))
+        {
+            bool bAdd = (name == L"AddRef");
+            ctx->fn = NF([bAdd](vector<Value>& a) -> Value {
+                ComRawTrace(L"[comraw] %ls self=%p\n", bAdd ? L"AddRef" : L"Release",
+                            a.empty() ? nullptr : (void*)(a[0].t == Value::Pointer ? a[0].ptr : nullptr));
+                void* self = a.empty() ? nullptr
+                    : ((a[0].t == Value::Pointer) ? a[0].ptr : nullptr);
+                if (!self) return Value::Num_(0);
+                auto* obj = (RawSinkObj*)self;
+                if (bAdd) return Value::Num_((double)InterlockedIncrement(&obj->ref));
+                LONG r = InterlockedDecrement(&obj->ref);
+                if (r == 0)
+                {
+                    // 不能就地销毁：当前正在执行的就是这个跳板
+                    g_rawSinkPending.push_back(obj);
+                }
+                return Value::Num_((double)(unsigned long)r);
+            });
+        }
+        else if (mi.kind == 2)
+        {
+            // IDispatch 的四个方法：真实实现（服务器会用 Invoke 派发事件）
+            const wstring dname = name;
+            if (dname == L"GetTypeInfoCount")
+            {
+                ctx->fn = NF([](vector<Value>& a) -> Value {
+                    if (a.size() > 1 && a[1].t == Value::Pointer && a[1].ptr)
+                        *(UINT*)a[1].ptr = 1;
+                    return Value::Num_(0);
+                });
+            }
+            else if (dname == L"GetTypeInfo")
+            {
+                ctx->fn = NF([st](vector<Value>& a) -> Value {
+                    if (a.size() > 3 && a[3].t == Value::Pointer && a[3].ptr)
+                    {
+                        ITypeInfo** pp = (ITypeInfo**)a[3].ptr;
+                        if (st->ti) { st->ti->AddRef(); *pp = st->ti; return Value::Num_(0); }
+                        *pp = nullptr;
+                    }
+                    return Value::Num_(0);
+                });
+            }
+            else if (dname == L"GetIDsOfNames")
+            {
+                ctx->fn = NF([st](vector<Value>& a) -> Value {
+                    if (a.size() < 6) return Value::Num_((double)(long long)E_INVALIDARG);
+                    LPOLESTR* names = (a[2].t == Value::Pointer) ? (LPOLESTR*)a[2].ptr : nullptr;
+                    UINT cNames = (UINT)(long long)a[3].n;
+                    DISPID* out = (a[5].t == Value::Pointer) ? (DISPID*)a[5].ptr : nullptr;
+                    if (!names || !out || cNames == 0)
+                        return Value::Num_((double)(long long)E_INVALIDARG);
+                    if (!st->ti) return Value::Num_((double)(long long)DISP_E_UNKNOWNNAME);
+                    if (FAILED(st->ti->GetIDsOfNames(names, cNames, out)))
+                        return Value::Num_((double)(long long)DISP_E_UNKNOWNNAME);
+                    return Value::Num_(0);
+                });
+            }
+            else
+            {
+                // Invoke(DISPID, REFIID, LCID, WORD, DISPPARAMS*, VARIANT*, EXCEPINFO*, UINT*)
+                //
+                // 服务器把我们的原始接口接收器当作 IDispatch 使用，
+                // 用 Invoke 派发事件（实测 Windows Media Player 的
+                // _WMPOCXEvents 走的就是这条路）。
+                // DISPID -> 事件名：用**源接口的类型信息**反查
+                // （dispinterface 的 FUNCDESC.memid 就是 DISPID）。
+                ctx->fn = NF([st, it](vector<Value>& a) -> Value {
+                    ComRawTrace(L"[comraw] Invoke argc=%d\n", (int)a.size());
+                    if (!it || a.size() < 9) return Value::Num_((double)(long long)E_FAIL);
+                    // DISPID 是 32 位整数：x64 下整型参数按 64 位读取，
+                    // 高位可能是符号扩展的垃圾值 —— 取低 32 位。
+                    DISPID dispid = (DISPID)(int32_t)(long long)a[1].n;
+                    void* pDispParams = (a[5].t == Value::Pointer) ? a[5].ptr : nullptr;
+                    void* pVarResult  = (a[6].t == Value::Pointer) ? a[6].ptr : nullptr;
+                    wstring name = ComDispIdToName(st->ti, dispid);
+                    ComRawTrace(L"[comraw] Invoke dispid=%d name=%ls\n",
+                                (int)dispid, name.c_str());
+                    if (name.empty()) return Value::Num_(0);   // 未知成员：静默忽略
+                    Value fn = it->GetMember(st->impl, Value::Str_(name), false, 1);
+                    if (fn.t != Value::Func && !fn.native)
+                        return Value::Num_(0);                  // 未定义成员：忽略
+                    std::vector<Value> args;
+                    if (pDispParams)
+                    {
+                        DISPPARAMS* dp = (DISPPARAMS*)pDispParams;
+                        if (dp->cArgs > 0 && dp->rgvarg)
+                        {
+                            args.resize(dp->cArgs);
+                            for (UINT i = 0; i < dp->cArgs; i++)
+                            {
+                                // rgvarg 是逆序存放的
+                                args[i] = ComVariantArgToValue(dp->rgvarg[dp->cArgs - 1 - i]);
+                            }
+                        }
+                    }
+                    Value ret = it->CallOwner(fn, st->impl, args);
+                    if (pVarResult)
+                    {
+                        // 事件处理函数通常没有返回值：留 VT_EMPTY，
+                        // 不要写 DISP_E_PARAMNOTFOUND（服务器会当成失败）。
+                        VARIANT* vr = (VARIANT*)pVarResult;
+                        VariantInit(vr);
+                        if (ret.t != Value::Null)
+                        {
+                            wstring err;
+                            VariantFromValue(ret, *vr, &err);
+                        }
+                    }
+                    return Value::Num_(0);
+                });
+            }
+        }
+        else if (mi.kind == 3)
+        {
+            // 其它继承接口的方法：不实现（栈清理仍按真实参数个数）
+            ctx->fn = NF([](vector<Value>&) -> Value {
+                return Value::Num_((double)(long long)E_NOTIMPL);
+            });
+        }
+        else
+        {
+            // 本接口的方法：按名字转发到 aardio 事件表的同名成员
+            ctx->fn = NF([st, name, it](vector<Value>& a) -> Value {
+                ComRawTrace(L"[comraw] method %ls argc=%d\n", name.c_str(), (int)a.size());
+                if (!it) return Value::Num_((double)(long long)E_FAIL);
+                Value fn = it->GetMember(st->impl, Value::Str_(name), false, 1);
+                if (fn.t != Value::Func && !fn.native)
+                    return Value::Num_((double)(long long)E_NOTIMPL);
+                std::vector<Value> args;
+                for (size_t i = 1; i < a.size(); i++) args.push_back(a[i]);
+                Value ret = it->CallOwner(fn, st->impl, args);
+                if (ret.t == Value::Num) return ret;
+                return Value::Num_(0);      // S_OK
+            });
+        }
+        CallbackTrampoline(ctx);
+        if (!ctx->code) return nullptr;
+        ComRawTrace(L"[comraw] stub %ls kind=%d code=%p interp=%p\n",
+                    mi.name.c_str(), mi.kind, ctx->code, (void*)ctx->interp);
+        g_cbs.push_back(ctx);
+        st->cbs.push_back(spCtx);
+        return ctx->code;
+    }
+
+    // 按接口类型信息生成一个实现了该接口的 COM 接收器
+    static RawSinkObj* BuildRawSink(ITypeInfo* pTI, const Value& impl, wstring* pErr)
+    {
+        if (!pTI) { if (pErr) *pErr = L"无效的接口类型信息"; return nullptr; }
+        TYPEATTR* attr = nullptr;
+        if (FAILED(pTI->GetTypeAttr(&attr)) || !attr)
+        {
+            if (pErr) *pErr = L"读取接口属性失败";
+            return nullptr;
+        }
+        IID iid = attr->guid;
+        TYPEKIND kind = attr->typekind;
+        pTI->ReleaseTypeAttr(attr);
+
+        std::vector<ComMethodInfo> methods;
+        // vtable = IUnknown(3) + 继承的接口（含 IDispatch 的四个方法）+ 自己的方法
+        // —— 实测：WMP 的 _WMPOCXEvents 在类型库里登记为 dispinterface，
+        //    服务器按接口 IID 查 sink 后直接调用 vtable 槽位，
+        //    槽位里必须包含 IDispatch 的四个方法（少了就崩）。
+        ComCollectMethods(pTI, methods, 0, true);
+        ComEnsureIUnknownSlots(methods);
+        // dispinterface 必须带 IDispatch 的四个槽（服务器用 Invoke 派发事件）
+        if (kind == TKIND_DISPATCH) ComEnsureDispatchSlots(methods);
+        if (methods.size() <= 3)
+        {
+            if (pErr) *pErr = L"该接口没有可实现的方法";
+            return nullptr;
+        }
+
+        auto st = std::make_shared<RawSinkState>();
+        st->impl = impl;
+        st->iid = iid;
+        st->ti = pTI;
+        pTI->AddRef();              // 源接口类型信息（DISPID -> 事件名）
+        for (const auto& m : methods)
+            if (m.kind == 2) { st->hasDispatch = true; break; }
+
+        auto* obj = new RawSinkObj();
+        obj->st = st;
+        obj->vtbl = new void*[methods.size()];
+        memset(obj->vtbl, 0, sizeof(void*) * methods.size());
+        Interp* it = g_interpCurrent;
+        for (size_t i = 0; i < methods.size(); i++)
+        {
+            void* stub = ComMakeStub(st, methods[i], it);
+            if (!stub)
+            {
+                if (pErr) *pErr = L"生成方法跳板失败";
+                delete obj;
+                return nullptr;
+            }
+            obj->vtbl[i] = stub;
+        }
+        return obj;
+    }
+
+    // 释放接收器的一次引用
+    static void ComReleaseRawSink(RawSinkObj* obj)
+    {
+        if (!obj) return;
+        if (InterlockedDecrement(&obj->ref) == 0)
+            g_rawSinkPending.push_back(obj);
+    }
+
+    // 把接收器包装成 aardio 值（可交给 com.AddConnection）
+    static Value WrapRawSink(RawSinkObj* obj)
+    {
+        auto w = std::make_shared<Table>();
+        w->map[L"_rawSink"] = Value::Pointer_((void*)obj);
+        w->map[L"_isComObject"] = Value::Bool_(true);
+        w->map[L"_rawSinkIid"] = Value::Str_(ComGuidString(obj->st->iid));
+        // 包装表持有最后一个引用：回收时释放
+        w->map[L"_gc"] = NF([obj](vector<Value>&) -> Value {
+            ComReleaseRawSink(obj);
+            return Value();
+        });
+        return Value::Table_(w);
+    }
+
+    static bool IsRawSinkValue(const Value& v)
+    {
+        return v.t == Value::TableT && v.tab &&
+               v.tab->map.count(L"_rawSink") > 0;
+    }
+
+    static IID RawSinkIid(const Value& v)
+    {
+        IID iid{};
+        if (v.t == Value::TableT && v.tab)
+        {
+            auto it = v.tab->map.find(L"_rawSinkIid");
+            if (it != v.tab->map.end() && it->second.t == Value::Str)
+                IIDFromString(BStr(it->second).c_str(), &iid);
+        }
+        return iid;
+    }
+
+    // 找原始（非 IDispatch）事件连接点：返回连接点与源接口的类型信息
+    //
+    // IConnectionPoint 只暴露**源接口** IID（GetConnectionInterface），
+    // 源接口的类型信息从组件的类型库里找（IProvideClassInfo ->
+    // GetClassInfo -> GetContainingTypeLib）——这与 dispinterface 路径同源。
+    static IConnectionPoint* FindRawConnectionPoint(IUnknown* pUnk, ITypeInfo** ppSrcTI)
+    {
+        *ppSrcTI = nullptr;
+        IConnectionPointContainer* pCpc = nullptr;
+        if (!pUnk || FAILED(pUnk->QueryInterface(IID_IConnectionPointContainer,
+                                                 (void**)&pCpc)) || !pCpc)
+            return nullptr;
+        IConnectionPoint* pFound = nullptr;
+        IEnumConnectionPoints* pEnum = nullptr;
+        if (SUCCEEDED(pCpc->EnumConnectionPoints(&pEnum)) && pEnum)
+        {
+            IConnectionPoint* pTmp = nullptr;
+            ULONG fetched = 0;
+            while (pEnum->Next(1, &pTmp, &fetched) == S_OK && pTmp)
+            {
+                IID iid{};
+                if (SUCCEEDED(pTmp->GetConnectionInterface(&iid)))
+                {
+                    ITypeInfo* ti = FindSourceTypeInfo(pUnk, iid, true);
+                    if (ti)
+                    {
+                        TYPEATTR* attr = nullptr;
+                        bool bRaw = false;
+                        if (SUCCEEDED(ti->GetTypeAttr(&attr)) && attr)
+                        {
+                            bRaw = (attr->typekind == TKIND_INTERFACE);
+                            ti->ReleaseTypeAttr(attr);
+                        }
+                        if (bRaw)
+                        {
+                            *ppSrcTI = ti;
+                            pFound = pTmp;
+                            break;
+                        }
+                        ti->Release();
+                    }
+                }
+                pTmp->Release();
+            }
+            pEnum->Release();
+        }
+        pCpc->Release();
+        return pFound;
+    }
+
+    // 在类型库里按名字找接口（可选先在指定 coclass 的嵌套接口里找）
+    static ITypeInfo* ComFindInterfaceInLib(ITypeLib* pTL, const wstring& name,
+                                            const wstring& coclassName, TYPEKIND* pKind)
+    {
+        if (!pTL) return nullptr;
+        auto typeName = [](ITypeInfo* ti) -> wstring {
+            BSTR bn = nullptr;
+            wstring n;
+            if (SUCCEEDED(ti->GetDocumentation(-1, &bn, nullptr, nullptr, nullptr)) && bn)
+                n = bn;
+            if (bn) SysFreeString(bn);
+            return n;
+        };
+        // 1) 指定了 coclass：在它的实现接口（嵌套类型）里找
+        if (!coclassName.empty())
+        {
+            UINT n = pTL->GetTypeInfoCount();
+            for (UINT i = 0; i < n; i++)
+            {
+                ITypeInfo* ti = nullptr;
+                if (FAILED(pTL->GetTypeInfo(i, &ti)) || !ti) continue;
+                TYPEATTR* attr = nullptr;
+                bool isCoc = false;
+                if (SUCCEEDED(ti->GetTypeAttr(&attr)) && attr)
+                {
+                    isCoc = (attr->typekind == TKIND_COCLASS);
+                    ti->ReleaseTypeAttr(attr);
+                }
+                if (!isCoc || typeName(ti) != coclassName) { ti->Release(); continue; }
+                for (int k = 0; ; k++)
+                {
+                    HREFTYPE hr = 0;
+                    if (FAILED(ti->GetRefTypeOfImplType(k, &hr))) break;
+                    ITypeInfo* nested = nullptr;
+                    if (SUCCEEDED(ti->GetRefTypeInfo(hr, &nested)) && nested)
+                    {
+                        if (typeName(nested) == name)
+                        {
+                            ti->Release();
+                            if (pKind)
+                            {
+                                TYPEATTR* na = nullptr;
+                                *pKind = TKIND_INTERFACE;
+                                if (SUCCEEDED(nested->GetTypeAttr(&na)) && na)
+                                {
+                                    *pKind = na->typekind;
+                                    nested->ReleaseTypeAttr(na);
+                                }
+                            }
+                            return nested;
+                        }
+                        nested->Release();
+                    }
+                }
+                ti->Release();
+            }
+        }
+        // 2) 顶层类型
+        UINT n = pTL->GetTypeInfoCount();
+        for (UINT i = 0; i < n; i++)
+        {
+            ITypeInfo* ti = nullptr;
+            if (FAILED(pTL->GetTypeInfo(i, &ti)) || !ti) continue;
+            if (typeName(ti) == name)
+            {
+                if (pKind)
+                {
+                    TYPEATTR* attr = nullptr;
+                    *pKind = TKIND_INTERFACE;
+                    if (SUCCEEDED(ti->GetTypeAttr(&attr)) && attr)
+                    {
+                        *pKind = attr->typekind;
+                        ti->ReleaseTypeAttr(attr);
+                    }
+                }
+                return ti;
+            }
+            ti->Release();
+        }
+        return nullptr;
+    }
+
+    // ProgID / CLSID -> 类型库
+    static ITypeLib* ComLoadTypeLibForProgId(const wstring& progId)
+    {
+        if (progId.empty()) return nullptr;
+        CLSID clsid{};
+        bool bHasCls = false;
+        if (SUCCEEDED(CLSIDFromString(progId.c_str(), &clsid))) bHasCls = true;
+        else if (SUCCEEDED(CLSIDFromProgID(progId.c_str(), &clsid))) bHasCls = true;
+        if (!bHasCls) return nullptr;
+        wstring clsidStr = ComGuidString(clsid);
+        // 1) 注册表 CLSID\{...}\TypeLib -> TypeLib\{guid}\<版本>
+        HKEY hk = nullptr;
+        wstring tlKey = L"CLSID\\" + clsidStr + L"\\TypeLib";
+        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, tlKey.c_str(), 0, KEY_READ, &hk) == ERROR_SUCCESS)
+        {
+            wchar_t buf[64] = {};
+            DWORD cb = sizeof(buf);
+            DWORD type = 0;
+            LONG rc = RegQueryValueExW(hk, nullptr, nullptr, &type,
+                                       (LPBYTE)buf, &cb);
+            RegCloseKey(hk);
+            if (rc == ERROR_SUCCESS && type == REG_SZ)
+            {
+                IID tlid{};
+                if (SUCCEEDED(IIDFromString(buf, &tlid)))
+                {
+                    // 版本号在子键名里（1.0 / 2.0 …），也可能写在 Version 值里
+                    wstring vKey = L"TypeLib\\" + wstring(buf);
+                    HKEY hv = nullptr;
+                    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, vKey.c_str(), 0,
+                                      KEY_READ, &hv) == ERROR_SUCCESS)
+                    {
+                        for (DWORD idx = 0; ; idx++)
+                        {
+                            wchar_t sub[64] = {};
+                            DWORD scb = sizeof(sub) * sizeof(wchar_t);
+                            LONG nr = RegEnumKeyExW(hv, idx, sub, &scb,
+                                                   nullptr, nullptr, nullptr, nullptr);
+                            if (nr != ERROR_SUCCESS) break;
+                            int maj = 0, min = 0;
+                            if (swscanf(sub, L"%d.%d", &maj, &min) != 2) continue;
+                            ITypeLib* pTL = nullptr;
+                            if (SUCCEEDED(LoadRegTypeLib(tlid, (WORD)maj, (WORD)min,
+                                                         LOCALE_USER_DEFAULT, &pTL)))
+                            {
+                                RegCloseKey(hv);
+                                return pTL;
+                            }
+                        }
+                        // 没有版本子键：退回 Version 值
+                        wchar_t ver[32] = {};
+                        DWORD vt = 0, vc = sizeof(ver);
+                        if (RegQueryValueExW(hv, L"Version", nullptr, &vt,
+                                             (LPBYTE)ver, &vc) == ERROR_SUCCESS)
+                        {
+                            int maj = 0, min = 0;
+                            swscanf(ver, L"%d.%d", &maj, &min);
+                            ITypeLib* pTL = nullptr;
+                            if (SUCCEEDED(LoadRegTypeLib(tlid, (WORD)maj, (WORD)min,
+                                                         LOCALE_USER_DEFAULT, &pTL)))
+                            {
+                                RegCloseKey(hv);
+                                return pTL;
+                            }
+                        }
+                        RegCloseKey(hv);
+                    }
+                }
+            }
+        }
+        // 2) 组件路径里的内嵌类型库
+        wstring inKey = L"CLSID\\" + clsidStr + L"\\InprocServer32";
+        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, inKey.c_str(), 0, KEY_READ, &hk) == ERROR_SUCCESS)
+        {
+            wchar_t path[MAX_PATH] = {};
+            DWORD cb = sizeof(path);
+            DWORD type = 0;
+            LONG rc = RegQueryValueExW(hk, nullptr, nullptr, &type,
+                                       (LPBYTE)path, &cb);
+            RegCloseKey(hk);
+            if (rc == ERROR_SUCCESS)
+            {
+                ITypeLib* pTL = nullptr;
+                if (SUCCEEDED(LoadTypeLibEx(path, REGKIND_NONE, &pTL)))
+                    return pTL;
+            }
+        }
+        return nullptr;
+    }
+
+    // 按类型信息生成一个「实现了该接口」的 COM 对象
+    //
+    // 官方 com.ImplInterface 的语义：把 aardio 表变成一个实现了指定接口的
+    // COM 对象，方法按名字转发到表的同名成员。无论类型库里把它登记成
+    // 原始接口（TKIND_INTERFACE）还是 dispinterface（TKIND_DISPATCH），
+    // 都按 vtable 实现 —— 实测 Windows Media Player 的 _WMPOCXEvents
+    // 在类型库里是 dispinterface，但服务器是按接口 IID 查 sink 再直接调用
+    // vtable 槽位的。
+    static Value ComMakeSinkValue(ITypeInfo* pTI, TYPEKIND kind,
+                                  const Value& impl, wstring* pErr)
+    {
+        RawSinkObj* obj = BuildRawSink(pTI, impl, pErr);
+        if (!obj) return Value();
+        return WrapRawSink(obj);
+    }
+
     // 连接点登记表：挂在 COM 对象包装表的隐藏成员上，供 ReleaseConnection 找到
     // cookie -> (连接点, 接收器)
     static Table* ComConnStoreOf(const Value& obj, bool bCreate)
@@ -1145,7 +1968,9 @@ namespace
     // 找 COM 对象的默认事件连接点（只取 dispinterface 型）
     // 连接点只暴露源接口 IID，源接口的类型信息要从类型库里找
     // （源接口在类型库里注册为 dispinterface，只能枚举类型库）。
-    static ITypeInfo* FindSourceTypeInfo(IUnknown* pUnk, REFIID srcIid)
+    // bAllowRaw=true 时也接受原始（非 IDispatch）接口。
+    static ITypeInfo* FindSourceTypeInfo(IUnknown* pUnk, REFIID srcIid,
+                                         bool bAllowRaw = false)
     {
         if (!pUnk) return nullptr;
         IProvideClassInfo* pPCI = nullptr;
@@ -1170,7 +1995,7 @@ namespace
                         if (SUCCEEDED(ti->GetTypeAttr(&attr)) && attr)
                         {
                             match = (IsEqualGUID(attr->guid, srcIid) &&
-                                     attr->typekind == TKIND_DISPATCH);
+                                     (bAllowRaw || attr->typekind == TKIND_DISPATCH));
                             ti->ReleaseTypeAttr(attr);
                         }
                         if (match) result = ti;
@@ -3231,6 +4056,84 @@ have_dispid:
     };
 } // namespace
 
+// ---- COM 调试追踪（写文件，避免控制台重定向吞掉输出） ----
+    void ComRawTrace(const wchar_t* fmt, ...)
+    {
+        static bool s_bInit = false;
+        if (!s_bInit)
+        {
+            s_bInit = true;
+            wchar_t sz[64] = {};
+            DWORD n = GetEnvironmentVariableW(L"NODIO_COM_TRACE", sz, 64);
+            wchar_t msg[256];
+            swprintf_s(msg, 256, L"[comraw] init env NODIO_COM_TRACE=%ls (n=%lu)\n",
+                       sz, (unsigned long)n);
+            FILE* f0 = nullptr;
+            _wfopen_s(&f0, L"C:\\Users\\QQ\\AppData\\Local\\Temp\\avtest\\comraw.log", L"a, ccs=UTF-8");
+            if (f0) { fputws(msg, f0); fclose(f0); }
+        }
+        if (!EnvFlag(L"NODIO_COM_TRACE")) return;
+        wchar_t buf[1024];
+        va_list ap;
+        va_start(ap, fmt);
+        vswprintf(buf, 1024, fmt, ap);
+        va_end(ap);
+        FILE* f = nullptr;
+        _wfopen_s(&f, L"C:\\Users\\QQ\\AppData\\Local\\Temp\\avtest\\comraw.log", L"a, ccs=UTF-8");
+        if (f) { fputws(buf, f); fclose(f); }
+    }
+
+// ---- COM 回调参数转换（engine/comsig.h 的契约，ffi.cpp 的跳板调用） ----
+//
+// 原始接口的方法参数来自类型库，比通用 FFI 的 int/pointer 更丰富：
+// BSTR 要变成 aardio 字符串，VARIANT* 要变成 aardio 值，
+// 接口指针要变成 COM 对象（官方 com.ImplInterface 的事件处理函数
+// 拿到的是 COM 对象，官方文档例子里直接写 item.sourceURL）。
+
+    Value ComArgFromBstr(void* p)
+    {
+        BSTR b = (BSTR)p;
+        if (!b) return Value();
+        return Value::Str_(wstring(b, SysStringLen(b)));
+    }
+
+    Value ComArgFromDispatch(void* p)
+    {
+        if (!p) return Value();
+        // 包成 COM 对象（官方 com.ImplInterface 的事件处理函数拿到的是
+        // COM 对象，官方文档例子里直接写 item.sourceURL）
+        return WrapDispatch(reinterpret_cast<IDispatch*>(p));
+    }
+
+    Value ComArgFromUnknown(void* p)
+    {
+        // 借用指针：调用方（COM 服务器）拥有它的生命周期
+        if (!p) return Value();
+        return Value::Pointer_(p);
+    }
+
+    Value ComArgFromVariant(void* p)
+    {
+        if (!p) return Value();
+        VARIANT* v = (VARIANT*)p;
+        wstring err;
+        Value r = VariantToValue(*v, &err);
+        return r;
+    }
+
+    Value ComArgFromIface(void* p)
+    {
+        if (!p) return Value();
+        // 接口指针：能取到 IDispatch 就包成 COM 对象，否则给原始指针
+        IDispatch* pd = nullptr;
+        if (SUCCEEDED(reinterpret_cast<IUnknown*>(p)->QueryInterface(
+                          IID_IDispatch, (void**)&pd)) && pd)
+        {
+            return WrapDispatch(pd);
+        }
+        return Value::Pointer_(p);
+    }
+
 // ---- RegisterComKernel ----
 // builds global.com with the kernel members the official library needs
 void Interp::RegisterComKernel(Env& globalsEnv)
@@ -3399,27 +4302,118 @@ void Interp::RegisterComKernel(Env& globalsEnv)
             return Value();
         };
         if (a.size() < 2) return fail(L"com.Connect: 缺少参数");
+        ComReapRawSinks();
         IUnknown* pUnk = ComUnknownPtr(a[0]);
         if (!pUnk) return fail(L"com.Connect: 参数不是 COM 对象");
-        ITypeInfo* pSrcTI = nullptr;
-        IConnectionPoint* pCp = FindEventConnectionPoint(pUnk, &pSrcTI);
-        if (!pCp)
-            return fail(L"com.Connect: 对象没有可用的 dispinterface 事件连接点"
-                       L"（原始接口的连接点本版本暂不支持）");
+
         // 事件接收器：已是 COM 对象（com.ImplInterface 的结果）就直接用，
         // 否则把 aardio 事件表包装成事件接收器
         IUnknown* pGiven = ComUnknownPtr(a[1]);
-        NodioEventSink* pOwn = nullptr;
+        IConnectionPoint* pCp = nullptr;
+        ITypeInfo* pSrcTI = nullptr;
         IUnknown* pSink = nullptr;
-        if (pGiven)
+        NodioEventSink* pOwn = nullptr;
+        RawSinkObj* pRawOwn = nullptr;
+
+        if (IsRawSinkValue(a[1]))
         {
+            // 已经实现了指定原始接口的接收器：按它的 IID 找连接点
+            IID iid = RawSinkIid(a[1]);
+            IConnectionPointContainer* pCpc = nullptr;
+            if (SUCCEEDED(pUnk->QueryInterface(IID_IConnectionPointContainer,
+                                               (void**)&pCpc)) && pCpc)
+            {
+                pCpc->FindConnectionPoint(iid, &pCp);
+                pCpc->Release();
+            }
+            if (!pCp)
+                return fail(L"com.Connect: 对象没有匹配该接口的事件连接点");
             pSink = pGiven;
             pSink->AddRef();
+            ComRawTrace(L"[comraw] Advise raw sink=%p vtbl=%p iid=%08X\n",
+                        (void*)pSink, (void*)((RawSinkObj*)pSink)->vtbl,
+                        (unsigned long)iid.Data1);
         }
         else
         {
-            pOwn = new NodioEventSink(a[1], pSrcTI);
-            pSink = pOwn;
+            // 1) dispinterface 连接点（HTML / ActiveX / OCX 的默认事件接口）
+            pCp = FindEventConnectionPoint(pUnk, &pSrcTI);
+            if (pCp)
+            {
+                // 源接口 IID 不是 IID_IDispatch 时，服务器按**源接口 IID**
+                // 查 sink（实测 Windows Media Player 的 _WMPOCXEvents
+                // 连接点就是这样），纯 IDispatch 接收器会被拒绝
+                // （0x80040202 EVENT_E_ALL_SUBSCRIBERS_FAILED）。
+                // 这种源接口要用原始 vtable 接收器（QI 同时回答
+                // 源接口 IID 与 IID_IDispatch，事件由 IDispatch::Invoke 派发）。
+                IID srcIid{};
+                bool bRawSrc = SUCCEEDED(pCp->GetConnectionInterface(&srcIid)) &&
+                               !IsEqualGUID(srcIid, IID_IDispatch);
+                if (pGiven)
+                {
+                    pSink = pGiven;
+                    pSink->AddRef();
+                }
+                else if (bRawSrc)
+                {
+                    wstring err;
+                    pRawOwn = BuildRawSink(pSrcTI, a[1], &err);
+                    if (!pRawOwn)
+                    {
+                        pSrcTI->Release();
+                        pCp->Release();
+                        return fail(L"com.Connect: " + err);
+                    }
+                    pSink = reinterpret_cast<IUnknown*>(pRawOwn);
+                }
+                else
+                {
+                    pOwn = new NodioEventSink(a[1], pSrcTI);
+                    pSink = pOwn;
+                }
+            }
+            else
+            {
+                // 2) 原始（非 IDispatch）接口的连接点：
+                //    按接收端接口的类型信息动态生成 vtable
+                ITypeInfo* pSinkTI = nullptr;
+                pCp = FindRawConnectionPoint(pUnk, &pSinkTI);
+                if (!pCp)
+                    return fail(L"com.Connect: 对象没有可用的事件连接点");
+                // 已经传入了一个 COM 对象：看它是否实现了接收端接口
+                bool bUseGiven = false;
+                if (pGiven)
+                {
+                    IID sinkIid{};
+                    TYPEATTR* ta = nullptr;
+                    if (SUCCEEDED(pSinkTI->GetTypeAttr(&ta)) && ta)
+                    {
+                        sinkIid = ta->guid;
+                        pSinkTI->ReleaseTypeAttr(ta);
+                    }
+                    void* pv = nullptr;
+                    if (SUCCEEDED(pGiven->QueryInterface(sinkIid, &pv)) && pv)
+                    {
+                        reinterpret_cast<IUnknown*>(pv)->Release();
+                        pSink = pGiven;
+                        pSink->AddRef();
+                        bUseGiven = true;
+                    }
+                }
+                if (!bUseGiven)
+                {
+                    wstring err;
+                    pRawOwn = BuildRawSink(pSinkTI, a[1], &err);
+                    if (!pRawOwn)
+                    {
+                        pSinkTI->Release();
+                        pCp->Release();
+                        return fail(L"com.Connect: " + err);
+                    }
+                    pSink = reinterpret_cast<IUnknown*>(pRawOwn);
+                }
+                pSinkTI->Release();
+            }
         }
         if (pSrcTI) pSrcTI->Release();
         DWORD cookie = 0;
@@ -4096,7 +5090,43 @@ void Interp::RegisterComKernel(Env& globalsEnv)
     });
 
     // com.ImplInterface(implObject) -> IDispatch COM wrapper table
+    // com.ImplInterface(implTable, progID, interfaceName) -> 实现指定接口的 COM 对象
     com->map[L"ImplInterface"] = NF([](vector<Value>& a) -> Value {
+        ComRawTrace(L"[comraw] ImplInterface argc=%d\n", (int)a.size());
+        if (a.size() >= 3)
+        {
+            // 官方契约（D:\aardio\lib\builtin\com.aardio:206）：
+            //   com.ImplInterface(implTable, progID, interfaceName)
+            //   例：com.ImplInterface(ocxEvents2,"WMPlayer.OCX.7","_WMPOCXEvents")
+            Interp* it = g_interpCurrent;
+            wstring prog = BStr(a[1]);
+            wstring ifname = BStr(a[2]);
+            ITypeLib* pTL = ComLoadTypeLibForProgId(prog);
+            if (!pTL)
+            {
+                if (it) *it->err = L"运行错误: com.ImplInterface: 找不到 " + prog +
+                                   L" 的类型库";
+                return Value();
+            }
+            TYPEKIND kind = TKIND_INTERFACE;
+            ITypeInfo* ti = ComFindInterfaceInLib(pTL, ifname, wstring(), &kind);
+            pTL->Release();
+            if (!ti)
+            {
+                if (it) *it->err = L"运行错误: com.ImplInterface: 类型库里没有接口 " +
+                                   ifname;
+                return Value();
+            }
+            wstring err;
+            Value ret = ComMakeSinkValue(ti, kind, a[0], &err);
+            ti->Release();
+            if (ret.t == Value::Null)
+            {
+                if (it) *it->err = L"运行错误: com.ImplInterface: " + err;
+                return Value();
+            }
+            return ret;
+        }
         if (a.empty()) return Value();
         const Value& v = a[0];
         if (v.t == Value::TableT && v.tab)
@@ -4110,6 +5140,62 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         else
             pDisp = new NodioTableDispatch(v);
         return WrapDispatch(pDisp);
+    });
+
+    // com.ImplInterfaceFromTypelib(implTable, typelibPath, interfaceName, coclassName)
+    // 官方契约（D:\aardio\lib\builtin\com.aardio:207）：用类型库实现 com 接口。
+    com->map[L"ImplInterfaceFromTypelib"] = NF([](vector<Value>& a) -> Value {
+        Interp* it = g_interpCurrent;
+        if (a.size() < 3)
+        {
+            if (it) *it->err = L"运行错误: com.ImplInterfaceFromTypelib: 缺少参数";
+            return Value();
+        }
+        wstring tlbPath = BStr(a[1]);
+        wstring ifname = BStr(a[2]);
+        wstring coclass = (a.size() > 3) ? BStr(a[3]) : wstring();
+        ITypeLib* pTL = nullptr;
+        HRESULT hr = LoadTypeLib(tlbPath.c_str(), &pTL);
+        if (FAILED(hr) || !pTL)
+        {
+            if (!pTL)
+            {
+                // 内嵌类型库的组件（OCX / DLL）
+                LoadTypeLibEx(tlbPath.c_str(), REGKIND_NONE, &pTL);
+            }
+            if (!pTL)
+            {
+                CLSID clsid{};
+                if (SUCCEEDED(CLSIDFromString(tlbPath.c_str(), &clsid)))
+                    LoadRegTypeLib(clsid, 1, 0, LOCALE_USER_DEFAULT, &pTL);
+            }
+            if (!pTL)
+                pTL = ComLoadTypeLibForProgId(tlbPath);
+        }
+        if (!pTL)
+        {
+            if (it) *it->err = L"运行错误: com.ImplInterfaceFromTypelib: 无法加载类型库 " +
+                               tlbPath;
+            return Value();
+        }
+        TYPEKIND kind = TKIND_INTERFACE;
+        ITypeInfo* ti = ComFindInterfaceInLib(pTL, ifname, coclass, &kind);
+        pTL->Release();
+        if (!ti)
+        {
+            if (it) *it->err =
+                L"运行错误: com.ImplInterfaceFromTypelib: 类型库里没有接口 " + ifname;
+            return Value();
+        }
+        wstring err;
+        Value ret = ComMakeSinkValue(ti, kind, a[0], &err);
+        ti->Release();
+        if (ret.t == Value::Null)
+        {
+            if (it) *it->err = L"运行错误: com.ImplInterfaceFromTypelib: " + err;
+            return Value();
+        }
+        return ret;
     });
 
     // com.DoObjectVerb(OLE对象, verb) —— 官方声明（lib/builtin/com.aardio）：
