@@ -43,6 +43,38 @@ namespace NodioVM
         return (size_t)-1;
     }
 
+    // Applies the section protections a normal loader would use: code
+    // sections become read+execute, writable data sections stay writable,
+    // everything else becomes read-only. Called after the relocations and
+    // the import address table have been patched.
+    static void MemDllSealSections(void* pBase, const IMAGE_NT_HEADERS* nt)
+    {
+        DWORD oldProtect = 0;
+        // the headers are never written again
+        VirtualProtect(pBase, nt->OptionalHeader.SizeOfHeaders,
+            PAGE_READONLY, &oldProtect);
+
+        const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        {
+            DWORD cb = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize
+                                               : sec[i].SizeOfRawData;
+            if (!cb) continue;
+            DWORD prot = PAGE_READONLY;
+            if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            {
+                prot = (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)
+                    ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+            }
+            else if (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)
+            {
+                prot = PAGE_READWRITE;
+            }
+            VirtualProtect((char*)pBase + sec[i].VirtualAddress, cb,
+                prot, &oldProtect);
+        }
+    }
+
     // Maps a PE image held in memory. Returns the base address or null.
     static void* MemDllMap(const std::vector<char>& buf, MemDll* pOut)
     {
@@ -66,12 +98,19 @@ namespace NodioVM
         if (!cbImage) return nullptr;
 
         // Try the preferred base first so relocations are usually a no-op.
+        //
+        // The image is mapped writable: relocations and the import address
+        // table have to be patched before any of its code can run. The
+        // sections are demoted to their real protections by
+        // MemDllSealSections once the patching is done, so the image never
+        // stays writable+executable as a whole — that is both sloppy and the
+        // behaviour antivirus engines recognise as "in-memory PE loading".
         void* pBase = VirtualAlloc((void*)nt->OptionalHeader.ImageBase,
                                    cbImage, MEM_RESERVE | MEM_COMMIT,
-                                   PAGE_EXECUTE_READWRITE);
+                                   PAGE_READWRITE);
         if (!pBase)
             pBase = VirtualAlloc(nullptr, cbImage, MEM_RESERVE | MEM_COMMIT,
-                                 PAGE_EXECUTE_READWRITE);
+                                 PAGE_READWRITE);
         if (!pBase) return nullptr;
 
         // headers
@@ -182,6 +221,10 @@ namespace NodioVM
                 }
             }
         }
+
+        // the image is fully patched — give every section its real
+        // protection before any of its code can run
+        MemDllSealSections(pBase, nt);
 
         pOut->pImage = pBase;
         pOut->cbImage = cbImage;

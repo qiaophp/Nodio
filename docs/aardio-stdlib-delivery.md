@@ -329,3 +329,87 @@ pwsh -NoProfile -File D:\Nodio\tests\builtin_api_check.ps1 -Exe D:\Nodio\build-x
 x64 / x86 **两套构建均全绿**；既有 7 套回归（`aardio_run_check` /
 `aardio_chunk_check` / `run_vm_tests` 90 passed / `run_stdlib_tests` /
 `import_contract_check` / `sysapi_check` / `s2_error_location_check`）全绿。
+
+## 11. 第二十四轮（前半）：杀软误报的代码层根治
+
+### 11.1 现象
+
+2026-10-21 起，本机火绒把 **32 位** `nodio.exe` 直接隔离，报 `HEUR:Backdoor/Farfli.e`；
+同一份源码编出的 **64 位** `nodio.exe` 从未被拦。x86 产物因此反复消失，
+`tests\run_editor_tests.ps1` 在加载 exe 时被中断，x86 回归链断在同一点。
+
+火绒自己的日志（`C:\ProgramData\Huorong\Sysdiag\log.db` → `HrLogV3_60`）
+给出了 5 条 `filemon` 记录，路径全部是 `D:\Nodio\build-x86\Release\nodio.exe`，
+父进程是跑 x86 编辑器回归的 `pwsh.exe`。5 条记录的 `hashsig` 完全相同
+（`0xbc090e8b,0x96b16b66b2186c9a`）而 SHA1 各不相同 —— 说明命中的是
+**规则特征集**，不是某个已知样本的哈希，所以改掉特征就能改判。
+
+另有一条独立告警：Defender 的 `VirTool:Win32/DefenderTamperingRestore`
+（12:36:40），`Path` 是注册表项
+`HKLM\...\Real-Time Protection\DisableBehaviorMonitoring`，检测源为系统、用户为
+`NT AUTHORITY\SYSTEM`、进程未知。它针对的是「有人改了 Defender 实时保护开关」，
+与 nodio 无关，写入者从日志查不到（**未知**）。
+
+### 11.2 二分定位
+
+用「独立 Win32 构建目录 + 跑一次看隔离区文件数是否增加」建立了可复现的判定回路，
+逐项开关嫌疑能力（每次只动一处，重新编译 x86，跑一次，读火绒隔离区）：
+
+| 配置 | 判定 |
+|---|---|
+| trampoline 关 + memdll 关 + 异常过滤器 关 | CLEAN |
+| trampoline 关 + memdll 开 + 异常过滤器 关 | CLEAN |
+| trampoline **开** + memdll 开 + 异常过滤器 关（RWX 内存） | **QUARANTINED** |
+| trampoline **开** + memdll 开 + 异常过滤器 关（改 RW） | CLEAN |
+| trampoline **开** + memdll 开 + 异常过滤器 **开**（RW→RX 封页） | **QUARANTINED** |
+
+结论：**命中需要两个特征同时存在**
+
+1. **可写且可执行的内存**（FFI 跳板池原本用 `PAGE_EXECUTE_READWRITE` 申请，
+   运行时在里面生成原生回调机器码）；
+2. **32 位未处理异常过滤器转储原始寄存器**
+   （`EIP/EAX/ECX/EDX/EBX/ESP/EBP/ESI/EDI`）—— 这正是 SEH 反调试/反分析的教科书形态。
+
+单改其中一项都不够：只有把两者一起去掉才干净。x64 一直不被拦，
+是因为 64 位没有 `ep->ContextRecord` 的寄存器转储分支。
+
+顺带排除的方向（都做了实测，不是推测）：
+
+- 最小复现程序（`VirtualAlloc` RWX + 写 x86 跳板模板 + 调用，x86/x64 各 4 个变体）
+  **全部 CLEAN** —— 跳板模板本身不是触发条件；
+- PE 结构对比：两架构的节表、导入表、熵分布、DEP/ASLR 标志均无实质差异；
+- 全仓字符串差分：x86 独有字符串 1932 条，逐条筛过，**无 C2/URL/下载器/注入器痕迹**；
+- 全仓搜索：无 PEB 访问、无 `IsDebuggerPresent`、无 `rdtsc`/`cpuid` 等反调试特征。
+
+### 11.3 修复（能力不减，只改形态）
+
+- `engine/ffi.cpp`：跳板页改为 **先可写申请 → 写入桩代码 → 降权为
+  `PAGE_EXECUTE_READ`**。页面从不以「可写 + 可执行」形态存在。
+  代价是每个回调独占一页（保护属性是最小页粒度，共享页无法再写），
+  即回到池化改造之前的内存占用水平。
+- `engine/ffi.cpp`：`EmitX64CallStub` 同样改为 RW → RX。
+- `engine/memdll.cpp`：内存 PE 映射改为 **先可写申请 → 打完重定位和 IAT → 按节降权**
+  （代码节 RX、数据节 RW、其余 R），不再整块 RWX。
+- `engine/entry.cpp`：32 位崩溃过滤器不再转储整组原始寄存器，
+  只保留 `EIP/ESP/EBP`；异常码、出错地址、模块内偏移、访问违例信息都还在。
+
+### 11.4 结果与残留
+
+- x64 / x86 两套构建重编后，**火绒判定均为 CLEAN**（隔离区无新增记录）；
+- 9 套既有回归（`aardio_run_check` / `aardio_chunk_check` / `run_vm_tests` 90 passed /
+  `run_stdlib_tests` / `import_contract_check` / `sysapi_check` /
+  `s2_error_location_check` / `builtin_api_check` / `run_publish_tests`）
+  在两套构建上**全绿**，`run_publish_tests` 覆盖了内存 DLL 加载路径；
+- 残留：`memdll` 的「可执行且可写」节（`IMAGE_SCN_MEM_EXECUTE|MEM_WRITE`）
+  仍需 `PAGE_EXECUTE_READWRITE`，这是该节自身可自修改所必需，
+  属已知取舍，不影响当前判定。
+
+### 11.5 回归锁
+
+新增 `tests/av_heuristic_check.ps1`：扫描 `engine/*.{cpp,h}`，断言
+
+1. 任何 `VirtualAlloc` 调用都**不**申请 `PAGE_EXECUTE_READWRITE`；
+2. `engine/entry.cpp` 不再出现整组 x86 寄存器转储格式串。
+
+脚本对两处都做了反向验证（改回旧写法即报 FAIL）。这是**源码级**断言，
+不依赖任何杀软，因此可以在任何机器上作为 CI 闸门。

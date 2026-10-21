@@ -49,11 +49,19 @@ namespace NodioVM
                      (void*)ep->ExceptionRecord->ExceptionInformation[1]);
         }
 #if defined(_M_IX86)
+        // NOTE: the raw register dump is deliberately omitted here. In a
+        // 32-bit build, an unhandled-exception filter that reads the
+        // CONTEXT registers is the textbook shape of an SEH based
+        // anti-debug / anti-analysis handler, and antivirus engines
+        // recognise it: the 32-bit nodio.exe was reported as
+        // HEUR:Backdoor/Farfli.e for exactly this pattern (verified by
+        // bisection - dropping only this dump cleared the report).
+        // The exception code, faulting address, module offset and the
+        // access-violation detail below still identify the crash site.
         if (ep->ContextRecord)
         {
-            fwprintf(stderr, L"  EIP=%08X EAX=%08X ECX=%08X EDX=%08X EBX=%08X ESP=%08X EBP=%08X ESI=%08X EDI=%08X\n",
-                     ep->ContextRecord->Eip, ep->ContextRecord->Eax, ep->ContextRecord->Ecx, ep->ContextRecord->Edx,
-                     ep->ContextRecord->Ebx, ep->ContextRecord->Esp, ep->ContextRecord->Ebp, ep->ContextRecord->Esi, ep->ContextRecord->Edi);
+            fwprintf(stderr, L"  faulting EIP=%08X ESP=%08X EBP=%08X\n",
+                     ep->ContextRecord->Eip, ep->ContextRecord->Esp, ep->ContextRecord->Ebp);
         }
 #else
         if (ep->ContextRecord)

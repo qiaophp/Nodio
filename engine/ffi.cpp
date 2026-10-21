@@ -190,40 +190,55 @@ namespace NodioVM
     }
 #endif
 
-    // ---- trampoline memory pool ----------------------------------------
-    // Every native callback needs a small executable stub. Giving each one
-    // its own VirtualAlloc page would burn a full 4 KB page per callback,
-    // and the official library creates one callback per window/hook/object
-    // (win.form installs a window procedure, key.hook a low level hook,
-    // win.subclass another one). The pool carves the stubs out of 64 KB
-    // pages instead, so a callback costs 256 bytes of address space.
-    // Released slots are NOT reused: native code that still holds the
-    // function pointer may call it after the collector released the
-    // callback, and a reused slot would then jump into an unrelated
-    // callback. The slot keeps a neutralized "return 0" stub instead.
+    // ---- trampoline memory --------------------------------------------
+    // Every native callback needs a small executable stub. The stub is
+    // generated at runtime, so its page has to be writable first and
+    // executable afterwards.
+    //
+    // Asking for a writable+executable page (PAGE_EXECUTE_READWRITE) is
+    // what made antivirus engines flag the binary: "writable and
+    // executable memory" plus "code emitted at runtime" is the canonical
+    // signature of a code generator, and raw.tostdcall is exactly that.
+    // The 32-bit build of nodio.exe was reported as HEUR:Backdoor/Farfli.e
+    // for this reason alone (verified by bisection: swapping only the
+    // protection flag cleared the report, and re-enabling only the
+    // trampoline brought it back).
+    //
+    // Writing the stub and then demoting the page to PAGE_EXECUTE_READ
+    // keeps the identical capability while the page is never writable and
+    // executable at the same time.
+    //
+    // One page per callback: protection is a page-granular property, so
+    // sealing a stub also seals every other stub sharing its page, and a
+    // sealed page can no longer be written. Packing many stubs into one
+    // page would force that page to stay writable+executable.
     namespace
     {
-        const size_t kTrampSlot = 256;    // x64 stub is 160 bytes
-        const size_t kTrampPage = 64 * 1024;
+        const size_t kTrampSlot = 4096;   // one page per callback
         std::vector<uint8_t*> g_trampPages;
-        uint8_t* g_trampCur = nullptr;
-        size_t g_trampLeft = 0;
 
         uint8_t* TrampAlloc()
         {
-            if (g_trampLeft < kTrampSlot)
-            {
-                uint8_t* page = (uint8_t*)VirtualAlloc(nullptr, kTrampPage,
-                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-                if (!page) return nullptr;
-                g_trampPages.push_back(page);
-                g_trampCur = page;
-                g_trampLeft = kTrampPage;
-            }
-            uint8_t* p = g_trampCur;
-            g_trampCur += kTrampSlot;
-            g_trampLeft -= kTrampSlot;
-            return p;
+            uint8_t* page = (uint8_t*)VirtualAlloc(nullptr, kTrampSlot,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!page) return nullptr;
+            g_trampPages.push_back(page);
+            return page;
+        }
+
+        // Demote a written stub to read+execute.
+        void TrampSeal(void* p)
+        {
+            DWORD oldProtect = 0;
+            VirtualProtect(p, kTrampSlot, PAGE_EXECUTE_READ, &oldProtect);
+        }
+
+        // Re-open a sealed stub so it can be rewritten (used when a
+        // callback is neutralised on release).
+        void TrampUnseal(void* p)
+        {
+            DWORD oldProtect = 0;
+            VirtualProtect(p, kTrampSlot, PAGE_READWRITE, &oldProtect);
         }
     }
 
@@ -245,6 +260,9 @@ namespace NodioVM
         // return 0 instead of entering a released context.
         if (ctx->code)
         {
+            // the page was sealed read+execute — re-open it for the
+            // neutralized stub, then seal it again
+            TrampUnseal(ctx->code);
             unsigned char* c = (unsigned char*)ctx->code;
             size_t n = 0;
             c[n++] = 0x31; c[n++] = 0xC0;          // xor eax,eax
@@ -263,6 +281,7 @@ namespace NodioVM
             c[n++] = 0xC3;                       // ret (caller cleans)
 #endif
             FlushInstructionCache(GetCurrentProcess(), ctx->code, n);
+            TrampSeal(ctx->code);
             ctx->code = nullptr;
         }
     }
@@ -302,6 +321,7 @@ namespace NodioVM
         if (!ctx->code) return;
         memcpy(ctx->code, code, n);
         FlushInstructionCache(GetCurrentProcess(), ctx->code, n);
+        TrampSeal(ctx->code);
 #else
         // Microsoft x64 trampoline — entered with:
         //   [rsp]   = return address (rsp_entry ≡ 8 mod 16)
@@ -351,6 +371,7 @@ namespace NodioVM
         ctx->codeSize = n;
         ctx->code = c;
         FlushInstructionCache(GetCurrentProcess(), c, n);
+        TrampSeal(c);
 #endif
     }
     bool ParseApiSig(const wstring& sig, ApiSig* out)
@@ -446,9 +467,11 @@ namespace NodioVM
 
     void* EmitX64CallStub(const ApiSig& sig)
     {
+        // writable first, executable once the stub is written — never
+        // writable+executable (see the note on trampoline memory above)
         unsigned char* c = (unsigned char*)VirtualAlloc(
             nullptr, 512, MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE);
+            PAGE_READWRITE);
         int n = 0;
         auto put = [&c, &n](const unsigned char* p, int len)
         { memcpy(c + n, p, (size_t)len); n += len; };
@@ -544,6 +567,8 @@ namespace NodioVM
             0xC3 };                                   // ret
         put(sEp, (int)sizeof(sEp));
         FlushInstructionCache(GetCurrentProcess(), c, n);
+        DWORD oldProtect = 0;
+        VirtualProtect(c, 512, PAGE_EXECUTE_READ, &oldProtect);
         return c;
     }
 
