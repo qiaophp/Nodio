@@ -8,6 +8,11 @@ title: aardio 标准库「全量可用」交付说明
 > 非 OK 项里**属于 Nodio 自身缺陷的是 0 项** —— 剩余 70 / 36 项全部落在
 > **物理边界 / 官方契约 / 官方库自身缺陷 / 环境限制** 四类。
 > 官方唯一样本 `lib/ide/aifix.aardio`（`=aardio` 预编译块）**已被真正执行跑完**。
+>
+> ⚠️ **口径提醒**：上面这句只覆盖 **import 层面**（模块能不能导进来）。
+> **函数 API 层面**另有 **17 个真缺口**（官方内建库 156 个成员里缺 15 个 +
+> 2 个未声明但被官方库调用的引擎原生），其中 **8 个有官方库实际调用点** ——
+> 详见 **§8**。
 
 本文是**验收口径**的落点；逐条取证见 `docs/aardio-bytecode.md`（§7 语义、§7.5.10
 调用约定定案）与 `docs/capability-gap.md`（§3 现状、§7 归因）。
@@ -115,8 +120,83 @@ x64 构建 = 除 32 位 DLL 那 34 项之外的全覆盖。
 * **官方库缺依赖 / `.api` 导出不可调用 / 断言失败** —— 官方自己也不通。
 * **`win.#DEFINE`** —— 伪模块名，官方文件名带 `#`。
 
-## 8. 变更记录
+## 8. 内建 API 层面的缺口（第二十二轮实测）
 
+> ⚠️ **§2 的「缺口归零」只覆盖 import 层面**（969 个模块能不能导进来）。
+> 下面这一节量的是**另一个维度**：官方**内建库**（8 个命名空间）的**函数级 API**
+> 是否在 Nodio 里存在。结论：**import 层面 0 缺口；函数层面还有 17 个真缺口。**
+
+### 8.1 量法
+
+1. 从官方 `D:\aardio\lib\builtin\*.aardio` 抽出**成员声明**（官方把引擎原生函数
+   也用 `name( = 文档` / `name(.(签名) = 文档` 写在内建文件里）→ 官方内建命名空间
+   成员清单 **156 个**（已剔除 `struct.*` 的 RECT 方法、`_get`/`_set` 元方法、
+   `if`/`elseif` 关键字等正则误匹配）；
+2. 运行期枚举 Nodio 的 8 个内建命名空间实际成员 → 逐项比对；
+3. 对缺口再回官方库源码统计**实际调用点**（`..com.NewObject` 这类带 `..` 前缀的
+   写法要一并计入），得出影响面。
+
+### 8.2 覆盖率
+
+| 命名空间 | 官方成员 | Nodio 覆盖 | 缺 |
+|---|---:|---:|---:|
+| `com` | 29 | 18 | 11 |
+| `io` | 13 | 13 | 0 |
+| `math` | 12 | 10 | 2 |
+| `raw` | 15 | 15 | 0 |
+| `string` | 28 | 27 | 1 |
+| `table` | 44 | 43 | 1 |
+| `thread` | 15 | 15 | 0 |
+| **合计** | **156** | **141** | **15** |
+
+（另有 2 个官方引擎原生、未写进内建文件但官方库代码实际调用：
+`io.libpath` / `io.lines` → **真缺口共 17 个**。）
+
+### 8.3 缺口清单与影响面
+
+**有官方库实际调用点（8 个）—— 这些会真的跑挂：**
+
+| 官方 API | 调用点 | 官方调用方 |
+|---|---:|---|
+| `io.libpath` | 10 | `autos.skills.*`、`autos.tools.handlers`、`py2/py3` 构建 |
+| `io.lines` | 6 | `debug`、`fsys.cookies`、`fsys.update.app` |
+| `com.Connect` | 4 | `com.wmPlayer`、`com.wmi`、`web.form` |
+| `com.GetPointer` | 2 | `dotNet.appDomain`、`web.form` |
+| `com.ReleaseConnection` | 2 | `win.ui.ctrl.atlax`、`win.ui.ctrl.metaProperty` |
+| `string.splitLiteral` | 2 | `builtin.string`、`fsys.openXml.docx.editor` |
+| `com.NewObject` | 1 | `com.activeX` |
+| `com.NewControl` | 1 | `com.activeX` |
+
+**零调用点（9 个）—— 只影响用户按官方风格写的代码：**
+`com.AddConnection`、`com.DoObjectVerb`、`com.ImplInterfaceFromTypelib`、
+`com.IsIUnknown`、`com.IsMember`、`com.SafeArray`、`math.fmod`、`math.lerp`、
+`table.setAttr`。
+
+### 8.4 另有一类「命名不兼容」（不是缺，是改了名）
+
+Nodio 的 COM 宿主（`engine/com.cpp`）**函数名与官方不同**，
+官方库按官方名调用会报「尝试调用非函数值」：
+
+| 官方名 | Nodio 现有 | 备注 |
+|---|---|---|
+| `com.NewObject(tab, progId)` | `com.CreateObject(progId)` | **签名也不同**：官方第 1 参是接收结果的表，不能直接加别名 |
+| `com.SafeArray` | `com.SafeArrayV` | |
+| `com.ReleaseConnection` | `com.Release` | |
+
+### 8.5 复现
+
+```powershell
+# 官方成员清单
+python <抽取脚本> D:\aardio\lib\builtin\*.aardio
+# Nodio 实际成员（运行期枚举 8 个命名空间）
+D:\Nodio\build-x64\Release\nodio.exe <枚举脚本>
+```
+
+## 9. 变更记录
+
+* **第二十二轮**：把「全量可用」的验收从 **import 层面**扩到 **函数 API 层面**，
+  量出官方内建库 **17 个真缺口**（其中 8 个有官方库实际调用点）与 3 处
+  **命名不兼容**（`com.NewObject` / `com.SafeArray` / `com.ReleaseConnection`）。
 * **第二十一轮**：`=aardio` 官方预编译块可真正执行（owner 调用约定 + 多返回值 +
   `0x2F` 返回槽与空结果跳过 `0x22`），标准库 Nodio 侧自有缺口**归零**。
   语义取证 `docs/aardio-bytecode.md` §7.5.10。
