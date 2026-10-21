@@ -746,6 +746,16 @@ Fixed & closed in recent sessions:
      `HIWORD=4660`；产物名**就用 `app.exe`**（曾崩的名字）。修前 FAIL（3 项 `<missing>`），
      修后 PASS，x64 / x86 双架构全绿。
    详见 `docs/capability-gap.md` §1.25 / §1.26、`docs/aardio-stdlib-delivery.md` §14
+10. [x] **语句级性能 —— 每条语句一次 `GetEnvironmentVariableW`（3~5 倍提速）**（2026-10-21 第二十七轮）—
+    x64 实测：200 万次迭代的空循环 89 ns/次，而 `s=s;` 却要 1838 ns/次 → 成本不在算术而在「执行一条语句」本身。
+    cdb 采样栈命中 `ntdll!RtlQueryEnvironmentVariable` → `KERNELBASE!GetEnvironmentVariableW` → `nodio+0x596b9`（`EnvFlag()`）—— 诊断开关 `EnvFlag(L"NODIO_GC_TRACE")` 被放在**每条语句**都会经过的 GC 安全点上（`runtime.cpp` 的 `MaybeCollectGC()` 两处 + `gc.cpp` 8 处，其中 `NODIO_GC_NOFINAL` 每对象一次），每次 `GetEnvironmentVariableW` 扫进程环境块 ≈ 1.75 µs。
+    - **修法**：诊断开关改为**进程启动时读一次**（`static const bool`）—— 新增 `GcTraceEnabled()` / `GcNoFinalEnabled()` / `ComTraceEnabled()`；顺带删掉 `com.cpp` 里遗留的写死 `%TEMP%\avtest\comraw.log` 临时诊断块。
+    - **改前/改后实测（x64, ns/次）**：空循环 89→80；`s=s` 1838→**359**；`s++` 2209→**453**；`s=s+1` 2183→**449**；`s=(s+i*3)` 2356→600；`%` 2503→732；函数调用 5640→1817；全局变量写 2049→471；局部变量写 1973→496；表字段写 2180→675 —— **语句成本下降 3~5 倍**。
+    - **残留**：每条语句仍约 450 ns（`Env::Find` 作用域链 + 命名空间表 2~4 次哈希查找；建议变量名 intern 成整数 slot）；函数调用 ~1.8 µs/次；`import win.ui` 净 ~310 ms；冷启动 ~60 ms；GC 阈值默认 2000 次分配粒度偏粗。
+    - **回归**：x64 全 15 套绿，x64 全量模块 sweep 与基线逐项一致（ok=899 / fail=70）。
+      ⚠ `tests/win_clip_check.ps1` 在 x86 上偶发红 —— 剪贴板是**全局系统资源**，被同机其它进程占用时官方语义是「静默失败」，而本测试只在开始时判定一次 `CLIP-OK`（该回归锁本身需要改成每次断言前重新探测可用性）。
+    详见 `docs/capability-gap.md` §1.27
+
 
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard

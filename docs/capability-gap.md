@@ -2073,3 +2073,87 @@ Gdiplus!GdiplusStartup+0x30:
 `tests/publish_official_lib_check.ps1` 的产物名**就用 `app.exe`**（曾崩的名字），
 并断言官方库在**隔离目录**里可用 —— 修前 FAIL（3 项 `<missing>`），修后 PASS。
 x64 / x86 双架构全绿。
+
+## 1.27 第二十六轮（续）：每条语句都在做一次 `GetEnvironmentVariableW` —— 解释器吞吐差 4~5 倍
+
+### 1.27.1 现象（实测）
+
+x64、200 万次迭代、每项取 3 次最优值，扣除进程启动基线（59.9 ms）：
+
+| 用例 | 改前 ns/次 | 改后 ns/次 | 倍数 |
+|---|---|---|---|
+| 空循环 `for(i=1;N;1){}` | 89 | 80 | 1.1× |
+| `s=s`（空赋值） | 1838 | **359** | 5.1× |
+| `s++` | 2209 | **453** | 4.9× |
+| `s=s+1` | 2183 | **449** | 4.9× |
+| `s=(s+i*3)` | 2356 | 600 | 3.9× |
+| `s=(s+i*3)%1000003` | 2503 | 732 | 3.4× |
+| 全局变量写 `s=s+1` | 2049 | 471 | 4.4× |
+| 函数内局部变量写 | 1973 | 496 | 4.0× |
+| 表字段写 `t.v=t.v+1` | 2180 | 675 | 3.2× |
+| 函数调用 `s=f(s)` | 5640 | 1817 | 3.1× |
+
+**空循环只要 89 ns，一条赋值却要 1838 ns** —— 成本不在算术、不在变量种类
+（局部/全局/表字段都一个量级），而在**执行一条语句本身**。
+
+### 1.27.2 根因（cdb 采样栈 + 代码定位）
+
+对长跑基准用 cdb 挂载采样，主线程栈顶是：
+
+```
+ntdll!RtlQueryEnvironmentVariable+0x188
+KERNELBASE!GetEnvironmentVariableW+0x40
+nodio+0x596b9        <- 引擎内 EnvFlag()
+```
+
+`engine/common.h` 的 `EnvFlag()` 直接调 `GetEnvironmentVariableW()` ——
+它要扫一遍进程环境块，**约 1~2 µs**。而 `EnvFlag(L"NODIO_GC_TRACE")` 被放在
+**每条语句都会经过**的位置：
+
+- `engine/runtime.cpp` 的 `MaybeCollectGC()`（语句边界上的 GC 安全点）——
+  两条分支各调一次；
+- `engine/gc.cpp` 的 `CollectGarbage()` —— 7 处（其中 `NODIO_GC_NOFINAL`
+  在**每个待终结对象**上都要问一次）。
+
+一次 `GetEnvironmentVariableW` ≈ 1.75 µs，与实测的「每条赋值多花 1.75 µs」
+**完全吻合**。
+
+### 1.27.3 修法
+
+诊断开关**一次性读取并缓存**（函数内 `static const bool`，只有一次初始化守卫，
+约 1 ns）：
+
+- `engine/common.h` 新增 `GcTraceEnabled()` / `GcNoFinalEnabled()` / `ComTraceEnabled()`；
+- `engine/gc.cpp`（8 处）、`engine/runtime.cpp`（2 处）改用缓存值；
+- `engine/com.cpp` 的 `ComRawTrace()` 同样缓存，并**删掉遗留的临时诊断块**
+  （写死 `%TEMP%\avtest\comraw.log` 的那段初始化日志）。
+
+语义不变：开关仍然按「环境变量是否存在」判定（与原 `EnvFlag` 一致），
+只是**每个进程只读一次**。
+
+### 1.27.4 残留性能问题（下一步的方向）
+
+修完之后仍有的开销（同一基准）：
+
+1. **每条语句仍要 ~450 ns**（空循环 80 ns）—— 变量查找走
+   `Env::Find()`：作用域链逐层 `unordered_map<wstring,Value>` 查找，
+   再叠加命名空间表（`nsTable->scopeVars` / `nsTable->map` / `object` 成员表）
+   的 2~4 次哈希查找。**下一步：把变量名 intern 成整数 slot**，
+   局部变量改成数组索引。
+2. **函数调用 ~1.8 µs/次** —— 闭包/环境帧构造 + GC 根栈与 epoch 栈的进出。
+3. **模块加载成本**：`import win.ui` 净 ~310 ms（编译并执行 60+ 个官方模块的
+   顶层代码）；冷启动（空脚本）~60 ms。
+4. **GC 阈值**：`nGCThreshold` 默认 2000 次分配，粒度偏粗；官方库模块
+   顶层代码会产生大量短命对象。
+
+### 1.27.5 回归
+
+`builtin_api_check` 7 段、`aardio_bytecode_check`、11 套既有回归
+**x64 / x86 双架构全绿**；x64 全量模块 sweep 与基线**逐项一致**
+（ok=899 / fail=70，0 新增失败）。
+
+> 另记：`tests/win_clip_check.ps1` 在 x86 上**偶发变红**（同一二进制 8 连过一次、
+> 另一轮 3 次里挂 1 次）—— 剪贴板是**全局系统资源**，被同机其它进程占用时
+> 官方语义是「静默失败」，而本测试只在**开始时**判定一次 `CLIP-OK`，
+> 中途被占用就会有一条往返断言失配。这条回归锁本身需要改成
+> 「每次断言前重新探测可用性」。

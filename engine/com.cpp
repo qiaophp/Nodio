@@ -4059,20 +4059,7 @@ have_dispid:
 // ---- COM 调试追踪（写文件，避免控制台重定向吞掉输出） ----
     void ComRawTrace(const wchar_t* fmt, ...)
     {
-        static bool s_bInit = false;
-        if (!s_bInit)
-        {
-            s_bInit = true;
-            wchar_t sz[64] = {};
-            DWORD n = GetEnvironmentVariableW(L"NODIO_COM_TRACE", sz, 64);
-            wchar_t msg[256];
-            swprintf_s(msg, 256, L"[comraw] init env NODIO_COM_TRACE=%ls (n=%lu)\n",
-                       sz, (unsigned long)n);
-            FILE* f0 = nullptr;
-            _wfopen_s(&f0, L"C:\\Users\\QQ\\AppData\\Local\\Temp\\avtest\\comraw.log", L"a, ccs=UTF-8");
-            if (f0) { fputws(msg, f0); fclose(f0); }
-        }
-        if (!EnvFlag(L"NODIO_COM_TRACE")) return;
+        if (!ComTraceEnabled()) return;
         wchar_t buf[1024];
         va_list ap;
         va_start(ap, fmt);

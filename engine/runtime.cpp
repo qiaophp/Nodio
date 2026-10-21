@@ -2788,7 +2788,7 @@ void Interp::MaybeCollectGC(Env* env)
             if (bInGC)
             {
                 static int s_nBusy = 0;
-                if (EnvFlag(L"NODIO_GC_TRACE") && s_nBusy++ < 5)
+                if (GcTraceEnabled() && s_nBusy++ < 5)
                 {
                     fwprintf(stderr, L"[GC] skip: bInGC\n");
                     fflush(stderr);
@@ -2821,7 +2821,7 @@ void Interp::MaybeCollectGC(Env* env)
             if (g_gcAllocTick - nLastGCTick < nGCThreshold)
             {
                 static int s_nSkip = 0;
-                if (EnvFlag(L"NODIO_GC_TRACE") && s_nSkip++ < 5)
+                if (GcTraceEnabled() && s_nSkip++ < 5)
                 {
                     fwprintf(stderr, L"[GC] skip: threshold=%ld alloc=%ld last=%ld\n",
                              nGCThreshold, (long)g_gcAllocTick.load(), nLastGCTick);

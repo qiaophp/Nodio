@@ -296,6 +296,29 @@ namespace NodioVM
         return GetEnvironmentVariableW(name, sz, 8) > 0;
     }
 
+    // Cached environment flags: the value is read ONCE per process.
+    // GetEnvironmentVariableW() scans the process environment block, so a
+    // call from a per-statement path costs ~1-2 microseconds. The GC's
+    // safe point runs on every statement, and the trace flag was checked
+    // there — that single call was the interpreter's dominant per-statement
+    // cost (measured: ~1.75us per statement, dropping to ~0.1us once
+    // the flag is cached).
+    inline bool GcTraceEnabled()
+    {
+        static const bool b = EnvFlag(L"NODIO_GC_TRACE");
+        return b;
+    }
+    inline bool GcNoFinalEnabled()
+    {
+        static const bool b = EnvFlag(L"NODIO_GC_NOFINAL");
+        return b;
+    }
+    inline bool ComTraceEnabled()
+    {
+        static const bool b = EnvFlag(L"NODIO_COM_TRACE");
+        return b;
+    }
+
     // x64 pointer-width API families: the runtime maps SetWindowLong /
     // GetWindowLong / SetClassLong / GetClassLong to the *PtrW exports in
     // 64-bit builds — the 32-bit exports cannot carry a 64-bit window

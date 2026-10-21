@@ -287,7 +287,7 @@ namespace NodioVM
         // from the collector.
         if (t->map.find(L"self") != t->map.end())
             return;
-        if (EnvFlag(L"NODIO_GC_TRACE"))
+        if (GcTraceEnabled())
         {
             wstring keys, where;
             int n = 0;
@@ -349,7 +349,7 @@ namespace NodioVM
         {
             // engine-native pattern: the member name of the finalizer
             wstring name = BStr(gcv);
-            if (EnvFlag(L"NODIO_GC_TRACE"))
+            if (GcTraceEnabled())
                 fwprintf(stderr, L"[GC] finalizer %p name=[%s] type=%d\n",
                          (void*)t, name.c_str(), (int)gcv.t);
             if (name.empty()) return;
@@ -359,7 +359,7 @@ namespace NodioVM
             if (!sp) return;
             fn = I.GetMember(Value::Table_(sp), name, false, 1);
         }
-        if (EnvFlag(L"NODIO_GC_TRACE"))
+        if (GcTraceEnabled())
             fwprintf(stderr, L"[GC] finalizer %p resolved type=%d\n",
                      (void*)t, (int)fn.t);
         if (fn.t != Value::Func && !fn.native) return;
@@ -374,7 +374,7 @@ namespace NodioVM
         GcRootScope rs;
         rs.add(owner);
         rs.add(fn);
-        if (EnvFlag(L"NODIO_GC_TRACE"))
+        if (GcTraceEnabled())
         {
             wstring keys;
             for (auto& kv : t->map)
@@ -409,7 +409,7 @@ namespace NodioVM
         I.nBreak = oldB;
         I.nContinue = oldC;
         if (I.err) *I.err = oldErr;
-        if (EnvFlag(L"NODIO_GC_TRACE"))
+        if (GcTraceEnabled())
         {
             fwprintf(stderr, L"[GC] finalizer %p done\n", (void*)t);
             fflush(stderr);
@@ -445,7 +445,7 @@ namespace NodioVM
         // the same lock.
         std::lock_guard<std::recursive_mutex> lkReg(g_gcRegistryMutex);
         GcInScope scope(I);
-        const bool bTrace = EnvFlag(L"NODIO_GC_TRACE");
+        const bool bTrace = GcTraceEnabled();
         LARGE_INTEGER t0, t1, t2, t3, freq;
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&t0);
@@ -455,7 +455,7 @@ namespace NodioVM
         m.envs.clear();
         m.tPath.clear();
         m.ePath.clear();
-        m.bTrackPaths = EnvFlag(L"NODIO_GC_TRACE");
+        m.bTrackPaths = GcTraceEnabled();
         GcMarkEnv(&I.globals, m);
         for (auto& kv : I.roots) GcMarkValue(kv.second, m, nullptr, L"root:" + kv.first);
         for (auto& kv : I.modules) GcMarkValue(kv.second, m, nullptr, L"module:" + kv.first);
@@ -583,7 +583,7 @@ namespace NodioVM
                 // a finalizer runs VM code: it may raise a script error or
                 // throw. One broken finalizer must not abort the sweep
                 // (the objects would stay alive forever).
-                if (EnvFlag(L"NODIO_GC_NOFINAL")) continue;
+                if (GcNoFinalEnabled()) continue;
                 try
                 {
                     GcRunFinalizer(I, t);
