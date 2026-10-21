@@ -668,6 +668,19 @@ Fixed & closed in recent sessions:
    （需按 ITypeInfo 动态构造原始接口 vtable，官方库零调用点）。
    回归：`tests/builtin_api_check.ps1`（5 段断言）+ `tests/builtin_api_coverage.ps1`
    （覆盖率核对），x64 / x86 均绿。详见 `docs/aardio-stdlib-delivery.md` §10
+6. [x] **comTypeInfo 类型信息契约补齐 + 杀软误报代码层根治**（2026-10-21 第二十四轮）—
+   `GetTypeAttr()` / `GetFuncDesc(i)` / `GetVarDesc(i)` / `GetImplType(i)` /
+   `GetImplTypeFlags(i)` 按官方 `!comTypeAttr` / `!comTypeFunc` / `!comTypeParameter`
+   形状补齐（索引从 1 起）。官方 `com.typeAttrs.summary` / `com.typeAttrs.load` /
+   `com.tlbDoc` / `com.interface.loadTypelibrary` 四个标准库消费者由此**全部打通**
+   （此前是死代码）：`com.tlbDoc` 现能输出 11121 字类型库文档，
+   `loadTypelibrary` 能从任意 TLB 动态生成接口声明类。
+   同轮根治火绒把 32 位 `nodio.exe` 报为 `HEUR:Backdoor/Farfli.e` 的误报：
+   二分定位到「可写+可执行内存」与「32 位异常过滤器转储原始寄存器」两特征共现，
+   改为「申请时可写 → 写入代码 → 降权 `PAGE_EXECUTE_READ`」+ 精简 x86 转储，
+   x64 / x86 复测均 CLEAN。回归：`tests/builtin_api_check.ps1` 新增第 6 段（32 条断言）、
+   新增 `tests/av_heuristic_check.ps1`（源码级闸门），11 套回归 x64 / x86 均绿。
+   详见 `docs/aardio-stdlib-delivery.md` §11、§12
 
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard

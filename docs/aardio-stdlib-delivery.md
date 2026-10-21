@@ -413,3 +413,78 @@ x64 / x86 **两套构建均全绿**；既有 7 套回归（`aardio_run_check` /
 
 脚本对两处都做了反向验证（改回旧写法即报 FAIL）。这是**源码级**断言，
 不依赖任何杀软，因此可以在任何机器上作为 CI 闸门。
+## 12. 第二十四轮（后半）：comTypeInfo 类型信息契约补齐
+
+### 12.1 缺口
+
+官方 `comTypeInfo`（`com.GetTypeInfo` / `com.LoadTypeLibrary(...).GetTypeInfo(i)` 的返回对象）
+在 Nodio 里只有 `GetTypeLib` / `GetDocumentation` / `DumpTypeInfo` 三个成员，
+**缺 `GetTypeAttr()` / `GetFuncDesc(i)`**。这两个成员是官方标准库的直接依赖：
+
+| 官方库文件 | 用到的成员 |
+|---|---|
+| `lib/com/typeAttrs.aardio` | `info.GetTypeAttr()` → `attr.typekind` / `attr.Funcs` / `attr.Vars` / `attr.GUID` / `attr.flags.*` |
+| `lib/com/tlbDoc.aardio` | `typeinfo.GetTypeAttr()` → `typeattr.Funcs`；`typeinfo.GetFuncDesc(i)` → `func.name` / `func.invkind` / `func.memid` / `func.type` / `func.vt` / `func.parameters` / `func.ParamsOpt` / `func.description` |
+| `lib/com/interface/_.aardio` | `info.GetTypeAttr()` → `attr.typekind` / `attr.Funcs` / `attr.GUID`；`info.GetFuncDesc(i)` → `f.name` |
+
+补齐之前，这三个官方文件都是**死代码**（调用即报成员不存在）。
+
+### 12.2 官方契约
+
+契约形状取自 `D:\aardio\lib\builtin\com.aardio` 的 intellisense 段
+（`!comTypeInfo` / `!comTypeAttr` / `!comTypeFunc` / `!comTypeParameter` / `!comTypeVar`）：
+
+- `comTypeAttr`：`Funcs` / `Vars` / `typekind` / `ImplTypes` / `flags.{cancreate,dispatchable,control,appobject,hidden,oleautomation}` / `GUID`
+- `comTypeFunc`：`dispatchable` / `restricted` / `memid` / `invkind`（`function` / `_get` / `_set` / `_setByRef`）/ `Params` / `ParamsOpt` / `name` / `description` / `helpfile` / `helpcontext` / `parameters` / `type` / `vt`
+- `comTypeParameter`：`default` / `in` / `opt` / `out` / `type` / `vt`
+- `comTypeVar`：`value` / `name`
+- 索引一律**从 1 开始**（官方 intellisense 明写「注意超始索引为1」）
+
+类型名字符串沿用官方 `tlbDoc` 已经在用的形状：`pointer/*VARIANT*/`（VARIANT*）、
+`pointer/*VARIANT*/[]`（VARIANT 安全数组）、`string` / `int` / `double` / `bool` / `variant` 等。
+
+### 12.3 实现要点
+
+- 本机 Windows SDK 的 `oaidl.h` 是**旧式 Automation 头**：
+  `FUNCDESC` 没有 `params[]` 数组和 `flags` 成员，参数描述在 `lprgelemdescParam` 里，
+  `cParamsOpt` 直接就是官方语义上的 `ParamsOpt`（变长参数函数为 -1，
+  官方 `tlbDoc` 正是用 `ParamsOpt==-1` 判断「不定个数参数」）。
+  `TA_F*` / `FUNCFLAG_*` 头文件未定义，按 Automation ABI 固定取值在源码内补齐。
+  既有代码里 `fd->invkind` 已在 MSXML 事件实测中验证过与运行期一致，
+  沿用同一套布局。
+- `GetImplType` / `GetImplTypeFlags` 同样按旧式原型实现
+  （`GetRefTypeOfImplType` 取 HREFTYPE → `GetRefTypeInfo` 取类型信息）。
+
+### 12.4 实测结果
+
+以系统类型库 `C:\Windows\System32\stdole2.tlb`（42 个类型）为例：
+
+- `GetTypeAttr()`：`typekind` 覆盖 record / interface / alias / enumeration /
+  dispinterface / coclass / module 全部分支；GUID 形如
+  `{00000000-0000-0000-C000-000000000046}`（IUnknown，正确）；
+  `Funcs` / `Vars` / `ImplTypes` / `flags.*` 均正确。
+- `GetFuncDesc(1)`（IUnknown 的 QueryInterface）：`name=QueryInterface`、
+  `invkind=function`、`Params=2`、`ParamsOpt=0`、`type=int`（VT_HRESULT=25）、
+  `vt=25`、`memid=1610612736`（0x60000000，正确）、
+  `restricted=true`（IUnknown::QueryInterface 确实带 FUNCFLAG_FRESTRICTED）、
+  `parameters[1].name=riid` / `type=pointer`（VT_PTR=26）/ `in=true`。
+- 官方 `com.typeAttrs.summary` → 库名 stdole、8 个 interface、2 个 coclass、2 个枚举；
+  官方 `com.typeAttrs.load` → 42 个类型；
+  官方 `com.tlbDoc` → 输出 11121 字的类型库文档（此前完全是死的）。
+- 官方 `com.interface.loadTypelibrary(tlb, "IFont")` → **动态生成了接口声明类**
+  `com.interface.IFont`（IID `{BEF6E002-A874-101A-8BBA-00AA00300CAB}` 正确），
+  可实例化。官方 `com.interface` 命名空间由此从「只有手写声明类」扩展到
+  「可从任意类型库动态生成」。
+
+### 12.5 仍未闭合
+
+`com.ImplInterfaceFromTypelib` / `com.ImplInterface`（3 参形式）**仍未实现**：
+它要求按 ITypeInfo **动态构造原始（非 IDispatch）接口的 vtable**，
+与「原始接口事件连接点」（如 `WMPlayer.OCX` 的 `_WMPOCXEvents`）是同一根因。
+本轮补齐的类型信息设施是它的前置条件，但 vtable 生成器本身还没做 —— 如实记账，不虚报。
+
+### 12.6 回归锁
+
+`tests/builtin_api_check.ps1` 新增第 6 段（`comTypeInfo / 官方类型库消费者`），
+共 32 条断言，覆盖 `GetTypeAttr` / `GetFuncDesc` / `GetVarDesc` / `GetImplType` /
+`GetImplTypeFlags` 的字段形状，以及三个官方库消费者的真实调用结果。

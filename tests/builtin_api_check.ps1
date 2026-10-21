@@ -320,6 +320,98 @@ io.print("== com.Connect / ReleaseConnection OK ==");
 '@
 Expect-Section $connCode 'com.Connect / ReleaseConnection' 'com.Connect / ReleaseConnection OK'
 
+# ================================================================
+# 6) comTypeInfo 类型信息契约 + 官方类型库消费者
+#    官方契约来源：
+#      D:\aardio\lib\builtin\com.aardio:269-341  (!comTypeInfo / !comTypeAttr /
+#                                                   !comTypeFunc / !comTypeParameter)
+#      D:\aardio\lib\com\typeAttrs.aardio:11-20  (com.typeAttrs.load/summary)
+#      D:\aardio\lib\com\tlbDoc.aardio:32-47      (com.tlbDoc)
+#      D:\aardio\lib\com\interface\_.aardio:143-168 (com.interface.loadTypelibrary)
+# ================================================================
+$tlbCode = @'
+var fail = 0;
+function chk(name, got, want) {
+  var ok = true;
+  if (type(got) != type(want)) ok = false;
+  else if (got !== want) ok = false;
+  if (ok) { io.print("PASS ", name); }
+  else { io.print("FAIL ", name, " got=", "" + got, " want=", "" + want); fail++; }
+}
+import com;
+import com.typeAttrs;
+import com.tlbDoc;
+import com.interface;
+
+var tlbPath = "C:\Windows\System32\stdole2.tlb";
+var tlb = com.LoadTypeLibrary(tlbPath);
+chk("LoadTypeLibrary", tlb != null, true);
+var cnt = tlb.GetTypeInfoCount();
+chk("GetTypeInfoCount", cnt > 10, true);
+
+// ---- GetTypeAttr：官方 !comTypeAttr ----
+var attr = null;
+for (i = 1; cnt; 1) {
+    var info = tlb.GetTypeInfo(i);
+    var a = info.GetTypeAttr();
+    if (a.typekind == "interface") { attr = a; break; }
+}
+chk("GetTypeAttr/typekind", attr.typekind, "interface");
+chk("GetTypeAttr/GUID-len", #attr.GUID, 38);
+chk("GetTypeAttr/GUID-prefix", string.left(attr.GUID, 1), "{");
+chk("GetTypeAttr/Funcs", attr.Funcs > 0, true);
+chk("GetTypeAttr/Vars", attr.Vars >= 0, true);
+chk("GetTypeAttr/ImplTypes", attr.ImplTypes >= 0, true);
+chk("GetTypeAttr/flags-table", type(attr.flags), "table");
+chk("GetTypeAttr/flags-cancreate", type(attr.flags.cancreate), "boolean");
+chk("GetTypeAttr/flags-dispatchable", type(attr.flags.dispatchable), "boolean");
+
+// ---- GetFuncDesc：官方 !comTypeFunc（索引从 1 开始）----
+var iu = null;
+for (i = 1; cnt; 1) {
+    var inf = tlb.GetTypeInfo(i);
+    if (inf.GetDocumentation().name == "IUnknown") { iu = inf; break; }
+}
+var fd = iu.GetFuncDesc(1);
+chk("GetFuncDesc/name", fd.name, "QueryInterface");
+chk("GetFuncDesc/invkind", fd.invkind, "function");
+chk("GetFuncDesc/Params", fd.Params, 2);
+chk("GetFuncDesc/ParamsOpt", fd.ParamsOpt, 0);
+chk("GetFuncDesc/type", fd.type, "int");
+chk("GetFuncDesc/vt", fd.vt, 25);
+chk("GetFuncDesc/memid", fd.memid, 1610612736);
+chk("GetFuncDesc/dispatchable", type(fd.dispatchable), "boolean");
+chk("GetFuncDesc/restricted", fd.restricted, true);
+chk("GetFuncDesc/description-len", #fd.description > 0, true);
+chk("GetFuncDesc/parameters-len", #fd.parameters, 2);
+chk("GetFuncDesc/param-name", fd.parameters[1].name, "riid");
+chk("GetFuncDesc/param-in", fd.parameters[1].in, true);
+chk("GetFuncDesc/param-out", fd.parameters[1].out, false);
+chk("GetFuncDesc/param-opt", fd.parameters[1].opt, false);
+chk("GetFuncDesc/param-type", fd.parameters[1].type, "pointer");
+
+// ---- 官方库消费者 ----
+var sum = com.typeAttrs.summary(tlbPath);
+chk("typeAttrs/summary", sum != null && #sum.interfaces > 0, true);
+chk("typeAttrs/summary-coclass", #sum.coclasses > 0, true);
+var all = com.typeAttrs.load(tlbPath);
+chk("typeAttrs/load", #all, cnt);
+var doc = com.tlbDoc(tlbPath);
+chk("tlbDoc/length", #doc > 1000, true);
+chk("tlbDoc/has-name", string.find(doc, "QueryInterface") != null, true);
+
+// ---- 官方 com.interface.loadTypelibrary：动态生成接口声明类 ----
+com.interface.loadTypelibrary(tlbPath, "IFont");
+var cls = com.interface["IFont"];
+chk("loadTypelibrary/class", cls != null, true);
+chk("loadTypelibrary/IID", cls.IID, "{BEF6E002-A874-101A-8BBA-00AA00300CAB}");
+chk("loadTypelibrary/instantiate", cls() != null, true);
+
+if (fail) { io.print("== TYPELIB CHECK FAILED: ", fail); return 1; }
+io.print("== comTypeInfo / 类型库 OK ==");
+'@
+Expect-Section $tlbCode 'comTypeInfo / 官方类型库消费者' 'comTypeInfo / 类型库 OK'
+
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 if ($fail -gt 0) { "== builtin api FAILED ($fail) =="; exit 1 }
 "== builtin api OK =="

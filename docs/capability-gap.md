@@ -1781,3 +1781,57 @@ var DAP_EXE   = NODIO_DIR ++ "nodio-dap.exe";
 > （§1.21 与第二十二轮 §8 的分母 156 不同：后者把 `thread._serialize`、
 > `thread.release`、`raw._json` 这类**嵌套表成员**也计进了成员数。）
 
+
+## 1.22 第二十四轮：comTypeInfo 类型信息契约 + 杀软误报根治
+
+### 1.22.1 官方类型信息契约（已闭合）
+
+**原缺口**：`comTypeInfo`（`com.GetTypeInfo` / `com.LoadTypeLibrary(...).GetTypeInfo(i)`）
+缺 `GetTypeAttr()` 与 `GetFuncDesc(i)`，导致三个官方标准库文件是死代码：
+
+- `lib/com/typeAttrs.aardio` —— `attr.typekind` / `attr.Funcs` / `attr.Vars` /
+  `attr.GUID` / `attr.flags.*`
+- `lib/com/tlbDoc.aardio` —— `func.name` / `func.invkind` / `func.memid` /
+  `func.type` / `func.vt` / `func.parameters` / `func.ParamsOpt` / `func.description`
+- `lib/com/interface/_.aardio` —— `com.interface.loadTypelibrary` 的全部前置字段
+
+**已补齐**（`engine/com.cpp`）：`GetTypeAttr()`、`GetFuncDesc(i)`、`GetVarDesc(i)`、
+`GetImplType(i)`、`GetImplTypeFlags(i)`，形状严格按官方 `!comTypeAttr` /
+`!comTypeFunc` / `!comTypeParameter` / `!comTypeVar`（索引从 1 起）。
+
+**实测**（`C:\Windows\System32\stdole2.tlb`，42 个类型）：
+
+- `GetTypeAttr()` 的 `typekind` 覆盖 record / interface / alias / enumeration /
+  dispinterface / coclass / module 全部官方取值；GUID 形如
+  `{00000000-0000-0000-C000-000000000046}`（IUnknown，正确）。
+- `GetFuncDesc(1)`（IUnknown::QueryInterface）：`name` / `invkind=function` /
+  `Params=2` / `ParamsOpt=0` / `type=int`（VT_HRESULT=25）/ `vt=25` /
+  `memid=1610612736`（0x60000000）/ `restricted=true` / `parameters[1].name=riid`。
+- 官方 `com.typeAttrs.summary` → 8 interface / 2 coclass / 2 enum；
+  官方 `com.typeAttrs.load` → 42 个类型；
+  官方 `com.tlbDoc` → 11121 字文档（此前完全不可用）；
+  官方 `com.interface.loadTypelibrary(tlb,"IFont")` → 动态生成 `com.interface.IFont`
+  （IID `{BEF6E002-A874-101A-8BBA-00AA00300CAB}` 正确），可实例化。
+
+**实现备注**：本机 SDK 的 `oaidl.h` 是旧式 Automation 头（`FUNCDESC` 无 `params[]`、
+无 `flags` 成员，参数描述在 `lprgelemdescParam`，`cParamsOpt` 即官方 `ParamsOpt`），
+`TA_F*` / `FUNCFLAG_*` 头文件未定义、按 Automation ABI 固定取值在源码内补齐。
+
+### 1.22.2 杀软误报（已闭合，非能力缺口）
+
+火绒把 **32 位** `nodio.exe` 报为 `HEUR:Backdoor/Farfli.e` 并隔离，64 位同源构建
+从不被拦。二分定位（独立 Win32 构建 + 逐项开关 + 读火绒隔离区）得到命中条件：
+**「可写且可执行的内存」与「32 位未处理异常过滤器转储原始寄存器」两特征共现**。
+
+修复：跳板页与内存 PE 映射改为「申请时可写 → 写入代码 → 按页/按节降权为
+`PAGE_EXECUTE_READ`」，页面从不以「可写+可执行」形态存在；32 位崩溃过滤器
+不再转储整组原始寄存器（保留 `EIP/ESP/EBP` + 异常码 + 出错地址 + 模块内偏移 +
+访问违例信息）。能力不减，x64 / x86 复测均 CLEAN。
+
+回归锁：`tests/av_heuristic_check.ps1`（源码级断言，不依赖杀软）。
+
+**仍未闭合**：`com.ImplInterfaceFromTypelib` / `com.ImplInterface`（3 参形式）——
+需按 ITypeInfo **动态构造原始（非 IDispatch）接口的 vtable**；与「原始接口事件
+连接点」（`WMPlayer.OCX` 的 `_WMPOCXEvents`）同根因。本轮补齐的类型信息设施
+是它的前置条件，vtable 生成器本身尚未实现。官方内建成员覆盖仍是
+**149 / 150（99.3%）**，唯一缺口不变。

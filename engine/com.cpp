@@ -2067,6 +2067,169 @@ namespace
         return Value::Table_(tb);
     }
 
+    // ---- type information helpers ------------------------------------
+    // Official contract (lib/builtin/com.aardio intellisense):
+    //   !comTypeAttr      Funcs / Vars / typekind / ImplTypes / flags.* / GUID
+    //   !comTypeFunc      dispatchable / restricted / memid / invkind / Params /
+    //                      ParamsOpt / name / description / helpfile /
+    //                      helpcontext / parameters / type / vt
+    //   !comTypeParameter default / in / opt / out / type / vt
+    //   !comTypeVar       value / name
+    // The official library reads these by name in lib/com/typeAttrs.aardio,
+    // lib/com/tlbDoc.aardio and lib/com/interface/_.aardio.
+
+    // TYPEATTR.wTypeFlags —— 本机 SDK 的 oaidl.h 是旧式 Automation 头，
+    // 没有定义 TA_F*，这里按 Automation ABI 的固定取值补齐。
+    // FUNCFLAGS 同理（wFuncFlags 是旧式 FUNCDESC 里的 WORD 字段）。
+    enum
+    {
+        TA_FAPPONLY_ = 0x00010000,
+        TA_FCANCREATE_ = 0x00020000,
+        TA_FLICENSE_ = 0x00040000,
+        TA_FPREDECLONLY_ = 0x00080000,
+        TA_FHIDDEN_ = 0x00100000,
+        TA_FCONTROL_ = 0x00200000,
+        TA_FDUAL_ = 0x00400000,
+        TA_FNONEXTENSIBLE_ = 0x00800000,
+        TA_FOLEAUTOMATION_ = 0x01000000,
+        TA_FDISPATCHABLE_ = 0x02000000,
+        TA_FREVERSEBIND_ = 0x04000000
+    };
+    enum
+    {
+        FUNCFLAG_FRESTRICTED_ = 0x0001,
+        FUNCFLAG_FSOURCE_ = 0x0002,
+        FUNCFLAG_FBINDABLE_ = 0x0004,
+        FUNCFLAG_FREQUESTEDIT_ = 0x0008,
+        FUNCFLAG_FDISPATCHABLE_ = 0x0010,
+        FUNCFLAG_FREVERSEBIND_ = 0x0020,
+        FUNCFLAG_FHIDDEN_ = 0x0080,
+        FUNCFLAG_FPROPGET_ = 0x0100,
+        FUNCFLAG_FPROPPUT_ = 0x0200,
+        FUNCFLAG_FPROPPUTREF_ = 0x0400
+    };
+
+    static wstring ComGuidString(const GUID& g)
+    {
+        wchar_t buf[64];
+        swprintf_s(buf, 64,
+            L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+            g.Data1, g.Data2, g.Data3,
+            g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+            g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+        return wstring(buf);
+    }
+
+    static wstring ComTypeKindName(TYPEKIND k)
+    {
+        switch (k)
+        {
+        case TKIND_ENUM: return L"enumeration";
+        case TKIND_RECORD: return L"record";
+        case TKIND_MODULE: return L"module";
+        case TKIND_INTERFACE: return L"interface";
+        case TKIND_DISPATCH: return L"dispinterface";
+        case TKIND_COCLASS: return L"coclass";
+        case TKIND_ALIAS: return L"alias";
+        case TKIND_UNION: return L"union";
+        }
+        return L"unknown";
+    }
+
+    // plain (uncommented) name of a base VARTYPE
+    static wstring ComTypePlainName(VARTYPE base)
+    {
+        switch (base)
+        {
+        case VT_EMPTY: return L"empty";
+        case VT_NULL: return L"null";
+        case VT_I1: case VT_UI1: case VT_I2: case VT_UI2:
+        case VT_I4: case VT_UI4: case VT_INT: case VT_UINT:
+        case VT_ERROR: case VT_HRESULT:
+            return L"int";
+        case VT_I8: case VT_UI8: return L"long";
+        case VT_R4: return L"float";
+        case VT_R8: return L"double";
+        case VT_CY: case VT_DECIMAL: return L"decimal";
+        case VT_DATE: return L"date";
+        case VT_BSTR: case VT_LPSTR: case VT_LPWSTR: return L"string";
+        case VT_BOOL: return L"bool";
+        case VT_VARIANT: return L"variant";
+        case VT_DISPATCH: return L"pointer/*IDispatch*/";
+        case VT_UNKNOWN: return L"pointer/*IUnknown*/";
+        case VT_PTR: case VT_INT_PTR: case VT_UINT_PTR: return L"pointer";
+        case VT_SAFEARRAY: return L"pointer/*SAFEARRAY*/";
+        case VT_CARRAY: return L"pointer/*CARRAY*/";
+        case VT_RECORD: return L"pointer/*RECORD*/";
+        case VT_FILETIME: return L"pointer/*FILETIME*/";
+        case VT_BLOB: return L"pointer/*BLOB*/";
+        case VT_STREAM: return L"pointer/*IStream*/";
+        case VT_STORAGE: return L"pointer/*IStorage*/";
+        case VT_CF: return L"pointer/*CLIPDATA*/";
+        case VT_CLSID: return L"pointer/*CLSID*/";
+        case VT_VOID: return L"void";
+        }
+        return L"unknown";
+    }
+
+    // C style name used inside the /*...*/ comment
+    static wstring ComTypeCName(VARTYPE base)
+    {
+        switch (base)
+        {
+        case VT_VARIANT: return L"VARIANT";
+        case VT_BSTR: return L"BSTR";
+        case VT_I1: return L"I1";
+        case VT_UI1: return L"UI1";
+        case VT_I2: return L"I2";
+        case VT_UI2: return L"UI2";
+        case VT_I4: return L"I4";
+        case VT_UI4: return L"UI4";
+        case VT_I8: return L"I8";
+        case VT_UI8: return L"UI8";
+        case VT_R4: return L"R4";
+        case VT_R8: return L"R8";
+        case VT_BOOL: return L"BOOL";
+        case VT_DISPATCH: return L"IDispatch";
+        case VT_UNKNOWN: return L"IUnknown";
+        case VT_DATE: return L"DATE";
+        case VT_CY: return L"CY";
+        case VT_INT: return L"INT";
+        case VT_UINT: return L"UINT";
+        case VT_HRESULT: return L"HRESULT";
+        case VT_ERROR: return L"SCODE";
+        case VT_RECORD: return L"RECORD";
+        case VT_FILETIME: return L"FILETIME";
+        case VT_BLOB: return L"BLOB";
+        case VT_STREAM: return L"IStream";
+        case VT_STORAGE: return L"IStorage";
+        case VT_CF: return L"CLIPDATA";
+        case VT_CLSID: return L"CLSID";
+        case VT_LPSTR: return L"LPSTR";
+        case VT_LPWSTR: return L"LPWSTR";
+        }
+        return ComTypePlainName(base);
+    }
+
+    // Official type string of a parameter / return type. The shapes the
+    // official library relies on are "pointer/*VARIANT*/" for a VARIANT*
+    // and "pointer/*VARIANT*/[]" for a SAFEARRAY of VARIANT
+    // (lib/com/tlbDoc.aardio strips the /*...*/ comment and maps the
+    // VARIANT forms onto "variant" / "variant[]").
+    static wstring ComTypeName(VARTYPE vt)
+    {
+        if (vt & VT_ARRAY)
+            return L"pointer/*" + ComTypeCName(vt & VT_TYPEMASK) + L"*/[]";
+        VARTYPE base = vt & VT_TYPEMASK;
+        if (vt & VT_BYREF)
+        {
+            wstring inner = (base == VT_VARIANT) ? wstring(L"VARIANT")
+                                                  : ComTypeCName(base);
+            return L"pointer/*" + inner + L"*/" + ((vt & VT_PTR) ? L"*" : L"");
+        }
+        return ComTypePlainName(base);
+    }
+
     static Value WrapTypeInfo(ITypeInfo* pTI)
     {
         if (!pTI) return Value();
@@ -2101,6 +2264,207 @@ namespace
             if (bstrDoc) SysFreeString(bstrDoc);
             if (bstrHelp) SysFreeString(bstrHelp);
             return Value::Table_(doc);
+        });
+
+        // comTypeAttr —— 官方 !comTypeAttr
+        tb->map[L"GetTypeAttr"] = NF([spTI](vector<Value>&) -> Value {
+            TYPEATTR* pTA = nullptr;
+            if (FAILED(spTI->GetTypeAttr(&pTA)) || !pTA)
+                return Value();
+            auto attr = std::make_shared<Table>();
+            attr->map[L"Funcs"] = Value::Num_((double)pTA->cFuncs);
+            attr->map[L"Vars"] = Value::Num_((double)pTA->cVars);
+            attr->map[L"ImplTypes"] = Value::Num_((double)pTA->cImplTypes);
+            attr->map[L"typekind"] = Value::Str_(ComTypeKindName(pTA->typekind));
+            attr->map[L"GUID"] = Value::Str_(ComGuidString(pTA->guid));
+            auto flags = std::make_shared<Table>();
+            flags->map[L"cancreate"] =
+                Value::Bool_((pTA->wTypeFlags & TA_FCANCREATE_) != 0);
+            flags->map[L"dispatchable"] =
+                Value::Bool_((pTA->wTypeFlags & TA_FDISPATCHABLE_) != 0);
+            flags->map[L"control"] =
+                Value::Bool_((pTA->wTypeFlags & TA_FCONTROL_) != 0);
+            flags->map[L"appobject"] =
+                Value::Bool_((pTA->wTypeFlags & TA_FAPPONLY_) != 0);
+            flags->map[L"hidden"] =
+                Value::Bool_((pTA->wTypeFlags & TA_FHIDDEN_) != 0);
+            flags->map[L"oleautomation"] =
+                Value::Bool_((pTA->wTypeFlags & TA_FOLEAUTOMATION_) != 0);
+            attr->map[L"flags"] = Value::Table_(flags);
+            spTI->ReleaseTypeAttr(pTA);
+            return Value::Table_(attr);
+        });
+
+        // comTypeFunc —— 官方 !comTypeFunc，起始索引为 1
+        tb->map[L"GetFuncDesc"] = NF([spTI](vector<Value>& a) -> Value {
+            if (a.empty() || a[0].t != Value::Num) return Value();
+            UINT idx = (UINT)a[0].n;
+            if (idx >= 1) idx -= 1;
+            FUNCDESC* pFD = nullptr;
+            if (FAILED(spTI->GetFuncDesc(idx, &pFD)) || !pFD)
+                return Value();
+
+            auto fn = std::make_shared<Table>();
+            // GetNames returns the function name followed by the parameter
+            // names — one call serves both.
+            BSTR bstrNames[32];
+            UINT cNames = 0;
+            HRESULT hrN = spTI->GetNames(pFD->memid, bstrNames, 32, &cNames);
+            if (FAILED(hrN)) cNames = 0;
+            fn->map[L"name"] = Value::Str_(
+                (cNames > 0 && bstrNames[0]) ? bstrNames[0] : L"");
+
+            fn->map[L"memid"] = Value::Num_((double)pFD->memid);
+            fn->map[L"dispatchable"] =
+                Value::Bool_((pFD->wFuncFlags & FUNCFLAG_FDISPATCHABLE_) != 0);
+            fn->map[L"restricted"] =
+                Value::Bool_((pFD->wFuncFlags & FUNCFLAG_FRESTRICTED_) != 0);
+
+            // invkind：官方取值为 function / _get / _set / _setByRef
+            wstring invKind = L"function";
+            if (pFD->invkind & INVOKE_PROPERTYGET) invKind = L"_get";
+            else if (pFD->invkind & INVOKE_PROPERTYPUT) invKind = L"_set";
+            else if (pFD->invkind & INVOKE_PROPERTYPUTREF) invKind = L"_setByRef";
+            fn->map[L"invkind"] = Value::Str_(invKind);
+
+            VARTYPE vtRet = pFD->elemdescFunc.tdesc.vt;
+            fn->map[L"Params"] = Value::Num_((double)pFD->cParams);
+            fn->map[L"type"] = Value::Str_(ComTypeName(vtRet));
+            fn->map[L"vt"] = Value::Num_((double)(long long)vtRet);
+
+            // cParamsOpt 即官方的 ParamsOpt；变长参数函数这里是 -1
+            // （官方 lib/com/tlbDoc.aardio 正是用 -1 判断「不定个数参数」）
+            fn->map[L"ParamsOpt"] = Value::Num_((double)pFD->cParamsOpt);
+
+            // 文档信息
+            BSTR bstrDoc = nullptr, bstrHelp = nullptr;
+            DWORD dwHelpCtx = 0;
+            if (SUCCEEDED(spTI->GetDocumentation(pFD->memid, &bstrDoc,
+                &bstrHelp, &dwHelpCtx, nullptr)))
+            {
+                fn->map[L"description"] = Value::Str_(bstrDoc ? bstrDoc : L"");
+                fn->map[L"helpfile"] = Value::Str_(bstrHelp ? bstrHelp : L"");
+                fn->map[L"helpcontext"] = Value::Num_((double)dwHelpCtx);
+            }
+            else
+            {
+                fn->map[L"description"] = Value::Str_(L"");
+                fn->map[L"helpfile"] = Value::Str_(L"");
+                fn->map[L"helpcontext"] = Value::Num_(0);
+            }
+            if (bstrDoc) SysFreeString(bstrDoc);
+            if (bstrHelp) SysFreeString(bstrHelp);
+
+            // 参数描述数组（comTypeParameter）
+            auto params = std::make_shared<Table>();
+            for (int i = 0; i < pFD->cParams; i++)
+            {
+                auto pd = std::make_shared<Table>();
+                wstring pname;
+                if ((UINT)(i + 1) < cNames && bstrNames[i + 1])
+                    pname = bstrNames[i + 1];
+                pd->map[L"name"] = Value::Str_(pname);
+
+                // 旧式 Automation ABI：参数描述在 lprgelemdescParam 数组里
+                VARTYPE pvt = VT_EMPTY;
+                USHORT wFlags = 0;
+                const PARAMDESCEX* pdex = nullptr;
+                if (pFD->lprgelemdescParam)
+                {
+                    const ELEMDESC& ed = pFD->lprgelemdescParam[i];
+                    pvt = ed.tdesc.vt;
+                    wFlags = ed.paramdesc.wParamFlags;
+                    pdex = ed.paramdesc.pparamdescex;
+                }
+                pd->map[L"in"] = Value::Bool_((wFlags & PARAMFLAG_FIN) != 0);
+                pd->map[L"out"] = Value::Bool_((wFlags & PARAMFLAG_FOUT) != 0);
+                pd->map[L"opt"] = Value::Bool_((wFlags & PARAMFLAG_FOPT) != 0);
+                pd->map[L"type"] = Value::Str_(ComTypeName(pvt));
+                pd->map[L"vt"] = Value::Num_((double)(long long)pvt);
+                // 默认值
+                Value defVal;
+                if ((wFlags & PARAMFLAG_FHASDEFAULT) && pdex)
+                {
+                    wstring err;
+                    defVal = VariantToValue(pdex->varDefaultValue, &err);
+                }
+                pd->map[L"default"] = defVal;
+                params->arr.push_back(Value::Table_(pd));
+            }
+            fn->map[L"parameters"] = Value::Table_(params);
+
+            for (UINT i = 0; i < cNames; i++)
+                if (bstrNames[i]) SysFreeString(bstrNames[i]);
+            spTI->ReleaseFuncDesc(pFD);
+            return Value::Table_(fn);
+        });
+
+        // comTypeVar —— 官方 !comTypeVar，起始索引为 1
+        tb->map[L"GetVarDesc"] = NF([spTI](vector<Value>& a) -> Value {
+            if (a.empty() || a[0].t != Value::Num) return Value();
+            UINT idx = (UINT)a[0].n;
+            if (idx >= 1) idx -= 1;
+            VARDESC* pVD = nullptr;
+            if (FAILED(spTI->GetVarDesc(idx, &pVD)) || !pVD)
+                return Value();
+            auto v = std::make_shared<Table>();
+            BSTR bstrName = nullptr;
+            if (SUCCEEDED(spTI->GetDocumentation(pVD->memid, &bstrName,
+                nullptr, nullptr, nullptr)) && bstrName)
+            {
+                v->map[L"name"] = Value::Str_(bstrName);
+                SysFreeString(bstrName);
+            }
+            else
+            {
+                v->map[L"name"] = Value::Str_(L"");
+            }
+            Value val;
+            if (pVD->lpvarValue)
+            {
+                wstring err;
+                val = VariantToValue(*pVD->lpvarValue, &err);
+            }
+            v->map[L"value"] = val;
+            spTI->ReleaseVarDesc(pVD);
+            return Value::Table_(v);
+        });
+
+        // 官方 !comTypeInfo.GetImplType（起始索引为 1）
+        // 旧式 Automation ABI：先取 HREFTYPE，再取类型信息
+        tb->map[L"GetImplType"] = NF([spTI](vector<Value>& a) -> Value {
+            if (a.empty() || a[0].t != Value::Num) return Value();
+            UINT idx = (UINT)a[0].n;
+            if (idx >= 1) idx -= 1;
+            HREFTYPE hrt = 0;
+            if (FAILED(spTI->GetRefTypeOfImplType(idx, &hrt)) || !hrt)
+                return Value();
+            ITypeInfo* pImpl = nullptr;
+            if (FAILED(spTI->GetRefTypeInfo(hrt, &pImpl)) || !pImpl)
+                return Value();
+            Value ret = WrapTypeInfo(pImpl);
+            pImpl->Release();
+            return ret;
+        });
+
+        // 官方 !comTypeInfo.GetImplTypeFlags（起始索引为 1）
+        tb->map[L"GetImplTypeFlags"] = NF([spTI](vector<Value>& a) -> Value {
+            if (a.empty() || a[0].t != Value::Num) return Value();
+            UINT idx = (UINT)a[0].n;
+            if (idx >= 1) idx -= 1;
+            INT f = 0;
+            if (FAILED(spTI->GetImplTypeFlags(idx, &f)))
+                return Value();
+            auto t = std::make_shared<Table>();
+            t->map[L"default"] =
+                Value::Bool_((f & IMPLTYPEFLAG_FDEFAULT) != 0);
+            t->map[L"source"] =
+                Value::Bool_((f & IMPLTYPEFLAG_FSOURCE) != 0);
+            t->map[L"restricted"] =
+                Value::Bool_((f & IMPLTYPEFLAG_FRESTRICTED) != 0);
+            t->map[L"defaultVTable"] =
+                Value::Bool_((f & IMPLTYPEFLAG_FDEFAULTVTABLE) != 0);
+            return Value::Table_(t);
         });
 
         tb->map[L"DumpTypeInfo"] = NF([spTI](vector<Value>&) -> Value {
