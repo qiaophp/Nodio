@@ -2822,3 +2822,96 @@ pre-fix 引擎用 `git archive HEAD` 导出到**独立目录**单独构建，与
 Nodio 就会把它当成未知标量，结构体布局随之错位**。后续补 x64 版本时，
 凡是遇到官方自造拼写（`stuct` 这种），都要按同样方式在引擎侧容错，
 而不是在自己的 overlay 里绕开 —— 否则 x86 这条唯一能跑官方库的路径会一直错下去。
+
+## 1.35 第三十轮（续）：av.video.kernel —— 官方**随库发布 C 源码**的模块，重编 x64 即可（4 项）
+
+### 1.35.1 官方形态与关键发现
+
+官方 `lib/av/video/kernel.aardio` 把 32 位 `kernel.dll` 用 `$"..."` 内嵌进源码再内存加载，
+x64 进程装不下 —— 但这一项**不需要自写实现**：
+
+官方 `D:\aardio\lib\av\video\.res\kernel.c`（28KB）**随库发布了 C 源码**，
+文件头注释写得很清楚：
+
+```txt
+C 源码在 .res/kernel.c，改完运行 .res/build.aardio 重建 kernel.dll（tcc 编译）；
+库（../kernel.aardio）用 $ 把 kernel.dll 编译进代码并内存加载，运行时不需要 tcc。
+```
+
+全库扫描（`D:\aardio\lib` 下所有 `.res` 目录）**只有两个 C 源码**：
+
+| 源码 | 状态 |
+|---|---|
+| `av/audio/.res/dsp.c` | 已补（`av.audio.dsp` 那批，5 项） |
+| `av/video/.res/kernel.c` | 本节补（4 项） |
+
+所以「官方没发源码」的三类里，`av.video.kernel` 属于**第三类：有源码 → 直接重编**，
+和 `av.audio.dsp` 同款路径。
+
+### 1.35.2 官方 API 面
+
+13 个导出（`dumpbin /exports` 实测，官方 DLL 与自编 DLL **同名同顺序**）：
+
+```txt
+v_bg  v_blend  v_blit  v_bounds  v_boxMean  v_clear  v_flickerScore
+v_glitch2  v_grain  v_lumaStats  v_motionCheck  v_over  v_resample
+```
+
+aardio 侧的封装逐字沿用官方 `kernel.aardio`：
+`background` / `resample` / `over` / `clear` / `bounds` / `blend` / `grain` / `blit` /
+`glitch` / `glitchMix` / `lumaStats` / `boxMean` / `flickerScore` / `motionCheck`。
+
+依赖链（补一个模块修好 4 项）：
+
+```txt
+av.video.kernel  ←  av.film  ←  autos.skills.codingFilm
+                 ←  av.video.flicker
+```
+
+### 1.35.3 Nodio 侧的实现（overlay，官方同名路径）
+
+| 文件 | 内容 |
+|---|---|
+| `lib/av/video/kernel.aardio` | 官方模块**逐字副本**，只把 DLL 来源换成 `io.splitpath(io.libpath("av.video.kernel")).dir + ".res\\kernel64.dll"` |
+| `lib/av/video/.res/kernel64.dll` | 官方 `.res/kernel.c` 用 MSVC 编出的 x64 DLL（`/LD /O2 /MT /GS- /W3 /utf-8`，**零警告**），13 个导出与官方同名同顺序 |
+
+### 1.35.4 验证
+
+* **13 个导出全覆盖的黄金探针**：同一段 aardio 代码把每个内核的输出缓冲
+  按十六进制全量回传，x86（官方 32 位 DLL）与 x64（自编 DLL）
+  **逐字节完全一致**（37263 字符全等）。
+* **回归锁**：新建 `tests/av_video_kernel_check.ps1`（x64 / x86 双绿）——
+  14 项像素级黄金值（`v_bg` 线性/径向、`v_grain`、`v_bounds`、`v_clear`、`v_over`、
+  `v_blend`、`v_blit`、`v_glitch2`、`v_resample`、`v_lumaStats`、`v_boxMean`、
+  `v_flickerScore`、`v_motionCheck`）+ overlay 文件存在性 + PE `machine == 0x8664` +
+  13 个导出符号齐全 + 模块解析路径（x64 命中 overlay，x86 走官方库）。
+* **sweep**：x64 全量模块 sweep **ok=929 → 933 / fail=40 → 36**（**-4**，失败集合**只减不增**）。
+  修掉的 4 项：`av.film` / `av.video.flicker` / `av.video.kernel` / `autos.skills.codingFilm`。
+
+### 1.35.5 踩到的坑
+
+* **`raw.buffer(...)` 指针不能按字段写**：`P.v[1] = 3.5` 对 raw 缓冲指针**无效**
+  （读回来是 null）—— 往缓冲区塞浮点数组必须走
+  `raw.buffer({double v[] = {...}})`，否则探针其实在测「全零输入」。
+* **官方 DLL 是 tcc 编的 32 位版**：tcc 用 x87 算浮点，MSVC x64 用 SSE2，
+  理论上最后一位可能有差异；实测这 13 个内核的输出**完全一致**
+  （代码里几乎所有浮点都立刻量化成 8 位整数，误差被吃掉了）。
+* **MSVC 编译官方 C 源码零警告**：`kernel.c` 只依赖 `math.h` / `string.h` / `stdlib.h`，
+  没有 32 位假设（像素偏移都用 `(u32)` 显式转换）。
+
+### 1.35.6 剩下 36 项 x64 失败（更新后的分类）
+
+| 类别 | 项数 | 明细 |
+|---|---:|---|
+| 官方只带 32 位 DLL（**未随库发源码**） | 13 | `web.view` 族 4（`webview.dll`，第三方 WebView2 封装）、`sevenZip.lzma` 族 4（`LzmaUtil.dll`）、`raw.fasm` 1（`FASM.DLL`，汇编器）、`web.layout` 族 4（`HTMLayout.dll` 是第三方 32 位商业库，这 4 项全是它的连带） |
+| 官方契约：必须先导入父命名空间 / 官方自带守卫 | 12 | `py3.export`、`py3.pip`、`sqlite.base` / `sqlite.backup`、`web.acme.httpClient`、`web.form.query`、`web.layout.debug` / `web.layout.valueObject` / `web.layout.element` / `web.layout.element.style`、`web.view.dev`、`winex.accObject.element` |
+| 官方同款导入顺序限制 | 2 | `win.ui.ctrl.splitter` / `win.ui.ctrl.thread` |
+| 官方库自带安装器 / 下载器（超时） | 6 | `fastcgi.iisInstall` / `java.jdk.v6ora` / `java.jdk.v8ora` / `java.jre.v8ora` / `process.php.7.4` / `process.php.8.3` |
+| 官方库依赖的官方库缺失 | 3 | `crypt.jwt.algorithm.EdDSA`（BouncyCastle）/ `process.ruby` / `process.ruby.simpleHttpServer` |
+| 官方库自身断言失败 | 1 | `web.layout.event`（HTMLayout 未装的连带） |
+| 依赖外部安装的官方 DLL | 1 | `com.autoComplete` |
+| sweep 清单伪条目 | 1 | `win.#DEFINE` |
+
+**仍然没有一项是 Nodio 自身的引擎缺陷。** 剩下真正需要动手的是 13 项「官方只有 32 位 DLL、
+没发源码」的：`web.view`（第三方 WebView2 封装）、`sevenZip.lzma`（LZMA 编解码）、
+`raw.fasm`（x86 汇编器）、`web.layout`（第三方 HTML 渲染引擎，许可与体量都不现实）。

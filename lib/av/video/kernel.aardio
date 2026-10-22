@@ -1,0 +1,153 @@
+//kernel 像素内核（C 函数，预编译 DLL）
+/*
+处理自上而下、步幅 宽×4 的 BGRA 缓冲区（预乘 alpha，与 gdip PARGB 位图内存相同）。
+调用前先对同一块内存上的画板调用 flush。
+C 源码在 .res/kernel.c，改完运行 .res/build.aardio 重建 kernel.dll（tcc 编译）；
+这里用 $ 把 DLL 编译进代码并内存加载，运行时不需要 tcc。
+*/
+namespace av.video.kernel;
+
+//多线程共享同一个内存 DLL 模块（C 函数没有可写的全局变量）
+// Nodio x64 版：官方把 32 位 kernel.dll 用 $ 内嵌进源码再内存加载，x64 进程装不下该 PE
+//（实测「无法加载 DLL: (内嵌的内存映像)」）。
+// 官方**随库发布了 C 源码**（.res/kernel.c，注释里写明用 tcc 编译成 32 位 DLL），
+// 所以这里按官方同名路径提供 Nodio 自己的版本：同目录 .res/kernel64.dll
+// 是用 MSVC 重新编译的 x64 DLL，导出函数与官方 32 位 DLL 完全一致。
+var _selfDir = io.splitpath(io.libpath("av.video.kernel")).dir;
+_dll = ..raw.loadDll(_selfDir + ".res\\kernel64.dll","av.video.kernel.dll","cdecl");
+if(!_dll) error("av.video.kernel 缺少 x64 DLL：" + _selfDir + ".res\\kernel64.dll",2);
+
+//原型必须与 kernel.c 里的 C 签名逐个一致：类型写错会直接崩溃
+var api = function(name,proto){
+	var f = _dll.api(name,proto);
+	if(!f) error("av.video.kernel 缺少函数：" + name,2);
+	return f;
+}
+var cBg = api("v_bg","void(ptr dst,int w,int h,int type,double angle,double cx,double cy,double radius,int n,ptr stops,double vignette,double grain,double cell,int seed)");
+var cResample = api("v_resample","int(ptr dst,int dw,int dh,ptr src,int sw,int sh,double sx0,double sy0,double sx1,double sy1,double dx0,double dy0,double dx1,double dy1,double opacity,int filter,int clx0,int cly0,int clx1,int cly1,int mode,double radius)");
+var cOver = api("v_over","void(ptr dst,ptr src,int w,int h,int x0,int y0,int x1,int y1,int op)");
+var cClear = api("v_clear","void(ptr dst,int w,int h,int x0,int y0,int x1,int y1)");
+//图层合成：把预乘 BGRA 图层 src 按整体不透明度叠加到 dst（同尺寸）；rect 为 {x0;y0;x1;y1}（像素，开区间），省略为整张
+over = function(dst,src,w,h,opacity,rect){
+	if(opacity === null) opacity = 1;
+	var op = ..math.floor(opacity * 256 + 0.5);
+	if(op <= 0) return;
+	if(rect) cOver(dst,src,w,h,rect.x0,rect.y0,rect.x1,rect.y1,op);
+	else cOver(dst,src,w,h,0,0,w,h,op);
+}
+var cBounds = api("v_bounds","int(ptr src,int w,int h,int &x0,int &y0,int &x1,int &y1)");
+//非透明像素的包围盒 {x0;y0;x1;y1}（像素，开区间）；全透明返回 null
+bounds = function(buf,w,h){
+	var n,x0,y0,x1,y1 = cBounds(buf,w,h,0,0,0,0);
+	if(n > 0) return {x0 = x0;y0 = y0;x1 = x1;y1 = y1};
+}
+//把矩形清成全透明；rect 省略为整张
+clear = function(buf,w,h,rect){
+	if(rect) cClear(buf,w,h,rect.x0,rect.y0,rect.x1,rect.y1);
+	else cClear(buf,w,h,0,0,w,h);
+}
+blend = api("v_blend","void(ptr dst,ptr src,int n,int a)");
+var cGrain = api("v_grain","void(ptr dst,int w,int h,double grain,double cell,int seed)");
+//给不透明 BGRX 图像加静态粗颗粒（与 background 的 grain 同一种噪声）：AI 生成等过于平滑的深色背景图防色带
+grain = function(buf,w,h,amount,cell,seed){
+	if(cell === null) cell = 3;
+	if(seed === null) seed = 1;
+	cGrain(buf,w,h,amount,cell,seed);
+}
+blit = api("v_blit","void(ptr dst,int dw,int dh,ptr src,int sw,int sh,int dx,int dy)");
+var cGlitch2 = api("v_glitch2","void(ptr dst,ptr a,ptr b,int w,int h,double amount,double mix,int seed,int layoutSeed,double split)");
+//故障：src 为 dst 的副本（dst 就地处理）；split 为满幅 RGB 分离占宽度比例，默认 0.004，0 = 不分离
+glitch = function(dst,src,w,h,amount,seed,split){
+	if(split === null) split = 0.004;
+	cGlitch2(dst,src,null,w,h,amount,0,seed,0,split);
+}
+//故障撕裂转场：旧画面 a 按固定细条逐条换成新画面 b（mix 0~1，单调），另有少量粗条带错位（seed 约 15Hz 换一次）；
+//layoutSeed 决定细条布局（整个转场保持不变）；dst 不能与 a、b 相同；split 默认 0（不分离）
+glitchMix = function(dst,a,b,w,h,amount,mix,seed,layoutSeed,split){
+	if(split === null) split = 0;
+	cGlitch2(dst,a,b,w,h,amount,mix,seed,layoutSeed : 0,split);
+}
+
+//分区亮度统计（闪烁检测用）：mean/sd 为 cols×rows 个 float 的缓冲区（可为 null）；stride 默认 w*4；step 采样步长默认 1
+var cLumaStats = api("v_lumaStats","void(ptr src,int w,int h,int stride,int cols,int rows,int step,ptr mean,ptr sd)");
+lumaStats = function(src,w,h,stride,cols,rows,mean,sd,step){
+	cLumaStats(src,w,h,stride : w * 4,cols,rows,step : 1,mean,sd);
+}
+boxMean = api("v_boxMean","void(ptr g,int cols,int rows,int win,ptr out)");
+var cFlickerScore = api("v_flickerScore","double(ptr a,ptr b,ptr c,ptr d,ptr e,int cols,int rows,int win,double thr,ptr mask,int &arg,int &sgn)");
+flickerScore = function(a,b,c,d,e,cols,rows,win,thr,mask){
+	var s,arg,sgn = cFlickerScore(a,b,c,d,e,cols,rows,win,thr,mask,0,0);
+	return s,arg,sgn;
+}
+var cMotionCheck = api("v_motionCheck","void(ptr P,ptr C,ptr N,int cols,int rows,int x0,int y0,int x1,int y1,int S,int gs,ptr out)");
+//闪烁复核（运动补偿）：P/C/N 为连续三帧的缩略亮度图（lumaStats 的 mean，cols×rows 个 float）；
+//区域 [x0,x1]×[y0,y1] 以格计（含两端）；S 为平移搜索半径（格）；gs 为粗搜间隔（默认 1 = 逐格，大位移用 2）。
+//返回 {e0;emc;d1x;d1y;d2x;d2y;peakMc;peak0;n}：不补偿/补偿后的残差和、P→C 与 C→N 的内容移动（格/帧）、单格最大残差、格数
+motionCheck = function(P,C,N,cols,rows,x0,y0,x1,y1,S,gs){
+	var out = ..raw.buffer(72);
+	cMotionCheck(P,C,N,cols,rows,x0,y0,x1,y1,S,gs : 1,out);
+	var r = ..raw.convert(out,{double v[9]}).v;
+	return {e0 = r[1];emc = r[2];d1x = r[3];d1y = r[4];d2x = r[5];d2y = r[6];peakMc = r[7];peak0 = r[8];n = r[9]};
+}
+
+/*
+背景：渐变 + 暗角 + 静态粗颗粒，写入不透明 BGRX。
+spec 字段：type="linear"|"radial"；angle（度，默认 90 即上→下）；cx,cy（径向中心，宽高比例，默认 0.5,0.42）；
+radius（半对角线比例，默认 1）；stops = {{位置,0xRRGGBB},...} 或颜色数组（均匀分布）；
+vignette（默认 0）；grain（颗粒幅度，默认 0）；cell（颗粒格子像素，默认 3）；seed
+*/
+background = function(buf,w,h,spec){
+	var stops = spec.stops : {0x000000};
+	var n = #stops;
+	var arr = {};
+	for(i=1;n){
+		var s = stops[i];
+		var pos,c;
+		if(type(s) == "table"){ pos,c = s[1],s[2]; }
+		else { c = s; pos = n > 1 ? (i - 1) / (n - 1) : 0; }
+		..table.push(arr,pos,(c >> 16) & 0xFF,(c >> 8) & 0xFF,c & 0xFF);
+	}
+	var st = ..raw.buffer({double v[] = arr});
+	var typ = spec.type == "radial" ? 1 : 0;
+	var num = function(v,def){ if(v === null) return def; return v; }
+	cBg(buf,w,h,typ,num(spec.angle,90),num(spec.cx,0.5),num(spec.cy,0.42),num(spec.radius,1),n,st,num(spec.vignette,0),num(spec.grain,0),num(spec.cell,3),num(spec.seed,1));
+}
+
+/*
+把源图（预乘 BGRA）的矩形 src 画到目标矩形 dst（浮点像素）：轴对齐缩放 + 平移，滤波重采样，边缘按覆盖率抗锯齿。
+srcRect/dstRect 为 {x;y;width;height}（省略 srcRect 即整张源图）；opt: opacity,filter(0 Mitchell/1 CatmullRom),clip{x;y;width;height},copy,
+radius（目标矩形的圆角半径，目标像素；角按覆盖率抗锯齿，随亚像素位置平滑移动）
+*/
+resample = function(dstBuf,dw,dh,srcBuf,sw,sh,dstRect,srcRect,opt){
+	srcRect = srcRect : {x=0;y=0;width=sw;height=sh};
+	opt = opt : {};
+	var clip = opt.clip;
+	var cx0,cy0,cx1,cy1 = 0,0,dw,dh;
+	if(clip){ cx0,cy0,cx1,cy1 = ..math.floor(clip.x),..math.floor(clip.y),..math.ceil(clip.x + clip.width),..math.ceil(clip.y + clip.height); }
+	var op = opt.opacity;
+	if(op === null) op = 1;
+	var radius = opt.radius;
+	if(radius === null) radius = 0;
+	return cResample(dstBuf,dw,dh,srcBuf,sw,sh,
+		srcRect.x,srcRect.y,srcRect.x + srcRect.width,srcRect.y + srcRect.height,
+		dstRect.x,dstRect.y,dstRect.x + dstRect.width,dstRect.y + dstRect.height,
+		op,opt.filter : 0,cx0,cy0,cx1,cy1,opt.copy ? 1 : 0,radius);
+}
+
+/**intellisense(av.video.kernel)
+_dll = 内存加载的 kernel.dll 模块
+background(buf,w,h,spec) = 生成背景：渐变 + 暗角 + 静态粗颗粒（浮点计算、量化一次），写入不透明 BGRX。\nspec: type="linear"|"radial",angle,cx,cy,radius,stops={{位置,0xRRGGBB}},vignette,grain,cell,seed
+resample(dstBuf,dw,dh,srcBuf,sw,sh,dstRect,srcRect,opt) = 轴对齐缩放平移重采样（浮点坐标精确、缩小有预滤波、边缘按覆盖率抗锯齿），\n预乘 alpha 叠加到目标；opt: opacity,filter,clip,copy,radius(圆角半径，目标像素)
+over(dst,src,w,h,opacity,rect) = 图层合成：同尺寸预乘 BGRA 图层按整体不透明度叠加到 dst；\nrect={x0;y0;x1;y1} 限定范围（像素，开区间），省略为整张
+clear(buf,w,h,rect) = 清成全透明；rect={x0;y0;x1;y1}，省略为整张
+bounds(buf,w,h) = 非透明像素（alpha>0）的包围盒 {x0;y0;x1;y1}（像素，开区间）；全透明返回 null
+blend(dst,src,pixels,a256) = 交叉混合 dst += (src-dst)*a/256
+grain(buf,w,h,amount,cell,seed) = 给不透明 BGRX 图像加静态粗颗粒（±amount 色阶，cell 像素一格，默认 3；与 background 的 grain 同一种噪声），\n用于过于平滑的深色背景图（AI 生成图常见）防止编码后出色带；只加在背景层
+blit(dst,dw,dh,src,sw,sh,dx,dy) = 整数偏移复制（带裁剪）
+glitch(dst,src,w,h,amount,seed,split) = 故障效果：少量粗条带错位，错位条带内轻微 RGB 分离；src 为 dst 的副本。\namount 0~1；seed 决定条带（建议约 15Hz 换一次，每个状态停留约 2 帧）；split 满幅 RGB 分离占宽度比例，默认 0.004，0 = 不分离
+glitchMix(dst,a,b,w,h,amount,mix,seed,layoutSeed,split) = 故障撕裂转场：旧画面 a 按固定细条逐条换成新画面 b（mix 0~1，单调），另有少量粗条带错位。\nseed 约 15Hz 换一次；layoutSeed 决定细条布局（整个转场不变）；dst 不能与 a、b 相同；split 默认 0（细彩边经 4:2:0 色度抽样会糊成色块）
+lumaStats(src,w,h,stride,cols,rows,meanBuf,sdBuf,step) = 分区亮度统计：cols×rows 格的平均亮度与标准差（0~255，float 缓冲区，可为 null）；\nstride 默认 w*4；step 采样步长（行列都隔 step 像素取样），默认 1
+boxMean(grid,cols,rows,win,outBuf) = 盒式均值：win×win 窗口（步长 1），输出 (cols-win+1)×(rows-win+1) 个 float
+flickerScore(a,b,c,d,e,cols,rows,win,thr,mask) = 单帧闪烁评分（av.video.flicker 内部使用）：a~e 为连续 5 帧的 boxMean 结果，评估中间帧；\n返回 分数(峰高/thr),窗口序号,方向(+1 更强/-1 更弱)
+motionCheck(P,C,N,cols,rows,x0,y0,x1,y1,S,gs) = 闪烁复核（av.video.flicker 内部使用）：用整体平移能否解释中间帧 C 的突变（规则纹理快速平移）。\nP/C/N 为连续三帧的缩略亮度图（float），区域以格计、含两端，S 搜索半径（格），gs 粗搜间隔（默认 1）；\n返回 {e0;emc;d1x;d1y;d2x;d2y;peakMc;peak0;n}：不补偿/补偿后残差和、P→C 与 C→N 的移动（格/帧）、单格最大残差、格数（区域全在图外为 0）
+end intellisense**/

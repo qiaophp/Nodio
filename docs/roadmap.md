@@ -892,6 +892,28 @@ Fixed & closed in recent sessions:
       否则 x86（唯一能跑官方库的架构）会一直错下去。
     详见 `docs/capability-gap.md` §1.34
 
+17. [x] **av.video.kernel：官方随库发布 C 源码的模块，重编 x64 即可（4 项失败）**（2026-10-22 第三十轮续）—
+    官方 `lib/av/video/kernel.aardio` 把 32 位 `kernel.dll` 用 `$"..."` 内嵌进源码再内存加载
+    → x64 装不下（实测「无法加载 DLL: (内嵌的内存映像)」）。
+    但**官方随库发布了 C 源码**（`D:\aardio\lib\av\video\.res\kernel.c`，注释写明用 tcc 编成 32 位 DLL）
+    → 不用自写，直接用官方源码重编 x64 即可（全库 `.res` 下的 C 源码只有两个，另一个 dsp.c 已做）。
+    - **补版**：`lib/av/video/kernel.aardio`（官方**逐字副本**，只换 DLL 来源）+
+      `.res/kernel64.dll`（官方 `.res/kernel.c` 用 MSVC 编出的 x64 DLL，`/MT` 静态 CRT，零警告；
+      13 个导出与官方 DLL **同名同顺序**）。
+      依赖链 `av.video.kernel ← av.film ← autos.skills.codingFilm`、`<- av.video.flicker`
+      → 补一个模块修好 **4 项**。
+    - **回归**：新建 `tests/av_video_kernel_check.ps1`（x64 / x86 双绿）——
+      13 个导出全覆盖的像素级黄金值（v_bg 线性/径向、v_grain、v_bounds、v_clear、v_over、
+      v_blend、v_blit、v_glitch2、v_resample、v_lumaStats、v_boxMean、v_flickerScore、v_motionCheck）
+      + overlay 文件/PE 架构/13 个导出符号/模块解析路径；
+      两架构的**全量十六进制输出逐字节一致**（37263 字符全等）；
+      x64 / x86 各 **24 套回归全绿**；x64 全量 sweep **ok=929 → 933 / fail=40 → 36**（-4，无新增失败）。
+    - **剩余 36 项 x64 失败里仍没有一项是 Nodio 引擎缺陷**：13 项官方只带 32 位 DLL 且未发源码
+      （`web.view` 族 4 / `sevenZip.lzma` 族 4 / `raw.fasm` 1 / `web.layout` 族 4）、
+      12 项官方契约守卫、2 项官方同款导入顺序、6 项自带安装器超时、3 项官方库缺失、
+      1 项官方断言、1 项外部安装缺件、1 项清单伪条目。
+    详见 `docs/capability-gap.md` §1.35
+
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard
 2. console.log string-encoding primitive layer (isUtf16/getUtf/toUtf16 semantics), `.join`/`.getMessage` gaps
