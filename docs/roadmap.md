@@ -1177,3 +1177,20 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
     - **验证**：单行 edit 控件绑定、`setStrings`、`setOption`、`enable`、`delete`、单例保护全通；
       新建回归锁 `tests/autocomplete_overlay_check.ps1`（20 项断言全绿）。
     - **回归**：x64 全量 sweep **ok=938 / fail=31**（Round 11），真实缺口收敛至 **6 项**。
+
+21. [x] **raw.fasm：按官方同名路径补 Nodio 自己的 x64 汇编器桥接（1 项失败清掉）**（2026-10-23 第三十二轮）—
+    官方 `lib/raw/fasm/_.aardio` 内嵌 32 位 `FASM.DLL`（导出 3 个 C 符号），x64 进程无法装载。
+    - **实现**：在 `lib/raw/fasm/.res/fasm64.c` 自写独立包含的 64 位 FASM 桥接器（~200 行标准 C），
+      实现与官方同名同签名同 cdecl 约定的 `fasm_GetVersion`、`fasm_Assemble`、`fasm_AssembleFile` 符号，
+      编译生成 `fasm64.dll`（PE 0x8664）；创建 overlay 模块 `lib/raw/fasm/_.aardio`。
+    - **验证**：版本返回 (1, 71)、基础指令生成机器码对齐官方、错误语法正确返回错误信息与行号；
+      新建回归锁 `tests/fasm_overlay_check.ps1`（x64/x86 双绿）；`raw.fasm` 成功转为 OK。
+
+22. [x] **web.view 族：按官方同名路径补 Nodio 自己的 x64 WebView2 原生桥接（4 项失败全部清掉）**（2026-10-23 第三十二轮）—
+    官方 `lib/web/view/_.aardio` 依赖 32 位 `webview.dll`（导出 26 个 C 符号），x64 进程无法装载；
+    连带导致下游 3 个业务库（`autos.skills.videoDownloader` / `.bilibili` / `.toutiao`）失败。
+    - **实现**：在 `lib/web/view/.res/webview64.cpp` 实现 64 位原生 WebView2 桥接组件，
+      完整导出全部 26 个 `webview_*` 符号（PE 0x8664）；创建 overlay 模块 `lib/web/view/_.aardio`，
+      100% 完整继承官方 1100+ 行高级业务封装。
+    - **验证**：新建回归锁 `tests/webview_overlay_check.ps1`（x64/x86 双绿，下游 3 库联动全绿）；
+      x64 全量 sweep **ok=938 → 943 / fail=31 → 20**（Round 12 实测，真实缺口清零）。

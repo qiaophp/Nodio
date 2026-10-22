@@ -1,0 +1,1209 @@
+// ── Nodio x64 补版（同名路径 overlay）────────────────────────────────────
+// 官方 lib/web/view/_.aardio 把 32 位 webview.dll 用 $"..." 内嵌进源码
+// 再内存加载，x64 进程装不下该 PE（实测「无法加载 DLL: (内嵌的内存映像)」）。
+// 这里在 Nodio 侧提供同名路径的自写实现：
+//
+//   · 核心是 Nodio 自写的 C++ 实现 .res\webview64.cpp（源码入库，可复现构建），
+//     编译成 x64 的 .res\webview64.dll；
+//   · 导出名 / 调用约定(cdecl) / 参数签名与官方 webview.dll 逐个一致（共 26 个）；
+//   · 本文件其余 1100+ 行逐字沿用官方实现，完整保留官方全部高级业务逻辑。
+//
+// x86 构建不命中 overlay，行为与官方一致。
+// ────────────────────────────────────────────────────────────────────────
+﻿import inet.url;
+import util.metaProperty;
+import util.registry;
+import JSON;
+import win.reg;
+import wsock;
+import string.args; 
+
+namespace web;
+
+if( _STUDIO_INVOKED && (!_WIN10_LATER) && _WIN7_LATER ){
+	//仅在开发环境中，Windows 7 的 web.view 自动降级为 web.view.7
+	global.import("web.view.7");
+	return;
+}
+
+class view {
+	ctor( winform,createBrowserOptions,browserArguments,...){{
+		if(!_WIN10_LATER) return;
+		
+		if(!checkRuntime(winform)) return;
+		if(!winform[["hwnd"]]) {
+			winform = winform ? ..win.form(winform) : ..win.form().messageOnly();
+		}
+		elseif(!winform[["_defClientRect"]]){
+			var errMsg = `web.view 的容器窗口（参数 @1 ）必须指定同一线程创建的窗体或控件对象。如果希望在独立线程启动 web.view ，可创建 cls 为 "thread" 的线程控件作为容器窗口，并在创建控件的参数中使用 loadForm 字段指定启动创建线程窗口的函数或代码（或代码文件路径）。`;
+			if(!..thread.get("web.view.thread.firstError")){
+				..thread.set("web.view.thread.firstError",true)
+				winform.msgboxErr(errMsg)
+			}
+			
+			error(errMsg,2);
+			return;
+		}
+		 
+		if(type.isString(createBrowserOptions)){
+			createBrowserOptions = {
+				userDataDir = createBrowserOptions;
+			}
+		}
+		elseif(!createBrowserOptions) createBrowserOptions = {};
+		elseif(type(createBrowserOptions)!="table") error("参数 @2 必须是表对象或字符串",2);
+		
+		if(!createBrowserOptions.userDataDir){
+			createBrowserOptions.userDataDir = _AARDIO_AUTOS_INVOKED ? "autos" : defaultUserDataDir;
+		}
+		
+		if(!..string.indexAny(createBrowserOptions.userDataDir,"\/")){
+			createBrowserOptions.userDataDir = ..io.joinpath(defaultUserDataDir,"~" + createBrowserOptions.userDataDir);
+		}
+		
+		if(browserArguments===null) browserArguments = createBrowserOptions.startArguments;
+		
+		if(browserArguments!==null){
+			if(type(browserArguments)=="number"){
+				if(!browserArguments) browserArguments = ..wsock.getFreePort("127.0.0.1");
+				browserArguments = "--remote-debugging-port=" + browserArguments;
+			} 
+			
+			browserArguments = ..string.args.joinEx(true,"=",false,browserArguments,...);
+			
+			this.remoteDebuggingPort = ..string.match(browserArguments,"\-\-remote\-debugging\-port\=(\d+)");
+			if(this.remoteDebuggingPort) this.remoteDebuggingPort = tonumber(this.remoteDebuggingPort);
+		 
+			if(!..string.find(browserArguments,"--remote-allow-origins") ) {
+				browserArguments = browserArguments + " --remote-allow-origins=http://127.0.0.1";
+			}
+		}
+		else {
+			browserArguments = self.browserArguments;
+			if(type(browserArguments) == "function") browserArguments = browserArguments()
+			
+			if(type(browserArguments)==="table"){
+				browserArguments = ..string.args.joinEx(true,"=",false,browserArguments,...);
+			}
+		}
+		
+		var browser = _dll.webview_newP();
+		this.browser = browser;
+		
+		var hr = _dll.webview_createW(browser,{
+  				addr window = winform.hwnd;
+  				ustring userDataDir = ..io.fullpath(createBrowserOptions.userDataDir);
+  				ustring language = createBrowserOptions.language;//例如 "zh-CN" 格式参考 ..sys.locale 库
+  				ustring startArguments = browserArguments;
+  				
+  				//浏览器最低兼容版本: https://aka.ms/webviewrelease 不能低于 "86.0.616.0"
+  				ustring compatibleBrowserVersion = createBrowserOptions.compatibleBrowserVersion || "86.0.616.0";
+  				bool extensions = createBrowserOptions.extensions;
+			} )
+			
+		if( hr < 0/*_FAILED*/){
+			return null,..lasterr(hr);
+		}
+		this.userDataDir = createBrowserOptions.userDataDir;
+		
+		if(winform._onDestroy) error("参数 @1 只能指定窗体（win.form）、custom 控件或 static 控件。",2);
+		winform._onDestroy = function(){
+			if(this.browser){
+				this._form.adjust = null;
+				_dll.webview_destroy(this.browser);	
+				this.browser = null;
+				browser = null;
+			}
+		}
+		
+		winform.onEraseBkgnd  = lambda() 0; 
+		
+		//避免回调函数指针被提前回收
+		this._cdpEventGC = {};
+		this._cdpCallbackGC = {};
+		this._jsCallbackGC = {};
+		
+		this.export = function(name,callback){
+			if(!this.browser) return;
+			if(type(name)==="table"){
+				for k,v in ..table.eachName(name){ 
+					if(type(v)==="function"){
+						this.export(k,v);
+					}
+				}
+				
+				return;
+			}
+			
+			if(type(name)!=="string") error("参数@1必须是字符串",2);
+			if((type(callback)!=="function")&&(type(callback)!=="class") ) error("参数@2必须是函数",2);
+			
+			this._jsCallbackGC[name] = ..raw.tocdecl(function(seq,req,arg){
+				var ok,ret;
+				
+				if(req){
+					req = ..JSON.parse(req);
+					ok,ret = call(callback,this,..table.unpackArgs(req))	
+				}
+				else {
+					ok,ret = call(callback,this)		
+				}
+				
+				if(!ok){
+					if(ret) errput(ret); 
+					_dll.webview_do_script(this.browser,"window._rpc[" + seq + "].reject(" + ..JSON.stringify(ret) + "); window._rpc[" +  seq + "] = undefined",null);
+					return;
+				}
+				
+				if(ret!==null){  
+					_dll.webview_do_script(this.browser,"window._rpc[" + seq + "].resolve(" + ..JSON.stringify(ret) + "); window._rpc[" +  seq + "] = undefined",null);
+				}
+			}
+			,"void(string seq,string req,ptr arg)")
+			
+			_dll.webview_bind(this.browser,name,this._jsCallbackGC[name],null); 
+		};
+
+		if(!winform.wait( function(){
+			if(browser && _dll.webview_ready(browser)){ 
+				this._jsEvalCallback = ..util.registry();
+				this.export(
+					$aardio_external_evalCallback = function(result,err,callbackId){
+						var cb = this._jsEvalCallback.unReg(callbackId);
+						if(cb){ cb(result,err); }
+					};
+					$aardio_external_onDocumentInit = function(url){
+						var r = this._jsEvalCallback;
+						for(i,cb in r){
+							if(type(i)=="number") {
+								if(type(cb)=="function"){ //cb 可能是 freeID
+									cb(null,"DOCUMENT_CLOSED") 
+								};
+								r[i] = null;
+							}
+						}
+						
+						this.$readyUrl = url;
+						if(this.onDocumentInit)this.onDocumentInit(url);
+					};
+					$aardio_external_onWindowLoad = function(url){ 
+						if(owner[["(onWindowLoad)"]]) invoke(owner[["(onWindowLoad)"]] ,owner,url); 
+					};
+					$aardio_external_onDocumentComplete = function(url){
+						this.$readyUrl = url;
+						if(owner[["(onDocumentComplete)"]]) invoke(owner[["(onDocumentComplete)"]] ,owner,url); 
+					};
+				);
+				
+				_dll.webview_set_size(browser);
+				_dll.webview_init(browser,"
+window.external = { invoke: s => window.chrome.webview.postMessage(s) };
+window.external.waitEle = function (selector, timeout, frequency) {
+	const isXPath = selector[0] == '/'  || selector[0] == '(';
+    return new Promise((resolve, reject) => {
+        var b = Date.now(); (function retry() {
+            let el;
+            if(isXPath) el = document.evaluate(selector, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue 
+            else el = document.querySelector(selector);
+            
+            if (el != null) { resolve(el); } else {
+                setTimeout(function () { let ms; if (timeout && (ms = Date.now() - b) > timeout) { reject('Promise timed out after ' + ms + ' ms'); } else { retry(); } }, frequency || 200);
+            }
+        })();
+    })
+};
+
+if (chrome.webview?.hostObjects) {
+    chrome.webview.hostObjects.options.shouldSerializeDates = true;
+}
+
+if (top == self) {
+    $aardio_external_onDocumentInit(location.href);
+}")
+				return true;
+			}
+		},,300)) return;
+		
+		_dll.webview_setIsStatusBarEnabled(this.browser,false);
+		_dll.webview_setVisible(this.browser,true)
+		
+		winform.adjust = function( cx,cy,wParam ) {	 
+			_dll.webview_set_size(browser); 
+		};
+		
+		this._form = winform;
+		this.hwndChrome = ..win.getChild(winform.hwnd); 
+		this._xcallbackCdecl = {};
+	} };
+	adjust = function(){
+		if(!this.browser) return;
+		_dll.webview_set_size(this.browser);
+	};
+	go = function(url,devPort,timeout){ 
+		if(type(devPort)=="table"){
+			url = ..inet.url.appendExtraInfo(url,devPort);
+			devPort = null;
+		}
+		
+		if(!this.browser) return; 
+		if(_STUDIO_INVOKED && devPort){
+			global.import("web.view.dev");
+			..web.view.dev(this,url,devPort,timeout);
+		}
+		else {
+			this.$location = ..io.localpath(url) : url;
+			var path,extraInfo = ..string.match(url,"([^\#\?]+)(.*)"); 
+			
+			if(..io.localpath(path)){ 
+				
+				if(..wsock[["tcp"]][["asyncHttpServer"]]){
+					if(!this.asyncHttpServer){
+						this.asyncHttpServer = ..wsock.tcp.asyncHttpServer();
+						this.asyncHttpServer.start("127.0.0.1");
+					}
+					
+					var tPath = ..io.splitpath(path);
+					if( ..string.cmp(tPath.file, "index.html")==0
+						|| ..string.cmp(tPath.file, "index.aardio")==0){
+						this.$location = this.asyncHttpServer.spaUrl(..string.concat(tPath.file,extraInfo),tPath.dir);
+					} 
+					else {
+						this.$location = this.asyncHttpServer.spaUrl(url);
+					} 
+				}
+				elseif(..wsock[["tcp"]][["simpleHttpServer"]]){
+					var tPath = ..io.splitpath(path);
+					if( ..string.cmp(tPath.file, "index.html")==0
+						|| ..string.cmp(tPath.file, "index.aardio")==0){
+						this.$location = ..wsock.tcp.simpleHttpServer.startSpaUrl(..string.concat(tPath.file,extraInfo),tPath.dir);
+					}
+					else {
+						this.$location = ..wsock.tcp.simpleHttpServer.startSpaUrl(url);
+					} 
+				}
+				elseif(extraInfo && ..io.exist(path) ){
+					this.$location = "file:///" + ..io.fullpath(path) + extraInfo;
+				} 
+			}
+			elseif(extraInfo && ..io.exist(path) ){
+				this.$location = "file:///" + ..io.fullpath(path) + extraInfo;
+			} 
+
+			var urlPath,extraInfo = ..string.match(this.$location,"([^\#]+)(.*)"); 
+			if(this.$readyUrl && #extraInfo){ 
+				readyPath = ..string.match(this.$readyUrl,"([^\#]+)"); 
+				  
+				if(..inet.url.cmp(urlPath,readyPath)==0 ){ 
+					var path = ..string.match(urlPath,"([^\?]+)"); 
+					if(..string.endsWith(path,".pdf",true)){ 
+						
+						//https://github.com/MicrosoftEdge/WebView2Feedback/issues/2409
+						_dll.webview_navigate(this.browser, "about:blank");
+					 
+						this.$readyUrl = null;
+						this._form.wait(function(){
+							return this.$readyUrl;
+						},,10);  
+					}
+					else{
+						_dll.webview_navigate(this.browser, this.$location);
+						..thread.delay(500); 
+						return;
+					}
+				}
+			} 
+
+			this.$readyUrl = null;
+			_dll.webview_navigate(this.browser, this.$location); 
+			
+			this._form.wait(function(){
+				return this.$readyUrl;
+			});
+		}
+	};
+	doScript = function(js,callback,cbOwner){
+		if(!this.browser) return; 
+			
+		if(type(callback)=="function"){
+			var callbackCdecl;
+			callbackCdecl = ..raw.tocdecl(function(err,json){
+				if(!err){
+					var r,e = call(callback,cbOwner,jsonTryParse(json));
+					if(!r){ errput(e:"ExecuteScript failed","WebView") }
+				}
+				else {
+					errput("ExecuteScript failed","WebView")
+				}
+				 
+				this._form.setTimeout(
+					function(){
+						..raw._release(callbackCdecl);
+						this._jsCallbackGC[callbackCdecl] = null; 
+					},0
+				)
+			},"void(int errCode,ustring json)")
+			
+			this._jsCallbackGC[callbackCdecl] = callback;
+			return _dll.webview_do_script(this.browser,js,callbackCdecl); 
+		}
+		
+		return _dll.webview_do_script(this.browser,"(function(){"+js+'\n})()',null)
+	};
+	eval = function(js,callback,...){
+		if(!this.browser) return;  
+		
+		if(type(callback)=="function"){ 
+			
+			var callbackCdecl;
+			callbackCdecl = ..raw.tocdecl(function(err,json){
+				if(!err){
+					var result = jsonTryParse(json);
+					callback(result)
+				} 
+				
+				this._form.setTimeout(
+					function(){
+						this._xcallbackCdecl[callbackCdecl] =  null;
+						..raw._release(callback);
+					} 
+				)
+			},"void(int errCode,ustring json)")
+			this._xcallbackCdecl[callbackCdecl] = callback;
+			
+			_dll.webview_do_script(this.browser,"("+js+")",callbackCdecl) 
+			return true;
+		}
+			
+		if(callback) js = ..string.format(js,callback,...);
+		
+		var done;
+		var result;
+		var callback = ..raw.tocdecl(function(err,json){
+			if(!err){
+				result = jsonTryParse(json);
+				done = true;
+			}
+			else {
+				done = false;
+			}
+		},"void(int errCode,ustring json)")
+		
+		_dll.webview_do_script(this.browser,"("+js+")",callback) 
+		..win.wait(lambda() done,winform.hwnd,,5);
+		 
+		..raw._release(callback);
+		return result;
+	};
+	xcall = function(method,...){
+		/*
+		能调用非阻塞的 webView.invoke ，
+		就尽量不要以阻塞等待返回值的方式调用 webView.xcall，webView.eval 。
+		webView.invoke 更轻量无需处理回调与返回值。
+		
+		调用 webView.invoke 时如果最后一个参数是接收 JS 返回值的 aardio 函数，
+		则不会阻塞等待返回值。
+		*/
+		var jsThis = "null";
+		if(!..string.find(method,"[\r\n\;\{\}\(\)]")){
+			jsThis = ..string.match(method,"(.+)\.[^.]+$") : "null";
+		}
+		
+		var args = [...]
+		if(type(args[#args])=="function"){
+			if(!this.browser) return;  
+			callback = ..table.pop(args);
+			var js  = "(" + method + ").apply(" + jsThis + "," + ..JSON.stringifyArray({...}) + ")";
+			
+			var callbackCdecl;
+			callbackCdecl = ..raw.tocdecl(function(err,json){
+				if(!err){
+					var result = jsonTryParse(json);
+					callback(result)
+				} 
+				
+				this._form.setTimeout(
+					function(){
+						this._xcallbackCdecl[callbackCdecl] =  null;
+						..raw._release(callback);
+					} 
+				)
+			},"void(int errCode,ustring json)")
+			this._xcallbackCdecl[callbackCdecl] = callback;
+			
+			_dll.webview_do_script(this.browser,"("+js+")",callbackCdecl) 
+			return true;
+		}
+		
+		var js  = "(" + method + ").apply(" + jsThis + "," + ..JSON.stringifyArray({...}) + ")";
+		return this.eval(js);
+	};
+	invoke = function(method,...){
+		if(type(method)==="function"){
+			return invoke(method,owner,...);
+		}
+		
+		var jsThis = "null";
+		if(!..string.find(method,"[\r\n\;\{\}\(\)]")){
+			jsThis = ..string.match(method,"(.+)\.[^.]+$") : "null";
+		}
+		
+		var js  = "(" + method + ").apply(" + jsThis + "," + ..JSON.stringifyArray({...}) + ")";
+		_dll.webview_do_script(this.browser,js,null)
+	};
+	waitEleSync = function(selector,callback,timeout){
+		if(!callback) return this.waitEle(selector,,timeout)
+		if(!this.waitEle(selector,,timeout)){
+			return;
+		}
+		
+		this.waitEle(selector,callback,timeout);
+		return true;
+	};
+	waitEle = function(selector,callback,timeout){
+		if(!this.browser) return; 
+		if(type(callback)==="number") timeout,callback = callback,null;
+		
+		if(type.isString(callback)){//当前文档对象关闭退出等待
+			selector = ..string.escape(selector,true,false);
+			_dll.webview_do_script(this.browser,'external.waitEle("'
+				+selector+""","+(timeout:0)+").then( (el)=>{ ((function(){"+callback+'\n}).bind(el))() } ).catch(e=>{})',null) 
+		}
+		elseif(callback){//当前文档对象关闭退出等待
+			selector = ..string.escape(selector,true,false);
+			var callbackId = this._jsEvalCallback.reg(callback); 
+			_dll.webview_do_script(this.browser,'external.waitEle("'
+				+selector+""","+(timeout:0)+").then( ()=>{ window.$aardio_external_evalCallback('"+selector+"',null,"+callbackId+")} ).catch( (e)=>{ window.$aardio_external_evalCallback(null,e,"+callbackId+")} )",null) 
+		}
+		else {//页面跳转或网上退出等待
+			var url = this.$readyUrl;
+			
+			//异步
+			var resultOk,resultErr;
+			this.waitEle(selector,function(ok,err){
+				resultOk,resultErr = ok,err;
+			},timeout)
+			
+			//同步
+			return this._form.wait(function(){
+				if(this.$readyUrl!=url) return null,"页面已跳转";
+				return resultOk,resultErr;
+			},,timeout); 
+		} 
+	};
+	waitEle2 = function(selector,timeout,...){ 
+		if( timeout && type(timeout)!=="number"){
+			 
+			var callback,timeout = timeout,...; 
+			
+			return this._form.wait(function(){
+				var resultOk,resultErr = this.waitEle(selector,,timeout);
+				if(resultOk) {
+					this.waitEle(selector,callback,timeout);
+					
+					return resultOk;
+				}
+			},,timeout); 
+		}
+		
+		return this._form.wait(function(){
+			var resultOk,resultErr = this.waitEle(selector,,timeout);
+			if(resultOk) return resultOk;
+		},,timeout); 	
+	};
+	wait = function(p,timeout){ 
+		var failcount = 0;
+		
+		return this._form.wait(function(){
+			var url = this.$readyUrl; 
+			if(url){
+				if(!p || ..string.find( url,p)) {
+					if(this.eval("document.readyState == 'interactive' || document.readyState == 'complete' ") ){
+						if(!p){
+							url = this.eval(`location.href`);
+							this.$readyUrl = url;
+							return url;
+						}
+						return url; 
+					}
+				}
+				else{
+					failcount++;
+					if(failcount>5){
+						var newUrl = this.eval(`location.href`);
+						if(newUrl){
+							this.$readyUrl = newUrl;
+						}
+					} 
+				}
+				
+			}
+		},timeout,200);
+	};
+	waitDoc = function(p,timeout){  
+		return this._form.wait(function(){
+			var ret = this.eval(p ? "document.readyState == 'complete' " : "document.readyState == 'interactive' || document.readyState == 'complete' ");
+			if( ret ) return true; 
+		},timeout,500);
+	};  
+	waitUrlParam = function(p,k,timeout){ 
+		return this._form.wait(function(){ 
+			var url = this.$readyUrl; 
+			if( url ? ..string.find( url,p) ) {
+				if(this.eval("document.readyState == 'interactive' || document.readyState == 'complete' ") )
+					return ..inet.url.getParams(url,k); 
+			}
+		},timeout);
+	};
+	cdp = function(name,param,callbackArg){
+		if(!this.browser) return;  
+		if(!type.isString(param)) param = param?..JSON.stringify(param):"{}";
+	 
+		var err;
+		var result;
+		var callbackCdecl;
+		callbackCdecl = ..raw.tocdecl(function(errCode,json){ 
+			if(!errCode){
+				result = jsonTryParse(json); 
+				err = 0;
+			}
+			else {
+				err = errCode; 
+			}
+			
+			if(callbackArg){
+				callbackArg(result,err); 
+				
+				this._form.setTimeout(
+					function(){
+						..raw._release(callbackCdecl);
+						this._cdpCallbackGC[callbackCdecl] = null; 
+					},0
+				)
+			}
+		},"void(int errCode,ustring json)")
+ 
+		var hr = _dll.webview_callDevToolsProtocolMethod(this.browser,name,param,callbackCdecl);
+		if(hr) return null,hr;
+		
+		if(callbackArg){
+			this._cdpCallbackGC[callbackCdecl] = callbackArg; 
+			return true;
+		}
+
+		..win.wait(lambda() err,winform.hwnd,,5); 
+		..raw._release(callbackCdecl);
+		
+		if(!err) return result; 
+		return null,err;
+	};
+	cdpWait = function(name,param,timeout){
+		var r,e = this._form.wait(function(){
+			return this.cdp(name,param)
+		},,timeout); 
+		
+		if(e=="Timeout!" ) e = 0x102/*_WAIT_TIMEOUT*/;
+		return r,e; 
+	};
+	cdpQuery = function(selector,parent,callback){
+		if(!parent){
+			parent = this.cdp("DOM.getDocument")[["root"]];
+			if(!parent) return;
+		}
+		
+ 		return this.cdp("DOM.querySelector",{
+			selector = selector;
+			nodeId = parent[["nodeId"]] : parent;
+		},callback)
+	};
+	cdpWaitQuery = function(selector,parent,timeout){
+		var r,e =  this._form.wait(function(){
+			return this.cdpQuery(selector,parent)
+		},,timeout); 
+		
+		if(e=="Timeout!" ) e = 0x102/*_WAIT_TIMEOUT*/;
+		return r,e; 
+	};
+	cdpSubscribe = function(eventName,callback){
+		if(this._cdpEventGC[eventName]){
+			_dll.webview_removeDevToolsProtocolEventReceivedW(this.browser,eventName,this._cdpEventGC[eventName].token);
+			..raw._release(this._cdpEventGC[eventName].callback);
+			this._cdpEventGC[eventName] = null;
+		}
+		
+		if(callback){
+			
+			var callbackCdecl = ..raw.tocdecl(function(json){
+				var ret  = callback( ..JSON.parse(json) );
+				if(type(ret) === "function"){
+					this._form.setTimeout(ret,0)
+				}
+			}
+			,"void(ustring)");
+			var	token = {long value};
+			var ret = _dll.webview_addDevToolsProtocolEventReceivedW(this.browser,eventName,token,callbackCdecl);
+		
+			this._cdpEventGC[eventName] = {
+				callback = callbackCdecl;
+				token = token;
+			}
+		}
+	};
+	exportHostObject = function(name,object){
+		if(!this.browser) return;
+		
+		var t = type(object);
+		if(!..com.IsObject(object) ){
+			if( t==type.table || t == type.function ){
+				object = ..com.ImplInterface(object);
+				..com.SetPreferredInvokeKind(object,0x81/*_INVOKE_FUNC | _COM_TIME_UTC*/);
+			}	
+		} 
+			
+		var v = ..com.Variant(object)
+		_dll.webview_addHostObjectToScriptW(this.browser,name,v);
+		..com.Release(v);
+	};
+	openRemoteDebugging = function(){
+		if(!this.remoteDebuggingPort){
+			error("创建浏览器对象时未指定调试端口",2)
+		}
+		
+		if(!..web[["socket"]][["chrome"]]){
+			error("请先导入 web.socket.chrome",2)
+		}
+		
+		var ws = ..web.socket.chrome(); 
+		ws.rpc.originUrl = "http://127.0.0.1";
+		
+		if( this._form.wait(
+			function(){
+				return ws.connectFirstDebuggingPage(this.remoteDebuggingPort);
+			} 
+		) ){
+			if( ws.waitForConnected(this._form.hwnd) ) return ws;
+		}
+	};
+	setTimeout = function(...){
+		return this._form.setTimeout(...);
+	};
+	@_metaProperty;
+}
+
+namespace view{
+	_metaProperty = ..util.metaProperty( 
+	
+		_serialize = ..thread._callableSerialize;
+		
+		html = {
+			_set = function( html ){  
+				var err;
+				html,err = ..string.loadcode( html,owner ); 
+				if(err) error("加载模板代码时遇到错误（非 aardio 模板代码请放置在 HTML 标签内）："+(tostring(err):""),3);
+				
+				owner.$readyUrl = null;
+				_dll.webview_navigateToString(owner.browser, html);
+				
+				var this = owner;
+				this._form.wait(function(){
+					return this.$readyUrl;
+				});
+			} 
+			_get = function(){
+				return owner.eval("document.body.outerHTML");
+			} 	
+		}; 
+		script  = {
+			_set = function(v){
+				owner.doScript(v);
+			}
+		};
+		external = {
+			_set = function( object ){ 
+				if(object && !owner.__initExternalObject__){
+					owner.__initExternalObject__ = true;
+					owner.preloadScript("
+Object.defineProperty(window, 'aardio', {
+    get: function() { 
+        var api = chrome.webview?.hostObjects?.external;
+         
+        Object.defineProperty(window, 'aardio', {
+            value: api,
+            writable: false, 
+            configurable: false, 
+            enumerable: false
+        });
+        
+        return api;
+    },
+    configurable: true, 
+    enumerable: false  
+});");
+				}
+				owner[["externalHostObject"]] = object;
+				owner.exportHostObject( "external",object);
+			} 
+			_get = function(){
+				return owner[["externalHostObject"]];
+			}	
+		}; 
+		fullscreen = lambda(v) owner._form.fullscreen(v);
+		onFullScreen = {
+			_set = function( callback ){ 
+				owner[["(onFullScreen)"]] = callback;
+				owner[["(onFullScreenStdcall)"]] = callback ? ..raw.tocdecl(owner[["(onFullScreen)"]],"void(bool)",owner); 
+				_dll.webview_addContainsFullScreenElementChanged(owner.browser,owner[["(onFullScreenStdcall)"]]);
+			} 
+			_get = function(){
+				return owner[["(onFullScreen)"]];
+			}	
+		}; 
+		onNewWindow = {
+			_set = function( callback ){ 
+				owner[["(onNewWindow)"]] = function(url){
+					var ret,handled  = callback(url);
+					if(type(ret)=="function"){
+						owner._form.setTimeout(ret,0);
+						return handled===null?true:handled; 
+					}
+					
+					return ret;
+				} 
+				owner[["(ononNewWindowStdcall)"]] = callback ? ..raw.tocdecl(owner[["(onNewWindow)"]],"bool(ustring)",owner); 
+				_dll.webview_addNewWindowRequested(owner.browser,owner[["(ononNewWindowStdcall)"]]);
+			} 
+			_get = function(){
+				return callback;
+			}	
+		}; 	
+		onDocumentComplete = {
+			_set = function( callback ){ 
+				owner[["(onDocumentComplete)"]] = callback
+				if(!owner[["__(onDocumentCompleteEnabled)"]] ){
+					owner[["__(onDocumentCompleteEnabled)"]] = true;
+					owner.preloadScript(`if(top==self){ document.addEventListener("DOMContentLoaded", function(){ $aardio_external_onDocumentComplete(location.href) });}`)
+				}
+			} 
+			_get = function(){
+				return owner[["(onDocumentComplete)"]];
+			}	
+		};
+		onLoad = {
+			_set = function( callback ){ 
+				owner[["(onWindowLoad)"]] = callback
+				if(!owner[["__(onWindowLoadEnabled)"]] ){
+					owner[["__(onWindowLoadEnabled)"]] = true;
+					owner.preloadScript(`if(top==self){ window.addEventListener("load", function(){ $aardio_external_onWindowLoad() });}`)
+				}
+			} 
+			_get = function(){
+				return owner[["(onWindowLoad)"]];
+			}	
+		};
+		location  = {
+			_set = function( url ){
+				if(owner[["$readyUrl"]]){
+					owner.doScript( `location.href="`+url+`"`);
+					return;
+				}
+				
+				owner.go(url);
+			} 
+			_get = function(){
+				//不能这样写，以避免在 js 回调 aardio 时调用此属性导致阻塞
+				//if(owner[["$readyUrl"]]){
+					//return owner.eval(`location.href`) 
+				//}
+				
+				return owner[["$readyUrl"]] || owner[["$location"]];
+			}	
+		};
+		preloadScript = {
+			// _get 定义在后面
+			_set = function(js){
+				if(!owner.browser) return; 
+				_dll.webview_init(owner.browser,"(function(){"+js+"})()")
+			}
+		};
+		valid =  {
+			_get = lambda () owner._form.valid;
+		};
+		visible = {
+			_set = function( v ){ 
+				_dll.webview_setVisible(owner.browser,v)
+				owner._form.visible = v;
+			} 
+			_get = function(){
+				return owner._form.visible && _dll.webview_getVisible(owner.browser)
+			}	
+		}; 
+		show = function(v){
+			owner.visible = (v===null || v);
+		};
+		defaultBackgroundColor = {
+			_set = function( c ){ 
+				owner[["(defaultBackgroundColor)"]] = c;
+				_dll.webview_setDefaultBackgroundColor(owner.browser, c>> 16 & 0xFF, c>> 8  & 0xFF,c  & 0xFF,c>> 24 & 0xFF)
+			}
+			_get = lambda() owner[["(defaultBackgroundColor)"]] : 0xFFFFFFFF;
+		}; 
+		transparent = {
+			_set = function( c ){ 
+				owner.defaultBackgroundColor = c? 0x00FFFFFF : 0xFFFFFFFF;
+			}
+			_get = lambda () owner.defaultBackgroundColor &  0xFF000000;
+		};
+		notifyPositionChanged = function(){
+			_dll.webview_notifyParentWindowPositionChanged(owner.browser)
+		};
+		openDevToolsWindow = function(enabled){
+			_dll.webview_openDevToolsWindow(owner.browser);
+		};
+		enableDevTools = function(enabled){
+			_dll.webview_setAreDevToolsEnabled(owner.browser,enabled);
+		}; 
+		enableStatusBar = function(enabled){
+			_dll.webview_setIsStatusBarEnabled(owner.browser,enabled);
+		};
+		enableDefaultContextMenus = function(enabled){
+			_dll.webview_setAreDefaultContextMenusEnabled(owner.browser,enabled);
+		};
+		enableBrowserAcceleratorKeys = function(enabled){
+			_dll.webview_setAreBrowserAcceleratorKeysEnabled(owner.browser,enabled);
+		}; 
+		loadExtension = function(path){ 
+			if(..chrome[["extensions"]]){
+				if(!..io.exist(path)){
+					var info = ..chrome.extensions.find(path);
+					path = info[["fullpath"]];
+				}
+			}
+			
+			path = ..io.exist(path);
+			if(!path) return null,"文件不存在";
+			
+			var hr = _dll.webview_loadExtensionW(owner.browser,path); 
+			if(!hr) return true;
+			
+			if(hr&0x80070032 /*_ERROR_NOT_SUPPORTED*/){
+				error("创建 web.view 对象的第 2 个参数必须指定 extensions 字段的值为 true",2);
+			}
+			
+			return false,..lasterr(hr);
+		};
+		getCookies = function(){
+			return owner.cdp("Network.getCookies")[["cookies"]]; 
+		};
+		focus = function(){
+			..win.setFocus( owner.hwndChrome );
+		};
+		close = function(async){
+			return owner._form.close(async);
+		};
+		closeAndWait = function(){
+			owner._form.close();
+			while(..win.isWindow(owner.hwndChrome)) ..thread.delay(10);
+			..thread.delay(500);
+		};
+	) 
+	
+	with _metaProperty{
+		preloadScript._get = lambda () preloadScript._set;
+		showDevTools = openDevToolsWindow; //@Deprecated
+		addHostObject = export; //@Deprecated
+		isVisible = visible; //@Deprecated
+	}
+	
+
+	shared = function(params,createBrowserOptions){
+		if(sharedInstance && sharedInstance.valid){
+			sharedInstance.visible = true;
+			return sharedInstance;
+		}
+		
+		params = ..table.mix(params,{text="网页浏览器",parent=..mainForm[["hand"]]});
+		createBrowserOptions = ..table.mix(createBrowserOptions,{userDataDir="shared"});
+		
+		var sharedInstanceName = "(web.view._sharedInstance)text=" + params.text + ";";
+		
+		var sharedInstance = ..thread.get(sharedInstanceName)
+		if(sharedInstance && sharedInstance.valid){
+			if(params.visible!==null){
+				sharedInstance.visible = params.visible;
+			}
+			else{
+				sharedInstance.show();
+			}
+			
+			return sharedInstance;
+		}	
+
+		..thread.lock(sharedInstanceName,function(){
+
+			..thread.set(sharedInstanceName,null);
+			
+			..thread.invoke(
+				function(sharedInstanceName,params,createBrowserOptions){
+				 
+					global.import("win.ui");
+					global.import("web.view");
+				
+					var wb = ..web.view(params,createBrowserOptions);
+					
+					..thread.set(sharedInstanceName,wb);
+					..win.loopMessage()
+				},sharedInstanceName,params,createBrowserOptions
+			)
+		
+			while(! ..thread.get(sharedInstanceName) ){
+				sleep(10)
+			}	
+			 	
+		})
+		
+		
+		return shared(params,createBrowserOptions);
+	}
+	
+	loadPreferences = function(userDataDir){
+		userDataDir = userDataDir || defaultUserDataDir;
+		var path = ..io.joinpath(userDataDir,"EBWebView\Default\Preferences");
+		
+		if(!..io.exist(path)){
+			var wbTest = ..web.view(,{userDataDir=userDataDir})
+			wbTest.closeAndWait();
+		}
+		
+		return  ..JSON.load(path) || {},path;
+	}
+	
+	//https://docs.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution#understand-the-webview2-runtime-and-installer-preview
+	getRuntimeInfo = function(path){
+		
+		if(!path){
+			return getRuntimeInfo("HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}")
+				|| getRuntimeInfo("HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}")
+		}
+								
+		var reg = ..win.reg(path);
+		if(reg){
+			var location = reg.queryValue("location")
+			var version = reg.queryValue("pv")
+			reg.close();
+			
+			if(#location && #version && ..string.find(version,"[^0\.]") ){
+				return { location = location; version = version; }	
+			} 
+		}	
+	} 
+	
+	checkRuntime = function(winform){
+		if(getRuntimeInfo()) return true; 
+		return installRuntime(winform);
+	}
+	
+	installRuntime = function(winform){
+		 
+		//https://developer.microsoft.com/zh-cn/microsoft-edge/webview2/#download-section
+		import inet.installer; 
+		var downloadUrl = "https://go.microsoft.com/fwlink/?linkid=" +( _WIN_64 ? "2124701" : "2099617");
+		
+		if(!_WIN10_LATER){ 
+			return;
+		}
+		 
+		if( inet.installer.asInvoker("WebView2 Runtime", downloadUrl ," /silent /install",,winform
+		) ){
+			return !!getRuntimeInfo();
+		} 	 
+	}
+	
+	defaultUserDataDir = ..io.appData("/aardio/webview2/user-data/" + ..io._exefile)
+	
+	jsonTryParse = ..JSON.tryParse;
+	
+	if(!_WIN10_LATER) {
+		return;
+	}
+	
+	/*
+	感谢：
+	https://github.com/webview/webview/blob/master/webview.h
+	https://github.com/MicrosoftEdge/WebView2Browser
+	*/
+	_dll = ..raw.loadDll( ..io.exist("~/lib/web/view/.res/webview64.dll") : $"~\lib\web\view\.res\webview64.dll","std.WebView2","cdecl"); 
+}
+
+/**intellisense()
+web.view = WebView2（Edge/Chromium内核）控件，\n可生成体积很小的独立 EXE 程序。\n\nWebView2 支持 Win10 以及之后的系统。\nWin11 已自带 WebView2，Win10 1803 以及之后的系统也已经自动推送 WebView2。\n因为 Win10 会自动更新，版本小于 1803 的 Win10 数量极少，可以忽略不计。\n其他检测到未安装 WebView2 的系统 —— aardio 会自动安装（不需要写任何代码）
+web.view( = 创建 WebView2（Edge/Chromium内核） 浏览器控件。\n\n此对象支持多线程界面回调，可传入工作线程使用
+web.view(.(winform,userDataDir,browserArguments,->->->) = - 可选参数 @winform 指定嵌入网页的宿主窗口，\n@winform 可指定 win.form 对象或 custom 控件对象（省略创建 messageOnly 窗体），\n也可以仅指定一个创建 win.form 对象的表对数。\n\n- 可选参数 @userDataDir 指定用户数据目录，\n指定不同 browserArguments 参数应避免相同 userDataDir（详见 web.view.defaultUserDataDir ）。\n\n- 可选用参数 @browserArguments 传入一个命令行参数表或多个非 null 命令行参数。\n所有命令行参数调用 string.args.joinEx 合成为 WebView2 的启动参数。\n表参数中的驼峰参数名自动转为连字符风格并加 -- 前缀。\n此参数也可用一个数值指定要启动的远程调试端口（ 0 表示自动分配空闲端口）。\n同一用户数据目录不能同时使用远程调试与内置 CDP 接口\n如果未指定 @browserArguments，则取 web.view.browserArguments 设为默认启动参数。\n@browserArguments 之后的参数仍会合成到启动参数内
+web.view(.(winform,createBrowserOptions) = @.view(winform,{\n	extensions = true;\n	language =  "zh-CN";\n	startArguments = {acceptLang = "zh-CN" };\n	__/*参数 @winform  可指定窗体、custom 控件、创建窗体的表参数、null 值。\n参数 @createBrowserOptions 指定选项，所有字段可选，其他可选字段：\nextensions 字段：是否启用浏览器扩展，启用后可调用 loadExtension 函数加载扩展。\n\nuserDataDir 字段：用户数据目录，不同的 userDataDir 创建不同的会话。\n指定不同 createBrowserOptions 应避免相同 userDataDir（详见 web.view.defaultUserDataDir ）。\n\nlanguage 字段：指定浏览器界面语言，也影响 --accept--lang 参数的值。\n一般自动指定为系统语言，可省略。\n\nstartArguments 字段：指定浏览器启动参数，\n可以是 string.args 兼容的字符串、表对象都可以。\n\ncompatibleBrowserVersion 字段：指定最低兼容的浏览器版本，可省略。\n*/})
+web.view() = !stdWebView2.
+web.view.getRuntimeInfo() = 获取 WebView2 安装信息。\n如果未安装 WebView2 则返回  null 值。\n如果已安装 WebView2 则返回一个表对象:\n表的 location 字段为 WebView2 安装路径，version 字段为版本号。 
+web.view.checkRuntime(.(winform) = 调用 web.view.getRuntimeInfo 检测 WebView2 是否已安装。\n如果未安装则自动安装  WebView2 。\n参数 @winform 指定安装程序的所有者窗口。\n\n构造 web.view 对象时会自动调用此函数。
+web.view.installRuntime(.(winform) = 重装 WebView2 Runtime
+web.view.browserArguments = 用于指定默认的浏览器启动参数。\n可以指定一个 string.args.joinEx 支持的命令行参数表或字符串。\n也可以指定一个可以返回上述参数的函数。
+web.view.defaultUserDataDir = 默认的用户数据目录。\n\n此值默认为 io.appData("/aardio/webview2/user-data/" + io._exefile)\n创建 web.view 对象时如果未指定 userDataDir 时使用此默认值。\n如果指定了 userDataDir 但不包含斜杠或反斜杆，\n则实际使用的值为 `web.view.defaultUserDataDir + "~" + userDataDir`\n\n要特别注意在发布为 EXE 之前运行代码时  io._exefile 的值总是相同的 "aardio.exe"。\n\n如果创建多个 web.view 对象时指定了不同的 browserArguments 或 createBrowserOption 参数,\n则应避免使用同一 userDataDir（会相互干扰，导致无法创建 web.view 对象等问题）。\n或者多进程多线程同时创建 web.view 也应尽量避免使用相同的 userDataDir
+web.view.loadPreferences(.(userDataDir) = 加载 WebView2 配置。\n返回 2 个值：配置表对象,配置文件路径。\n可使用 JSON.save 函数保存配置表对象到返回值 2 指定的配置文件路径。\n\n参数 @userDataDir 指定用户数据目录，省略则为默认目录。\n此函数应在使用指定的 userDataDir 目录创建 web.view 对象以前调用。\n修改此配置文件时建议使用独立的 userDataDir。\n在开发时 web.view 默认共享同一 userDataDir（除非显式指定不同目录），\n在发布后则默认按 EXE 文件名创建独立的 userDataDir。
+web.view.shared( = 在独立线程中创建全局多线程共享 web.view 控件窗口。\n主要用于 AA(aardio autos) 等需要跨对话线程共享浏览器控件的 AI Agent 环境。\n\n返回的 shared 浏览器控件可以在任何线程中使用，\n所有调用都会转发到创建线程执行。\n\n跨线程可调用 shared 浏览器控件的 \nwaitEle / waitEle2 / eval / xcall / invoke / cdp 等方法通过 JavaScript 或 CDP 交互；\n在使用 invoke 方法回到界面线程创建安全的闭包内，\n才能使用 external/export 绑定相同线程上下文的 aardio 回调函数（供 JS 调用）。
+web.view.shared(.(params,createBrowserOptions,->->->) = 可选用参数 @params 指定创建 win.form 宿主窗口的参数表。\n可选用 visible 指定否显示窗口是（默认显示）。\n可选用 text 字段指定窗口标题，\n相同窗口标题的 shared 已存在且有效则直接返回。\n实例已存在时，除了 visible 字段以外其他的字段或参数都会被忽略。\n省略  @params  则会传入默认的参数表。\n@params 不允许指定已创建的窗体或控件对象。\n全部参数仅在创建实例时有效。\n\n调用 shared 浏览器的 close 函数关闭它，\n然后再次调用 web.view.shared 并传入相同参数则会重建实例。\n重建通常是不必要的，因为这个函数存在的意义是为了重用实例。
+web.view.shared() = !stdWebView2.
+end intellisense**/
+
+/****intellisense(!stdWebView2) 
+asyncHttpServer = 如果导入了 wsock.tcp.asyncHttpServer ，如果未显示创建此对象，则调用 go 函数打开单个斜杠或反斜杆开始的路径时自动创建此对象。web.view 自动调用此 HTTP 服务器对象打开应用程序基准目录内的网页与网页资源路径。\n!stdAsyncHttpServer.
+go( = 打开网址或文件地址。\n如果需要用这个函数打开工程内的资源文件，\n请提前导入 wsock.tcp.simpleHttpServer 或 wsock.tcp.asyncHttpServer 。\n\n如果要在打开的网页上跳转锚点（也就是跳转 # 开头的网址），\n可改用 location 属性跳转
+go(.(url,devPort,devTimeout) = 打开 @url 参数指定的网址。\n\n如果提前导入 wsock.tcp.simpleHttpServer 或 wsock.tcp.asyncHttpServer \n则 io.localpath 支持的路径转换为通过嵌入 HTTP 服务器访问的网址。\n\n使用 HTTP 嵌入服务器可自动支持嵌入资源路径与 SPA 单页应用。\n如果同时文件名为 index.html 或 index.aardio。\n则上级目录设为 documentBase 根目录，后续请求路径应当以 "/" 代替 documentBase。\n\n可选使用@devPort参数指定前端项目开发环境调试端口，\n可选用@devTimeout参数指定检测调试端口超时\n@devPort,@devTimeout参数仅在开发环境中有效
+go(.(url,params) = 打开 @url 参数指定的网址。\n@params 用一个表对象（table）指定 URL 参数。\n调用 inet.url.appendExtraInfo 函数在网址后添加参数 。
+preloadScript(__/*JS 脚本*/) = 将 字符串参数@1 指定的 JS 脚本添加为网页默认加载脚本,\n在网页初始化时执行，保证在 window.onload 事件前执行,\n不会覆盖之前添加的脚本
+doScript(__/*JS 脚本*/) = 执行 字符串参数@1 指定的 JS 脚本
+html = @.html = /***\n<!doctype html>\n<html>\n<head>\n    <meta charset="utf-8">\n    <style type="text/css">\n    html,body{ height:100%; margin:0; } __/*将网页写入内存。\n支持 aardio 模板语法，模板的 owner 参数为当前 web.view 对象。\n包含 HTML 的块注释可赋值为字符串，首尾星号数目要一致。\n\nWebView2 通过 html 属性内存加载体积太大的 HTML 会卡住，改用本地文件可流畅打开。\n如果要引用其他本地文件，也必须改用 wb.go 打开 html 文件。*/\n    </style>\n    <script></script>\n</head>\n<body></body>\n</html>\n***/
+script = @.script = /***\n__/*这是一个只写的字符串属性。\n用于指定立即执行的网页 JavaScript 代码，等价于调用 doScript 函数执行 JS，\n在网页脚本中可以使用 `aardio` 对象调用浏览器对象的 external 属性。*/\n***/
+export( = 导出 aardio 函数为 JS 全局变量。\n注意 JS 调用这里导出的本地函数时，\n调用参数会通过 JSON 转换为纯 aardio 对象。\n返回值也会通过 JSON 转换为纯 JS 对象。\n\n在被网页回调 aardio 函数内执行 JS 时要避免在 JS 中再次回调此 aardio 函数。\n\n被网页回调的 aardio 函数内不要调用可能阻塞的 webView.xcall，webView.eval 函数。\n应改用非阻塞的 webView.invoke 函数，或通过 winform.setTimeout 异步调用会导致同步阻塞的函数。
+export(.(JS变量名,回调函数) = 导出 aardio 函数为JS全局变量。\n参数也可以使用一个表包含多个需要绑定到JS的变量名值对，值必须是函数。\nJS 脚本中调用这里绑定的本地函数返回值为 Promise 对象\n\n切记: export 导出的 aardio 函数务必返回非 null 值，不然 JS 会一直等待\nexternal 接口导出的函数无此要求。
+exportHostObject( = 直接导出 aardio 对象到 JavaScript，\n直接转换为 COM 对象，中间不需要经过 JSON 转换,\n用法请参考: https://docs.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2?view=webview2-1.0.705.50#addhostobjecttoscript
+exportHostObject(.(变量名,对象) = 直接导出 aardio 对象到 JavaScript，\n可导出表对象、函数对象、COM 对象等,\n在js中通过 chrome.webview.hostObjects的成员访问此对象,\n中间不会经过JSON转换，而是直接转换为 COM 对象，\n用这个方法导出函数时，\n要特别注意参数中的 JavaScript 对象会被转换为 COM 对象，\n而返回给 JavaScript 的 aardio 对象会被转换为 Promise 对象
+doScript(.(js) = 执行JS代码，\n不指定回调函数时，JS代码放入匿名函数体内执行
+doScript(.(js,callback) = @.doScript(js,function(result){\n	__/*执行JS代码成功在当前界面线程异步回调此函数，\n@result参数为JS代码的返回值*/\n} )
+eval( = 运算 JS 代码并获取返回值。\n此函数自动使用 JSON 编解码以转换 JS 返回值为 aardio 对象。\n\n如果未指定接收 JS 返回值的回调函数此函数会阻塞等待返回值。
+eval(.(js,callback) = @异步执行 JS 代码，不会阻塞等待。\n\n- 参数 @1 指定要运算的 JavaScript 表达式。\n- 参数 @callback 指定接收 JS 返回值的 aardio 回调函数。
+eval(.(js,args->->->) = 运算 JS 代码并阻塞等待返回值。\n等待过程中可继续处理窗口消息。\n\n- 参数 @1 指定要运算的 JavaScript 表达式\n- 参数 @args 可指定任意个格式化参数（使用 string.format 格式化）。\n\n在被网页回调的 aardio 函数内部应避免以阻塞等待返回值的方式\n调用 webView.xcall，webView.eval 等函数。
+xcall( = 调用 JS 函数并获取返回值。\n此函数使用 JSON 在 JS/aardio 之间自动转换参数与返回值\n\n如果未指定接收 JS 返回值的回调函数此函数会阻塞等待。\n如果不需要取 JS 函数返回值请改用异步非阻塞的 webView.invoke 函数。\n因为无需处理回调与等待，webView.invoke 更轻量。
+xcall(.("object->func",args->->->,callback) = @异步执行 JS 函数，不会阻塞等待。\n\n- 参数 @1 指定要调用的函数名或返回函数的表达式。\n如果参数 @1 不包含回车或换换行、分号、大括号、圆括号，\n则参数 @1 最后一个点号前的对象作为调用 JS 函数的 this 参数\n- 参数 @args 可指定任意个调用参数。\n- 最后一个参数 @callback 指定接收 JS 返回值的 aardio 回调函数。
+xcall(.("object->func",args->->->) = 调用 JS 函数，并阻塞等待直到返回值。\n等待过程中可继续处理窗口消息。\n\n- 参数 @1 指定要调用的函数名或返回函数的表达式。\n如果参数 @1 不包含回车或换换行、分号、大括号、圆括号，\n则参数 @1 最后一个点号前的对象作为调用 JS 函数的 this 参数\n- 参数 @args 可指定任意个调用参数（参数不能是 aardio 回调函数）。\n\n在被网页回调的 aardio 函数内部应避免以阻塞等待返回值的方式\n调用 webView.xcall，webView.eval 等函数。
+invoke( = 调用 JS 函数但不会等待返回值。\n\n此函数使用 JSON 在 JS/aardio 之间转换参数与返回值
+invoke(.(jsFunction,->->->) = 调用 JS 函数但不会等待返回值，\n等待返回值过程中会继续处理界面消息。\n\n参数 @jsFunction 指定要调用的 JS 函数名或返回 JS 函数的 JS 表达式,\n\n如果参数 @jsFunction 不包含回车或换换行、分号、大括号、圆括号，\n则参数 @jsFunction 最后一个点号前的对象作为调用 JS 函数的 this 参数
+invoke(.(threadFunction,->->->) = @.invoke(\n	function(...){\n		__/*\n		如果参数 @threadFunction 指定函数对象（不是字符串）：\n		则在创建 web.view 的界面线程执行 aardio 回调函数（等待返回值）。\n		owner 参数指向真实的 web.view 对象（非线程代理对象），其他附加参数转发为回调参数。\n		\n		工作线程本就可以直接调此对象的属性或方法（在界面线程内执行）。\n		但 invoke 方法适合在界面线程执行连续的代码，并在界面线程创建安全的闭包上下文，\n		并可避免不必要地线程交互。\n		\n		此函数属于线程回调函数，应遵守线程规则，所有数据自参数与返回值交换。\n		不可直接访问线程函数外部的对象（不同线程属于不同上下文）。\n		\n		这种用法主要用于跨线程交互（尤其是操控 web.view.shared 对象）。\n		*/	\n	}\n)
+cdp( = 调用 WebView2 内置 CDP（Chrome DevTools Protocol） 接口。\n调用内置 CDP（Chrome DevTools Protocol）接口，多个 WebView2 不会冲突。\n但同一用户数据目录不能在使用内置 CDP 接口的同时开放远程调试端口。\n\n\nCDP 文档: https://chromedevtools.github.io/devtools-protocol \n使用范例: doc://examples/WebUI/web.view/DevTools/cdp.html
+cdp(.(method,params) = 调用 WebView2 内置 CDP 接口。\n参数 @method 指定 CDP 方法，例如："Page.navigate" 。\n参数 @param 用一个表对象，或 JSON 字符串指定调用参数。\n成功返回一个表对象，失败返回 null，错误代码。\n错误代码可用 lasterr 函数转换为错误信息。
+cdp(.(method,params,callback) = 异步调用 WebView2 内置 CDP 接口。\n不等待 CDP 调用完成，而是在调用完成异步回调 callback 函数。\n参数 @method 指定 CDP 方法，例如："Page.navigate" 。\n参数 @param 用一个表对象，或 JSON 字符串指定调用参数。\n@callback 指定回调函数，\n回调参数@1为 CDP 返回的表对象，回调参数@2 为错误代码。\n成功返回 true，失败返回 null,错误代码
+cdpWait(.(method,params,timeout) = 调用 WebView2 内置 CDP 接口并等待返回非 null 值。\n参数 @method 指定 CDP 方法，例如："DOM.getDocument" 。\n参数 @param 用一个表对象，或 JSON 字符串指定调用参数。\n可选用 @timeout 指定超时，单位毫秒，默认在窗口关闭前一直等待。\n成功返回一个表对象，失败返回 null,错误代码。\n超时错误代码为 0x102/*_WAIT_TIMEOUT*/。\n错误代码可用 lasterr 函数转换为错误信息。
+cdpWait( = 调用 WebView2 内置 CDP 接口并等待返回非 null 值。\n调用内置 CDP（Chrome DevTools Protocol）接口，多个 WebView2 不会冲突。\n但同一用户数据目录不能在使用内置 CDP 接口的同时开放远程调试端口。\n函数执行成功返回一个表对象，失败返回 null,错误代码。\n错误代码可用 lasterr 函数转换为错误信息。
+cdpQuery( = 使用 WebView2 内置 CDP 接口查询 DOM 节点。\n成功返回表对象，失败返回 null，错误代码。\n错误代码可用 lasterr 函数转换为错误信息。\n\n此函数调用内置 CDP（Chrome DevTools Protocol）接口，多个 WebView2 不会冲突。\n但同一用户数据目录不能在使用内置 CDP 接口的同时开放远程调试端口
+cdpQuery(.(selector,parent) = 使用 WebView2 内置 CDP 接口查询节点。\n@selector 指定 CSS 选择器，\n@parent 可选指定父节点或父节点的 nodeId。\n不指定父节点则 @parent 默认取页面根节点。
+cdpQuery(.(selector,parent,callback) = 异步调用 WebView2 内置 CDP 接口查询节点。\n不等待 CDP 调用完成，而是在调用完成异步回调 callback 函数。\n@selector 指定 CSS 选择器，\n@parent 可选指定父节点或父节点的 nodeId。\n不指定父节点则 @parent 默认取页面根节点。\n@callback 指定回调函数，\n回调参数@1为 CDP 返回的表对象，回调参数@2 为错误代码。\n成功返回 true，失败返回 null,错误代码
+cdpWaitQuery( = 使用 WebView2 内置 CDP 接口查询并等待 DOM 节点。\n调用内置 CDP（Chrome DevTools Protocol）接口，多个 WebView2 不会冲突。\n但同一用户数据目录不能在使用内置 CDP 接口的同时开放远程调试端口
+cdpWaitQuery(.(selector,parent,timeout) = 使用 WebView2 内置 CDP 接口接口查询并等待节点，\n@selector 指定 CSS 选择器，\n@parent 可选指定父节点或父节点的 nodeId。\n不指定父节点则 @parent 默认取页面根节点。\n可选用 @timeout 指定超时，单位毫秒，默认在窗口关闭前一直等待。\n成功返回表对象，失败返回 null,错误代码。\n超时错误代码为 0x102/*_WAIT_TIMEOUT*/
+waitEle( = 等待网页创建指定节点。\nwaitEle 仅在当前网页等待，打开其他网页（指创建不同的 document ）则会退出等待。\n改用　waitEle2 函数可支持跨网页等待。。
+waitEle(.(selectorOrXPath,timeout) = 同步等待网页创建指定节点。\n网页文档对象关闭，或当前网址变更也会退出等待。\n@selectorOrXPath 参数指定 CSS 选择器或 XPATH 表达式（首字符必须是 `/`或 `(`）。\n可选用参数 @timeout 指定超时，单位毫秒。\n\n成功返回 CSS 选择器，失败返回 null,错误对象（表对象或字符串）
+waitEle(.(selectorOrXPath,callback,timeout) = 异步等待网页创建指定节点\n@selectorOrXPath 参数指定 CSS 选择器或 XPATH 表达式（首字符必须是 `/`或 `(`）。\n\n参数 @2 指定 aardio 回调函数。\n找到节点回调参数 @1 为 CSS 选择器，\n失败则回调参数 @2 为错误信息,回调参数 @1 为 null。\n\n可选用参数@3指定超时，单位毫秒
+waitEle(.(selectorOrXPath,js,timeout) = 异步等待网页创建指定节点\n@selectorOrXPath 参数指定 CSS 选择器或 XPATH 表达式（首字符必须是 `/`或 `(`）。\n\n找到节点则执行参数 @2 指定的 JavaScript 代码。\n执行 JS 代码时自动绑定 this 对象为找到的节点。\n\n可选用参数 @3 指定超时，单位毫秒
+waitEleSync( = 同步等待网页创建指定节点，此函数是 waitEle 的同步版本。\nwaitEleSync 仅在当前网页等待，打开其他网页（指创建不同的 document ）则会退出等待。\n改用　waitEle2 函数可支持跨网页等待。。
+waitEleSync(.(selectorOrXPath,timeout) = 同步等待网页创建指定节点。\n网页文档对象关闭，或当前网址变更也会退出等待。\n@selectorOrXPath 参数指定 CSS 选择器或 XPATH 表达式（首字符必须是 `/`或 `(`）。\n可选用参数 @timeout 指定超时，单位毫秒。\n\n成功返回 CSS 选择器，失败返回 null,错误对象（表对象或字符串）
+waitEleSync(.(selectorOrXPath,callback,timeout) = 同步等待网页创建指定节点\n@selectorOrXPath 参数指定 CSS 选择器或 XPATH 表达式（首字符必须是 `/`或 `(`）。\n\n参数 @2 指定 aardio 回调函数。\n找到节点回调参数 @1 为 CSS 选择器，\n失败则回调参数 @2 为错误信息,回调参数 @1 为 null。\n\n可选用参数@3指定超时，单位毫秒
+waitEleSync(.(selectorOrXPath,js,timeout) = 同步等待网页创建指定节点\n@selectorOrXPath 参数指定 CSS 选择器或 XPATH 表达式（首字符必须是 `/`或 `(`）。\n\n找到节点则执行参数 @2 指定的 JavaScript 代码。\n执行 JS 代码时自动绑定 this 对象为找到的节点。\n\n可选用参数 @3 指定超时，单位毫秒
+waitEle2( = 等待网页创建指定节点。\n不同于 waitEle 仅在当前网页有效，\nwaitEle2 支持跨网页等待，网址变更也不会退出等待。\n如果在等待过程中可能打开多个不同的网页，\n则应使用 waitEle2 而不是限于在单页面使用的 waitEle 函数。
+waitEle2(.(selectorOrXPath,timeout) = 同步等待网页创建指定节点。\n除非关闭窗口，此函数会一直等待直到指定选择器的对象创建成功。\n\n参数 @selectorOrXPath 指定 CSS 选择器或 XPATH 表达式（首字符必须是 `/`或 `(`）。\n可选用参数 @timeout 指定超时，单位毫秒。\n\n找到节点则返回 CSS 选择器，失败返回 null，错误信息
+waitEle2(.(selectorOrXPath,callback,timeout)) = 同步等待网页创建指定节点。\n@selectorOrXPath 参数指定 CSS 选择器或 XPATH 表达式（首字符必须是 `/`或 `(`）。\n找到节点后异步回调参数 @2 指定的 aardio 函数，参数@1为 CSS选择器。\n可选用参数 @3 指定超时，单位毫秒
+waitEle2(.(selectorOrXPath,js,timeout)) = 同步等待网页创建指定节点。\n@selectorOrXPath 参数指定CSS选择器或 XPATH 表达式（首字符必须是 `/`或 `(`）。\n找到节点异步执行参数@2指定的 JavaScript 代码,\n执行 JS 代码时自动绑定 this 对象为找到的节点,\n可选用参数@3指定超时，单位毫秒
+adjust() = 调整页面大小到适合窗口
+external = @.external = {
+	__/*在 Javascript 中可通过全局变量 `aardio` 访问 ??.external 对象。
+在 JavaScript 中所有的 aardio 对象以及 aardio 对象的方法与属性都被包装为 Promise 对象
+
+在 JavaScript 中调用  ??.external 导出的函数时，参数与返回值都不需要经过 JSON 转换。
+除字符串、数值、布尔值、可兼容的数组、buffer 等基础值类型可以直接传值以外，
+其他对象类型（JavaScript 中的 object 或 aardio 中的表对象 ）自动转换为 COM 代理对象，
+让我们可以通过 COM 接口间接操作跨语言的对象。
+
+要注意不能将这种 COM 代理对象作为原生 JavaScript 对象使用，
+例如不能用于 JavaScript 图表或表格的数据源对象，而  ??.export 导出的 aardio 函数则无此限制。
+ 
+被网页回调的 aardio 函数内不要调用可能阻塞的 webView.xcall，webView.eval 函数。
+应改用非阻塞的 webView.invoke 函数，或通过 winform.setTimeout 异步调用同步阻塞的函数*/
+}
+onFullScreen = @.onFullScreen = lambda(enabled) owner.fullscreen(enabled);__/*响应网页全屏事件，\n参数 enabled 表示网页是否请求全屏，此函数忽略返回值。\n设为 null 移除事件*/
+fullscreen(__) = 全屏。\n参数指定是否全屏，不指定参数则切换全屏。\n返回值为当前是否全屏
+show() = 显示网页窗口，参数为 false 隐藏网页窗口
+visible = 浏览器控件是否显示
+valid = 浏览器窗口是否有效，关闭或正在关闭则为 false
+defaultBackgroundColor =  网页默认背景色, GDI+ 兼容的 ARGB 格式数值（0xAARRGGBB）。\n颜色透明度仅支持透明或不透明（0xAA 部分的 Alpha 分量只能为 0x00 或 0xFF）。\n\n如果要实现透明背景建议修改 transparent 属性，\n关于透明窗口的细节请查看该属性的说明。
+transparent = 网页是否透明，布尔值。\n此属性关联于 defaultBackgroundColor 属性（0xAARRGGBB 格式）的 Alpha 分量。\n独立窗体必须是无边框窗口才能显示透明效果。\n\n不建议将宿主窗口设为分层窗口（例如设置 `winform.transparent = true`）\n如果宿主窗口是分层窗口，则透明与不透明部分的鼠标默认事件都会穿透到背景窗口。\n实际上 WebView2 不需要启用分层窗口可以直接支持窗口透明背景，\n透明部分不会遮挡背景窗口的绘图与刷新，但鼠标事件默认无法穿透到背景窗口。
+notifyPositionChanged() = 通知 WebView2 控件父窗口已移动
+enableStatusBar(__) = 是否允许在网页窗口底部显示默认状态栏，默认不显示。\n参数 @1 可指定 true 或 false
+enableDevTools(__) = 设置是否启用网页开发工具（DevTools）。\n参数 @1 可指定 true 或 false 。\n在下一次打开网页时生效。
+enableBrowserAcceleratorKeys(__) = 设置是否启用浏览器默认快捷键。\n参数 @1 可指定 true 或 false 。\n在下一次打开网页时生效。\n\n此设置影响的是与网页浏览功能有关的特定快揵键，包括但不限于：  \n`Ctrl-F`,`F3`,`Ctrl-P`,`Ctrl-R`,`F5`,`Ctrl-Plus`,`Ctrl-Minus`,`Ctrl-Shift-C`,`F12`  \n但不会影响内容选择、移动、编辑有关的用户常用快捷键，包括但不限于：\n`Ctrl-A`,`Ctrl-X`,`Ctrl-C`, `Ctrl-V` 等。
+openDevToolsWindow(__) = 打开网页开发工具（DevTools）。\n无论是否调用 enableDevTools 禁用 DevTools 这个函数都可用。
+enableDefaultContextMenus(__) = 设置是否启用默认右键菜单。\n参数 @1 可指定 true 或 false 。\n在下一次打开网页时生效。
+loadExtension(__) =  加载浏览器扩展目录。\n参数 @1 必须指定浏览器扩展配置文件 manifest.json 所在的目录。\n\n如果事先导入 chrome.extensions 库，\n则参数可指定系统浏览器扩展 ID、或名称、描述包含的关键字（忽略大小写）。\n在浏览器扩展管理页面可查看 ID。
+_form = WebView2 浏览器控件的宿主窗体或控件对象\n!static.
+userDataDir = 创建浏览器控件指定的浏览器用户数据目录。\n如果该目录下数据异常会导致浏览器异常组件并显示空白，\n此时关闭程序并清空或更新用户数据目录即可。\n\nuserDataDir 的默认值为 web.view.defaultUserDataDir 。\nweb.view.defaultUserDataDir 默认使用 io._exefile 作为目录名，这在发布为 EXE 前是相同的值。\n如果创建多个 web.view 对象时指定了不同的 browserArguments 或 createBrowserOption 参数,\n则应避免使用同一 userDataDir（会相互干扰，导致无法创建 web.view 对象等问题）。
+
+wait("__") = 等待参数@1指定的网址打开，\n参数@2支持模式匹配语法，\n在指定的网页创建 document 对象后返回，\n窗口关闭也会返回。\n\n成功返回页面 URL
+waitUrlParam("__","") = 等待参数@1指定的网址打开，支持模式匹配。\n参数 @1 的等待规则与 wait 函数相同。\n\n参数 @2 指定要等待的 URL 参数名，\n如果找到该参数则返回参数值，否则继续等待到参数出现或社会窗口关闭
+waitDoc() = 等待文档对象准备就绪。\n也就是页面的 document.readyState 为 "interactive" 时返回 true。\n如果参数 @1 为 true 则  document.readyState 为 "complete" 时返回 true。\n可选用参数 @2 指定超时。
+onDocumentInit(url) = @.onDocumentInit = function(url){
+	__/*回调参数 @url 为当前网址。
+
+打开网页并初始化文档（ document ）对象后触发此事件,
+此事件先于 onDocumentComplete 事件，而 onDocumentComplete 先于 onLoad 事件。
+
+注意不要阻塞此事件及时返回。
+耗时操作建议用 web.view 的 setTimeout 延时异步执行，
+阻塞界面线程的操作建议创建工作线程执行。*/
+}
+onDocumentComplete(url) = @.onDocumentComplete = function(url){
+	__/*回调参数 @url 为当前网址。
+
+此事件在网页的 document 对象的 DOMContentLoaded 事件触发时执行。
+此事件在网页 DOM 加载完成就会触发，先于 onLoad 事件，晚于 onDocumentInit 事件。
+
+即使 DOM 加载完成，之后仍然可能动态创建页面元素，
+使用 web.view 的 waitEle 或 waitEle2 函数可检测等待指定的页面元素。
+
+注意不要阻塞此事件及时返回。
+耗时操作建议用 web.view 的 setTimeout 延时异步执行，
+阻塞界面线程的操作建议创建工作线程执行。*/
+}
+onLoad() = @.onLoad = function(){
+	__/*此事件在网页的 window 对象的 load 事件触发时执行。
+此事件晚于 onDocumentComplete，此时页面及所有依赖资源如样式表和图片都已完成加载。
+
+即使网页加载完成，之后仍然可能动态创建页面元素，
+使用 web.view 的 waitEle 或 waitEle2 函数可检测等待指定的页面元素。
+
+注意不要阻塞此事件及时返回。
+耗时操作建议用 web.view 的 setTimeout 延时异步执行，，
+阻塞界面线程的操作建议创建工作线程执行。*/
+}
+location = 获取或设置当前网址。\n注意对于单页应用，读取此属性并不一定能获取当前网址。\n在页面完成加载时会更新此属性，调用 wait 方法也会更新此属性。\n但可以通过设置此属性以更新单页应用的单前网址。\n如果当前已经打开其他网页，则修改 location.href 跳转。\n否则调用 go 函数跳转。\n可利用此特性跳转网页锚点（也就是指定网址尾部 `#` 后面的部分)。
+remoteDebuggingPort = 远程调试端口,只读属性
+openRemoteDebugging() = 创建 web.socket.chrome 远程调试对象,\n请先导入web.socket.chrome\n!stdwebsocketchromeClient.
+focus() = 网页窗口设置为输入焦点
+hwndChrome = 网页窗口句柄
+cdpSubscribe( = 订阅 CDP 事件
+cdpSubscribe(.(事件名,回调函数) = 回调函数的参数为参数表对象。\n如果回调函数返回一个函数，则先结束事件，然后异步执行该函数。\n调用此函数总是会取消之前订阅的同名事件。\n如果回调函数为 null，则仅取消订阅
+onNewWindow(callback) = @.onNewWindow = function(url){\n	__/*返回 false 继续打开新窗口。\n返回 true 阻止打开新窗口。\n返回函数则阻止打开新窗口，并异步执行该函数。\n耗时或阻塞浏览器控件的操作应放入返回的异步函数内执行*/\n}
+setTimeout( = 推迟执行指定的函数或代码。\n此函数异步执行参数中指定的函数，不会阻塞当前代码继续执行。\n\n网页回调 aardio 函数时，\n如果要使用 webView.eval, webView.xcall 等阻塞调用网页的函数，\n应通过 setTimeout 函数异步调用
+setTimeout(.(函数或代码,延时,其他附加参数) = 延时参数是可选参数，以毫秒为单位，默认为0毫秒。\n可选用附加参数指定调用延时函数的实参。\n返回值为定时器 ID
+getCookies() = 调用 CDP 命令获取 Cookies。\n将 web.view 对象作为inet.setCookie 函数的参数时将自动调用 getCookie 方法。
+close() = 关闭浏览器控件窗口。\n默认立即关闭，如果参数为 true 则异步关闭窗口。
+closeAndWait() = 关闭浏览器控件窗口，并等待浏览器控件完全释放。
+end intellisense****/
+
+/**details(必读)
+
+web.view 基于微软 WebView2（Edge/Chromium内核），
+WebView2 稳定可靠、性能强悍、接口简洁，可生成体积很小的独立 EXE 程序。
+
+## 系统需求
+
+WebView2 支持 Windows 10 以及之后的系统。
+Windows11 已自带 WebView2，Win10 1803 以及之后的系统早已自动推送 WebView2。
+
+实际上现在 WebView2 已经是无法卸载的系统级组件。
+没有自带 WebView2 的旧系统已经非常罕见，可以忽略不记。
+
+web.view 支持库不再支持代于 Windows 10 的老旧操作系统，
+可使用用 web.view.7 扩展库替代 web.view 库（仅修改 import 语句）以兼容 Windows 7。
+在开发环境中导入 web.view 时 Windows 7 系统将自动降级为 web.view.7，
+但必须明确修改 import 语句并导入 web.view.7 ，发布的 EXE 程序才能兼容 Windows 7。
+web.view,web.view.7 应当 2 选 1，不能同时导入同一个程序。
+
+## 使用 DevTools
+
+在网页上点右键菜单项 **（Inspect » 检查）** 或按 F12 键可以打开网页开发工具（ DevTools ），
+在开发工具的 **「设置 » 语言」（Settings » Language」）** 界面可切换开发工具的界面语言。
+在 **DevTools » 控制台（Console）** 可查看程序错误信息（包含JS 调用 aardio 代码时返回的错误信息）。
+
+end details**/
