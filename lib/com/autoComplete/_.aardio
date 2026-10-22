@@ -1,0 +1,73 @@
+// ── Nodio x64 补版（同名路径 overlay）────────────────────────────────────
+// 官方这一份从 AppData 目录加载 32 位 autoComplete.dll，x64 进程装不下该 PE，
+// 导致本模块在 x64 上导入失败。
+// 这里在 Nodio 侧按官方同名路径提供等价 x64 实现：
+//   .res\autoComplete64.cpp：Nodio 自写 C++ COM 自动完成实现（标准 C++，零外部依赖，源码入库）
+//   .res\autoComplete64.dll：用 MSVC 编出的 x64 DLL
+// 导出 CreateIDispatchObject 符号，与官方 32 位 DLL 签名及 cdecl 约定一致。
+// 其余源码逐字保留 —— API 面与官方完全一致。
+// x86 构建不命中 overlay（engine/import.cpp 的 GetOverlayLibDir：32 位构建
+// 直接用 aardio 官方 32 位标准库），行为与官方一致。
+// ────────────────────────────────────────────────────────────────────────
+namespace com;
+
+var _selfDir = io.splitpath(io.libpath("com.autoComplete")).dir;
+var dll = ..raw.loadDll(_selfDir + ".res\autoComplete64.dll",,"cdecl");
+if(!dll) error("com.autoComplete 缺少 x64 DLL：" + _selfDir + ".res\autoComplete64.dll",2);
+
+class autoComplete{
+	ctor(edit,option,format){
+		var hwnd = edit[["hwnd"]];
+		if(!hwnd) error("参数请指定 edit 控件对象",2);
+		
+		if(edit.editBox){
+			edit = edit.editBox;
+			hwnd =  edit.hwnd;
+		}
+		
+		if(edit.autoCompleteObject){
+			return edit.autoCompleteObject;
+		}
+		
+		var objPtr = dll.CreateIDispatchObjectP(hwnd,option||(1|2|0x20|0x10));
+		this = ..com.QueryObjectR(objPtr);
+		
+		edit.autoCompleteObject = this;
+
+		edit._onDestroy_stdReserved__ = function(){
+			edit.autoCompleteObject = null;
+			this.delete();//此函数不能重复调用
+			this.delete = function(){}
+		} 
+		
+		this[["hide"]] = function(){
+			this.enable(false);
+			this.enable(true);
+		}
+		
+		edit.onOk = function(){
+			this.hide();
+		}
+		
+		this[["show"]] = function(){
+			::User32.PostMessage(hwnd,0x100, 0x28/*_VK_DOWN*/, ::User32.MapVirtualKey(0x28, 0) << 16 | 1 );
+		}
+	}; 
+}
+
+//@guide [🅰 使用范例](doc://examples/Windows/edit/autoComplete.aardio) [📄 autoComplete.dll 源码](doc://examples/Languages/CPP/com.autoComplete.aardio)
+
+/*****intellisense()
+com.autoComplete = 自动完成接口。\n仅适用于 edit 控件（单行模式），并不兼容 richedit 控件。
+com.autoComplete( = 创建自动完成对象
+com.autoComplete(.(edit,option) = 参数 @edit 指定 edit 控件对象（或启用编辑模式的 plus 控件）。\n参数 @option 可选用数值指定默认选项，可用选项请参考 setOption 函数说明。\n一般不需要指定 @option 。
+com.autoComplete() = !stdComAomplete.
+end intellisense*****/
+
+/*****intellisense(!stdComAomplete)
+setOption(__) = 使用参数 @1 指定一个数值更新自动完成选项。\n可用选项请参考[文档](https://learn.microsoft.com/windows/win32/api/shldisp/ne-shldisp-autocompleteoptions)\n一般没必要修改 option 。
+enable(__) = 启用或禁用自动完成，使用参数 @1 可指定 true 或 false 。
+setStrings(__/*字符串数组*/) = 将参数 @1 指定的字符串数组设置为 edit 控件的自动完成列表。\n必须在用户输入前设置好所有需要提示的字符串，如果正在输入时变更字符串列表不会实时生效。
+hide() = 临时隐藏自动完成列表。\n调用此函数后会启用自动完成功能。\n默认会在回车时调用此功能。
+show() = 显示下拉列表。\n此函数模拟发送 _VK_DOWN 按键的 _WM_KEYDOWN 消息，\n只有启用了 _ACO_UPDOWNKEYDROPSLIST 选项（默认设置），\n并在文本框已获得焦点时才会有效。
+end intellisense*****/

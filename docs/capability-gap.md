@@ -3008,3 +3008,37 @@ av.video.kernel  ←  av.film  ←  autos.skills.codingFilm
 - 新增回归锁 `tests/lzma_overlay_check.ps1`（19 项断言，覆盖静态产物、PE 架构、导出符号、API 面、空串/结构体/内存与文件编解码往返、下游 4 模块独立导入），x64 与 x86 双绿；
 - x64 全量 969 模块 sweep（Round 10）：**ok=937 / fail=32**，净新增 4 个通过模块，无任何回归；
 - x64 真实缺口正式收敛到 **7 项**。
+
+---
+
+## 1.38 com.autoComplete x64 补版（自写 C++ COM 自动完成 IDispatch 实现，1 项失败清掉）
+
+> 目标：官方 `lib/com/autoComplete/_.aardio` 依赖从 AppData 动态提取的 32 位 `autoComplete.dll`
+> （由 VC6/MFC 构建，24KB，导出 `CreateIDispatchObject`），x64 进程装不下该 PE（实测
+> 「无法加载 DLL: C:\Users\QQ\AppData\Local\aardio/std/com/autoComplete.dll」）。
+> 官方在 `examples/Languages/CPP/com.autoComplete.aardio` 中随发行包带了 C++ 源码。
+> 按官方同名路径在 Nodio 侧提供自写 x64 等价实现，使 `com.autoComplete` 在 x64 上恢复可用。
+
+### 1.38.1 架构与符号对齐
+
+官方 32 位 DLL 是基于 MFC `CCmdTarget` 实现的 COM `IDispatch` 包装器，只导出 1 个符号：
+`CreateIDispatchObject(HWND hwndEdit, DWORD dwOptions)`（`cdecl` 调用约定）。
+返回的 `IDispatch` 接口暴露 4 个方法：
+1. `setStrings(items)`：接收字符串数组（`VT_ARRAY | VT_BSTR` 或 `VT_ARRAY | VT_VARIANT`），传给内部 `IEnumString`；
+2. `setOption(dwOptions)`：设置自动完成选项标志位；
+3. `enable(bEnable)`：启用或禁用自动完成；
+4. `delete()`：显式释放底层 `IAutoComplete2` 与 `IEnumString` 资源。
+
+### 1.38.2 现代标准 C++ 无 MFC 实现
+
+在 `lib/com/autoComplete/.res/autoComplete64.cpp` 中自包含实现完整的现代标准 C++ COM 组件：
+- **零 MFC 依赖、纯标准 Windows SDK**：摆脱老旧 VC6/MFC 运行时捆绑，仅依赖 Windows 核心 COM/OLE 运行时；
+- **线程安全的 `CEnumString`**：实现标准 `IEnumString` 接口（`Next`、`Skip`、`Reset`、`Clone`），使用临界区保护多线程访问，使用 `CoTaskMemAlloc` 分配输出字符串；
+- **原生 `IDispatch` 派发引擎**：精准实现 `GetIDsOfNames`（区分大小写不敏感匹配 `setStrings` / `setOption` / `enable` / `delete`）与 `Invoke`（支持正反向参数与 VARIANT 类型转换）；
+- **生命周期与引用计数对齐**：构造初始引用为 1，`CreateIDispatchObject` 将所有权移交调用方；支持 aardio `QueryObjectR` 语义及显式 `delete()` 双重生命周期管理。
+
+### 1.38.3 回归与全量验证
+
+- 新增回归锁 `tests/autocomplete_overlay_check.ps1`（20 项断言，覆盖静态产物、PE 架构、导出符号、API 面、功能与生命周期、单例复用、参数防护），**20 passed, 0 failed**；
+- x64 全量 969 模块 sweep（Round 11）：**ok=937 → 938 / fail=32 → 31**，净减少 1 项失败，无任何回归；
+- 真实缺口进一步收敛至 **6 项**（其中 1 项为第三方商业库 `web.layout`）。

@@ -1167,3 +1167,13 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
     - **回归**：新建 `tests/lzma_overlay_check.ps1`（19 项断言，x64/x86 双绿）；
       x64 全量 sweep **ok=933 → 937 / fail=36 → 32**（-4，无新增失败）。
     - **x64 真实缺口收敛至 7 项**：`web.view` 族 4 项、`raw.fasm` 1 项、`com.autoComplete` 1 项、`web.layout` 1 项（不现实）。
+
+20. [x] **com.autoComplete：按官方同名路径补 Nodio 自己的 x64 版本（1 项失败）**（2026-10-22 第三十一轮续）—
+    官方 `lib/com/autoComplete/_.aardio` 依赖 32 位 `autoComplete.dll`（VC6 MFC 构建，24KB），
+    x64 装不下（实测「无法加载 DLL: C:\Users\QQ\AppData\Local\aardio/std/com/autoComplete.dll」）。
+    - **实现**：根据官方范例源码在 `lib/com/autoComplete/.res/autoComplete64.cpp` 实现纯标准 C++
+      零 MFC 依赖的 `CEnumString` 与 `IDispatch` 自动完成组件，导出与官方同名同签名同 cdecl
+      约定的 `CreateIDispatchObject` 符号；编译生成 `autoComplete64.dll`；创建 overlay 模块 `lib/com/autoComplete/_.aardio`。
+    - **验证**：单行 edit 控件绑定、`setStrings`、`setOption`、`enable`、`delete`、单例保护全通；
+      新建回归锁 `tests/autocomplete_overlay_check.ps1`（20 项断言全绿）。
+    - **回归**：x64 全量 sweep **ok=938 / fail=31**（Round 11），真实缺口收敛至 **6 项**。
