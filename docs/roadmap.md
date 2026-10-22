@@ -1155,3 +1155,15 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 - [ ] 事件代码生成
 - [ ] 设计 ↔ 源码视图切换（`switchActiveForm`）
 - [ ] 自定义控件替身映射（`ide.customCtrl` 的 `cls→drawAs` 表）
+
+19. [x] **sevenZip.lzma：官方没发源码的模块，Nodio 侧自写 x64 LZMA1 编解码器（4 项失败）**（2026-10-22 第三十一轮续）—
+    官方 `lib/sevenZip/lzma/_.aardio` 将 32 位 `LzmaUtil.dll`（76KB / 3 个导出）内嵌在源码中，
+    x64 装不下（实测「无法加载 DLL: (内嵌的内存映像)」）；官方未随库发源码。
+    - **实现**：在 `lib/sevenZip/lzma/.res/lzma64.c` 自写独立包含的 LZMA1 编解码器（~940 行标准 C），
+      实现与官方同名同签名同 cdecl 约定的 `LzmaCompress`、`LzmaUncompress`、`lzmafile` 符号，
+      编译生成 `lib/sevenZip/lzma/.res/lzma64.dll`；创建 overlay 模块 `lib/sevenZip/lzma/_.aardio`。
+    - **验证**：与官方 32 位 DLL 进行全量跨架构双向交叉验证（自编→官解 7/7 PASS，官编→自解 7/7 PASS，
+      SHA256 逐字节全等）；下游 4 个模块（`sevenZip.lzma` / `.httpFile` / `.tar` / `fsys.update.maker`）全部恢复通过。
+    - **回归**：新建 `tests/lzma_overlay_check.ps1`（19 项断言，x64/x86 双绿）；
+      x64 全量 sweep **ok=933 → 937 / fail=36 → 32**（-4，无新增失败）。
+    - **x64 真实缺口收敛至 7 项**：`web.view` 族 4 项、`raw.fasm` 1 项、`com.autoComplete` 1 项、`web.layout` 1 项（不现实）。

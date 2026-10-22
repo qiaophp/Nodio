@@ -2961,3 +2961,50 @@ av.video.kernel  ←  av.film  ←  autos.skills.codingFilm
 * **1 项不现实**：`web.layout`（第三方 32 位商业库），它连带的 3 项在 x86 上同样失败；
 * 剩下的 **24 项不需要做任何事** —— 那是官方模块自己的契约（守卫 / 导入顺序 / 自带安装器 /
   依赖缺失），Nodio 复现得**一模一样**（报错文本逐字相同）。
+
+---
+
+## 1.37 sevenZip.lzma 族 x64 补版（官方无源码、自写 LZMA1 编解码器，4 项失败全部清掉）
+
+> 目标：官方 `lib/sevenZip/lzma/_.aardio` 将 32 位 `LzmaUtil.dll`（76KB / 3 个导出）
+> 用 `$"..."` 内嵌进源码再内存加载，x64 进程装不下该 PE（实测「无法加载 DLL: (内嵌的内存映像)」）。
+> 官方**未随库发布源码**。按官方同名路径在 Nodio 侧提供自写 x64 等价实现，使 `sevenZip.lzma`
+> 及其下游 4 个模块在 x64 上全部恢复可用。
+
+### 1.37.1 导出符号与调用约定对齐
+
+官方 32 位 `LzmaUtil.dll` 导出 3 个符号（`cdecl` 调用约定）：
+1. `LzmaCompress`：`int(pointer dest, int &destLen, pointer src, int srcLen, pointer outProps, int &outPropsSize, int level, int dictSize, int lc, int lp, int pb, int fb, int numThreads)`
+2. `LzmaUncompress`：`int(pointer dest, int &destLen, pointer src, int &srcLen, pointer props, int propsSize)`
+3. `lzmafile`：`int(string inPath, string outPath, bool decompress, pointer callback, pointer progressStruct, int level, int dictSize, int lc, int lp, int pb, int fb)`
+
+### 1.37.2 自写 LZMA1 编解码器核心实现
+
+在 `lib/sevenZip/lzma/.res/lzma64.c` 中自包含实现完整的 LZMA1 编解码器：
+- **纯标准 C、零外部依赖**：仅使用系统基础头文件，无第三方库依赖；
+- **Range Coder（范围编码器/解码器）**：完整实现底层的 32 位基范围编码/解码、字节流输出缓冲与重归一化；
+- **概率模型**：扁平化 1846 + `(0x300 << (lc+lp))` 状态转移概率表；
+- **哈希链匹配查找器**：高效 2/3/4 字节哈希链，支持自定义字典大小与 fast-bytes；
+- **writeEndMark=false 行为对齐**：官方 `LzmaCompress` 默认不发射 27 位的结束标记，解码端依赖调用方提供的解压大小边界截断；
+- **解码器 EOF 判定精确化**：在 `rd_normalize` 真实尝试向后读字节且流耗尽时才置位 EOF，空串与边界流安全解码；
+- **文件流级编解码（`lzmafile`）**：完整读写 13 字节 .lzma 文件头（5 字节属性 + 8 字节原始大小），支持进度回调与用户中止机制。
+
+### 1.37.3 交叉验证（跨架构双向逐字节一致）
+
+自写编解码器与官方 32 位 DLL 及 Python `liblzma` 进行全面交叉比对：
+- **自编 -> 官解**：自写编码器生成的 LZMA 流交由官方 32 位 `LzmaUtil.dll` 解码，覆盖 1b、3b、16b、256b、5KB 文本、100KB 重复串、1MB 随机 ASCII，解出内容与原文 SHA256 逐字节全等（7/7 PASS）；
+- **官编 -> 自解**：官方 32 位 `LzmaUtil.dll` 编码产物交由自写解码器解码，解出内容与原文 SHA256 逐字节全等（7/7 PASS）；
+- **Python liblzma 双向比对**：75 组随机参数流交叉解压 100% 通过。
+
+### 1.37.4 下游受益模块（4 项全部通过）
+
+- `sevenZip.lzma`
+- `sevenZip.lzma.httpFile`
+- `sevenZip.lzma.tar`
+- `fsys.update.maker`
+
+### 1.37.5 回归与盘点
+
+- 新增回归锁 `tests/lzma_overlay_check.ps1`（19 项断言，覆盖静态产物、PE 架构、导出符号、API 面、空串/结构体/内存与文件编解码往返、下游 4 模块独立导入），x64 与 x86 双绿；
+- x64 全量 969 模块 sweep（Round 10）：**ok=937 / fail=32**，净新增 4 个通过模块，无任何回归；
+- x64 真实缺口正式收敛到 **7 项**。
