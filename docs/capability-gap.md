@@ -2915,3 +2915,49 @@ av.video.kernel  ←  av.film  ←  autos.skills.codingFilm
 **仍然没有一项是 Nodio 自身的引擎缺陷。** 剩下真正需要动手的是 13 项「官方只有 32 位 DLL、
 没发源码」的：`web.view`（第三方 WebView2 封装）、`sevenZip.lzma`（LZMA 编解码）、
 `raw.fasm`（x86 汇编器）、`web.layout`（第三方 HTML 渲染引擎，许可与体量都不现实）。
+
+## 1.36 收官盘点：用 x86 对照 sweep 把「官方同款行为」摘出去 —— x64 真正还差 11 项，不是 36 项
+
+### 1.36.1 为什么要做这个对照
+
+之前对 x64 失败的分类是**按报错文本人工归因**的（"官方契约守卫 12 项"、"官方同款导入顺序 2 项"…），
+归因是人写的，就可能写错。更硬的口径是：
+
+> **同一个模块，x86（走官方 32 位标准库）也失败吗？**
+>
+> * 两边都失败、报错一致 → **官方同款行为**，不是 x64 缺口，不用做任何事；
+> * 只有 x64 失败 → **真正的 x64 缺口**，需要补 x64 版本。
+
+做法：两个架构各跑一次全量 sweep（969 个模块，同一份清单 `tests/public_lib_modules.txt`），
+再逐模块比对**状态 + 报错文本**。
+
+### 1.36.2 实测结果
+
+| 分类 | 项数 | 说明 |
+|---|---:|---|
+| **x64 专属失败（真缺口）** | **11** | 见 §1.36.3 |
+| 两边都失败、报错一致（官方同款行为） | 24 | 12 项官方契约守卫（`sqlite.base` / `sqlite.backup` / `py3.pip` / `web.acme.httpClient` / `web.form.query` / `web.layout.*` / `web.view.dev` / `winex.accObject.element`）+ 2 项官方同款导入顺序（`win.ui.ctrl.splitter` / `win.ui.ctrl.thread`）+ 6 项自带安装器/下载器超时（`fastcgi.iisInstall` / `java.jdk.*` / `java.jre.v8ora` / `process.php.*`）+ 3 项官方库缺失（`crypt.jwt.algorithm.EdDSA` / `process.ruby*`）+ 1 项官方库自身断言（`web.layout.event`）+ 1 项清单伪条目（`win.#DEFINE`） |
+| 两边都失败、报错不同 | 1 | `py3.export`：x64 报「需要先 import py3 以初始化 Python 运行时」（Nodio overlay 给的明确提示），x86 报官方的「尝试调用非函数值 (.PyModule_Create2P)」—— 都是失败，x64 的提示更友好 |
+| x64 通过、x86 失败 | 11 | `py2.*` / `py3.*` 共 11 个子模块：官方要求「先 import 父命名空间」，x86 走官方库就是这个行为；Nodio 的 x64 overlay 让子模块**可独立导入**（§1.30 有意为之） |
+
+**两次 sweep 的总数完全一样（都是 ok=933 / fail=36），但含义完全不同。**
+总数相同是因为 x64 补版修好了 12 项、同时 x86 那边本来就有的失败项两边一样多。
+
+### 1.36.3 真正的 x64 缺口：11 项，分 5 个模块族
+
+| 模块族 | 项数 | 根因（实测） | 可行性 |
+|---|---:|---|---|
+| `sevenZip.lzma` 族 | 4 | 官方 `LzmaUtil.dll`（32 位 / 76KB / 3 个导出 / **无源码**）→ `sevenZip.lzma` / `.httpFile` / `.tar` / `fsys.update.maker` | **可自写**：LZMA 编解码器（解码器 ~400 行 + 编码器 ~800 行 C），用官方 DLL 的输出做**交叉验证**（我的编码 → 官方解码；官方编码 → 我的解码） |
+| `web.view` 族 | 4 | 官方 `webview.dll`（32 位 / 381KB / 26 个导出，第三方 WebView2 封装）→ `web.view` / `autos.skills.videoDownloader` / `.bilibili` / `.toutiao` | 需要自己写 WebView2 的 COM 绑定（工作量大）；本机已装 WebView2 运行时 `155.0.4283.62` |
+| `raw.fasm` | 1 | 官方 `FASM.DLL`（32 位 / 98KB / 3 个导出，Flat Assembler，**无源码**） | 可自写，但**工作量最大**（要实现一个 x86 汇编器） |
+| `web.layout` | 1 | `HTMLayout.dll`（**第三方 32 位商业库**，2.4MB / 100+ 导出） | **不现实**（许可 + 体量）；它连带的 3 项在 x86 上同样失败 |
+| `com.autoComplete` | 1 | `%LOCALAPPDATA%\aardio\std\com\autoComplete.dll`（实测存在，**32 位**，由官方安装器安装） | 官方安装器只发 32 位版；x64 要么自写要么另找来源 |
+
+### 1.36.4 结论
+
+* **x64 的真实缺口是 11 项**（不是 36 项）；
+* 其中 **9 项可解**：`sevenZip.lzma` 族 4（自写 LZMA）+ `raw.fasm` 1（自写汇编器）+
+  `com.autoComplete` 1（自写）+ `web.view` 族 4（自写 WebView2 绑定）；
+* **1 项不现实**：`web.layout`（第三方 32 位商业库），它连带的 3 项在 x86 上同样失败；
+* 剩下的 **24 项不需要做任何事** —— 那是官方模块自己的契约（守卫 / 导入顺序 / 自带安装器 /
+  依赖缺失），Nodio 复现得**一模一样**（报错文本逐字相同）。

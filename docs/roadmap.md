@@ -914,6 +914,23 @@ Fixed & closed in recent sessions:
       1 项官方断言、1 项外部安装缺件、1 项清单伪条目。
     详见 `docs/capability-gap.md` §1.35
 
+18. [x] **收官盘点：x86 对照 sweep —— x64 真正还差 11 项，不是 36 项**（2026-10-22 第三十轮续）—
+    之前的失败分类是**按报错文本人工归因**的；更硬的口径是「同一个模块，x86（走官方 32 位标准库）
+    也失败吗？」→ 两边都失败且报错一致 = **官方同款行为**（不是缺口，不用做事）；
+    只有 x64 失败 = **真缺口**。
+    - **做法**：两个架构各跑一次全量 sweep（969 个模块，同一份清单），逐模块比对状态 + 报错文本。
+    - **结果**：x64 专属失败 **11** 项；两边都失败报错一致 **24** 项（12 官方契约守卫 + 2 官方同款导入顺序
+      + 6 自带安装器超时 + 3 官方库缺失 + 1 官方断言 + 1 清单伪条目）；报错不同 1 项（`py3.export`，
+      x64 的提示更友好）；x64 通过 x86 失败 11 项（`py2.*`/`py3.*` 子模块，x64 overlay 让它们可独立导入）。
+      **两次 sweep 总数一样（ok=933 / fail=36），含义完全不同。**
+    - **11 项真缺口的归属**：`sevenZip.lzma` 族 4（自写 LZMA 编解码，官方 DLL 无源码）、
+      `web.view` 族 4（第三方 WebView2 封装，需自写 COM 绑定；本机有 WebView2 运行时 155.0.4283.62）、
+      `raw.fasm` 1（自写 x86 汇编器，工作量最大）、`web.layout` 1（**第三方 32 位商业库，不现实**）、
+      `com.autoComplete` 1（官方安装器只发 32 位版）。
+    - **结论**：24 项**不需要做任何事**（官方自己的契约，Nodio 复现得逐字一致）；
+      9 项可解、1 项不现实。
+    详见 `docs/capability-gap.md` §1.36
+
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard
 2. console.log string-encoding primitive layer (isUtf16/getUtf/toUtf16 semantics), `.join`/`.getMessage` gaps
