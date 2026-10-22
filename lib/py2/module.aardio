@@ -1,0 +1,53 @@
+//module 模块
+// ---- Nodio x64 补版：先载入父命名空间（放在 namespace 之前，避免命名空间作用域被 import 冲掉）----
+import ..py2;
+namespace py2
+
+// ---- Nodio x64 补版：64 位环境无 python27.dll 时优雅降级 ----
+// 官方 py2 只带 32 位 python27.dll，x64 进程无法加载；这里注册一个明确报错的占位类，
+// 避免在导入期因 ::Python2 为空而崩溃。
+if(!::Python2) {
+	self.module = class {
+		ctor(...){
+			error("当前 64 位环境未检测到 64 位 python27.dll。Python 2.7 官方已废弃，建议升级使用 py3 扩展库", 2);
+		}
+	};
+	return;
+}
+
+class module{
+	ctor( object ){
+	
+		if(!object) return;
+		this = ..py2.object( object,true );
+		// 避免调用 set 元方法
+		this[["getDict"]] = function(){
+			var objPtr = PyModule_GetDict(owner.pyObject);
+			if(objPtr){
+				..py2.IncRef(objPtr);//Borrowed reference 
+				return ..py2.dict(objPtr);
+			} 
+		};
+		
+		this[["getFilename"]] = function(){
+			var p = ::Python2.PyModule_GetFilenameP(owner.pyObject);
+			if(p) return ..raw.str(p);
+		};
+	};  
+}
+
+namespace module{
+	PyModule_GetDict = ::Python2.api("PyModule_GetDict","pyObject(PyObject mod)");
+}
+
+/**intellisense(!py2Module) 
+getFilename() = 返回模块文件路径
+getDict() = 如果对象是一个模块,返回字典对象\n!py2Dict.
+getAttr("__/*属性名*/") = 读属性值，也可以用成员操作符获取。\n除数值、布尔值、字符串、字节数组以外的值在 aardio 中存为 py.object 对象
+setAttr("__/*属性名*/",) = 写属性成员的值，也可以用成员操作符赋值
+getItem(__/*索引*/) = 返回指定索引的项，也可以用索引下标操作符 [] 取值。\n除数值、布尔值、字符串、字节数组以外的值在 aardio 中存为 py.object 对象
+setItem(__/*索引*/，) = 修改指定索引的项，也可以用索引下标操作符 [] 赋值。
+getAttr() = !p3yObject.
+has("__/*属性名*/") = 是否存在指定的属性
+? = 输入 Python 对象属性或函数名称。\n如果首字符为 $ ，则返回支持命名参数的函数对象。\n也就是说 pyObject.$fun 等价于 pyObject.fun.invoke。\n!py2Object.
+end intellisense**/

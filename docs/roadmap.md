@@ -801,6 +801,32 @@ Fixed & closed in recent sessions:
       导入顺序、1 项清单伪条目。
     详见 `docs/capability-gap.md` §1.29
 
+13. [x] **py2 / py3 子模块：按官方同名路径补 Nodio 自己的 x64 版本（13 项失败）**（2026-10-22 第二十九轮续）—
+    官方 py2 / py3 的**子模块约定「必须先 import 父命名空间」**：子模块在类体作用域里
+    直接 `::Python3.api(...)`，父模块没载入时 `::Python3` 为空 → 导入即报错
+    （x86 同样失败，与官方同款，不是 x64 独有偏差）。
+    - **宿主**：官方只带 32 位 `python27.dll` / `python38.dll`（PE `machine == 0x014C`）；
+      仓库内已备 64 位 `lib/py3/.res/DLLs/python38.dll`（`0x8664`）→ **py3 在 x64 上可用，
+      py2 不可用**。
+    - **补版**：13 个 overlay 文件全是官方模块的**逐字副本**，只做最小补丁 ——
+      `lib/py3/_.aardio` 让 `::Python3` 与 `::Py3Runtime` 指向同一个 DLL 句柄；
+      `lib/py3/{dict,export,list,module,object,tuple}.aardio` 自行载入运行时
+      （`::Py3Runtime := ::Py3Runtime || loadDll(...)`）并把 API 绑定改绑 `::Py3Runtime.*`
+      → 子模块**可独立导入**；`lib/py2/{...}.aardio` 在 `::Python2` 为空时注册
+      **明确报错的占位类**并提前返回 → 导入不崩溃、使用时给出与 `lib/py2/_.aardio`
+      一致的提示。
+    - **`py3.export` 例外**：导入期就执行 Python 代码（`..py3.exec`），官方同样要求先
+      `import py3`；overlay 把内部错误换成明确提示，并给它的命名空间 `_set` 元方法加
+      `Py_IsInitialized()` 守卫 —— 否则会调用未初始化的 CPython **直接让进程崩溃**
+      （实测 `0xC0000409`）。
+    - **回归**：新建 `tests/py_overlay_check.ps1`（21 项断言，x64/x86 双绿）；
+      x64 / x86 各 20 套回归全绿；x64 全量 sweep
+      **ok=908 → 919 / fail=60 → 49**（-11，新增失败 0 项）。
+    - **剩余 49 项 x64 失败里仍没有一项是 Nodio 引擎缺陷**：23 项官方只带 32 位 DLL
+      且未发源码、12 项官方契约守卫、2 项官方同款导入顺序、6 项自带安装器超时、
+      3 项官方库缺失、1 项官方断言、1 项外部安装缺件、1 项清单伪条目。
+    详见 `docs/capability-gap.md` §1.30
+
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard
 2. console.log string-encoding primitive layer (isUtf16/getUtf/toUtf16 semantics), `.join`/`.getMessage` gaps

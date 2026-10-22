@@ -1,0 +1,313 @@
+﻿//export 导出模块
+import util.registry;
+
+// ---- Nodio x64 补版：py3.export 依赖已初始化的 Python 运行时 ----
+// 官方 py3.export 在导入期就执行 Python 代码（..py3.exec），必须先 import py3。
+// 这里给出明确提示，避免出现"尝试调用非函数值"这类内部错误。
+if(!..py3[["exec"]]) {
+	error("py3.export 需要先 import py3 以初始化 Python 运行时",2);
+}
+namespace py3;
+
+// ---- Nodio x64 补版：允许 py3 子模块被独立导入 ----
+// 官方约定必须先 import py3 才能使用 py3.xxx；这里自行载入 64 位 Python 运行时，
+// 使 py3.xxx 可以单独导入（::Py3Runtime 与父模块共用同一个 DLL 句柄）。
+::Py3Runtime := ::Py3Runtime || ..raw.loadDll("~\lib\py3\.res\DLLs\python38.dll",,"cdecl");
+if(!::Py3Runtime) {
+	error("未检测到 64 位 python38.dll，py3 扩展库不可用",2);
+}
+
+class export{
+	ctor( obj ){{ 
+		var t = type(obj); 
+		if(!exportable[t]) {
+			if(..math.isInteger(obj)){
+				return ..py3.int(obj);
+			}
+			return obj;
+		}
+		
+		var id = __proxyRegistry__.reg(obj);
+		 
+    	return ..py3.builtin["aardioObjectBox__"](id);
+	}}; 
+}
+
+namespace export;
+
+exportable = {["table"]=1,["class"]=1,["cdata"]=1,["function"]=1};
+__proxyRegistry__ = ..util.registry();
+__staticModuleDef__ = {};
+
+self@ = {
+
+	_set = function(k,v){
+		if(!::Py3Runtime.Py_IsInitialized()){
+			// Nodio x64 补版：Python 运行时尚未初始化（未 import py3）时不做模块导出
+			self[[k]] = v;
+			return;
+		}
+
+		if( ( type(k)!= type.string ) || (type(v) != type.table) ){
+			self[[k]] = v;
+			return;
+		}
+		
+		var pyMethods = {}  
+		var callbacks ={}
+		var moduleTable = v;
+		var moduleName = k;
+		if( __staticModuleDef__[moduleName] ){
+			error("已经导出过该名称的 aardio 模块到 Python",2); 
+		}
+		self[[k]] = v;
+		
+		for(k,v in moduleTable){
+			if( type(v) != type.function ) continue ;
+			if( type(k) != type.string ) continue ;
+			
+			var callback = ..raw.tocdecl(
+				function(self_,args){
+					var tp = ..py3.tuple(args);	
+					var args2 = tp.parseValue();
+					tp.stealPtr();
+					var ret = invoke(v,owner,..table.unpackArgs(args2) );
+					return ..py3.object(ret).stealPtr();
+				},"pyObject(pyObject self,pyObject args)",moduleTable);
+				
+			..table.push(pyMethods,{string name=k;ptr method = callback;int flags = 1|2;string doc = moduleTable[k+"Doc"]: k});
+		}
+		..table.push(pyMethods,{string name;ptr method;int flags;string doc })
+		
+		var pyModuleDef = {
+			//ptr _ob_next_debug; 
+			//ptr _ob_prev_debug; 
+			addr ob_refcnt = 1;
+			ptr ob_type;
+			ptr m_init;
+			addr m_index;
+			ptr m_copy; 
+			string m_name = moduleName;
+			string m_doc = moduleName;
+			addr m_size = -1;
+			ptr m_methods =  ..raw.buffer({struct defs[]=pyMethods });
+			ptr m_slots;
+			ptr m_traverse;
+			ptr m_clear;
+			ptr m_free;
+		} 
+		
+		//分配固定的内存地址
+		var pyModuleDefPtr = ..raw.buffer(pyModuleDef);
+		
+		var m =  ::Py3Runtime.PyModule_Create2P(pyModuleDefPtr ,1013);
+	
+		if(m){
+			var ptrObj = ::Py3Runtime.PyImport_GetModuleDictP();
+			..py3.IncRef(ptrObj);
+			
+			var md = ..py3.dict(ptrObj);
+			md.setItem(moduleName,..py3.object(m,true) ) 
+			..py3.DecRef(m);
+				
+			/*
+			因为Python会继续引用pyModuleDefPtr以及pyModuleDef的成员字段的内存地址，
+			所以在这里添加全局静态引用避免变量被aardio回收释放，
+			*/
+			__staticModuleDef__[moduleName] = {
+				pyModuleDefPtr = pyModuleDefPtr; 
+				pyModuleDef = pyModuleDef;
+				pyMethods = pyMethods;
+			}; 	
+		}
+	} 
+} 
+ 
+self.__aardioProxy__ = { 
+	
+	callSelf = function(id,...) {
+        var obj = __proxyRegistry__[id];
+        if(obj){ 
+        	return ..py3.export( obj(...) );
+        } 
+    }
+    
+    xcall = function(id,k,...) {
+        var obj = __proxyRegistry__[id];
+        if(obj){ 
+        	return ..py3.export( invoke(obj[k],obj,...) );
+        } 
+    }
+    
+    callable = function(id,k){
+        var obj = __proxyRegistry__[id];
+    	if(obj) return type.callable( obj[k] );
+    }
+    
+    get = function(id,k){
+        var obj = __proxyRegistry__[id];
+    	if(obj) return ..py3.export( obj[k] );
+    }
+    
+    set = function(id,k,value,saveId){ 
+        var obj = __proxyRegistry__[id];
+    	if(obj) { 
+    	    if( saveId){
+    	    	value = __proxyRegistry__[saveId]
+    	    }
+    		obj[k] = value;
+    	}
+    }
+    
+    next = function(id,current){
+        var obj = __proxyRegistry__[id];
+    	if(obj) { 
+    	    var tuple;
+    	    if(type.callable(obj)) tuple = {obj(current)};
+    		else tuple = {..table.next( obj,current)};
+    		
+    		for(k,v in tuple){
+				tuple[k] = ..py3.export(v);
+			}
+			
+			return ..py3.tuple(tuple);
+    	}
+    }
+    
+    remove = function(id,name){
+        var obj = __proxyRegistry__[id];
+    	if(obj) obj[name] = null;
+    }
+      
+    release = function(id){
+    	__proxyRegistry__.unReg(id);
+    } 
+    
+    toString = function(id){
+    	var obj = __proxyRegistry__[id];
+        if(obj){
+            return tostring(obj)
+        }
+    } 
+};
+
+..py3.exec(` 
+import __aardioProxy__
+class aardioObjectBox__Iterator__(object):
+	def __init__(self, objId):
+		self.__objId = objId 
+		self.current = None
+
+	def __next__(self): 
+		c= self.current 
+		if( c and len(c) ): c = c[0] 
+		
+		self.current = __aardioProxy__.next(self.__objId,c)
+		if( not( self.current and len(self.current) ) ):
+			raise StopIteration
+		else:
+			return self.current
+            
+class aardioObjectBox__(object): 
+
+	def __init__(self, objId):
+		self.__objId = int(objId) 
+		
+	def __getattr__(self, k):
+		if( __aardioProxy__.callable(self.__objId,k) ):
+			return lambda *args: __aardioProxy__.xcall(self.__objId, k, *args)
+		else:
+			return __aardioProxy__.get(self.__objId, k)
+
+	def __setattr__(self,k,value): 
+		if(k=="_aardioObjectBox____objId"):
+			super(aardioObjectBox__, self).__setattr__(k,value)
+		else:
+			if(hasattr(value,"_aardioObjectBox____objId")):
+				__aardioProxy__.set(self.__objId,k,None,value._aardioObjectBox____objId)
+			else:
+				__aardioProxy__.set(self.__objId,k,value)
+				
+	def __getitem__(self, k):
+		return __aardioProxy__.get(self.__objId, k)
+
+	def __setitem__(self,k,value):  
+		if(hasattr(value,"_aardioObjectBox____objId")):
+			__aardioProxy__.set(self.__objId,k,None,value._aardioObjectBox____objId)
+		else:
+			__aardioProxy__.set(self.__objId,k,value)
+	 
+	def __call__(self,*args):
+		return __aardioProxy__.callSelf(self.__objId, *args)
+
+	def __delattr__(self,k):
+		__aardioProxy__.remove(self.__objId, k)
+						
+	def __del__(self):
+		__aardioProxy__.release(self.__objId)
+	
+	def __iter__(self): 
+		return aardioObjectBox__Iterator__(self.__objId)
+  
+	def __str__(self):
+		return __aardioProxy__.toString(self.__objId)
+			
+__builtins__.aardioObjectBox__ = aardioObjectBox__
+`);
+
+/**details(重要说明)
+一、简介
+-----------------------------------------------------------
+当 py3.export() 作为对象构造函数使用时，
+可用于导入参数指定的 aardio 对象为 Python 对象。
+这种「代理对象」在 Python 中将保持对原始 aardio 对象的引用，也就是传址而非传值。
+
+二、解决了什么问题
+-----------------------------------------------------------
+aardio 在与 Python 交互时，
+默认除了布尔值、浮点数值、小于53位的整数值，布尔值转换为纯 aardio 值以外。
+在 aardio 这些对象存为 pyObject，并保留对原始 Python 对象的引用。
+
+而 aardio 对象在自动转换为 Python 对象时，
+默认是传值而非传址，Python 中不保留对 aardio  对象的引用。
+
+py3.export 的特别之处在于可以导出 aardio 模块到 Python，
+在 Python 中引用与操作原始的 aardio 对象。
+
+例如：
+
+	py3.export.aardio = {
+		exportFunction = function(){
+			
+		} 
+	}
+
+然后可以在 Python 中 import aardio，调用这个模块的所有成员函数。
+
+三、py3.export( aardioObject ) 使用要点
+-----------------------------------------------------------
+py3.export( aardioObject ) 
+可以导出 aardio 中的 table,cdata,class,function 等 aardio 对象，
+也可以自动导出 aardio 迭代器，适用于 Python 的 for 语句（aardio 迭代器在 Python 中返回 tuple 而非单个值)
+
+对于整型数值 py3.export( number ) 默认转换为 Python 中的整型，而非浮点数。
+其他类型（例如字符串） py3.export 不作转换直接返回。
+
+Python 调用导出函数的返回值也会由 py3.export() 再次导出 。
+Python 调用 aardio 导出函数的参数会自动调用 parseValue() 解析为纯 aardio 值。
+
+四、使用限制
+-----------------------------------------------------------
+注意 py3.export 只能在 Python 启动线程中使用,
+这是 Python 的限制与 aardio 无关！ 
+
+aardio 可以支持真多线程，
+也提供了 py3.lock 简化了 Python 全局锁操作，支持除 py3.export 以外的接口。
+但是：py3.export 不支持多线程。
+
+在非 Python 主线程下，py3.export 为 null 值,
+使用 py3.mainThread 也可以检测是否  Python 主线程， 
+
+其实 Python 因为有全局锁 —— 无法实现真正的多线程， 
+调用 process.python 创建多进程来替代多线程可能更方便一些。
+end details**/

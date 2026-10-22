@@ -2426,3 +2426,91 @@ var dll = ..raw.loadDll( io.splitpath(io.libpath("win.region.png")).dir + ".res\
 | `sevenZip.lzma` 族（4 项） | 7-Zip SDK（LGPL）可换 64 位版；但 Nodio 已有 `lib/zlib` 方案，需评估 API 兼容性 |
 | `raw.fasm`（1 项） | FASM 源码公开（GPL），可换 64 位构建 |
 | `com.autoComplete`（1 项） | 依赖外部安装的 `autoComplete.dll`（`%LOCALAPPDATA%\aardio\std\com\`），属环境缺件 |
+
+## 1.30 第二十九轮（续）：py2 / py3 子模块 —— 按官方同名路径补 Nodio 自己的 x64 版本（13 项）
+
+### 1.30.1 官方 py2 / py3 的结构与两条硬约束
+
+```txt
+lib/py2/_.aardio                    父模块：载入 python27.dll，导出全局保留常量 ::Python2
+lib/py2/{dict,export,list,module,object,tuple}.aardio      子模块
+lib/py3/_.aardio                    父模块：载入 python38.dll，导出 ::Python3
+lib/py3/{dict,export,list,module,object,tuple}.aardio      子模块
+```
+
+两条约束都从**官方源码直接读出**，不是推测：
+
+1. **宿主 DLL 只有 32 位。** 官方 `lib/py2/.res/DLLs/python27.dll` 与
+   `lib/py3/.res/DLLs/python38.dll` 的 PE `machine` 都是 `0x014C`（x86）。
+   x64 进程装不下 → `::Python2` / `::Python3` 为空。
+   Nodio 仓库内另备了一份 **64 位** `lib/py3/.res/DLLs/python38.dll`
+   （`machine == 0x8664`，含整套 64 位 `.pyd`），所以 **py3 在 x64 上可用、py2 不可用**。
+
+2. **子模块约定「必须先 import 父命名空间」。** 子模块在**类体作用域**里直接
+   `::Python3.api("PyDict_New","pyObject()","cdecl")`（`py3/dict.aardio:154`），
+   父命名空间没载入时 `::Python3` 为空 → 类体求值报错。
+   官方自己也遵守这条约定：`py3/_.aardio:49-53` 自己
+   `import ..py3.object/module/dict/list/tuple`；而 `py3/pip.aardio` 用的是
+   `import py3;`（父命名空间），不是 `import py3.pip`。
+
+实测（x64，官方库直连）：`import py3.dict;` → `尝试调用非函数值 (.api) @ .../py3/dict.aardio:154`；
+x86 同样失败 → **与官方同款**，不是 x64 独有的偏差。
+
+### 1.30.2 Nodio 侧的实现（overlay，官方同名路径）
+
+| 文件 | 与官方的差异 |
+|---|---|
+| `lib/py3/_.aardio` | 官方副本。`::Python3 := ::Py3Runtime \|\| loadDll(...)`，并让 `::Py3Runtime` 与 `::Python3` 指向**同一个** DLL 句柄 |
+| `lib/py3/{dict,export,list,module,object,tuple}.aardio` | 官方副本。子模块自己载入 64 位运行时（`::Py3Runtime := ::Py3Runtime \|\| loadDll(...)`），API 绑定从 `::Python3.*` 改绑 `::Py3Runtime.*` → **子模块可独立导入** |
+| `lib/py2/{dict,export,list,module,object,tuple}.aardio` | 官方副本。`import ..py2;` 之后若 `::Python2` 为空（64 位无 python27.dll），注册一个**明确报错的占位类**并提前返回 → **导入不崩溃，使用时给出与 `lib/py2/_.aardio` 一致的提示** |
+
+几个关键点：
+
+* **保留常量语义**：`::` 是 aardio 的**保留常量**操作符（全局命名空间下、赋非空值后不可改）。
+  `::X := v` 等价于 `::X = ::X or v`，所以六个子模块各自重复执行载入语句是安全的
+  （第一次真正加载，之后保持原值，句柄仍然唯一）。
+* **`import` 与命名空间作用域的顺序**：`import ..py2;` 必须放在 `namespace py2;` **之前**。
+  实测把 `import` 写在 `namespace` 之后，导入语句会把当前命名空间作用域顶掉，
+  后面声明的类会落进错误的命名空间（实测 `nsx.sub` 变成空命名空间而不是类）。
+* **`py3.export` 例外**：它在**导入期**就要执行 Python 代码
+  （`py3/export.aardio:187` 的 `..py3.exec(\`...\`)`），官方同样要求先 `import py3`。
+  Nodio overlay 把内部错误「尝试调用非函数值 (.PyModule_Create2P)」换成明确提示
+  「py3.export 需要先 import py3 以初始化 Python 运行时」。
+  另外给它的命名空间 `_set` 元方法加了 `Py_IsInitialized()` 守卫 ——
+  否则 Python 尚未初始化时会调用未初始化的 CPython，**直接让进程崩溃**
+  （实测 `Fatal Python error: _PyInterpreterState_Get(): no current thread state`，
+  退出码 `0xC0000409`）。这条守卫同时消掉了「导入期崩溃」这个隐患。
+* **x86 行为不变**：overlay 目录只在 x64 生效（`engine/import.cpp` 的
+  `GetOverlayLibDir()`：32 位构建直接用官方 32 位标准库），
+  所以 x86 上 py2 仍能真实调用 32 位 python27.dll（实测 `py2.eval("2+3") == 5`）。
+
+### 1.30.3 验证
+
+* **功能**：新建 `tests/py_overlay_check.ps1`（21 项断言，x64 / x86 双绿）——
+  py3 的 `version / exec / eval / dict 往返 / object / list / tuple / module` 全部正常；
+  x64 下 py3 六个子模块**可独立导入**（`py3.export` 按官方约定仍要求先 `import py3`）；
+  x64 下 py2 `isSupported == false`、`py2.exec` 与 `py2.dict()` 抛出
+  「当前 64 位环境未检测到 64 位 python27.dll…」，六个子模块独立导入不崩溃；
+  x86 下 py2 真实执行 `py2.eval("2+3") == 5`。
+* **全量**：x64 / x86 各 20 套回归全绿（新增 `py_overlay_check` 一套）；
+  x64 全量模块 sweep **ok=908 → 919 / fail=60 → 49**（**-11**，
+  失败集合**只减不增**，新增失败 0 项）。
+* 修复的 11 项：`py2.dict` / `py2.export` / `py2.list` / `py2.module` / `py2.object` /
+  `py2.tuple` / `py3.dict` / `py3.list` / `py3.module` / `py3.object` / `py3.tuple`。
+
+### 1.30.4 剩下的 49 项 x64 失败（更新后的分类）
+
+| 类别 | 项数 | 明细 |
+|---|---:|---|
+| 官方只带 32 位 DLL（**未随库发源码**） | 23 | `av.video.kernel` 族 4（`av.film` / `av.video.flicker` / `av.video.kernel` / `autos.skills.codingFilm`）、`web.view` 族 4、`string.markdown` 族 8、`sevenZip.lzma` 族 4、`raw.fasm` 1、`string.keywords` 1、`web.layout` 1（HTMLayout.dll 缺失） |
+| 官方契约：必须先导入父命名空间 / 官方自带守卫 | 12 | `py3.export`（导入期执行 Python 代码，官方同款）、`py3.pip`（官方守卫「只能用于开发环境」）、`sqlite.base` / `sqlite.backup` / `web.acme.httpClient` / `web.form.query` / `web.layout.debug` / `web.layout.valueObject` / `web.layout.element` / `web.layout.element.style` / `web.view.dev` / `winex.accObject.element` |
+| 官方同款导入顺序限制 | 2 | `win.ui.ctrl.splitter` / `win.ui.ctrl.thread`（官方同样要求先 `import win;`） |
+| 官方库自带安装器 / 下载器（超时） | 6 | `fastcgi.iisInstall` / `java.jdk.v6ora` / `java.jdk.v8ora` / `java.jre.v8ora` / `process.php.7.4` / `process.php.8.3` |
+| 官方库依赖的官方库缺失 | 3 | `crypt.jwt.algorithm.EdDSA`（BouncyCastle）/ `process.ruby` / `process.ruby.simpleHttpServer` |
+| 官方库自身断言失败 | 1 | `web.layout.event`（HTMLayout 未装的连带） |
+| 依赖外部安装的官方 DLL | 1 | `com.autoComplete`（`%LOCALAPPDATA%\aardio\std\com\autoComplete.dll`） |
+| sweep 清单伪条目 | 1 | `win.#DEFINE`（官方文件名带 `#`，不能出现在 import 名里） |
+
+**仍然没有一项是 Nodio 自身的引擎缺陷。** 下一批的目标是「官方没发源码的那 23 项」——
+`string.markdown` 族 8 项 + `string.keywords` 1 项是纯算法，
+可在 Nodio 侧用 aardio 源码重写（API 面按官方 `sd_markdown_*` / `sdhtml_*` 对齐）。

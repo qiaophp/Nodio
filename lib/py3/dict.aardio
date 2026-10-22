@@ -1,0 +1,198 @@
+//dict 字典
+import util.metaProperty;
+namespace py3;
+
+// ---- Nodio x64 补版：允许 py3 子模块被独立导入 ----
+// 官方约定必须先 import py3 才能使用 py3.xxx；这里自行载入 64 位 Python 运行时，
+// 使 py3.xxx 可以单独导入（::Py3Runtime 与父模块共用同一个 DLL 句柄）。
+::Py3Runtime := ::Py3Runtime || ..raw.loadDll("~\lib\py3\.res\DLLs\python38.dll",,"cdecl");
+if(!::Py3Runtime) {
+	error("未检测到 64 位 python38.dll，py3 扩展库不可用",2);
+}
+	
+class dict {
+
+	ctor( object ){ 
+	
+		var tt = type(object) 
+		select(tt) {
+			case type.pointer{
+				this.pyObject = object;
+			}
+			case type.null{
+				this.pyObject = PyDict_New();
+			}
+			else {
+				if(object[["pyObject"]] ){
+					if( object.checkDict() ){
+						this[["pyObject"]] = object[["pyObject"]];
+						..py3.IncRef(this.pyObject);
+					}
+					else {
+						var dict =  ..py3.builtin.dict(object);
+						if(dict.checkDict()){
+							this[["pyObject"]] = dict.stealPtr()
+						}
+						else {
+							return null;
+						}
+					}
+				}
+				else{
+					if(tt===type.table && !object@){
+						this.pyObject = PyDict_New();
+						this@ = _metaProperty; 
+						
+						for k,v in ..table.eachName(object) this.setItem(k,v);
+						..table.add_gc(this,"release");
+						return this;
+					}
+					else {
+						error("py3.dict 构造参数不支持此数据类型:" + tt ,2);
+					}   
+				}
+			} 
+		}
+		
+		this@ = _metaProperty; 
+		..table.add_gc(this,"release");
+	}
+}
+
+namespace dict {
+
+	_metaProperty = ..util.metaProperty(   
+	
+		_topointer = function(){
+			if(!owner.pyObject) error("Python Dict已销毁",2);
+			return owner.pyObject;
+		};   
+		getItem = function(k){
+			return owner[k]
+		}; 
+		setItem = function(k,v){
+			owner[k] = v;
+		}; 
+		__get = function(k,ownerCall){ 
+			var t = type(k);
+			if( t==="string" && (ownerCall!==null) ){
+				if( owner.has(k) ){
+					//避免 owner.getAttr(k) 调用 owner.has(k)
+					return ..py3.object( PyObject_GetAttrString(owner.pyObject,k),true ).parseValue(true)
+				}
+				
+				//下标不能访问属性，但不存在的属性可以改为访问下标。
+			}
+		 
+			var item;
+			if(t==="string" ){
+					item = PyDict_GetItemString(owner.pyObject,k) 
+			}
+			else {
+					item = ::Py3Runtime.PyDict_GetItemP(owner.pyObject,..py3.object(k)) 
+			}
+			
+			if(item){
+				..py3.IncRef(item);//特例 borrow reference
+				return ..py3.object(  item,true ).parseValue(true) ;
+			} 
+		};
+		__set = function(k,v,ownerAttr){
+			var t = type(k);
+			if( t==="string" && ownerAttr ){
+				owner.setAttr(k,v);
+				return; 
+			}
+			 
+			if(t==="string" ){
+				if(v===null)
+					PyDict_DelItemString(owner.pyObject,k);
+				else {
+			 		PyDict_SetItemString(owner.pyObject,k,..py3.object(v) ); 
+				}	
+			}
+			else {
+				if(v===null)
+					::Py3Runtime.PyDict_DelItem(owner.pyObject,..py3.object(k));
+				else {
+			 		::Py3Runtime.PyDict_SetItem(owner.pyObject,..py3.object(k),..py3.object(v) ); 
+				}	
+			}  
+		};
+		each = function(){
+			var pos = 0;
+			var ret,k,v;
+			return function(){
+				ret,pos,k,v = PyDict_Next(owner.pyObject,pos);
+				if( k !== null){
+					..py3.IncRef(k);
+					..py3.IncRef(v);
+					return ..py3.object(k,true) ,..py3.object(v,true) 
+				}
+			} 
+		};
+		len = function(){
+			return PyDict_Size(owner._pyObject);
+		} 
+		statement = function(s,locals){
+			if( !PyDict_GetItemString(owner.pyObject,"__builtins__")  ){
+				//模块会自动导入对内建模块的引用,自己创建的字典需要手动导入
+				PyDict_SetItemString( owner.pyObject,"__builtins__",::Py3Runtime.PyEval_GetBuiltinsP());
+			}
+			PyRun_String(s,256/*_Py_single_input*/,owner,locals || owner);
+		};
+		exec = function(s,locals){
+			if( !PyDict_GetItemString(owner.pyObject,"__builtins__")  ){
+				PyDict_SetItemString( owner.pyObject,"__builtins__",::Py3Runtime.PyEval_GetBuiltinsP());
+			}
+			PyRun_String(s,257/*_Py_file_input*/,owner,locals || owner);
+		};
+		eval = function(s,locals){
+			if( !PyDict_GetItemString(owner.pyObject,"__builtins__")  ){
+				PyDict_SetItemString( owner.pyObject,"__builtins__",::Py3Runtime.PyEval_GetBuiltinsP());
+			}
+			var p = PyRun_String(s ,258/*_Py_eval_input*/,owner,locals || owner);
+			if( p ) return ..py3.object( p,true ); 
+		};
+		
+		_type = "py3.dict";
+	);
+	..table.mix(_metaProperty,..py3.object._metaProperty);
+	
+	PyDict_New = ::Py3Runtime.api("PyDict_New","pyObject()","cdecl")  
+	PyDict_GetItemString = ::Py3Runtime.api("PyDict_GetItemString","pyObject(PyObject dp,string key)","cdecl")  
+	PyDict_SetItemString = ::Py3Runtime.api("PyDict_SetItemString","pyObject(PyObject dp,string key,pyObject item)","cdecl") 
+	PyDict_DelItemString = ::Py3Runtime.api("PyDict_DelItemString","pyObject(PyObject dp,string key)","cdecl")  
+	PyDict_Next = ::Py3Runtime.api("PyDict_Next","int(PyObject dp,INT &pos,pyObject &key,pyObject &value)","cdecl")  
+	PyDict_Size = ::Py3Runtime.api("PyDict_Size","INT(PyObject dp)","cdecl") 
+	PyRun_String = ::Py3Runtime.api("PyRun_String","pointer(string str, int start, PyObject globals, PyObject locals)")
+}
+
+/**intellisense()
+py3.dict( = 创建新的字典对象\n此对象继承自 py3.object,\n一般不需要手动创建此对象,aardio 会在传参数时自动转换
+py3.dict(.() = 创建新字典
+py3.dict(.(pyObject指针) = 参数为指针则作为 Python 字典指针构建对象,\n不会添加引用计数,但对象销毁时负责释放引用计数
+py3.dict(.(pyObject对象) = 如果传入 Python 对象是一个 dict,\n返回绑定相同对象的 py3.dict 对象,添加引用计数,对象销毁时负责释放引用计数\n否则将传入对象作为 Python 内置函数 dict 的参数并返回 py3.dict 对象\n失败返回 null
+py3.dict(.(aardio表) = 数为未指定元表的 aardio 表则转换为 Python 字典
+!py3Dict.stealPtr() =  接管此对象的指针并盗用一次引用计数\n原对象的内部指针被清空,并不再负责释放引用计数\n steal references
+!py3Dict.parseValue() = 转换为 aardio 表对象
+!py3Dict.type() = 返回类型名字
+!py3Dict.has("__/*属性名*/") = 是否存在指定的属性
+!py3Dict.getAttr("__/*属性名*/") = 读属性值，也可以用成员操作符获取。\n除数值、布尔值、字符串、字节数组以外的值在 aardio 中存为 py.object 对象
+!py3Dict.setAttr("__/*属性名*/",) = 写属性成员的值，也可以用成员操作符赋值。
+!py3Dict.getAttr() = !py3Object.
+!py3Dict.setItem("键名",) = 修改指定索引的项，也可以用索引下标操作符 [] 赋值。
+!py3Dict.getItem("键名") = 返回指定索引的项，也可以用索引下标操作符 [] 取值。\n除数值、布尔值、字符串、字节数组以外的值在 aardio 中存为 py.object 对象
+!py3Dict.getItem() = !py3Object.
+!py3Dict.toString() = 转换为 aardio 字符串\n也可以直接将对象作为参数传入 tostring 函数转换为字符串
+!py3Dict.toTuple() = 转换为 Python 元组\n!py3Tuple.
+!py3Dict.toList() = 转换为 Python 列表\n!py3List.
+!py3Dict.checkDict() = 检测是否字典
+!py3Dict.each() =  @for( kObject,vObject in ??.each() ){\n	__/*两个都是py.object对象*/\n}\n!py3Object.
+!py3Dict.? = !py3Object.
+!py3Dict.statement(.("Python语句",locals) = 以该字典为命名空间运行单个 Python 语句
+!py3Dict.exec(.("Python代码",locals) = 以该字典为命名空间运行代码,省略参数 @locals 省略则默认设为当前字典\n类似 Python 代码中的 exec "..." in globals, locals 语句
+!py3Dict.eval(.("Python表达式",locals) = 以该字典为命名空间运行代码并返回值,省略参数 @locals 则默认设为当前字典\n类似 Python 代码中的 execfile("test.py", globals, locals)
+!py3Dict.eval() = !py3Object.
+py3.dict() = !py3Dict.
+end intellisense**/

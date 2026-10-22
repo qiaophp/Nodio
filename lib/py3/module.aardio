@@ -1,0 +1,47 @@
+//module 模块
+namespace py3
+
+// ---- Nodio x64 补版：允许 py3 子模块被独立导入 ----
+// 官方约定必须先 import py3 才能使用 py3.xxx；这里自行载入 64 位 Python 运行时，
+// 使 py3.xxx 可以单独导入（::Py3Runtime 与父模块共用同一个 DLL 句柄）。
+::Py3Runtime := ::Py3Runtime || ..raw.loadDll("~\lib\py3\.res\DLLs\python38.dll",,"cdecl");
+if(!::Py3Runtime) {
+	error("未检测到 64 位 python38.dll，py3 扩展库不可用",2);
+}
+
+class module{
+	ctor( object ){
+	
+		if(!object) return;
+		this = ..py3.object( object,true );
+		// 避免调用 set 元方法
+		this[["getDict"]] = function(){
+			var objPtr = PyModule_GetDict(owner.pyObject);
+			if(objPtr){
+				..py3.IncRef(objPtr);//Borrowed reference 
+				return ..py3.dict(objPtr);
+			} 
+		};
+		
+		this[["getFilename"]] = function(){
+			var p = ::Py3Runtime.PyModule_GetFilenameP(owner.pyObject);
+			if(p) return ..raw.str(p);
+		};
+	};  
+}
+
+namespace module{
+	PyModule_GetDict = ::Py3Runtime.api("PyModule_GetDict","pyObject(PyObject mod)");
+}
+
+/**intellisense(!py3Module) 
+getFilename() = 返回模块文件路径
+getDict() = 如果对象是一个模块,返回字典对象\n!py3Dict.
+getAttr("__/*属性名*/") = 读属性值，也可以用成员操作符获取。\n除数值、布尔值、字符串、字节数组以外的值在 aardio 中存为 py.object 对象
+setAttr("__/*属性名*/",) = 写属性成员的值，也可以用成员操作符赋值。
+getItem(__/*索引*/) = 返回指定索引的项，也可以用索引下标操作符 [] 取值。\n除数值、布尔值、字符串、字节数组以外的值在 aardio 中存为 py.object 对象
+setItem(__/*索引*/，) = 修改指定索引的项，也可以用索引下标操作符 [] 赋值。
+getAttr() = !py3Object.
+has("__/*属性名*/") = 是否存在指定的属性
+? = 输入 Python 对象属性或函数名称。\n如果首字符为 $ ，则返回支持命名参数的函数对象。\n也就是说 pyObject.$fun 等价于 pyObject.fun.invoke。\n!py3Object.
+end intellisense**/

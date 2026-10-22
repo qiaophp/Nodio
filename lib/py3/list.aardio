@@ -1,0 +1,177 @@
+//list 列表数组
+import util.metaProperty;
+namespace py3;
+
+// ---- Nodio x64 补版：允许 py3 子模块被独立导入 ----
+// 官方约定必须先 import py3 才能使用 py3.xxx；这里自行载入 64 位 Python 运行时，
+// 使 py3.xxx 可以单独导入（::Py3Runtime 与父模块共用同一个 DLL 句柄）。
+::Py3Runtime := ::Py3Runtime || ..raw.loadDll("~\lib\py3\.res\DLLs\python38.dll",,"cdecl");
+if(!::Py3Runtime) {
+	error("未检测到 64 位 python38.dll，py3 扩展库不可用",2);
+}
+	
+class list {
+
+	ctor( object ){ 
+
+		var tt = type(object) 
+		select(tt) {
+			case type.pointer{
+				this.pyObject = object;
+			}
+			case type.null{
+				this.pyObject = PyList_New(0);
+			}
+			case type.number{
+				this.pyObject = PyList_New(object);
+			}
+			case type.table{ 
+			
+				if(object[["pyObject"]] ){
+					if( object.checkList() ){
+						this[["pyObject"]] = object[["pyObject"]]; 
+						..py3.IncRef(this.pyObject);
+					}
+					else {
+						var list =  ..py3.builtin.list(object);
+						if(list.checkList()){
+							this[["pyObject"]] = list.stealPtr()
+						}
+						else {
+							return null;
+						}
+					}
+				}
+			  	else{
+					var len = #object;
+					this.pyObject = PyList_New(len); 
+					
+					for(i=1;len;1)
+						PyList_SetItem(this.pyObject,i-1,..py3.object(object[i]).stealPtr() );   
+				}
+			}
+			else {
+				error("pyObject构造参数不支持此数据类型:" + tt ,2);
+			} 
+		}
+		
+		..table.add_gc(this,"release");
+	}
+	@_metaProperty
+}
+
+namespace list {
+
+	_metaProperty = ..util.metaProperty(   {
+	
+		_topointer = function(){
+			if(!owner.pyObject) error("Python List已销毁",2);
+			return owner.pyObject;
+		} 
+		
+		parseValue = function(baseType){
+			var result = {}; 
+			var len = PyList_Size(owner.pyObject);
+			for(i=0;len-1;1){
+				var item = PyList_GetItem(owner.pyObject,i);
+				if(item){
+					item = ..py3.object(  item,true );
+					result[i+1] = item.parseValue(baseType);
+					item.stealPtr();//因为item是借用，所以盗用还回去
+				}
+			}
+			return result; 
+		}
+		  
+		getItem = function(k){
+			return owner[k]
+		}  
+		
+		setItem = function(k,v){
+			owner[k] = v;
+		}
+		
+		append = function(v){
+			if(v!==nul)PyList_Append(owner.pyObject,..py3.object(v) ); 
+		}	
+		
+		__get = function(k,ownerCall){ 
+			var t = type(k);
+			if( t==="string" && (ownerCall!==null) ){
+				return owner.getAttr(k); 
+			} 
+			
+			if( t == "number" ) {
+				if(k<0){
+					k = owner.len()-1;
+				}
+				
+				var item = PyList_GetItem(owner.pyObject,k);
+				if(item){
+					..py3.IncRef(item);//特例 borrow reference
+					return ..py3.object(item,true).parseValue(true);
+				} 
+			} 
+		}
+		
+		__set = function(k,v,ownerAttr){
+			var t = type(k);
+			if( t==="string" && ownerAttr ){
+				owner.setAttr(k,v);
+				return;
+			}
+			
+			if( t != "number" ) return ;
+			
+			if(v===null)
+				PyList_DelItem(owner.pyObject,k);
+			else {
+				if( type(v) == "pointer" ){
+					..py3.IncRef(v);
+					PyList_SetItem(this.pyObject,k,v );  
+				}
+				else{
+					PyList_SetItem(owner.pyObject,k,..py3.object(v).stealPtr() ); 
+				}
+			} 
+		}
+		len = function(){
+			return PyList_Size(owner.pyObject);
+		}
+		_type = "py3.list";
+	} );
+	..table.mix(_metaProperty,..py3.object._metaProperty); 
+	
+	PyList_New = ::Py3Runtime.api("PyList_New","pyObject(int size)")  
+	PyList_GetItem = ::Py3Runtime.api("PyList_GetItem","pyObject(PyObject dp,INT key)")  
+	PyList_SetItem = ::Py3Runtime.api("PyList_SetItem","pyObject(PyObject dp,INT key,pyObject item)") 
+	PyList_Append = ::Py3Runtime.api("PyList_Append","pyObject(PyObject dp,pyObject item)")  
+	PyList_Size = ::Py3Runtime.api("PyList_Size","INT(PyObject dp)") 
+}
+
+
+/**intellisense()
+py3.list( = 创建新的列表。\n此对象继承自pyObject（py3.object）。\n一般不需要手动创建此对象，aardio 会在传参数时自动转换
+py3.list(.(列表长度) = 创建新的列表。\n也可以省略参数
+py3.list(.(pyObject指针) = 创建新的python列表,\n不会添加引用计数,但对象销毁时负责释放引用计数
+py3.list(.(pyObject对象) = 如果传入 Python 对象是一个 list,\n返回绑定相同对象的 py3.list 对象,添加引用计数,对象销毁时负责释放引用计数\n否则将传入对象作为 python 内置函数 list 的参数并返回 py3.list 对象\n失败返回 null
+py3.list(.(aardio数组) = 参数传入aardio数组,\n创建并返回新的的python列表\n注意 python中下标自0开始,而aardio中下标是自1开始
+!py3List.stealPtr() =  接管此对象的指针并盗用一次引用计数\n原对象的内部指针被清空,并不再负责释放引用计数\n steal references
+!py3List.parseValue() = 转换为 aardio 数组。\n除浮点数、53存储位以下整数、布尔值、字节数组之外的类型通过 JSON 转换为 aardio 值。
+!py3List.parseValue() = 转换为 aardio 数组。\n保留除浮点数、53存储位以下整数、布尔值、字节数组之外的类型为 PyObject 不作转换。
+!py3List.type() = 返回类型名字
+!py3List.has("__/*属性名*/") = 是否存在指定的属性
+!py3List.getAttr("__/*属性名*/") = 读属性值，也可以用成员操作符获取。\n除数值、布尔值、字符串、字节数组以外的值在 aardio 中存为 py.object 对象
+!py3List.setAttr("__/*属性名*/",) = 写属性成员的值，也可以用成员操作符赋值。
+!py3List.getAttr() = !py3Object.
+!py3List.getItem(__/*索引*/) = 返回指定列表项，也可以用索引下标操作符 [] 取值。\nPython 列表起始下标为 0，可用负数索引表示从尾部计数。\n注意：普通 aardio 数组起始下标为 1，不能使用负数计数
+!py3List.setItem(__/*索引*/，) = 修改指定列表项，也可以用索引下标操作符 [] 赋值。\nPython 列表起始下标为 0，可用负数索引表示从尾部计数。\n注意：普通 aardio 数组起始下标为 1，不能使用负数计数
+!py3List.getItem() = !py3Object.
+!py3List.toString() = 转换为 aardio 字符串\n也可以直接将对象作为参数传入 tostring 函数转换为字符串
+!py3List.toTuple() = 转换为 Python 元组\n!py3Tuple.
+!py3List.toList() = 转换为 Python 列表\n!py3List.
+!py3List.checkList() = 检测是否列表
+!py3List.each() = @for( item in ??.each() ){\n	__/*创建迭代器用于遍历所有的项,返回一个值*/\n}\n!py3Object. 
+!py3List.? = !py3Object.
+py3.list() = !py3List. 
+end intellisense**/
