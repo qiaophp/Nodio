@@ -2622,3 +2622,128 @@ x64 = `D:\Nodio\lib\string\keywords\_.aardio`）。
 （API 面按官方 `sd_markdown_*` / `sdhtml_*` 对齐）；
 `av.video.kernel` / `web.view` / `sevenZip.lzma` / `raw.fasm` / `web.layout`
 依赖具体二进制能力，需要单独评估可行性。
+
+## 1.33 第三十轮（续）：string.markdown —— 官方没发源码的模块，Nodio 侧自写 x64 版本（8 项）
+
+### 1.33.1 官方形态与「不能复刻」的理由
+
+官方 `lib/string/markdown/_.aardio` 把 32 位 `sundown.dll` 用 `$"..."` **内嵌进源码**
+再内存加载。x64 进程装不下这个 32 位 PE —— 实测报错：
+
+```txt
+无法加载 DLL: (内嵌的内存映像)
+```
+
+官方 `.res/README.TXT` 写明：该组件基于 `https://github.com/vmg/sundown` 改造，
+**没有随库发布源码**，且许可条款禁止脱离 aardio 单独分发。
+所以这一项既不能像 `av.audio.dsp` 那样「同一份源码重编成 x64」，
+也不能照抄官方二进制 —— 只能在 **Nodio 侧自己写一份等价实现**。
+
+官方 DLL 的导出表实测（`dumpbin /exports`）共 **17 个符号**，与上游 sundown 的 API 一致：
+
+| 类别 | 符号 |
+|---|---|
+| 缓冲区 | `bufcstr` / `bufdata` / `bufgrow` / `bufnew` / `bufprefix` / `bufput` / `bufputc` / `bufrelease` / `bufsize` |
+| 解析器 | `sd_markdown_free` / `sd_markdown_new` / `sd_markdown_render` / `sd_version` |
+| HTML 渲染 | `sdhtml_is_tag` / `sdhtml_renderer` / `sdhtml_smartypants` / `sdhtml_toc_renderer` |
+
+### 1.33.2 官方 API 面（逐字沿用，不缩水）
+
+```aardio
+string.markdown(文本)                      // -> HTML 字符串
+string.markdown(扩展,嵌套深度,渲染标志)    // -> 解析器实例
+```
+
+实例方法：`render` / `renderCode` / `renderFile` / `free` /
+`setRenderFlags` / `setTaskCheckboxEnabled`；
+命名空间成员：`dll` / `sd_markdown_new` / `sd_markdown_render` / `sd_markdown_free` /
+`sdhtml_renderer` / `sdhtml_smartypants` / `buffer` 类 / `html_renderopt` /
+`sd_callbacks` / `sd_callbacks_proto` / `codeBlock`。
+
+### 1.33.3 Nodio 侧的实现（overlay，官方同名路径）
+
+| 文件 | 内容 |
+|---|---|
+| `lib/string/markdown/_.aardio` | 官方模块**逐字副本**，只把 DLL 来源换成 `..raw.loadDll(io.splitpath(io.libpath("string.markdown")).dir + ".res\\markdown64.dll","markdown64.dll","cdecl")` |
+| `lib/string/markdown/.res/markdown64.c` | **Nodio 自写实现**（源码入库，可复现），约 3200 行 |
+| `lib/string/markdown/.res/markdown64.dll` | 上面源码用 MSVC 编出的 x64 DLL（`/LD /O2 /MT /GS- /W3 /utf-8`，零警告），导出 17 个符号与官方**同名同签名同调用约定** |
+
+结构体布局必须与 aardio 类**逐字节一致**，否则回调会拿到垃圾：
+
+* `html_renderopt` = `{int toc_data[3]; INT flags; pointer link_attributes;}`
+  —— x64 布局 24 字节，`flags` 在偏移 12；
+* `sd_callbacks` = 26 个指针，顺序与官方类字段逐项一致
+  （含官方的拼写错误字段名 `utolink`，**逐字保留官方行为**）；
+* 导出函数的整型参数统一声明为 **32 位 `unsigned int`** ——
+  aardio 的 `INT` 是 32 位，x64 下用 `size_t` 接 `INT` 实参会读满 64 位寄存器，
+  高位是垃圾。
+
+官方 fork 与上游 sundown 的差异（全部按官方实测对齐）：
+
+| 差异点 | 官方输出 |
+|---|---|
+| 表格对齐样式 | `style="text-align:left;"`（**带分号**） |
+| 围栏代码块 | `<pre><code class="js language-js">` |
+| 任务列表 | `<input type="checkbox" [checked] [disabled]>`，启用态用 `<label>` 包裹 |
+| 普通文本转义 | `'` → `&#39;`、`"` → `&quot;`、`&` → `&amp;` |
+
+### 1.33.4 踩到的坑（都是实测）
+
+* **Windows 下 `io.print` 会把串里的 LF 转成 CRLF**（CRT 文本模式）。
+  用 stdout 抓「官方黄金输出」拿到的是 CRLF，而**真实字符串是 LF** ——
+  照着它写回归锁会全红。回归锁改成在 aardio 侧把字符串**按字节编成十六进制**回传。
+* **aardio 双引号是「原样串」**：`"a\nb"` 是 5 个字面字符，不是换行；
+  测换行语义必须用单引号 `'a\nb'`。
+* **官方类里写的是 `stuct toc_data`**（`struct` 少一个 r，官方自身的拼写错误）。
+  自己的 overlay 用正确拼写 `struct`，引擎侧另加容错（见下一节）。
+* **本机无网络**（`web_fetch` / `web_search` 均失败）→ 拿不到上游 sundown 源码，
+  只能按官方行为反推实现。
+* **Nodio FFI 支持把带 `_topointer` 的类实例当 `POINTER` 传参**
+  （`engine/ffi.cpp`）→ 官方 `buffer` 类实例可以直接传给 `sd_markdown_render`。
+
+### 1.33.5 验证
+
+* **61 例黄金电池**：从**官方 32 位 sundown 的实测**采集
+  （ATX/setext 标题、段落、强调×3、代码段、围栏、缩进代码、引用、
+  列表×3、嵌套列表、表格与对齐、链接/图片/引用式链接、自动链接、
+  裸链接、裸邮箱、任务列表 4 种形态、HTML 块、行内强调、转义、实体、
+  Front Matter、硬换行、撇号/反斜杠/尖括号…），
+  x86（官方）与 x64（自写）**逐字节完全一致**。
+* **回归锁**：新建 `tests/markdown_overlay_check.ps1`（x64 / x86 双绿）——
+  61 例渲染用例 + 16 项 API 面断言 + overlay 文件存在性 +
+  `markdown64.dll` 的 PE `machine == 0x8664` + 17 个导出符号齐全 +
+  模块解析路径（x64 命中 Nodio overlay，x86 走官方库）。
+* **全量**：x64 / x86 各 **22 套回归全绿**（新增 `markdown_overlay_check` 一套）。
+* **sweep**：x64 全量模块 sweep **ok=921 → 929 / fail=48 → 40**（**-8**，失败集合**只减不增**）。
+  修掉的 8 项 = `string.markdown` 族 8 项：
+  `string.markdown` / `string.markdown.toDocx` / `string.markdown.toRtf` /
+  `autos.ui.memories` / `autos.ui.setting` / `web.form.chat` /
+  `web.form.simpleMarkdown` / `win.dlg.flashDict`。
+
+### 1.33.6 本轮挖出并修掉的一个实现级 bug
+
+`rndr_paragraph` 的 **hard-wrap 分支漏了 `i++`**：段落里出现**真实换行**时
+会无限追加 `<br>`，直到 `realloc` 失败，进程被 `exit(1)` 掉 ——
+实测 stderr 是 `markdown64: out of memory`，而 x86 官方同一输入正常输出
+`<p>a<br>\nb</p>`。
+
+这个 bug **61 例电池抓不到**（电池用默认渲染标志，段落里没有真实换行），
+是回归锁的 API 面断言（`setRenderFlags(0x80, ...)` 开 hard wrap）把它挖出来的 ——
+**这正是「黄金电池 + 行为断言」两层锁的意义**。
+
+### 1.33.7 剩下的 40 项 x64 失败（更新后的分类）
+
+| 类别 | 项数 | 明细 |
+|---|---:|---|
+| 官方只带 32 位 DLL（**未随库发源码**） | 14 | `av.video.kernel` 族 4（`av.film` / `av.video.flicker` / `av.video.kernel` / `autos.skills.codingFilm`）、`web.view` 族 4、`sevenZip.lzma` 族 4、`raw.fasm` 1、`web.layout` 1（HTMLayout.dll 缺失） |
+| 官方契约：必须先导入父命名空间 / 官方自带守卫 | 12 | `py3.export`（导入期执行 Python 代码，官方同款）、`py3.pip`（官方守卫「只能用于开发环境」）、`sqlite.base` / `sqlite.backup` / `web.acme.httpClient` / `web.form.query` / `web.layout.debug` / `web.layout.valueObject` / `web.layout.element` / `web.layout.element.style` / `web.view.dev` / `winex.accObject.element` |
+| 官方同款导入顺序限制 | 2 | `win.ui.ctrl.splitter` / `win.ui.ctrl.thread`（官方同样要求先 `import win;`） |
+| 官方库自带安装器 / 下载器（超时） | 6 | `fastcgi.iisInstall` / `java.jdk.v6ora` / `java.jdk.v8ora` / `java.jre.v8ora` / `process.php.7.4` / `process.php.8.3` |
+| 官方库依赖的官方库缺失 | 3 | `crypt.jwt.algorithm.EdDSA`（BouncyCastle）/ `process.ruby` / `process.ruby.simpleHttpServer` |
+| 官方库自身断言失败 | 1 | `web.layout.event`（HTMLayout 未装的连带） |
+| 依赖外部安装的官方 DLL | 1 | `com.autoComplete`（`%LOCALAPPDATA%\aardio\std\com\autoComplete.dll`） |
+| sweep 清单伪条目 | 1 | `win.#DEFINE`（官方文件名带 `#`，不能出现在 import 名里） |
+
+**仍然没有一项是 Nodio 自身的引擎缺陷。** 下一批的目标是「官方没发源码的那 14 项」——
+`av.video.kernel` / `web.view` / `sevenZip.lzma` / `raw.fasm` / `web.layout`
+都依赖具体二进制能力，需要逐个评估可行性。

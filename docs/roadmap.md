@@ -849,6 +849,28 @@ Fixed & closed in recent sessions:
       3 项官方库缺失、1 项官方断言、1 项外部安装缺件、1 项清单伪条目。
     详见 `docs/capability-gap.md` §1.31
 
+15. [x] **string.markdown：官方没发源码的模块，Nodio 侧自写 x64 版本（8 项失败）**（2026-10-22 第三十轮续）—
+    官方 `lib/string/markdown/_.aardio` 把 32 位 `sundown.dll` 用 `$"..."` 内嵌进源码再内存加载
+    → x64 装不下（实测「无法加载 DLL: (内嵌的内存映像)」）；官方 `.res/README.TXT` 写明
+    该组件基于 `vmg/sundown` 改造、**未随库发布源码**且禁止脱离 aardio 分发
+    → 只能像 `string.keywords` 那样在 Nodio 侧自己实现。
+    - **补版**：`lib/string/markdown/_.aardio`（官方**逐字副本**，只换 DLL 来源）+
+      `.res/markdown64.c`（**Nodio 自写渲染器，源码入库，可复现**）+
+      `.res/markdown64.dll`（MSVC x64 /MT 静态 CRT，导出 17 个符号与官方同名同签名同调用约定）。
+      结构体布局与官方类**逐字节一致**（`html_renderopt` 24 字节 / `sd_callbacks` 26 个指针，
+      含官方自己的 `stuct` 拼写错误字段名）。
+    - **回归**：新建 `tests/markdown_overlay_check.ps1`（x64 / x86 双绿）——
+      61 例渲染黄金用例（期望值取自**官方 32 位 sundown 的实测**）+ 16 项 API 面断言 +
+      overlay 文件/PE 架构/17 个导出符号/模块解析路径；
+      x64 / x86 各 **22 套回归全绿**；x64 全量 sweep
+      **ok=921 → 929 / fail=48 → 40**（-8，新增失败 0 项）。
+    - **顺带修掉一个实现级 bug**：hard-wrap 分支漏 `i++` → 段落含真实换行时无限追加 `<br>`，
+      直到 `realloc` 失败把进程打挂（stderr「markdown64: out of memory」），x86 官方同输入正常。
+    - **剩余 40 项 x64 失败里仍没有一项是 Nodio 引擎缺陷**：14 项官方只带 32 位 DLL
+      且未发源码、12 项官方契约守卫、2 项官方同款导入顺序、6 项自带安装器超时、
+      3 项官方库缺失、1 项官方断言、1 项外部安装缺件、1 项清单伪条目。
+    详见 `docs/capability-gap.md` §1.33
+
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard
 2. console.log string-encoding primitive layer (isUtf16/getUtf/toUtf16 semantics), `.join`/`.getMessage` gaps
