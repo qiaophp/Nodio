@@ -361,6 +361,14 @@ namespace NodioVM
             L"short", L"SHORT", L"ushort", L"USHORT", L"wchar", L"char", L"CHAR",
             L"uchar", L"UCHAR", L"int8", L"INT8", L"uint8", L"UINT8", L"i64", L"qword", L"handle",
             L"hwnd", L"hkey", L"lpvoid", L"strb",
+            // 官方源码里的拼写错误：lib/string/markdown/_.aardio 的 html_renderopt
+            // 类写的是 `stuct toc_data = { ... };`（struct 少了一个 r）。
+            // aardio 容忍这个写法；Nodio 若不认，这个嵌套结构体字段就不会进
+            // `_struct` 定义，序列化出来的内存布局随之错位 ——
+            // 实测：官方 sundown 的 html_renderopt.flags 因此读到越界垃圾，
+            // 同一个输入的渲染结果在 <hr> / <hr/> 之间随机跳变，
+            // 含 "://" 的链接还会直接崩进程（0xC0000005）。
+            L"stuct",
             nullptr };
         for (int k = 0; kTypes[k]; k++)
             if (w == kTypes[k]) return true;

@@ -679,6 +679,19 @@ namespace NodioVM
                 size_t sp = item.find_first_of(L" \t");
                 if (sp == wstring::npos) continue;
                 wstring stype = item.substr(0, sp);
+                // 官方源码里存在拼写错误：lib/string/markdown/_.aardio 的
+                // html_renderopt 类写的是 `stuct toc_data = {...}`（少一个 r）。
+                // aardio 容忍这个写法；Nodio 若把它当成未知标量类型，嵌套结构体
+                // 就只占 4 字节，整个结构体的内存布局随之错位 ——
+                // 实测：官方 sundown 的 html_renderopt.flags 因此读到越界垃圾，
+                // 同一个输入的渲染结果在 `<hr>` / `<hr/>` 之间随机跳变，
+                // 含 "://" 的链接还会直接崩进程（0xC0000005）。
+                // 这里按 struct 处理，与 aardio 的实际语义一致。
+                {
+                    wstring lowType = stype;
+                    for (auto& c : lowType) c = towlower(c);
+                    if (lowType == L"stuct") stype = L"struct";
+                }
                 wstring srest = item.substr(sp + 1);
                 while (!srest.empty() && (srest[0] == L' ' || srest[0] == L'\t'))
                     srest.erase(0, 1);

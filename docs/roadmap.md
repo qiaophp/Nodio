@@ -871,6 +871,27 @@ Fixed & closed in recent sessions:
       3 项官方库缺失、1 项官方断言、1 项外部安装缺件、1 项清单伪条目。
     详见 `docs/capability-gap.md` §1.33
 
+16. [x] **引擎级缺陷：官方 `stuct` 拼写导致结构体布局错位（与架构无关）**（2026-10-22 第三十轮续）—
+    官方 `lib/string/markdown/_.aardio` 的 `html_renderopt` 类里写的是
+    `stuct toc_data = { ... };`（`struct` 少一个 r，官方自己的拼写错误）。
+    aardio 容忍它；Nodio 的 `IsStructType()` 不认 → 这条声明整个从类的布局里消失
+    → `flags` 落到偏移 0、`link_attributes` 落到偏移 4 → sundown 按「24 字节 / flags 在偏移 12」
+    读就是**越界读** → 渲染结果在 `<hr>` / `<hr/>` 之间跳变，含 `://` 的链接**直接崩进程**。
+    - **实测（pre-fix 引擎用 `git archive HEAD` 导出到独立目录单独构建，与工作区隔离）**：
+      x64 `stuct` 类序列化长度 **16 → 24**、flags 偏移 **0 → 12**；
+      x86 官方 `html_renderopt` 长度 **8 → 20**；
+      x86 官方库渲染 `[a](http://x.com)`：**0xC0000005 崩溃 → 正常输出**。
+    - **修法（引擎两处，缺一不可）**：`engine/common.h` 的 `IsStructType()` 加 `L"stuct"` 别名
+      （让解析器认它是结构体成员声明）+ `engine/ffi.cpp` 的 `ParseStructDef()` 把
+      `stuct` 归一化成 `struct`（让布局按 12 字节算）。
+    - **回归**：新建 `tests/struct_alias_check.ps1`（x64 / x86 双绿）——
+      两种拼写序列化字节完全相同 + 布局长度 16+指针宽 + flags 落在偏移 12 +
+      官方 `html_renderopt` 布局一致；在 pre-fix 引擎上跑它 **3 项失败**（真回归，不是假绿）。
+    - 教训：官方源码里落在「类型名」位置的任何拼写错误，Nodio 都会当成未知标量 →
+      结构体布局错位。补 x64 版本时要在**引擎侧容错**，不能只在自己的 overlay 里绕开 ——
+      否则 x86（唯一能跑官方库的架构）会一直错下去。
+    详见 `docs/capability-gap.md` §1.34
+
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard
 2. console.log string-encoding primitive layer (isUtf16/getUtf/toUtf16 semantics), `.join`/`.getMessage` gaps

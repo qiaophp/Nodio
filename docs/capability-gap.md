@@ -2747,3 +2747,78 @@ string.markdown(扩展,嵌套深度,渲染标志)    // -> 解析器实例
 **仍然没有一项是 Nodio 自身的引擎缺陷。** 下一批的目标是「官方没发源码的那 14 项」——
 `av.video.kernel` / `web.view` / `sevenZip.lzma` / `raw.fasm` / `web.layout`
 都依赖具体二进制能力，需要逐个评估可行性。
+
+## 1.34 第三十轮（续）：官方 `stuct` 拼写导致结构体布局错位 —— 一个**引擎级**缺陷（与架构无关）
+
+### 1.34.1 缺陷（真实）
+
+官方 `lib/string/markdown/_.aardio` 的 `html_renderopt` 类里写的是：
+
+```aardio
+class html_renderopt {
+	stuct toc_data = {          // <-- 官方自己的拼写错误（struct 少了一个 r）
+		int header_count;
+		int current_level;
+		int level_offset;
+	};
+	INT flags;
+	pointer link_attributes;
+}
+```
+
+aardio 容忍这个写法。Nodio 的解析器用 `IsStructType()` 判断「这是不是一个结构体成员声明」，
+`stuct` 不在名单里 → **这条声明整个从布局里消失** → 类的内存布局随之错位。
+
+**这个缺陷与架构无关**：x86 走官方库文件一样中招（x86 是唯一能跑官方 sundown 的架构，
+也正是它把缺陷暴露出来）。
+
+### 1.34.2 实测（pre-fix 引擎 vs 修复后引擎）
+
+pre-fix 引擎用 `git archive HEAD` 导出到**独立目录**单独构建，与仓库工作区完全隔离
+（不动工作区、不动仓库 git 状态）。
+
+| 测量项 | pre-fix | 修复后 |
+|---|---|---|
+| x64：`struct` 正确拼写的类，序列化长度 | 24 | 24 |
+| x64：`stuct` 拼写的类，序列化长度 | **16** | **24** |
+| x64：`stuct` 的 `flags` 落点 | 偏移 0 | 偏移 12 |
+| x86：官方 `string.markdown.html_renderopt()` 的 `raw.buffer` 长度 | **8** | **20** |
+| x86：官方库渲染 `[a](http://x.com)` | **崩溃 `0xC0000005`** | `<p><a href="http://x.com">a</a></p>` |
+
+### 1.34.3 根因链
+
+1. **解析**：类体里的 `stuct toc_data = {...}` 因为 `stuct` 不是已知结构体类型名，
+   不被当作「结构体成员声明」→ 类的 `_struct` 布局串里**没有这个嵌套结构体**；
+2. **布局**：嵌套结构体（3 个 int = 12 字节）不存在 → `flags` 落到偏移 0，
+   `link_attributes` 落到偏移 4，整个类只有 8/16 字节；
+3. **C 侧**：sundown 按「24 字节 / `flags` 在偏移 12 / `link_attributes` 在偏移 16」读写
+   → **越界读**，`flags` 拿到的是堆上的垃圾 → XHTML 位（`0x100`）随机
+   → 同一个输入的渲染结果在 `<hr>` / `<hr/>` 之间跳变；
+4. **越界访问**：`link_attributes` 在偏移 16，而缓冲区只有 8（x86）/ 16（x64）字节
+   → 渲染含 `://` 的链接时直接 **0xC0000005 崩进程**（实测）。
+
+### 1.34.4 修法（引擎两处，缺一不可）
+
+| 位置 | 改法 | 作用 |
+|---|---|---|
+| `engine/common.h` | `IsStructType()` 的类型名表里加 `L"stuct"` | 让**解析器**把 `stuct toc_data = {...}` 认成结构体成员声明 |
+| `engine/ffi.cpp` | `ParseStructDef()` 解析 `_struct` 布局串时把 `stuct` 归一化成 `struct` | 让**布局计算**按嵌套结构体（12 字节）算，而不是按未知标量算 |
+
+### 1.34.5 回归锁
+
+新建 `tests/struct_alias_check.ps1`（x64 / x86 双绿）：
+
+* `stuct` 与 `struct` 两种拼写，序列化出来的**字节完全相同**；
+* 布局长度 = 16 + 指针宽度，`flags` 落在偏移 12（两个架构都是 12）；
+* 官方 `string.markdown.html_renderopt` 的布局同上
+  （x86 走官方库文件 —— 那个文件里写的就是 `stuct`）。
+
+在 **pre-fix 引擎**上跑这个回归 → **3 项失败**（`16 ≠ 24` / 字节不同 / `4 ≠ 16`），
+证明它真的锁住了这个缺陷，而不是「一直绿」的假回归。
+
+### 1.34.6 影响面与教训
+
+这个坑的通用形态是：**官方源码里的任何拼写错误，只要落在「类型名」位置，
+Nodio 就会把它当成未知标量，结构体布局随之错位**。后续补 x64 版本时，
+凡是遇到官方自造拼写（`stuct` 这种），都要按同样方式在引擎侧容错，
+而不是在自己的 overlay 里绕开 —— 否则 x86 这条唯一能跑官方库的路径会一直错下去。
