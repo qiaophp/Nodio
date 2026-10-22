@@ -2514,3 +2514,111 @@ x86 同样失败 → **与官方同款**，不是 x64 独有的偏差。
 **仍然没有一项是 Nodio 自身的引擎缺陷。** 下一批的目标是「官方没发源码的那 23 项」——
 `string.markdown` 族 8 项 + `string.keywords` 1 项是纯算法，
 可在 Nodio 侧用 aardio 源码重写（API 面按官方 `sd_markdown_*` / `sdhtml_*` 对齐）。
+
+## 1.31 第二十九轮（续）：string.keywords —— 官方没发源码的模块，Nodio 侧自写 x64 版本（1 项）
+
+### 1.31.1 官方形态与「不能复刻」的理由
+
+官方 `lib/string/keywords/_.aardio` 把 32 位 `keywords.dll` 用
+`$"~/lib/string/keywords/.res/keywords.dll"` **内嵌进源码**再内存加载。
+x64 进程装不下这个 32 位 PE —— 实测报错：
+
+```txt
+无法加载 DLL: (内嵌的内存映像)
+```
+
+官方 `.res` 目录里**只有二进制、没有 C 源码**（与 `av.audio.dsp` 那 6 个模块不同），
+所以这一项无法像 `av.audio.dsp` 那样「同一份源码重编成 x64」，
+只能**在 Nodio 侧自己写一份实现**。
+
+官方 DLL 的导出表实测（`dumpbin /exports`）只有 5 个符号，ordinal 1..5 ——
+`findOne` / `findAll` / `anyMatchLines` / `allMatchLines` / `noneMatchLines`。
+
+### 1.31.2 官方语义（x86 上跑官方 32 位 DLL 实测，作为基准）
+
+| API | 官方实测语义 |
+|---|---|
+| `findOne(data,len,pKw,pSz,n)` | 返回**在数据里出现位置最靠前**的关键字的 **1 基**索引；出现位置相同时取关键字表里下标最小的那个；没有命中返回 0；空数据返回 0 |
+| `findAll(...)` | 全部关键字都命中返回 0（官方模块用 `0 == findAll(...)` 转成 true/false），否则返回非 0；**空数据返回 true**；**关键字表为空也返回 true** |
+| `anyMatchLines` / `allMatchLines` / `noneMatchLines` | 逐行回调。**只按 `\n` 切行**（孤立 `\r` 不分行）；**关键字匹配用未剥离的原始行**；**回调报告的行长度会去掉行末所有的 `\r`**；数据以 `\n` 结尾时不再多出一个空行；**关键字表为空时三个函数都一行都不回调** |
+
+回调原型：`void (__cdecl *)(const char* p, int len)` —— `p` 指向行首，`len` 为该行长度
+（不含行尾换行符）。
+
+官方 32 位 DLL 上的实测样例（x86）：
+
+| 输入 | 官方结果 |
+|---|---|
+| `findOne({"alpha","beta","gamma"}, "gamma and alpha")` | `3` |
+| `findOne({"alpha","beta","gamma"}, "alpha and gamma")` | `1` |
+| `findOne({"zebra","apple"}, "apple zebra")` | `2` —— **按数据位置，不是按关键字表顺序** |
+| `findAll("")` | `true` |
+| 关键字表为空时的 `findAll("abc")` | `true` |
+| 关键字表为空时的 `anyMatchLines` / `allMatchLines` / `noneMatchLines` | 三个都返回**空数组** |
+| `anyMatchLines('ax\ry\rcz')`（关键字 `x`） | 1 行，长度 7 —— 孤立 `\r` 不分行 |
+| `noneMatchLines('abc\r')` | 1 行，长度 3 |
+| `noneMatchLines('a\r\r')` | 1 行，长度 1 —— 行末两个 `\r` **都**去掉 |
+| `noneMatchLines('a\r\n\r\nb')` | 3 行，长度 1 / 0 / 1 —— 中间空行保留 |
+| `noneMatchLines('a\n\rb\n')` | 2 行，长度 1 / 2 —— 行内的 `\r` 保留 |
+| 关键字 `"x\r"` 匹配 `'x\r\n'` 的第一行 | 命中，报告长度 1 —— **匹配用原始行，报告长度去掉 `\r`** |
+
+### 1.31.3 Nodio 侧的实现（overlay，官方同名路径）
+
+| 文件 | 内容 |
+|---|---|
+| `lib/string/keywords/_.aardio` | 官方模块**逐字副本**，只把 DLL 来源换成 `..raw.loadDll(io.splitpath(io.libpath("string.keywords")).dir + ".res\\keywords64.dll","string.keyword.dll","cdecl")` |
+| `lib/string/keywords/.res/keywords64.c` | **Nodio 自写实现**（源码入库，可复现）。关键字比较用 `memcmp` 逐字节做 —— 二进制安全，不受 UTF-8 限制 |
+| `lib/string/keywords/.res/keywords64.dll` | 上面源码用 MSVC 编出的 x64 DLL（`/LD /O2 /MT /GS-`），导出 5 个符号与官方同名同签名同调用约定 |
+
+overlay 机制（`engine/import.cpp`）：x64 下 `GetOverlayLibDir()` 依次找
+`NODIO_OVERLAY_LIBDIR` → `<exeDir>\lib` → `<exeDir>\..\lib` → `D:\Nodio\lib`；
+`ResolveModulePath()` 里 **overlay 的全部候选路径优先于官方库** →
+官方代码 `import string.keywords` 自动命中 Nodio 的版本，**调用方零改动**。
+x86 构建不命中 overlay（32 位构建直接用官方 32 位标准库），行为与官方完全一致
+（实测 x86 的 `io.libpath("string.keywords")` = `D:\aardio\lib\string\keywords\_.aardio`，
+x64 = `D:\Nodio\lib\string\keywords\_.aardio`）。
+
+### 1.31.4 踩到的坑（都是实测）
+
+* **aardio 双引号是「原样串」**：`"\r\n"` 是 4 个字面字符（`\` `r` `\` `n`），**不是换行**。
+  测换行语义必须用单引号 `'\r\n'` —— 否则测的是「一行里含有字面量 \r\n」，
+  官方行为会被整个测歪（本轮踩了）。
+* **PowerShell `Compare-Object` 的 `=>` / `<=` 方向**在本机与直觉相反（`=>` 落在
+  DifferenceObject 上）。任何「谁对谁错」的结论一律以**原始字节**
+  （`open(...,'rb')`）为准，不能只看 diff 的输出。
+* **空关键字表时 `..raw.buffer({int items[]={}})` 返回空指针**，所以 C 侧不能用
+  「指针是否为空」代替「关键字个数为 0」的判断 —— 否则 `findAll` 会与官方**相反**
+  （官方空关键字表返回 true）。
+* 官方 `keywords.dll` 的导出偏移（`findOne@0x1000` 等）与自写版不同，
+  可以用它来确认实际加载的是哪一份二进制。
+
+### 1.31.5 验证
+
+* **黄金样本**：4 组探针（基础语义 / 边界 / 切行规则 / 含 CR 的关键字）在
+  x86（官方 DLL）与 x64（自写 overlay）上**输出逐字节相同**（SHA-256 一致）。
+* **功能**：新建 `tests/keywords_overlay_check.ps1`（44 项断言，x64 / x86 双绿）——
+  断言值全部取自**官方 32 位 DLL 的实测**；另外断言 overlay 三个文件都在库里、
+  `keywords64.dll` 的 PE `machine == 0x8664`、以及模块解析路径
+  （x64 命中 Nodio overlay，x86 走官方库）。
+* **全量**：x64 / x86 各 21 套回归全绿（新增 `keywords_overlay_check` 一套）；
+  x64 全量模块 sweep **ok=919 → 921 / fail=49 → 48**（**-1**，失败集合**只减不增**）。
+* 修复的 1 项：`string.keywords`。
+
+### 1.31.6 剩下的 48 项 x64 失败（更新后的分类）
+
+| 类别 | 项数 | 明细 |
+|---|---:|---|
+| 官方只带 32 位 DLL（**未随库发源码**） | 22 | `av.video.kernel` 族 4（`av.film` / `av.video.flicker` / `av.video.kernel` / `autos.skills.codingFilm`）、`web.view` 族 4、`string.markdown` 族 8、`sevenZip.lzma` 族 4、`raw.fasm` 1、`web.layout` 1（HTMLayout.dll 缺失） |
+| 官方契约：必须先导入父命名空间 / 官方自带守卫 | 12 | `py3.export`（导入期执行 Python 代码，官方同款）、`py3.pip`（官方守卫「只能用于开发环境」）、`sqlite.base` / `sqlite.backup` / `web.acme.httpClient` / `web.form.query` / `web.layout.debug` / `web.layout.valueObject` / `web.layout.element` / `web.layout.element.style` / `web.view.dev` / `winex.accObject.element` |
+| 官方同款导入顺序限制 | 2 | `win.ui.ctrl.splitter` / `win.ui.ctrl.thread`（官方同样要求先 `import win;`） |
+| 官方库自带安装器 / 下载器（超时） | 6 | `fastcgi.iisInstall` / `java.jdk.v6ora` / `java.jdk.v8ora` / `java.jre.v8ora` / `process.php.7.4` / `process.php.8.3` |
+| 官方库依赖的官方库缺失 | 3 | `crypt.jwt.algorithm.EdDSA`（BouncyCastle）/ `process.ruby` / `process.ruby.simpleHttpServer` |
+| 官方库自身断言失败 | 1 | `web.layout.event`（HTMLayout 未装的连带） |
+| 依赖外部安装的官方 DLL | 1 | `com.autoComplete`（`%LOCALAPPDATA%\aardio\std\com\autoComplete.dll`） |
+| sweep 清单伪条目 | 1 | `win.#DEFINE`（官方文件名带 `#`，不能出现在 import 名里） |
+
+**仍然没有一项是 Nodio 自身的引擎缺陷。** 下一批的目标是「官方没发源码的那 22 项」——
+`string.markdown` 族 8 项是纯算法，可在 Nodio 侧用 aardio 源码重写
+（API 面按官方 `sd_markdown_*` / `sdhtml_*` 对齐）；
+`av.video.kernel` / `web.view` / `sevenZip.lzma` / `raw.fasm` / `web.layout`
+依赖具体二进制能力，需要单独评估可行性。

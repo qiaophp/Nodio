@@ -827,6 +827,28 @@ Fixed & closed in recent sessions:
       3 项官方库缺失、1 项官方断言、1 项外部安装缺件、1 项清单伪条目。
     详见 `docs/capability-gap.md` §1.30
 
+14. [x] **string.keywords：官方没发源码的模块，Nodio 侧自写 x64 版本（1 项失败）**（2026-10-22 第二十九轮续）—
+    官方 `lib/string/keywords/_.aardio` 把 32 位 `keywords.dll` 用 `$"..."` 内嵌进源码再内存加载
+    → x64 装不下（实测「无法加载 DLL: (内嵌的内存映像)」）；官方 `.res` 里**只有二进制没有源码**
+    → 无法像 `av.audio.dsp` 那样重编成 x64，只能在 Nodio 侧自己实现。
+    - **官方语义（x86 上跑官方 32 位 DLL 实测）**：`findOne` 返回**在数据里出现位置最靠前**的
+      关键字的 1 基索引（**不是**按关键字表顺序）；`findAll` 在空数据 / 空关键字表时都返回 true；
+      三个 `*MatchLines` **只按 `\n` 切行**、**匹配用未剥离的原始行**、
+      **报告长度去掉行末所有的 `\r`**、数据以 `\n` 结尾不产生末尾空行，
+      关键字表为空时一行都不回调。
+    - **补版**：`lib/string/keywords/_.aardio`（官方**逐字副本**，只换 DLL 来源）+
+      `lib/string/keywords/.res/keywords64.c`（**Nodio 自写实现，源码入库，可复现**）+
+      `.res/keywords64.dll`（MSVC x64 /MT 静态 CRT，导出 5 个符号与官方同名同签名同调用约定）。
+      官方代码 `import string.keywords` 自动命中 overlay，**调用方零改动**。
+    - **回归**：新建 `tests/keywords_overlay_check.ps1`（44 项断言，x64/x86 双绿）；
+      4 组黄金探针在 x86（官方 DLL）与 x64（自写 overlay）上**输出逐字节相同**；
+      x64 / x86 各 21 套回归全绿；x64 全量 sweep
+      **ok=919 → 921 / fail=49 → 48**（-1，新增失败 0 项）。
+    - **剩余 48 项 x64 失败里仍没有一项是 Nodio 引擎缺陷**：22 项官方只带 32 位 DLL
+      且未发源码、12 项官方契约守卫、2 项官方同款导入顺序、6 项自带安装器超时、
+      3 项官方库缺失、1 项官方断言、1 项外部安装缺件、1 项清单伪条目。
+    详见 `docs/capability-gap.md` §1.31
+
 Still open (the remaining path to 100%):
 1. language-host primitives: py2/py3 (x86), `golang` import self-guard
 2. console.log string-encoding primitive layer (isUtf16/getUtf/toUtf16 semantics), `.join`/`.getMessage` gaps
