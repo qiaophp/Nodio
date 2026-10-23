@@ -36,6 +36,8 @@ namespace NodioPublish
 
     static const unsigned long long kMagic = 0x4255504F49444F4EULL; // "NODIOPUB"
     static const unsigned int kVersion = 1;
+    // debug tracing is opt-in: NODIO_PUBDBG=1 (never pollute normal CLI output)
+    static const bool kPubDbg = GetEnvironmentVariableW(L"NODIO_PUBDBG", nullptr, 0) != 0;
 
     struct Trailer
     {
@@ -95,20 +97,27 @@ namespace NodioPublish
         return e;
     }
 
+    static std::wstring Utf8BytesToWide(const char* p, size_t cb)
+    {
+        int w = MultiByteToWideChar(CP_UTF8, 0, p, (int)cb, nullptr, 0);
+        std::wstring s((size_t)max(w, 0), 0);
+        if (w > 0)
+            MultiByteToWideChar(CP_UTF8, 0, p, (int)cb, &s[0], w);
+        return s;
+    }
+    // UTF-8 (BOM-tolerant) raw bytes -> wide text
+    static std::wstring DecodeUtf8Bytes(const std::vector<char>& raw)
+    {
+        size_t off = (raw.size() >= 3 && (unsigned char)raw[0] == 0xEF &&
+                      (unsigned char)raw[1] == 0xBB &&
+                      (unsigned char)raw[2] == 0xBF) ? 3 : 0;
+        return Utf8BytesToWide(raw.data() + off, raw.size() - off);
+    }
     static std::wstring ReadTextUtf8(const std::wstring& path)
     {
         std::vector<char> raw;
         if (!ReadWholeFile(path, raw)) return L"";
-        size_t off = (raw.size() >= 3 && (unsigned char)raw[0] == 0xEF &&
-                      (unsigned char)raw[1] == 0xBB &&
-                      (unsigned char)raw[2] == 0xBF) ? 3 : 0;
-        int w = MultiByteToWideChar(CP_UTF8, 0, raw.data() + off,
-                                    (int)(raw.size() - off), nullptr, 0);
-        std::wstring s((size_t)max(w, 0), 0);
-        if (w > 0)
-            MultiByteToWideChar(CP_UTF8, 0, raw.data() + off,
-                                (int)(raw.size() - off), &s[0], w);
-        return s;
+        return DecodeUtf8Bytes(raw);
     }
 
     static std::wstring JoinPath(const std::wstring& a,
@@ -191,16 +200,58 @@ namespace NodioPublish
 
     // ---- import closure --------------------------------------------------
 
+    static std::wstring StripComments(const std::wstring& src)
+    {
+        std::wstring out;
+        out.reserve(src.size());
+        size_t n = src.size();
+        for (size_t i = 0; i < n; i++)
+        {
+            if (i + 1 < n && src[i] == L'/' && src[i + 1] == L'/')
+            {
+                i += 2;
+                while (i < n && src[i] != L'\n') i++;
+                if (i < n) out.push_back(src[i]);
+            }
+            else if (i + 1 < n && src[i] == L'/' && src[i + 1] == L'*')
+            {
+                i += 2;
+                while (i + 1 < n && !(src[i] == L'*' && src[i + 1] == L'/')) i++;
+                if (i + 1 < n) i++;
+            }
+            else if (src[i] == L'"' || src[i] == L'\'')
+            {
+                wchar_t quote = src[i];
+                out.push_back(L' ');
+                i++;
+                while (i < n && src[i] != quote)
+                {
+                    if (src[i] == L'\\' && i + 1 < n) i++;
+                    i++;
+                }
+                out.push_back(L' ');
+            }
+            else
+            {
+                out.push_back(src[i]);
+            }
+        }
+        return out;
+    }
+
     // Scans source for `import a.b.c` / `import ..a.b` / `import a` and
     // resolves each name to a lib file (folder layout preferred).
     // Recursive with a visited set.
-    static void CollectClosure(const std::wstring& src,
+    static void CollectClosure(const std::wstring& srcRaw,
                                const std::wstring& strLibDir,
                                std::map<std::wstring, std::wstring>& files,
+                               std::map<std::wstring, std::vector<char>>&
+                                   bytesCache,
                                std::set<std::wstring>& visited,
                                int depth)
     {
         if (depth > 24) return;
+        std::wstring src = StripComments(srcRaw);
         size_t pos = 0;
         while (true)
         {
@@ -266,14 +317,19 @@ namespace NodioPublish
             visited.insert(visitKey);
             std::vector<char> bytes;
             if (!ReadWholeFile(found, bytes)) continue;
+            if (kPubDbg)
             {
                 fwprintf(stderr, L"[PUBDBG] import %s -> key=%s file=%s\n",
                          name.c_str(), key.c_str(), found.c_str());
                 fflush(stderr);
             }
+            // decode once from the bytes we already hold; cache the bytes
+            // so the payload assembly never re-reads the file from disk
+            std::wstring text = DecodeUtf8Bytes(bytes);
+            bytesCache[found] = std::move(bytes);
             files[key] = found;
             // recurse into nested imports
-            CollectClosure(ReadTextUtf8(found), strLibDir, files, visited,
+            CollectClosure(text, strLibDir, files, bytesCache, visited,
                            depth + 1);
         }
     }
@@ -702,28 +758,32 @@ namespace NodioPublish
 
         std::map<std::wstring, std::wstring> colFiles;   // key -> abs path
         std::set<std::wstring> visited;
-        if (GetEnvironmentVariableW(L"NODIO_PUBDBG", nullptr, 0))
+        if (kPubDbg)
         {
             fwprintf(stderr, L"[PUBDBG] srcMain=%d libdir=%s\n",
                      (int)srcMain.size(), opt.strLibDir.c_str());
             fflush(stderr);
         }
         // 64-bit native overlay library takes precedence over official libDir
+        std::map<std::wstring, std::vector<char>> fileBytes;   // abs path -> raw bytes (read each lib file from disk exactly once)
         std::wstring strOverlay = GetOverlayLibDir();
         if (!strOverlay.empty())
-            CollectClosure(srcMain, strOverlay, colFiles, visited, 0);
+            CollectClosure(srcMain, strOverlay, colFiles, fileBytes, visited, 0);
         if (!opt.strLibDir.empty())
-            CollectClosure(srcMain, opt.strLibDir, colFiles, visited, 0);
+            CollectClosure(srcMain, opt.strLibDir, colFiles, fileBytes, visited, 0);
         // project-local lib: proj\lib\X == import X, resolved after the global lib root
         {
             std::wstring strProjLib = JoinPath(strProjDir, L"lib");
             if (GetFileAttributesW(strProjLib.c_str()) != INVALID_FILE_ATTRIBUTES)
-                CollectClosure(srcMain, strProjLib, colFiles, visited, 0);
+                CollectClosure(srcMain, strProjLib, colFiles, fileBytes, visited, 0);
         }
-        fwprintf(stderr, L"[PUBDBG] closure=%d libdir=%s srclen=%d\n",
-                 (int)colFiles.size(), opt.strLibDir.c_str(),
-                 (int)srcMain.size());
-        fflush(stderr);
+        if (kPubDbg)
+        {
+            fwprintf(stderr, L"[PUBDBG] closure=%d libdir=%s srclen=%d\n",
+                     (int)colFiles.size(), opt.strLibDir.c_str(),
+                     (int)srcMain.size());
+            fflush(stderr);
+        }
 
         // embedded resources per .aproj (embed=true, ignored=false)
         for (auto& f : projFiles)
@@ -733,6 +793,12 @@ namespace NodioPublish
             std::wstring key = f.strPath;
             for (auto& c : key) if (c == L'/') c = L'\\';
             colFiles[key] = abs;
+            if (!fileBytes.count(abs))
+            {
+                std::vector<char> bytes;
+                if (ReadWholeFile(abs, bytes))
+                    fileBytes[abs] = std::move(bytes);
+            }
         }
 
         // 3) payload: compile scripts into binary bytecode; embed non-scripts as raw bytes
@@ -761,9 +827,19 @@ namespace NodioPublish
         for (auto& kv : colFiles)
         {
             std::wstring key = kv.first;
+            // reuse the bytes captured during closure analysis when
+            // possible — each lib file is read from disk only once
+            const std::vector<char>* pBytes = nullptr;
+            std::vector<char> readBack;
+            auto ib = fileBytes.find(kv.second);
+            if (ib != fileBytes.end())
+                pBytes = &ib->second;
+            else if (ReadWholeFile(kv.second, readBack))
+                pBytes = &readBack;
+            if (!pBytes) continue;
             if (NodioVM::HasScriptExtension(key))
             {
-                std::wstring srcLib = ReadTextUtf8(kv.second);
+                std::wstring srcLib = DecodeUtf8Bytes(*pBytes);
                 std::vector<uint8_t> bc;
                 std::wstring compErr;
                 std::wstring libDir = DirOf(kv.second);
@@ -773,9 +849,7 @@ namespace NodioPublish
                     continue;
                 }
             }
-            std::vector<char> bytes;
-            if (!ReadWholeFile(kv.second, bytes)) continue;
-            payload[key] = std::string(bytes.data(), bytes.size());
+            payload[key] = std::string(pBytes->data(), pBytes->size());
         }
 
         // manifest: "key\t<size>\n" lines in UTF-8
@@ -863,10 +937,37 @@ namespace NodioPublish
         // 4c) subsystem (2 = GUI, 3 = CUI)
         PatchSubsystemBuf(exe, opt.bConsole);
 
-        // 5) append the payload onto the now-stamped image
+        // 4d) Write base PE to destination file
+        if (!WriteWholeFile(opt.strOut, exe))
+        {
+            strErr = L"写入输出程序失败: " + opt.strOut;
+            return false;
+        }
+
+        // 4e) Stamp Icon BEFORE appending payload (EndUpdateResourceW rewrites resource section and clobbers overlay)
+        if (!opt.strIcon.empty() && GetFileAttributesW(opt.strIcon.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            if (!StampIcon(opt.strOut, opt.strIcon))
+            {
+                fwprintf(stderr, L"[PUBDBG] 写入图标警告: 无法将指定图标写入目标程序\n");
+                fflush(stderr);
+            }
+        }
+
+        // 5) append payload onto the stamped executable
+        FILE* pfOut = nullptr;
+        if (_wfopen_s(&pfOut, opt.strOut.c_str(), L"ab") != 0 || !pfOut)
+        {
+            strErr = L"打开输出程序追加载荷失败: " + opt.strOut;
+            return false;
+        }
         for (auto& kv : payload)
-            exe.insert(exe.end(), kv.second.begin(), kv.second.end());
-        exe.insert(exe.end(), manifest.begin(), manifest.end());
+        {
+            if (!kv.second.empty())
+                fwrite(kv.second.data(), 1, kv.second.size(), pfOut);
+        }
+        if (!manifest.empty())
+            fwrite(manifest.data(), 1, manifest.size(), pfOut);
         Trailer tr{};
         tr.magic = kMagic;
         tr.version = kVersion;
@@ -874,13 +975,8 @@ namespace NodioPublish
         tr.manifestSize = manifest.size();
         tr.payloadSize = payloadSize;
         const char* pTr = (const char*)&tr;
-        exe.insert(exe.end(), pTr, pTr + sizeof(Trailer));
-
-        if (!WriteWholeFile(opt.strOut, exe))
-        {
-            strErr = L"写入输出失败: " + opt.strOut;
-            return false;
-        }
+        fwrite(pTr, 1, sizeof(Trailer), pfOut);
+        fclose(pfOut);
 
         return true;
     }

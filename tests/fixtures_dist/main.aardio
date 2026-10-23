@@ -1,0 +1,8 @@
+﻿import console;
+import string;
+
+var s = "NodioStandaloneExeSuccess";
+var sub = string.left(s, 15);
+console.log("APP_PAYLOAD_EXEC_START");
+console.log("SUBSTR:" ++ sub);
+console.log("STANDALONE_RUN_OK");

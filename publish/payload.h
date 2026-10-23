@@ -51,24 +51,52 @@ namespace NodioPayload
 
     // Probes the running exe (or any path) for an appended payload.
     // On success keyOut maps lib-relative keys to raw bytes (std::string).
+    // Reads ONLY the trailer, the manifest and the individual file slices
+    // (seek-based) — the exe image is never loaded into memory whole, so
+    // startup cost is proportional to payload content, not exe size.
     inline bool ReadPayload(const wchar_t* szExePath,
                             std::map<std::wstring, std::string>& keyOut)
     {
-        std::vector<char> exe;
-        if (!ReadWholeFile(szExePath, exe)) return false;
-        if (exe.size() < sizeof(Trailer)) return false;
+        FILE* pf = nullptr;
+        if (_wfopen_s(&pf, szExePath, L"rb") != 0 || !pf)
+            return false;
+        if (fseek(pf, 0, SEEK_END) != 0) { fclose(pf); return false; }
+        long cbFile = ftell(pf);
+        if (cbFile < (long)sizeof(Trailer)) { fclose(pf); return false; }
         Trailer tr{};
-        memcpy(&tr, exe.data() + exe.size() - sizeof(Trailer), sizeof(Trailer));
-        if (tr.magic != kMagic || tr.version != kVersion) return false;
-        size_t cbManifest = (size_t)tr.manifestSize;
-        size_t cbPayload = (size_t)tr.payloadSize;
-        if (exe.size() < sizeof(Trailer) + cbManifest + cbPayload) return false;
-        const char* pPayload =
-            exe.data() + exe.size() - sizeof(Trailer) - cbManifest - cbPayload;
-        const char* pManifest = pPayload + cbPayload;
+        if (fseek(pf, cbFile - (long)sizeof(Trailer), SEEK_SET) != 0 ||
+            fread(&tr, 1, sizeof(Trailer), pf) != sizeof(Trailer))
+        {
+            fclose(pf);
+            return false;
+        }
+        if (tr.magic != kMagic || tr.version != kVersion)
+        {
+            fclose(pf);
+            return false;
+        }
+        unsigned long long cbManifest = tr.manifestSize;
+        unsigned long long cbPayload = tr.payloadSize;
+        if ((unsigned long long)cbFile <
+            sizeof(Trailer) + cbManifest + cbPayload)
+        {
+            fclose(pf);
+            return false;
+        }
+        long long offManifest =
+            cbFile - (long long)sizeof(Trailer) - (long long)cbManifest;
+        std::string manifest((size_t)cbManifest, '\0');
+        if (cbManifest &&
+            (fseek(pf, offManifest, SEEK_SET) != 0 ||
+             fread(&manifest[0], 1, (size_t)cbManifest, pf) != (size_t)cbManifest))
+        {
+            fclose(pf);
+            return false;
+        }
+        long long offPayload = offManifest - (long long)cbPayload;
 
-        std::string manifest(pManifest, cbManifest);
         size_t off = 0, pos = 0;
+        bool bOk = true;
         while (pos < manifest.size())
         {
             size_t eol = manifest.find('\n', pos);
@@ -86,11 +114,19 @@ namespace NodioPayload
             if (w > 0)
                 MultiByteToWideChar(CP_UTF8, 0, keyU8.c_str(),
                                     (int)keyU8.size(), &key[0], w);
-            if (off + cb > cbPayload) break;
-            keyOut[key] = std::string(pPayload + off, cb);
+            if (off + cb > cbPayload) { bOk = false; break; }
+            std::string data((size_t)cb, '\0');
+            if (cb && (fseek(pf, offPayload + (long long)off, SEEK_SET) != 0 ||
+                       fread(&data[0], 1, cb, pf) != cb))
+            {
+                bOk = false;
+                break;
+            }
+            keyOut[key] = std::move(data);
             off += cb;
         }
-        return true;
+        fclose(pf);
+        return bOk;
     }
 
     // Payload bytes -> engine string map. Engine strings hold arbitrary
