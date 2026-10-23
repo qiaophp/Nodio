@@ -1,0 +1,41 @@
+import win.ui;
+import console;
+
+var winform = win.form(text="MsgReflectionTest";right=400;bottom=300);
+winform.add(
+    btn1 = {cls="button";text="TestButton";left=20;top=20;right=120;bottom=60;autoResize=false};
+);
+
+var results = {};
+
+// 1. 验证子控件 oncommand 反射
+winform.btn1.oncommand = function(id, event){
+    results.btnOnCommand = true;
+    results.btnId = id;
+    results.btnEvent = event;
+};
+
+// 2. 模拟向 winform 发送来自 btn1 的 WM_COMMAND
+var WM_COMMAND = 0x111;
+var BN_CLICKED = 0;
+var wp = winform.btn1.id | (BN_CLICKED << 16);
+::User32 := raw.loadDll("user32.dll");
+::User32.SendMessageW(winform.hwnd, WM_COMMAND, wp, winform.btn1.hwnd);
+
+assert(results.btnOnCommand == true, "btn1.oncommand was not called!");
+assert(results.btnId == winform.btn1.id, "btn1 id mismatch!");
+
+// 3. 验证窗体自定义 wndproc 拦截
+winform.wndproc = function(hwnd, message, wParam, lParam){
+    if (message == 0x0400/*WM_USER*/ + 123) {
+        results.wndprocHandled = true;
+        return 999;
+    }
+};
+
+var WM_USER = 0x400;
+var ret = ::User32.SendMessageW(winform.hwnd, WM_USER + 123, 11, 22);
+assert(results.wndprocHandled == true, "winform.wndproc was not called!");
+assert(ret == 999, "winform.wndproc return value mismatch, expected 999, got " ++ tostring(ret));
+
+console.log("WINUI_REFLECTION_PASS");

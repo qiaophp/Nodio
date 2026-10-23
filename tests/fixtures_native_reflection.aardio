@@ -1,0 +1,37 @@
+import console;
+
+// 原生 win.form（直接由内建 C++ 构造，不经由 win.ui 库包装）
+var rawForm = win.form("RawNativeForm", 300, 200);
+rawForm.add(
+    subBtn = { cls = "button"; text = "Sub"; left = 10; top = 10; right = 90; bottom = 40; }
+);
+
+var rawResults = {};
+rawForm.subBtn.oncommand = function(id, event){
+    rawResults.subOnCommand = true;
+    rawResults.id = id;
+};
+rawForm.oncommand = function(id, event){
+    rawResults.formOnCommand = true;
+};
+rawForm.wndproc = function(hwnd, message, wParam, lParam){
+    if (message == 0x400/*WM_USER*/ + 888) {
+        rawResults.rawWndproc = true;
+        return 777;
+    }
+};
+
+::User32 := raw.loadDll("user32.dll");
+var WM_COMMAND = 0x111;
+var BN_CLICKED = 0;
+var rawWp = rawForm.subBtn.id | (BN_CLICKED << 16);
+::User32.SendMessageW(rawForm.hwnd, WM_COMMAND, rawWp, rawForm.subBtn.hwnd);
+
+assert(rawResults.subOnCommand == true, "rawForm.subBtn.oncommand failed");
+assert(rawResults.formOnCommand == true, "rawForm.oncommand failed");
+
+var rawRet = ::User32.SendMessageW(rawForm.hwnd, 0x400/*WM_USER*/ + 888, 0, 0);
+assert(rawResults.rawWndproc == true, "rawForm.wndproc failed");
+assert(rawRet == 777, "rawForm.wndproc return mismatch");
+
+console.log("NATIVE_REFLECTION_PASS");
