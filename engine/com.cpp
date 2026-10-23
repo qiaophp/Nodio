@@ -241,7 +241,7 @@ namespace
             SYSTEMTIME st;
             if (VariantTimeToSystemTime(in.date, &st))
             {
-                Value vtCtor = g_interpCurrent ? g_interpCurrent->globals.vars[L"time"] : Value();
+                Value vtCtor = g_interpCurrent ? g_interpCurrent->globals.vars[NameId(L"time")] : Value();
                 if (vtCtor.t == Value::TableT && vtCtor.tab)
                 {
                     auto icl = vtCtor.tab->map.find(L"_call");
@@ -5521,10 +5521,10 @@ void Interp::RegisterComKernel(Env& globalsEnv)
 
     com->map[L"GetEnumerator"] = fnGetEnumerator;
     com->map[L"isEnumerator"] = fnIsEnumerator;
-    globalsEnv.vars[L"GetEnumerator"] = fnGetEnumerator;
-    globalsEnv.vars[L"isEnumerator"] = fnIsEnumerator;
+    globalsEnv.vars[NameId(L"GetEnumerator")] = fnGetEnumerator;
+    globalsEnv.vars[NameId(L"isEnumerator")] = fnIsEnumerator;
 
-    globalsEnv.vars[L"com"] = Value::Table_(com);
+    globalsEnv.vars[NameId(L"com")] = Value::Table_(com);
     // plain `import com` must resolve to this kernel namespace
     // instead of creating an empty fallback module that would shadow it
     roots[L"com"] = Value::Table_(com);

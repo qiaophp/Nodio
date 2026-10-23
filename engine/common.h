@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <deque>
 #include <memory>
 #include <wininet.h>
 
@@ -45,6 +46,17 @@ namespace NodioVM
         bool bLeadingSpace = false;
         bool bUtf16 = false;
         bool bRawBytes = false;
+        // Absolute offset of the token's FIRST character in the source
+        // string (wchar units == UTF-16 code units, same unit LSP's
+        // `character` uses). The lexer only tracked the line number before,
+        // which is enough for diagnostics but not for "go to definition" —
+        // a jump needs the exact column, and the column of a token can only
+        // be derived from its absolute offset (a line's start offset is not
+        // known until the whole file has been scanned).
+        //
+        // Filled by Lex() for every token; 0 for tokens synthesized by hand
+        // (the parser never synthesizes any).
+        size_t pos = 0;
     };
 
     // Compiled (bytecode) modules begin with a configured magic header
@@ -141,6 +153,36 @@ namespace NodioVM
 
     // builtin-writing helpers (round 19)
     inline wstring BStr(const Value& v) { return v.ToString(); }
+    // zero-copy string arg access for hot natives: returns the Value's own
+    // wstring when it already holds text (no per-call full-string copy);
+    // only non-string args pay one conversion copy into `tmp`. Callers
+    // keep one tmp per arg slot alive for the whole call.
+    inline const wstring& BStrRef(const Value& v, wstring& tmp)
+    {
+        if (v.t == Value::Str) return v.s;
+        tmp = v.ToString();
+        return tmp;
+    }
+    // tight UTF-8 byte-length walk over wstring storage; only astral high
+    // surrogates pay the next-wchar lookahead. Hot path of #s and every
+    // position builtin — replaces per-use kernel conversion calls
+    // (A/B benchmarked: a shared c2-lookahead helper measured ~2.6x
+    // slower per wchar on this walk).
+    inline size_t Utf8ByteLenOf(const wstring& w)
+    {
+        size_t acc = 0;
+        for (size_t i = 0; i < w.size(); i++)
+        {
+            wchar_t c = w[i];
+            if (c < 0x80) { acc += 1; continue; }
+            if (c < 0x800) { acc += 2; continue; }
+            if (c >= 0xD800 && c <= 0xDBFF && i + 1 < w.size() &&
+                w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF)
+            { acc += 4; i++; continue; }
+            acc += 3;
+        }
+        return acc;
+    }
     // UTF-8 byte view of a string value (for byte-level primitives such
     // as string.crc32)
     inline std::string BUtf8(const Value& v)
@@ -664,6 +706,10 @@ namespace NodioVM
     bool RETry(const vector<vector<RE>>& branches, const wstring& s,
                size_t pos, bool anchored, vector<wstring>& caps,
                size_t* pEnd);
+    // true when pat parses to a plain literal-char sequence (no
+    // metacharacters) — lets find/match/count use memchr-speed
+    // wstring::find instead of the per-position matcher
+    bool REIsPlainLiteral(const wstring& pat);
 
     struct JParser
     {
@@ -826,6 +872,64 @@ namespace NodioVM
 
     struct Env;
 
+    // ---- variable-name interning (round 12) ----
+    // Variable names are interned to uint32 ids so Env::vars uses plain
+    // int keys: hot-path lookups (loop bodies, call frames) do zero
+    // wstring hashing. The registry only grows — ids are valid for the
+    // whole process lifetime, so a cached id (Node::nid, Node::nameIds)
+    // never goes stale. Id 0 is the "not interned" sentinel and is never
+    // returned. The mutex guards REGISTRATION only: worker threads parse
+    // scripts too (thread.create), but readers that already hold an id
+    // never touch the registry, so hot paths run lock-free.
+    inline std::mutex& NameIntMutex()
+    {
+        static std::mutex m;
+        return m;
+    }
+    inline std::unordered_map<wstring, uint32_t>& NameIdMap()
+    {
+        static std::unordered_map<wstring, uint32_t> m;
+        return m;
+    }
+    // id -> name; deque so element references stay stable while the
+    // parser (possibly on a worker thread) registers more names.
+    inline std::deque<wstring>& NameTable()
+    {
+        static std::deque<wstring> t;
+        return t;
+    }
+    inline uint32_t NameId(const wstring& name)
+    {
+        std::lock_guard<std::mutex> lk(NameIntMutex());
+        auto& ids = NameIdMap();
+        auto it = ids.find(name);
+        if (it != ids.end())
+            return it->second;
+        uint32_t id = (uint32_t)NameTable().size() + 1;
+        NameTable().emplace_back(name);
+        ids.emplace(NameTable().back(), id);
+        return id;
+    }
+    inline const wstring& NameOf(uint32_t id)
+    {
+        std::lock_guard<std::mutex> lk(NameIntMutex());
+        return NameTable()[(size_t)(id - 1)];
+    }
+    // Prefer a cached id (AST node); fall back to live interning for
+    // nodes the parser did not annotate (defensive — should be rare).
+    inline uint32_t NameIdOf(const wstring& name, uint32_t cached)
+    {
+        return cached ? cached : NameId(name);
+    }
+    // Pre-interned ids for the runtime-synthesized bindings. Magic
+    // statics make first use thread-safe; every later use is a plain
+    // int read (no registry lock).
+    inline uint32_t IdThis() { static uint32_t id = NameId(L"this"); return id; }
+    inline uint32_t IdOwner() { static uint32_t id = NameId(L"owner"); return id; }
+    inline uint32_t IdArg() { static uint32_t id = NameId(L"arg"); return id; }
+    inline uint32_t IdDots() { static uint32_t id = NameId(L"..."); return id; }
+    inline uint32_t IdSelf() { static uint32_t id = NameId(L"self"); return id; }
+
     struct EnvWeakRef
     {
         std::weak_ptr<Env> wp;
@@ -848,7 +952,11 @@ namespace NodioVM
         // Machine-lifetime envs (globals) use a no-op deleter.
         std::shared_ptr<Env> parent;
         EnvWeakRef self;
-        std::unordered_map<wstring, Value> vars;
+        // Round 12: keys are interned name ids (see NameId above) —
+        // loop/call hot paths hash nothing. Use NameOf(id) when a
+        // human-readable name is needed (dumps, mirrors back to
+        // wstring-keyed Table maps).
+        std::unordered_map<uint32_t, Value> vars;
         shared_ptr<Table> nsTable;   // namespace scope: bare names land here
         shared_ptr<Table> modTable;  // file/module scope table: scopeVars
         // S-2: the source file that owns the code running in this frame.
@@ -892,10 +1000,21 @@ namespace NodioVM
         Table* instTable = nullptr;
         Value* Find(const wstring& k)
         {
+            return FindById(NameId(k), k);
+        }
+        // Hot path: the parser cached the interned id on the AST node
+        // (Node::nid), so loop bodies and call frames resolve names with
+        // plain int keys — zero wstring hashing per lookup.
+        Value* Find(uint32_t id, const wstring& k)
+        {
+            return FindById(id, k);
+        }
+        Value* FindById(uint32_t id, const wstring& k)
+        {
             // 1. Local frames (frames that have a parent)
             for (Env* e = this; e && e->parent; e = e->parent.get())
             {
-                auto it = e->vars.find(k);
+                auto it = e->vars.find(id);
                 if (it != e->vars.end())
                     return &it->second;
             }
@@ -916,7 +1035,7 @@ namespace NodioVM
             {
                 Env* root = this;
                 while (root->parent) root = root->parent.get();
-                auto it = root->vars.find(k);
+                auto it = root->vars.find(id);
                 if (it != root->vars.end())
                     return &it->second;
             }
@@ -952,7 +1071,7 @@ namespace NodioVM
             // 4. Global variables (root env where parent == nullptr)
             Env* root = this;
             while (root->parent) root = root->parent.get();
-            auto it = root->vars.find(k);
+            auto it = root->vars.find(id);
             if (it != root->vars.end())
                 return &it->second;
 
@@ -983,7 +1102,9 @@ namespace NodioVM
     {
         if (frames.empty() || frames.back().get() != self)
         {
-            fwprintf(stderr, L"[GCFRAME] %s: popping %p but top is %p (size=%zu)\n",
+            // %hs: `where` is a narrow string, and fwprintf's %s would
+            // reinterpret those bytes as UTF-16 (garbage output).
+            fwprintf(stderr, L"[GCFRAME] %hs: popping %p but top is %p (size=%zu)\n",
                      where, (void*)self,
                      frames.empty() ? nullptr : (void*)frames.back().get(),
                      frames.size());
@@ -1020,7 +1141,32 @@ namespace NodioVM
         bool bUtf16 = false;         // Str literal: '...'u UTF-16 string
         bool bRawBytes = false;      // Str literal: raw binary bytes
         int line = 0;                // source line (round 30 error reporting)
+        // Round 12: interned variable-name id for Ident/left-value nodes
+        // (0 = not cached — NameIdOf falls back to live interning).
+        uint32_t nid = 0;
+        // Parallel to `names` (params / var names): interned ids filled by
+        // the parser. Hot bind sites prefer nameIds[i] when sizes match.
+        vector<uint32_t> nameIds;
     };
+
+    // Interned id of parameter i of a function value. The FuncLit node
+    // caches ids in Node::nameIds (parser-filled, parallel to names /
+    // Value::params); fall back to live interning when sizes disagree
+    // (native-constructed function values).
+    inline uint32_t ParamIdAt(const Value& f, size_t i)
+    {
+        if (f.fn && i < f.fn->nameIds.size() && i < f.params.size())
+            return f.fn->nameIds[i];
+        return NameId(f.params[i]);
+    }
+
+    // Interned id of names[i] on a node (VarDecl / ForIn bind sites).
+    inline uint32_t NodeNameIdAt(const PNode& n, size_t i)
+    {
+        if (i < n->nameIds.size() && i < n->names.size())
+            return n->nameIds[i];
+        return NameId(n->names[i]);
+    }
 
     // ---------------- parser ----------------
 
@@ -1034,6 +1180,7 @@ namespace NodioVM
         std::map<int, Value> selchgs;       // control id -> selchange dispatch
         std::map<int, Value> ctrls;         // control id -> control table
         std::map<int, HWND> hCtrl;          // control id -> handle
+        std::map<HWND, int> hCtrlRev;       // handle -> control id (O(1) reverse lookup for WM_COMMAND/WM_NOTIFY dispatch)
         int nNextId = 2000;
         // round 40: paint/timer — the form table is kept so WndProc can
         // read "onpaint"/"ontimer" live (scripts assign plain members)

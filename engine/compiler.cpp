@@ -497,6 +497,7 @@ namespace NodioVM
             ps.strEmbedBase = *pBaseDir;
         ps.strEmbedRoot = EmbedRoot();
         PNode prog = ps.ParseBlock();
+        AnnotateNameIds(prog);
         if (!localErr.empty())
         {
             if (err) *err = localErr;

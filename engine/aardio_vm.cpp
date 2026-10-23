@@ -497,7 +497,11 @@ namespace NodioVM
                 nf.slots.assign((size_t)nSlots, RtSlot());
                 nf.slots[0] = owner;                 // owner（隐含首参数）
                 for (size_t k = 0; k < args.size(); k++)
-                    nf.slots[k + 1] = SlotGet(args[k]);   // 实参按值拷贝（官方：整段复制）
+                {
+                    // 实参按值拷贝（官方：整段复制）；box 穿透一次拷贝到位
+                    const RtSlot& rs = args[k];
+                    nf.slots[k + 1] = rs.box ? rs.box->value : rs;
+                }
                 nf.upvalues = fn.closure->upvalues;
                 nf.ns = fn.closure->ownerNs ? fn.closure->ownerNs : frames.back().ns;
                 nf.parent = nullptr;                  // 帧栈会重排，不留悬挂父指针
@@ -515,7 +519,12 @@ namespace NodioVM
                 std::vector<Value> a;
                 a.reserve(args.size());
                 for (size_t k = 0; k < args.size(); k++)
-                    a.push_back(SlotGet(args[k]).val);
+                {
+                    // one Value copy per arg (SlotGet's by-value RtSlot
+                    // copy was doubling string traffic on every call)
+                    const RtSlot& rs = args[k];
+                    a.push_back(rs.box ? rs.box->value.val : rs.val);
+                }
                 Value out = fn.val.native(a);
                 WriteReturns(frames.back(), retSlot, retCount, out);
                 return 0;
@@ -526,7 +535,12 @@ namespace NodioVM
                 std::vector<Value> a;
                 a.reserve(args.size());
                 for (size_t k = 0; k < args.size(); k++)
-                    a.push_back(SlotGet(args[k]).val);
+                {
+                    // one Value copy per arg (SlotGet's by-value RtSlot
+                    // copy was doubling string traffic on every call)
+                    const RtSlot& rs = args[k];
+                    a.push_back(rs.box ? rs.box->value.val : rs.val);
+                }
                 Value out;
                 wstring herr;
                 if (!host->callHostFunc(fn.val, a, &out, &herr))

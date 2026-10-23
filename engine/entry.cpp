@@ -42,6 +42,15 @@ namespace NodioVM
                  szMod,
                  g_curModuleFile.c_str(),
                  g_interpCurrent ? g_interpCurrent->nErrLine : 0);
+        // 模块内偏移：只有偏移才能把崩溃点定位到具体导出函数
+        // （地址本身每次运行都随机，没法查）
+        if (hMod)
+        {
+            size_t off = (size_t)((const unsigned char*)ep->ExceptionRecord->ExceptionAddress -
+                                   (const unsigned char*)hMod);
+            fwprintf(stderr, L"  module base=%p offset=0x%zX\n",
+                     (void*)hMod, off);
+        }
         if (ep->ExceptionRecord->NumberParameters >= 2)
         {
             fwprintf(stderr, L"  AccessViolation: op=%lld target=%p\n",
@@ -125,6 +134,7 @@ namespace NodioVM
                 ps.strEmbedBase = *pBaseDir;
             ps.strEmbedRoot = EmbedRoot();
             prog = ps.ParseBlock();   // whole program as a block
+            AnnotateNameIds(prog);
         }
         if (!localErr.empty() || !prog)
         {
@@ -223,7 +233,7 @@ namespace NodioVM
             {
                 if (wcscmp(szPause, L"0") == 0)
                 {
-                    it.globals.vars[L"_CONSOLE_NO_PAUSE"] = Value::Bool_(true);
+                    it.globals.vars[NameId(L"_CONSOLE_NO_PAUSE")] = Value::Bool_(true);
                     it.roots[L"_CONSOLE_NO_PAUSE"] = Value::Bool_(true);
                 }
             }
@@ -260,6 +270,7 @@ namespace NodioVM
             psBoot.strEmbedBase = pBaseDir ? *pBaseDir : wstring();
             psBoot.strEmbedRoot = EmbedRoot();
             PNode progBoot = psBoot.ParseBlock();
+            AnnotateNameIds(progBoot);
             it.ExecBlock(progBoot, &it.globals);
             it.err = pPrevErr;
             if (pPrevErr)

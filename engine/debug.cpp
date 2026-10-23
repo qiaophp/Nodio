@@ -65,15 +65,15 @@ void Interp::DumpVars(Env* env)
             {
                 for (const wchar_t* g : { L"User32", L"Kernel32", L"type" })
                 {
-                    auto i = globals.vars.find(g);
+                    auto i = globals.vars.find(NameId(g));
                     if (i != globals.vars.end())
-                        list.push_back({ i->first, i->second });
+                        list.push_back({ NameOf(i->first), i->second });
                 }
             }
             if (env)
             {
                 for (auto& kv : env->vars)
-                    list.push_back({ kv.first, kv.second });
+                    list.push_back({ NameOf(kv.first), kv.second });
             }
             for (auto& kv : list)
             {
@@ -210,7 +210,7 @@ bool Interp::DebugPipeStop(int nLine, Env* env)
                 if (e)
                 {
                     for (auto& kv : e->vars)
-                        list.push_back({ kv.first, kv.second });
+                        list.push_back({ NameOf(kv.first), kv.second });
                 }
                 for (auto& kv : list)
                 {

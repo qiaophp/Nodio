@@ -201,11 +201,11 @@ Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
                     for (auto& kv : mod.tab->scopeVars)
                         if (!vOld.tab->scopeVars.count(kv.first))
                             vOld.tab->scopeVars[kv.first] = kv.second;
-                    globals.vars[names[0]] = vOld;
+                    globals.vars[NameId(names[0])] = vOld;
                     return vOld;
                 }
                 roots[names[0]] = mod;
-                globals.vars[names[0]] = mod;
+                globals.vars[NameId(names[0])] = mod;
                 return mod;
             }
             // bind a dotted import path into the root namespaces
@@ -827,6 +827,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     ps.strEmbedBase = baseDir;
                     ps.strEmbedRoot = EmbedRoot();
                     prog = ps.ParseBlock();
+                    AnnotateNameIds(prog);
                 }
                 if (!modErr.empty() || !prog)
                 {
@@ -871,7 +872,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 auto modEnv2 = std::make_shared<Env>();
                 modEnv2->self = modEnv2;
                 modEnv2->parent = globals.self;
-                modEnv2->vars[L"owner"] = modPlaceholder2;
+                modEnv2->vars[IdOwner()] = modPlaceholder2;
                 // S-2: the module frame owns its source file, so a runtime
                 // error inside it can be attributed to the file the line
                 // number really comes from.  An embedded module has no
@@ -893,7 +894,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 ExecBlock(prog, modEnv2.get());
                 bool bTopReturn = (nReturn != 0);
                 for (auto& kv : modEnv2->vars)
-                    placeholder2->scopeVars[kv.first] = kv.second;
+                    placeholder2->scopeVars[NameOf(kv.first)] = kv.second;
                 g_curModuleFile = oldModFile2;
                 Value mod2 = ret;
                 nReturn = oldR; nBreak = oldB; nContinue = oldC;
@@ -909,7 +910,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 if (mod2.t != Value::TableT)
                 {
                     Value curNs;
-                    auto itFirst = globals.vars.find(n->names[0]);
+                    auto itFirst = globals.vars.find(NameId(n->names[0]));
                     if (itFirst != globals.vars.end())
                         curNs = itFirst->second;
                     for (size_t ni = 1; ni < n->names.size(); ++ni)
@@ -936,7 +937,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     else
                     {
                         for (auto& kv : modEnv2->vars)
-                            placeholder2->map[kv.first] = kv.second;
+                            placeholder2->map[NameOf(kv.first)] = kv.second;
                         mod2 = modPlaceholder2;
                     }
                 }
@@ -1071,6 +1072,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                     ps.strEmbedRoot = EmbedRoot();
                 }
                 prog = ps.ParseBlock();
+                AnnotateNameIds(prog);
             }
             if (!modErr.empty() || !prog)
             {
@@ -1146,7 +1148,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             auto modEnv = std::make_shared<Env>();
             modEnv->self = modEnv;
             modEnv->parent = globals.self;
-            modEnv->vars[L"owner"] = modPlaceholder;
+            modEnv->vars[IdOwner()] = modPlaceholder;
             // S-2: the module frame owns its source file — a runtime error
             // inside it reports "<this file>:<line>" instead of a bare line
             // number that could belong to any imported package.
@@ -1176,7 +1178,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             ExecBlock(prog, modEnv.get());
             bool bTopReturn = (nReturn != 0);
             for (auto& kv : modEnv->vars)
-                placeholder->scopeVars[kv.first] = kv.second;
+                placeholder->scopeVars[NameOf(kv.first)] = kv.second;
             g_curModuleFile = oldModFile;
             Value mod = ret;
             nReturn = oldR; nBreak = oldB; nContinue = oldC;
@@ -1191,7 +1193,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             if (mod.t != Value::TableT)
             {
                 Value curNs;
-                auto itFirst = globals.vars.find(n->names[0]);
+                auto itFirst = globals.vars.find(NameId(n->names[0]));
                 if (itFirst != globals.vars.end())
                     curNs = itFirst->second;
                 for (size_t ni = 1; ni < n->names.size(); ++ni)
@@ -1218,7 +1220,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 else
                 {
                     for (auto& kv : modEnv->vars)
-                        placeholder->map[kv.first] = kv.second;
+                        placeholder->map[NameOf(kv.first)] = kv.second;
                     mod = modPlaceholder;
                 }
             }
@@ -1261,7 +1263,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                             const wstring& nm = n->names[ni];
                             if (ns.t != Value::TableT || !ns.tab)
                             {
-                                auto ig = globals.vars.find(nm);
+                                auto ig = globals.vars.find(NameId(nm));
                                 if (ig != globals.vars.end())
                                     ns = ig->second;
                                 else break;

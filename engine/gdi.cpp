@@ -149,6 +149,27 @@ namespace NodioVM
     {
         auto it = g_forms.find(hwnd);
         FormState* fs = it != g_forms.end() ? it->second : nullptr;
+
+        // Form-level custom wndproc interceptor:
+        // winform.wndproc = function(hwnd, message, wParam, lParam)
+        if (fs && fs->it && fs->formVal.tab)
+        {
+            auto iw = fs->formVal.tab->map.find(L"wndproc");
+            if (iw != fs->formVal.tab->map.end() &&
+                (iw->second.t == Value::Func || iw->second.native))
+            {
+                vector<Value> wpArgs{
+                    Value::Num_((double)(INT_PTR)hwnd),
+                    Value::Num_((double)msg),
+                    Value::Num_((double)(INT_PTR)wp),
+                    Value::Num_((double)(INT_PTR)lp)
+                };
+                Value ret = fs->it->CallVmFunc(iw->second, wpArgs);
+                if (ret.t == Value::Num) return (LRESULT)(INT_PTR)ret.n;
+                if (ret.t == Value::Bool) return (LRESULT)(ret.b ? 1 : 0);
+            }
+        }
+
         switch (msg)
         {
         case WM_PAINT:
@@ -187,9 +208,10 @@ namespace NodioVM
             }
             break;
         case WM_COMMAND:
-            if (fs)
+            if (fs && fs->it)
             {
                 WORD id = LOWORD(wp), code = HIWORD(wp);
+                HWND hCtrlWnd = (HWND)lp;
                 // round 41: menu commands carry lParam==0 and live in the
                 // 5000+ id range — check them before control dispatch
                 auto im = fs->menus.find(id);
@@ -200,30 +222,146 @@ namespace NodioVM
                 }
                 else
                 {
-                bool bChange = code == EN_CHANGE &&
-                               fs->changes.count(id);
-                bool bClick = code == BN_CLICKED &&
-                              fs->callbacks.count(id);
-                bool bSel = code == LBN_SELCHANGE &&
-                            fs->selchgs.count(id);
-                if (bChange)
-                {
-                    Value f = fs->changes[id];
-                    vector<Value> noArgs;
-                    fs->it->CallVmFunc(f, noArgs);
+                    Value ctrlVal;
+                    auto ic = fs->ctrls.find(id);
+                    if (ic != fs->ctrls.end())
+                    {
+                        ctrlVal = ic->second;
+                    }
+                    else if (hCtrlWnd)
+                    {
+                        auto ir = fs->hCtrlRev.find(hCtrlWnd);
+                        if (ir != fs->hCtrlRev.end())
+                        {
+                            auto itc = fs->ctrls.find(ir->second);
+                            if (itc != fs->ctrls.end())
+                            {
+                                ctrlVal = itc->second;
+                                id = (WORD)ir->second;
+                            }
+                        }
+                    }
+
+                    bool bConsumed = false;
+                    bool bStopBubble = false;
+                    if (ctrlVal.tab)
+                    {
+                        auto ioc = ctrlVal.tab->map.find(L"oncommand");
+                        if (ioc != ctrlVal.tab->map.end() &&
+                            (ioc->second.t == Value::Func || ioc->second.native))
+                        {
+                            vector<Value> cArgs{ Value::Num_((double)id), Value::Num_((double)code) };
+                            Value ret = fs->it->CallVmFunc(ioc->second, cArgs);
+                            bConsumed = true;
+                            if (ret.t == Value::Num) return (LRESULT)(INT_PTR)ret.n;
+                            if (ret.t == Value::Bool && !ret.b) bStopBubble = true;
+                        }
+                    }
+
+                    if (!bConsumed)
+                    {
+                        bool bChange = code == EN_CHANGE && fs->changes.count(id);
+                        bool bClick = code == BN_CLICKED && fs->callbacks.count(id);
+                        bool bSel = code == LBN_SELCHANGE && fs->selchgs.count(id);
+                        if (bChange)
+                        {
+                            Value f = fs->changes[id];
+                            vector<Value> cArgs{ Value::Num_((double)id), Value::Num_((double)code) };
+                            fs->it->CallVmFunc(f, cArgs);
+                        }
+                        else if (bClick)
+                        {
+                            Value f = fs->callbacks[id];
+                            vector<Value> cArgs{ Value::Num_((double)id), Value::Num_((double)code) };
+                            fs->it->CallVmFunc(f, cArgs);
+                        }
+                        else if (bSel)
+                        {
+                            Value f = fs->selchgs[id];
+                            vector<Value> cArgs{ Value::Num_((double)id), Value::Num_((double)code) };
+                            fs->it->CallVmFunc(f, cArgs);
+                        }
+                    }
+
+                    // Form-level oncommand reflection: winform.oncommand(id, event)
+                    // Dispatched unless explicitly stopped by child control returning false
+                    if (!bStopBubble && fs->formVal.tab)
+                    {
+                        auto ifoc = fs->formVal.tab->map.find(L"oncommand");
+                        if (ifoc != fs->formVal.tab->map.end() &&
+                            (ifoc->second.t == Value::Func || ifoc->second.native))
+                        {
+                            vector<Value> fArgs{ Value::Num_((double)id), Value::Num_((double)code) };
+                            Value ret = fs->it->CallVmFunc(ifoc->second, fArgs);
+                            if (ret.t == Value::Num) return (LRESULT)(INT_PTR)ret.n;
+                            if (ret.t == Value::Bool && !ret.b) return 0;
+                        }
+                    }
                 }
-                else if (bClick)
+            }
+            return 0;
+        case WM_NOTIFY:
+            if (fs && fs->it && lp)
+            {
+                LPNMHDR nmhdr = (LPNMHDR)lp;
+                HWND hFrom = nmhdr->hwndFrom;
+                UINT_PTR idFrom = nmhdr->idFrom;
+                int code = nmhdr->code;
+
+                Value ctrlVal;
+                auto ic = fs->ctrls.find((int)idFrom);
+                if (ic != fs->ctrls.end())
                 {
-                    Value f = fs->callbacks[id];
-                    vector<Value> noArgs;
-                    fs->it->CallVmFunc(f, noArgs);
+                    ctrlVal = ic->second;
                 }
-                else if (bSel)
+                else if (hFrom)
                 {
-                    Value f = fs->selchgs[id];
-                    vector<Value> noArgs;
-                    fs->it->CallVmFunc(f, noArgs);
+                    auto ir = fs->hCtrlRev.find(hFrom);
+                    if (ir != fs->hCtrlRev.end())
+                    {
+                        auto itc = fs->ctrls.find(ir->second);
+                        if (itc != fs->ctrls.end())
+                            ctrlVal = itc->second;
+                    }
                 }
+
+                bool bStopBubble = false;
+                if (ctrlVal.tab)
+                {
+                    auto ion = ctrlVal.tab->map.find(L"onnotify");
+                    if (ion != ctrlVal.tab->map.end() &&
+                        (ion->second.t == Value::Func || ion->second.native))
+                    {
+                        vector<Value> nArgs{
+                            Value::Num_((double)idFrom),
+                            Value::Num_((double)code),
+                            Value::Num_((double)(INT_PTR)lp)
+                        };
+                        Value ret = fs->it->CallVmFunc(ion->second, nArgs);
+                        if (ret.t == Value::Num) return (LRESULT)(INT_PTR)ret.n;
+                        if (ret.t == Value::Bool)
+                        {
+                            if (!ret.b) bStopBubble = true;
+                            else return 1;
+                        }
+                    }
+                }
+
+                if (!bStopBubble && fs->formVal.tab)
+                {
+                    auto ifon = fs->formVal.tab->map.find(L"onnotify");
+                    if (ifon != fs->formVal.tab->map.end() &&
+                        (ifon->second.t == Value::Func || ifon->second.native))
+                    {
+                        vector<Value> fnArgs{
+                            Value::Num_((double)idFrom),
+                            Value::Num_((double)code),
+                            Value::Num_((double)(INT_PTR)lp)
+                        };
+                        Value ret = fs->it->CallVmFunc(ifon->second, fnArgs);
+                        if (ret.t == Value::Num) return (LRESULT)(INT_PTR)ret.n;
+                        if (ret.t == Value::Bool) return (LRESULT)(ret.b ? 1 : 0);
+                    }
                 }
             }
             return 0;

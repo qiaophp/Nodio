@@ -552,6 +552,7 @@ namespace NodioVM
             ps.strEmbedBase = g_interpCurrent->baseDir;
         ps.strEmbedRoot = EmbedRoot();
         PNode blk = ps.ParseBlock();
+        AnnotateNameIds(blk);
         if (!e.empty())
         {
             if (err) *err = e;
@@ -633,41 +634,157 @@ namespace NodioVM
     // and every string position argument/return (find/match/sub/slice/...)
     // operate on BYTES, while the engine stores strings as wstring. These
     // helpers translate a 1-based UTF-8 byte position <-> wchar index.
+    // Perf note (A/B benchmarked): these walkers are on the hot path of
+    // every position-based string builtin (find/match/index/lastIndexOf/
+    // sub/left/right/len). They must stay tight: only astral HIGH
+    // surrogates pay the next-wchar lookahead; loading w[i+1] on every
+    // step (a shared WcharUtf8ByteCount(c1,c2,isPair&) helper) measured
+    // ~2.6x slower per wchar and made string.find regress 2.7x end to end.
     static size_t WcharToUtf8Pos(const wstring& w, size_t wcharIdx1)
     {
-        // wcharIdx1: 1-based wchar index → returns 1-based UTF-8 byte pos
+        // wcharIdx1: 1-based wchar index → returns 1-based UTF-8 byte pos.
+        // Pure arithmetic (no kernel API): O(prefix) with per-wchar byte
+        // counts; a wchar index landing mid-surrogate-pair left-clamps to
+        // the pair start, mirroring Utf8PosToWcharIdx.
         if (wcharIdx1 <= 1) return 1;
-        int cb = WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
-                                     (int)min(wcharIdx1 - 1, w.size()),
-                                     nullptr, 0, nullptr, nullptr);
-        return (size_t)max(cb, 0) + 1;
+        size_t lim = min(wcharIdx1 - 1, w.size());
+        size_t acc = 0;
+        for (size_t i = 0; i < lim; i++)
+        {
+            wchar_t c = w[i];
+            if (c < 0x80) { acc += 1; continue; }
+            if (c < 0x800) { acc += 2; continue; }
+            if (c >= 0xD800 && c <= 0xDBFF)
+            {
+                if (i + 1 < w.size() && w[i + 1] >= 0xDC00 &&
+                    w[i + 1] <= 0xDFFF)
+                {
+                    if (i + 1 < lim) { acc += 4; i++; continue; }
+                    return acc + 1; // lim cuts inside the pair → clamp
+                }
+            }
+            acc += 3;
+        }
+        return acc + 1;
     }
     static size_t Utf8PosToWcharIdx(const wstring& w, size_t bytePos1)
     {
         // bytePos1: 1-based UTF-8 byte pos → wchar index (clamped)
         if (bytePos1 <= 1) return 1;
-        std::string u8;
-        u8.reserve(bytePos1 - 1);
-        // walk wchar->utf8 until we reach the byte offset
-        int acc = 0;
+        size_t acc = 0;
         for (size_t i = 0; i < w.size(); i++)
         {
-            wchar_t ch = w[i];
-            char tmp[4];
-            int n = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, tmp, 4, nullptr, nullptr);
-            if (n <= 0) n = 1;
-            if ((size_t)acc + (size_t)n >= bytePos1)
+            wchar_t c = w[i];
+            int n;
+            if (c < 0x80) n = 1;
+            else if (c < 0x800) n = 2;
+            else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < w.size() &&
+                     w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF)
+                n = 4;
+            else n = 3;
+            if (acc + (size_t)n >= bytePos1)
                 return i + 1;
-            acc += n;
+            acc += (size_t)n;
+            if (n == 4) i++;
         }
         return w.size() + 1;
     }
+    static void Utf8TwoPosToWchar(const wstring& w, size_t b1, size_t b2,
+                                  size_t& wa, size_t& wb)
+    {
+        // fused twin of Utf8PosToWcharIdx: resolves TWO 1-based UTF-8 byte
+        // positions to wchar indexes in ONE walk (callers used to pay
+        // Utf8LenOf + two Utf8PosToWcharIdx passes). Per-position semantics
+        // are identical to Utf8PosToWcharIdx: pos <= 1 → 1, a byte landing
+        // mid-codepoint clamps to the codepoint start, and a position past
+        // the byte end yields w.size() + 1. b2 may exceed any real position
+        // (e.g. (size_t)-1) to mean "to the end of the string".
+        wa = wb = w.size() + 1;
+        bool f1 = b1 <= 1, f2 = b2 <= 1;
+        if (f1) wa = 1;
+        if (f2) wb = 1;
+        if (f1 && f2) return;
+        size_t acc = 0;
+        for (size_t i = 0; i < w.size(); i++)
+        {
+            wchar_t c = w[i];
+            int n;
+            if (c < 0x80) n = 1;
+            else if (c < 0x800) n = 2;
+            else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < w.size() &&
+                     w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF)
+                n = 4;
+            else n = 3;
+            if (!f1 && acc + (size_t)n >= b1) { wa = i + 1; f1 = true; }
+            if (!f2 && acc + (size_t)n >= b2) { wb = i + 1; f2 = true; }
+            if (f1 && f2) return;
+            acc += (size_t)n;
+            if (n == 4) i++;
+        }
+    }
     static size_t Utf8LenOf(const wstring& w)
     {
-        if (w.empty()) return 0;
-        int cb = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
-                                     nullptr, 0, nullptr, nullptr);
-        return (size_t)max(cb, 0);
+        // single source of truth: the tight walk lives in common.h
+        // (Utf8ByteLenOf); keeping one copy avoids drift and lets #s,
+        // publish and other translation units share it.
+        return Utf8ByteLenOf(w);
+    }
+    static size_t CharLenOf(const wstring& w)
+    {
+        size_t count = 0;
+        for (size_t i = 0; i < w.size(); i++)
+        {
+            wchar_t c = w[i];
+            if (c >= 0xD800 && c <= 0xDBFF && i + 1 < w.size() && w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF)
+            {
+                i++;
+            }
+            count++;
+        }
+        return count;
+    }
+    static size_t CharPosToWcharIdx(const wstring& w, size_t charPos1)
+    {
+        if (charPos1 <= 1) return 1;
+        size_t cur = 1;
+        for (size_t i = 0; i < w.size(); i++)
+        {
+            if (cur == charPos1) return i + 1;
+            wchar_t c = w[i];
+            if (c >= 0xD800 && c <= 0xDBFF && i + 1 < w.size() && w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF)
+            {
+                i++;
+            }
+            cur++;
+        }
+        return w.size() + 1;
+    }
+    static void CharTwoPosToWchar(const wstring& w, size_t c1, size_t c2,
+                                  size_t& wa, size_t& wb)
+    {
+        // fused twin of CharPosToWcharIdx: resolves TWO 1-based codepoint
+        // positions to wchar indexes in ONE walk (callers used to pay
+        // CharLenOf + two CharPosToWcharIdx passes). Per-position semantics
+        // identical: pos <= 1 → 1, a position past the codepoint count
+        // yields w.size() + 1. c2 may exceed any real position to mean
+        // "to the end of the string".
+        wa = wb = w.size() + 1;
+        bool f1 = c1 <= 1, f2 = c2 <= 1;
+        if (f1) wa = 1;
+        if (f2) wb = 1;
+        if (f1 && f2) return;
+        size_t cur = 1; // 1-based codepoint index of w[i]
+        for (size_t i = 0; i < w.size(); i++)
+        {
+            if (!f1 && cur == c1) { wa = i + 1; f1 = true; }
+            if (!f2 && cur == c2) { wb = i + 1; f2 = true; }
+            if (f1 && f2) return;
+            wchar_t ch = w[i];
+            if (ch >= 0xD800 && ch <= 0xDBFF && i + 1 < w.size() &&
+                w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF)
+                i++;
+            cur++;
+        }
     }
 
     // raw memory bytes of a string value:
@@ -742,7 +859,7 @@ DWORD WINAPI ThreadWorkerProc(LPVOID pv)
     local->parent = wt.globals.self;
     Interp::GcFrameScope fsThread(wt, local);
     if (job->owner.t != Value::Null)
-        local->vars[L"owner"] = job->owner;
+        local->vars[IdOwner()] = job->owner;
 for (size_t i = 0; i < job->params.size(); i++)
     {
         if (job->params[i] == L"...")
@@ -759,10 +876,10 @@ for (size_t i = 0; i < job->params.size(); i++)
             }
             Value vD = tbV->arr.empty() ? Value() : Value::Table_(tbV);
             if (vD.tab) { vD.mrets = vargs; vD.bDots = true; }
-            local->vars[L"..."] = vD;
+            local->vars[IdDots()] = vD;
             break;
         }
-        local->vars[job->params[i]] =
+        local->vars[NameId(job->params[i])] =
             i < job->args.size() ? job->args[i] : Value();
     }
     wt.nReturn = 0;
@@ -1181,7 +1298,7 @@ void Interp::InitBuiltins()
         {
             // ---- global call() builtin: call(fn, owner, ...)
             // returns ok, ret (metaProperty machinery depends on it)
-            globals.vars[L"call"] =
+            globals.vars[NameId(L"call")] =
                 NF([this](vector<Value>& a) -> Value {
                 auto finish = [this](bool ok, Value r) -> Value {
                     Value vOk = Value::Bool_(ok);
@@ -1232,7 +1349,8 @@ void Interp::InitBuiltins()
                     return Value::Str_(BStr(a[0])); });
                 tb->map[L"charAt"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t == Value::Null) return Value();
-                    wstring s = BStr(a[0]);
+                    wstring t0;
+                    const wstring& s = BStrRef(a[0], t0);
                     long long pos = a.size() > 1 ? (long long)BNum(a[1]) : 1;
                     if (pos < 0) pos = (long long)s.size() + pos + 1;
                     if (pos < 1 || (size_t)pos > s.size()) return Value();
@@ -1240,9 +1358,18 @@ void Interp::InitBuiltins()
                 });
                 // string.repeat(s,n) — repeat the string n times
                 tb->map[L"repeat"] = NF([](vector<Value>& a) -> Value {
-                    wstring s = BStr(a[0]);
+                    wstring t0;
+                    const wstring& s = BStrRef(a[0], t0);
                     long long n = a.size() > 1 ? (long long)BNum(a[1]) : 1;
                     wstring out;
+                    if (n > 0 && !s.empty())
+                    {
+                        // single allocation instead of log-growth reallocs
+                        unsigned long long total =
+                            (unsigned long long)n * s.size();
+                        if (total < (unsigned long long)out.max_size())
+                            out.reserve((size_t)total);
+                    }
                     for (long long i = 0; i < n; i++)
                         out += s;
                     return Value::Str_(out); });
@@ -1295,40 +1422,161 @@ void Interp::InitBuiltins()
                     {
                         if (v.t == Value::Null) continue;
                         bAny = true;
-                        out += v.ToString();
+                        // ToString() copies the whole string for Str args;
+                        // append the storage directly instead
+                        if (v.t == Value::Str) out += v.s;
+                        else out += v.ToString();
                     }
                     return bAny ? Value::Str_(out) : Value(); });
-                // string.sub(s,i,j) — 1-based UTF-8 BYTE positions,
-                // negative = from end (official contract: chars=false default)
+                // string.sub(s,i,j,chars=false) / string.slice(s,i,j,chars=false)
+                // official contract: 1-based index, negative = from end.
+                // chars = true: count in Unicode characters (codepoints); false: count in UTF-8 bytes.
                 tb->map[L"sub"] = NF([](vector<Value>& a) -> Value {
-                    wstring s = BStr(a[0]);
-                    size_t nb = Utf8LenOf(s);
-                    long long n = (long long)nb;
-                    long long st = a.size() > 1 ? (long long)BNum(a[1]) : 1;
-                    long long en = a.size() > 2 && a[2].t != Value::Null ? (long long)BNum(a[2]) : n;
-                    if (st < 0) st = n + st + 1;
-                    if (en < 0) en = n + en + 1;
-                    if (st < 1) st = 1;
-                    if (en > n) en = n;
-                    if (en < st) return Value::Str_(L"");
-                    if ((size_t)st > nb || (size_t)en > nb) return Value::Str_(L"");
-                    size_t wi = Utf8PosToWcharIdx(s, (size_t)st);
-                    size_t wj = Utf8PosToWcharIdx(s, (size_t)en + 1);
-                    if (wj > s.size() + 1) wj = s.size() + 1;
-                    if (wj <= wi) return Value::Str_(L"");
-                    return Value::Str_(s.substr(wi - 1, wj - wi)); });
+                    if (a.empty()) return Value::Str_(L"");
+                    wstring t0;
+                    const wstring& s = BStrRef(a[0], t0);
+                    bool bChars = false;
+                    long long st = 1;
+                    long long en = -1;
+                    bool hasEn = false;
+
+                    if (a.size() > 1) st = (long long)BNum(a[1]);
+                    if (a.size() > 2)
+                    {
+                        if (a[2].t == Value::Bool)
+                        {
+                            bChars = a[2].b;
+                        }
+                        else if (a[2].t != Value::Null)
+                        {
+                            en = (long long)BNum(a[2]);
+                            hasEn = true;
+                        }
+                    }
+                    if (a.size() > 3)
+                    {
+                        if (a[3].t == Value::Bool) bChars = a[3].b;
+                        else if (a[3].t == Value::Num) bChars = (a[3].n != 0);
+                    }
+
+                    if (bChars)
+                    {
+                        // fast path: both bounds positive → one fused walk
+                        // replaces CharLenOf + two CharPosToWcharIdx passes
+                        if (st >= 1 && (!hasEn || en >= 1))
+                        {
+                            long long enc = en;
+                            if (hasEn && enc > (long long)s.size())
+                                enc = (long long)s.size(); // cast guard; still > real codepoint count
+                            size_t wa, wb;
+                            CharTwoPosToWchar(s, (size_t)st,
+                                              hasEn ? (size_t)(enc + 1)
+                                                    : (size_t)-1, wa, wb);
+                            if (wa > s.size()) return Value::Str_(L""); // st past codepoint count
+                            if (wb <= wa) return Value::Str_(L"");      // en < st
+                            if (wb > s.size() + 1) wb = s.size() + 1;
+                            return Value::Str_(s.substr(wa - 1, wb - wa));
+                        }
+                        size_t nc = CharLenOf(s);
+                        long long n = (long long)nc;
+                        if (!hasEn) en = n;
+                        if (st < 0) st = n + st + 1;
+                        if (en < 0) en = n + en + 1;
+                        if (st < 1) st = 1;
+                        if (en > n) en = n;
+                        if (en < st || (size_t)st > nc) return Value::Str_(L"");
+                        size_t wi = CharPosToWcharIdx(s, (size_t)st);
+                        size_t wj = CharPosToWcharIdx(s, (size_t)en + 1);
+                        if (wj > s.size() + 1) wj = s.size() + 1;
+                        if (wj <= wi) return Value::Str_(L"");
+                        return Value::Str_(s.substr(wi - 1, wj - wi));
+                    }
+                    else
+                    {
+                        // fast path: both bounds positive → no negative-end
+                        // normalization, so one fused walk replaces the
+                        // Utf8LenOf + two Utf8PosToWcharIdx passes
+                        if (st >= 1 && (!hasEn || en >= 1))
+                        {
+                            long long enb = en;
+                            if (hasEn && enb > (long long)s.size() * 4)
+                                enb = (long long)s.size() * 4; // cast guard; still > real byte len
+                            size_t wa, wb;
+                            Utf8TwoPosToWchar(s, (size_t)st,
+                                              hasEn ? (size_t)(enb + 1)
+                                                    : (size_t)-1, wa, wb);
+                            if (wa > s.size()) return Value::Str_(L"");   // st past byte end
+                            if (wb <= wa) return Value::Str_(L"");        // en < st or same codepoint
+                            if (wb > s.size() + 1) wb = s.size() + 1;
+                            return Value::Str_(s.substr(wa - 1, wb - wa));
+                        }
+                        size_t nb = Utf8LenOf(s);
+                        long long n = (long long)nb;
+                        if (!hasEn) en = n;
+                        if (st < 0) st = n + st + 1;
+                        if (en < 0) en = n + en + 1;
+                        if (st < 1) st = 1;
+                        if (en > n) en = n;
+                        if (en < st || (size_t)st > nb) return Value::Str_(L"");
+                        size_t wi = Utf8PosToWcharIdx(s, (size_t)st);
+                        size_t wj = Utf8PosToWcharIdx(s, (size_t)en + 1);
+                        if (wj > s.size() + 1) wj = s.size() + 1;
+                        if (wj <= wi) return Value::Str_(L"");
+                        return Value::Str_(s.substr(wi - 1, wj - wi));
+                    }
+                });
                 tb->map[L"slice"] = tb->map[L"sub"];
-                // string.reverse(s)
+                // string.reverse(s) — per Unicode codepoint: surrogate
+                // pairs must stay intact (a raw wchar reverse would split
+                // every astral character into lone surrogates)
                 tb->map[L"reverse"] = NF([](vector<Value>& a) -> Value {
                     wstring s = BStr(a[0]);
-                    std::reverse(s.begin(), s.end());
-                    return Value::Str_(s); });
+                    wstring r;
+                    r.reserve(s.size());
+                    size_t i = s.size();
+                    while (i > 0)
+                    {
+                        if (i >= 2 && s[i - 1] >= 0xDC00 && s[i - 1] <= 0xDFFF &&
+                            s[i - 2] >= 0xD800 && s[i - 2] <= 0xDBFF)
+                        {
+                            r.push_back(s[i - 2]);
+                            r.push_back(s[i - 1]);
+                            i -= 2;
+                        }
+                        else
+                        {
+                            r.push_back(s[i - 1]);
+                            i--;
+                        }
+                    }
+                    return Value::Str_(r); });
                 tb->map[L"len"] = NF([](vector<Value>& a) {
-                    return Value::Num_((double)BStr(a[0]).size()); });
+                    if (a.empty()) return Value::Num_(0);
+                    wstring t0;
+                    const wstring& s = BStrRef(a[0], t0);
+                    bool bChars = true;
+                    if (a.size() > 1)
+                    {
+                        if (a[1].t == Value::Bool) bChars = a[1].b;
+                        else if (a[1].t == Value::Num) bChars = (a[1].n != 0);
+                    }
+                    if (bChars)
+                        return Value::Num_((double)CharLenOf(s));
+                    // byte mode: short strings arithmetic, long strings
+                    // SIMD kernel (same hybrid as the # operator)
+                    if (s.size() <= 1024)
+                        return Value::Num_((double)Utf8LenOf(s));
+                    {
+                        int cb = WideCharToMultiByte(CP_UTF8, 0, s.c_str(),
+                                                     (int)s.size(), nullptr, 0,
+                                                     nullptr, nullptr);
+                        return Value::Num_((double)max(cb, 0));
+                    } });
                 // string.charCodeAt(str, pos = 1) -> unicode code point
                 tb->map[L"charCodeAt"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t == Value::Null) return Value();
-                    wstring s = BStr(a[0]);
+                    wstring t0;
+                    const wstring& s = BStrRef(a[0], t0);
                     long long pos = a.size() > 1 ? (long long)BNum(a[1]) : 1;
                     if (pos < 1) return Value();
                     long long curChar = 1;
@@ -1357,51 +1605,146 @@ void Interp::InitBuiltins()
                 });
                 tb->map[L"left"] = NF([](vector<Value>& a) {
                     if (a.empty()) return Value::Str_(L"");
-                    wstring s = BStr(a[0]);
-                    size_t nb = Utf8LenOf(s);
+                    wstring t0;
+                    const wstring& s = BStrRef(a[0], t0);
                     double nK = a.size() > 1 ? BNum(a[1]) : 1;
-                    if (nK >= 0)
+                    bool bChars = false;
+                    if (a.size() > 2)
                     {
-                        size_t k = (size_t)nK;
-                        if (k >= nb) return Value::Str_(s);
-                        size_t wj = Utf8PosToWcharIdx(s, k + 1);
+                        if (a[2].t == Value::Bool) bChars = a[2].b;
+                        else if (a[2].t == Value::Num) bChars = (a[2].n != 0);
+                    }
+                    if (bChars)
+                    {
+                        // fast path: no CharLenOf pass needed — "c2 not
+                        // found by the fused walk" is exactly k >= count
+                        if (nK >= 0)
+                        {
+                            size_t k = (size_t)nK;
+                            size_t wa, wb;
+                            CharTwoPosToWchar(s, 1, k + 1, wa, wb);
+                            if (wb > s.size()) return Value::Str_(s);
+                            return Value::Str_(s.substr(0, wb - 1));
+                        }
+                        size_t nc = CharLenOf(s);
+                        long long drop = (long long)(-nK) - 1;
+                        if (drop < 0) drop = 0;
+                        if ((size_t)drop >= nc) return Value::Str_(L"");
+                        size_t wj = CharPosToWcharIdx(s, nc - (size_t)drop + 1);
                         return Value::Str_(s.substr(0, wj - 1));
                     }
-                    long long drop = (long long)(-nK) - 1;
-                    if (drop < 0) drop = 0;
-                    if ((size_t)drop >= nb) return Value::Str_(L"");
-                    size_t wj = Utf8PosToWcharIdx(s, nb - (size_t)drop + 1);
-                    return Value::Str_(s.substr(0, wj - 1)); });
+                    else
+                    {
+                        // fast path: no Utf8LenOf pass needed — "b2 not
+                        // found by the fused walk" is exactly k >= byte len
+                        if (nK >= 0)
+                        {
+                            size_t k = (size_t)nK;
+                            size_t wa, wb;
+                            Utf8TwoPosToWchar(s, 1, k + 1, wa, wb);
+                            if (wb > s.size()) return Value::Str_(s);
+                            return Value::Str_(s.substr(0, wb - 1));
+                        }
+                        size_t nb = Utf8LenOf(s);
+                        long long drop = (long long)(-nK) - 1;
+                        if (drop < 0) drop = 0;
+                        if ((size_t)drop >= nb) return Value::Str_(L"");
+                        size_t wj = Utf8PosToWcharIdx(s, nb - (size_t)drop + 1);
+                        return Value::Str_(s.substr(0, wj - 1));
+                    }
+                });
                 tb->map[L"right"] = NF([](vector<Value>& a) {
                     if (a.empty()) return Value::Str_(L"");
-                    wstring s = BStr(a[0]);
-                    size_t nb = Utf8LenOf(s);
+                    wstring t0;
+                    const wstring& s = BStrRef(a[0], t0);
                     double nK = a.size() > 1 ? BNum(a[1]) : 1;
-                    if (nK >= 0)
+                    bool bChars = false;
+                    if (a.size() > 2)
                     {
-                        size_t k = (size_t)nK;
-                        if (k >= nb) return Value::Str_(s);
-                        size_t wi = Utf8PosToWcharIdx(s, nb - k + 1);
+                        if (a[2].t == Value::Bool) bChars = a[2].b;
+                        else if (a[2].t == Value::Num) bChars = (a[2].n != 0);
+                    }
+                    if (bChars)
+                    {
+                        size_t nc = CharLenOf(s);
+                        if (nK >= 0)
+                        {
+                            size_t k = (size_t)nK;
+                            if (k >= nc) return Value::Str_(s);
+                            size_t wi = CharPosToWcharIdx(s, nc - k + 1);
+                            return Value::Str_(s.substr(wi - 1));
+                        }
+                        long long start = (long long)(-nK) - 1;
+                        if (start < 0) start = 0;
+                        if ((size_t)start >= nc) return Value::Str_(L"");
+                        size_t wi = CharPosToWcharIdx(s, (size_t)start + 1);
                         return Value::Str_(s.substr(wi - 1));
                     }
-                    long long start = (long long)(-nK) - 1;
-                    if (start < 0) start = 0;
-                    if ((size_t)start >= nb) return Value::Str_(L"");
-                    size_t wi = Utf8PosToWcharIdx(s, (size_t)start + 1);
-                    return Value::Str_(s.substr(wi - 1)); });
+                    else
+                    {
+                        // reverse walk: accumulate byte counts from the tail
+                        // until k bytes are covered — replaces Utf8LenOf +
+                        // Utf8PosToWcharIdx (2 full passes) with an O(k)
+                        // walk, and "never reaches k" means k >= byte len.
+                        if (nK >= 0)
+                        {
+                            size_t k = (size_t)nK;
+                            if (k == 0) return Value::Str_(L"");
+                            size_t acc = 0;
+                            size_t i = s.size();
+                            while (i > 0)
+                            {
+                                size_t wstart = i - 1;
+                                wchar_t c = s[wstart];
+                                size_t n;
+                                if (c < 0x80) n = 1;
+                                else if (c < 0x800) n = 2;
+                                else n = 3;
+                                // scanning backwards, a pair is detected by
+                                // the LOW surrogate looking at its HIGH
+                                // predecessor (mirror of the forward walk)
+                                if (c >= 0xDC00 && c <= 0xDFFF && wstart > 0 &&
+                                    s[wstart - 1] >= 0xD800 &&
+                                    s[wstart - 1] <= 0xDBFF)
+                                { n = 4; wstart--; }
+                                acc += n;
+                                if (acc >= k)
+                                    return Value::Str_(s.substr(wstart));
+                                i = wstart;
+                            }
+                            return Value::Str_(s);
+                        }
+                        // negative: drop |k|-1 bytes from the head; the
+                        // walk's past-the-end outcome (wi > size) is exactly
+                        // start >= byte length, so no Utf8LenOf pass either
+                        long long start = (long long)(-nK) - 1;
+                        if (start < 0) start = 0;
+                        size_t wi = Utf8PosToWcharIdx(s, (size_t)start + 1);
+                        if (wi > s.size()) return Value::Str_(L"");
+                        return Value::Str_(s.substr(wi - 1));
+                    }
+                });
                 tb->map[L"mid"] = NF([](vector<Value>& a) {
-                    wstring s = BStr(a[0]);
-                    size_t nb = Utf8LenOf(s);
+                    if (a.empty()) return Value::Str_(L"");
+                    wstring t0;
+                    const wstring& s = BStrRef(a[0], t0);
                     long long st = (long long)BNum(a[1]); if (st < 1) st = 1;
                     long long ct = a.size() > 2 ? (long long)BNum(a[2]) : -1;
-                    if (ct < 0 || (size_t)(st - 1 + ct) > nb)
-                        ct = (long long)nb - (st - 1);
-                    if (ct < 0 || (size_t)st > nb) return Value::Str_(L"");
-                    size_t wi = Utf8PosToWcharIdx(s, (size_t)st);
-                    size_t wj = Utf8PosToWcharIdx(s, (size_t)(st + ct));
-                    if (wj > s.size() + 1) wj = s.size() + 1;
-                    if (wj <= wi) return Value::Str_(L"");
-                    return Value::Str_(s.substr(wi - 1, wj - wi)); });
+                    // fused single walk replaces Utf8LenOf + two
+                    // Utf8PosToWcharIdx passes (mid has no negative bounds)
+                    long long ub = (long long)s.size() * 4;
+                    if (st > ub) st = ub + 1; // beyond any byte length
+                    size_t b2;
+                    if (ct < 0 || ct > ub - st)
+                        b2 = (size_t)-1; // to the end of the string
+                    else
+                        b2 = (size_t)(st + ct);
+                    size_t wa, wb;
+                    Utf8TwoPosToWchar(s, (size_t)st, b2, wa, wb);
+                    if (wa > s.size()) return Value::Str_(L"");
+                    if (wb <= wa) return Value::Str_(L"");
+                    if (wb > s.size() + 1) wb = s.size() + 1;
+                    return Value::Str_(s.substr(wa - 1, wb - wa)); });
                 tb->map[L"upper"] = NF([](vector<Value>& a) {
                     wstring s = BStr(a[0]);
                     for (auto& c : s) c = (wchar_t)towupper(c);
@@ -1566,15 +1909,30 @@ void Interp::InitBuiltins()
                     }
                     return Value::Num_((double)(crc ^ 0xFFFFFFFFu));
                 });
-                // string.indexOf / lastIndexOf(s, sub, from?) — 1-based
-                // position or null; plain search (no pattern)
-                tb->map[L"lastIndexOf"] =
+                // string.lastIndexOf(s, sub, from?) — last 1-based UTF-8
+                // BYTE position or null; plain search (no pattern).
+                // `from` is a 1-based inclusive byte position bounding the
+                // match start (matches starting after it are ignored);
+                // out-of-range `from` clamps to the string end.
                 tb->map[L"lastIndexOf"] =
                     NF([](vector<Value>& a) -> Value {
-                    wstring s = BStr(a[0]), sub = BStr(a[1]);
-                    size_t pos = s.rfind(sub);
+                    wstring t0, t1;
+                    const wstring& s = BStrRef(a[0], t0);
+                    const wstring& sub = BStrRef(a[1], t1);
+                    size_t maxStartW = wstring::npos;
+                    if (a.size() > 2 && a[2].t != Value::Null)
+                    {
+                        size_t from = (size_t)BNum(a[2]);
+                        if (from < 1) from = 1;
+                        if (from > Utf8LenOf(s) + 1)
+                            from = Utf8LenOf(s) + 1;
+                        maxStartW = Utf8PosToWcharIdx(s, from) - 1;
+                    }
+                    size_t pos = maxStartW == wstring::npos
+                        ? s.rfind(sub)
+                        : s.rfind(sub, maxStartW);
                     if (pos == wstring::npos) return Value();
-                    return Value::Num_((double)(pos + 1)); });
+                    return Value::Num_((double)WcharToUtf8Pos(s, pos + 1)); });
                 // string.startsWith / endsWith(s, prefix/suffix, ci?)
                 tb->map[L"startsWith"] =
                     NF([](vector<Value>& a) -> Value {
@@ -1722,27 +2080,64 @@ void Interp::InitBuiltins()
                 tb->map[L"setUtf"] = NF([](vector<Value>& a) -> Value {
                     return a.empty() ? Value() : a[0]; });
                 tb->map[L"index"] = NF([](vector<Value>& a) {
-                    wstring s = BStr(a[0]), sub = BStr(a[1]);
+                    // official contract: indexOf(s, sub, from?) — 1-based
+                    // UTF-8 BYTE position or null; plain search (no
+                    // pattern). `from` is a 1-based inclusive byte
+                    // position, consistent with string.find/match and the
+                    // byte mode of string.sub/left/right.
+                    wstring t0, t1;
+                    const wstring& s = BStrRef(a[0], t0);
+                    const wstring& sub = BStrRef(a[1], t1);
                     size_t from = a.size() > 2 ? (size_t)BNum(a[2]) : 1;
-                    if (from < 1) from = 1;
-                    size_t pos = s.find(sub, from - 1);
+                    // skip the O(n) bounds/convert walks entirely for the
+                    // default from==1 shape (the common hot path)
+                    size_t startW = 0;
+                    if (from > 1)
+                    {
+                        if (from > Utf8LenOf(s) + 1) return Value();
+                        startW = Utf8PosToWcharIdx(s, from) - 1;
+                    }
+                    size_t pos = s.find(sub, startW);
                     if (pos == wstring::npos) return Value();
-                    return Value::Num_((double)(pos + 1)); });
+                    return Value::Num_((double)WcharToUtf8Pos(s, pos + 1)); });
                 tb->map[L"indexOf"] = tb->map[L"index"];
                 tb->map[L"find"] = NF([](vector<Value>& a) {
                     // official contract: find(s,p,init) -> start,end,
                     // capture1..N as multiple returns (`matchStart,
                     // matchEnd = string.find(...)` in the shipped lib);
                     // no match -> null. Positions are UTF-8 BYTES.
-                    wstring s = BStr(a[0]), pat = BStr(a[1]);
+                    wstring t0, t1;
+                    const wstring& s = BStrRef(a[0], t0);
+                    const wstring& pat = BStrRef(a[1], t1);
                     size_t startByte = a.size() > 2 ? (size_t)BNum(a[2]) : 1;
-                    if (startByte < 1) startByte = 1;
-                    if (startByte > Utf8LenOf(s) + 1) return Value();
-                    size_t start = Utf8PosToWcharIdx(s, startByte);
+                    // skip the O(n) bounds/convert walks for from==1
+                    size_t start = 1;
+                    if (startByte > 1)
+                    {
+                        if (startByte > Utf8LenOf(s) + 1) return Value();
+                        start = Utf8PosToWcharIdx(s, startByte);
+                    }
                     vector<vector<RE>> br; bool anchored = false;
                     int nGroups = 0; wstring perr;
                     if (!RECompile(pat, br, &anchored, &nGroups, &perr))
                         return Value();
+                    // literal fast path: no metacharacters → plain
+                    // substring search (memchr speed); the per-position
+                    // matcher measured ~24ns/position (33k-char tail
+                    // scan: 795us/call)
+                    if (nGroups == 0 && !anchored && REIsPlainLiteral(pat))
+                    {
+                        size_t pos = s.find(pat, start - 1);
+                        if (pos == wstring::npos) return Value();
+                        Value first = Value::Num_(
+                            (double)WcharToUtf8Pos(s, pos + 1));
+                        auto outs = std::make_shared<vector<Value>>();
+                        outs->push_back(Value::Num_((double)(
+                            WcharToUtf8Pos(s, pos + 1)
+                                + Utf8ByteLenOf(pat) - 1)));
+                        first.mrets = outs;
+                        return first;
+                    }
                     vector<wstring> caps; size_t end = 0;
                     for (size_t p0 = start - 1; p0 <= s.size(); p0++)
                     {
@@ -1769,15 +2164,29 @@ void Interp::InitBuiltins()
                     // captures as extra returns — `fence,lang,title =
                     // string.match(...)`; no match -> null.
                     // The @pos argument is a UTF-8 byte position.
-                    wstring s = BStr(a[0]), pat = BStr(a[1]);
+                    wstring t0, t1;
+                    const wstring& s = BStrRef(a[0], t0);
+                    const wstring& pat = BStrRef(a[1], t1);
                     size_t startByte = a.size() > 2 ? (size_t)BNum(a[2]) : 1;
-                    if (startByte < 1) startByte = 1;
-                    if (startByte > Utf8LenOf(s) + 1) return Value();
-                    size_t start = Utf8PosToWcharIdx(s, startByte);
+                    // skip the O(n) bounds/convert walks for from==1
+                    size_t start = 1;
+                    if (startByte > 1)
+                    {
+                        if (startByte > Utf8LenOf(s) + 1) return Value();
+                        start = Utf8PosToWcharIdx(s, startByte);
+                    }
                     vector<vector<RE>> br; bool anchored = false;
                     int nGroups = 0; wstring perr;
                     if (!RECompile(pat, br, &anchored, &nGroups, &perr))
                         return Value();
+                    // literal fast path (see string.find): plain substring
+                    // match, zero position conversions
+                    if (nGroups == 0 && !anchored && REIsPlainLiteral(pat))
+                    {
+                        size_t pos = s.find(pat, start - 1);
+                        if (pos == wstring::npos) return Value();
+                        return Value::Str_(s.substr(pos, pat.size()));
+                    }
                     vector<wstring> caps; size_t end = 0;
                     for (size_t p0 = start - 1; p0 <= s.size(); p0++)
                     {
@@ -2084,18 +2493,20 @@ void Interp::InitBuiltins()
                     wstring s = a.empty() ? wstring() : BStr(a[0]);
                     auto tb2 = std::make_shared<Table>();
                     if (s.empty()) return Value::Table_(tb2); // 空串 -> 长度 0 的数组
-                    // 第 2 参省略或为 null -> 逐字符拆分（UTF-8 码点）
+                    // 第 2 参省略或为 null -> 逐字符拆分（Unicode 码点，
+                    // 引擎字符串为 UTF-16：代理对保持完整，不能按 UTF-8
+                    // 首字节猜长度 —— 旧逻辑会把 π/ÿ/Emoji 错拆）
                     if (a.size() < 2 || a[1].t == Value::Null)
                     {
                         size_t i = 0;
                         while (i < s.size())
                         {
-                            unsigned char c = (unsigned char)s[i];
                             size_t n = 1;
-                            if (c >= 0xF0) n = 4;
-                            else if (c >= 0xE0) n = 3;
-                            else if (c >= 0xC0) n = 2;
-                            if (i + n > s.size()) n = 1;
+                            wchar_t c = s[i];
+                            if (c >= 0xD800 && c <= 0xDBFF &&
+                                i + 1 < s.size() &&
+                                s[i + 1] >= 0xDC00 && s[i + 1] <= 0xDFFF)
+                                n = 2;
                             tb2->arr.push_back(Value::Str_(s.substr(i, n)));
                             i += n;
                         }
@@ -2137,6 +2548,16 @@ void Interp::InitBuiltins()
                     int nGroups = 0; wstring perr;
                     if (!RECompile(f, br, &anchored, &nGroups, &perr))
                         return Value::Num_(0);
+                    // literal fast path: non-overlapping memchr-speed
+                    // counting (same rationale as string.find)
+                    if (nGroups == 0 && !anchored && REIsPlainLiteral(f))
+                    {
+                        long long cLit = 0;
+                        for (size_t p1 = s.find(f); p1 != wstring::npos;
+                             p1 = s.find(f, p1 + f.size()))
+                            cLit++;
+                        return Value::Num_((double)cLit);
+                    }
                     long long c = 0;
                     size_t p0 = 0;
                     while (p0 <= s.size())
@@ -2157,6 +2578,10 @@ void Interp::InitBuiltins()
                 tb->map[L"rep"] = NF([](vector<Value>& a) {
                     wstring s = BStr(a[0]); long long k = (long long)BNum(a[1]);
                     wstring r;
+                    // single allocation instead of geometric regrowth
+                    if (k > 0 && !s.empty() &&
+                        (unsigned long long)k * s.size() < (1ull << 30))
+                        r.reserve((size_t)((unsigned long long)k * s.size()));
                     for (long long i = 0; i < k; i++) r += s;
                     return Value::Str_(r); });
                 tb->map[L"toUtf16"] = NF([](vector<Value>& a) -> Value {
@@ -4833,7 +5258,7 @@ void Interp::InitBuiltins()
                 timeMeta->map[L"_timeCtor"] = timeCtor;
                 tb->map[L"_call"] = timeCtor;
                 tb->map[L"_meta"] = Value::Table_(timeMeta);
-                globals.vars[L"time"] = Value::Table_(tb);
+                globals.vars[NameId(L"time")] = Value::Table_(tb);
                 roots[L"time"] = Value::Table_(tb);
 
                 tb->map[L"is"] = NF([](vector<Value>& a) -> Value {
@@ -5521,7 +5946,12 @@ void Interp::InitBuiltins()
                         if (a2[0].t == Value::Pointer)
                             fp = (FARPROC)a2[0].ptr;
                         else if (a2[0].t == Value::Num)
-                            fp = (FARPROC)(INT_PTR)a2[0].n;
+                        {
+                            if (hMod && a2[0].n > 0 && a2[0].n < 65536)
+                                fp = ::GetProcAddress(hMod, MAKEINTRESOURCEA((WORD)(INT_PTR)a2[0].n));
+                            else
+                                fp = (FARPROC)(INT_PTR)a2[0].n;
+                        }
                         else
                         {
                             strName = BStr(a2[0]);
@@ -7263,14 +7693,14 @@ void Interp::InitBuiltins()
                     vector<Value> ua{ Value::Str_(L"User32.dll") };
                     if (uDll.native)
                     {
-                        globals.vars[L"User32"] = uDll.native(ua);
-                        roots[L"User32"] = globals.vars[L"User32"];
+                        globals.vars[NameId(L"User32")] = uDll.native(ua);
+                        roots[L"User32"] = globals.vars[NameId(L"User32")];
                     }
                     vector<Value> ka{ Value::Str_(L"Kernel32.dll") };
                     if (uDll.native)
                     {
-                        globals.vars[L"Kernel32"] = uDll.native(ka);
-                        roots[L"Kernel32"] = globals.vars[L"Kernel32"];
+                        globals.vars[NameId(L"Kernel32")] = uDll.native(ka);
+                        roots[L"Kernel32"] = globals.vars[NameId(L"Kernel32")];
                     }
                     // Preload common system library roots (::Shell32 / ::Gdi32 / ::Comctl32)
                     // crtReopen() uses ::Msvcrt to reopen
@@ -7292,7 +7722,7 @@ void Interp::InitBuiltins()
                                 return Value::Pointer_(pf); });
                             dv.tab->map[L"_open_osfhandle"] = NF([](vector<Value>&) -> Value {
                                 return Value::Num_(-1.0); });
-                            globals.vars[L"Msvcrt"] = dv;
+                            globals.vars[NameId(L"Msvcrt")] = dv;
                             roots[L"Msvcrt"] = dv;
                         }
                     }
@@ -7309,7 +7739,7 @@ void Interp::InitBuiltins()
                         Value dv = uDll.native(da);
                         wstring nm(DLLS[di]);
                         nm = nm.substr(0, nm.size() - 4);
-                        globals.vars[nm] = dv;
+                        globals.vars[NameId(nm)] = dv;
                         roots[nm] = dv;
                     }
                 }
@@ -7406,8 +7836,8 @@ void Interp::InitBuiltins()
                 tb->map[L"callback"] = fnCallback;
                 tb->map[L"tostdcall"] = fnCallback;
                 tb->map[L"tocdecl"] = fnTocdecl;
-                globals.vars[L"tostdcall"] = fnCallback;
-                globals.vars[L"tocdecl"] = fnTocdecl;
+                globals.vars[NameId(L"tostdcall")] = fnCallback;
+                globals.vars[NameId(L"tocdecl")] = fnTocdecl;
 
                 auto tbThread = GetRoot(L"thread").tab;
                 if (tbThread)
@@ -7630,8 +8060,8 @@ void Interp::InitBuiltins()
                 });
                 tb->map[L"isArray"] = fnIsArray;
                 tb->map[L"isArrayLike"] = fnIsArray;
-                globals.vars[L"isArray"] = fnIsArray;
-                globals.vars[L"isArrayLike"] = fnIsArray;
+                globals.vars[NameId(L"isArray")] = fnIsArray;
+                globals.vars[NameId(L"isArrayLike")] = fnIsArray;
                 tb->map[L"append"] = NF([](vector<Value>& a) {
                     // official contract (pinned by the official testCase):
                     // table.append(arr, v1, v2, ...) appends EVERY arg;
@@ -7671,7 +8101,7 @@ void Interp::InitBuiltins()
                     return Value::Num_((double)t->arr.size());
                 });
                 tb->map[L"push"] = fnPush;
-                globals.vars[L"push"] = fnPush;
+                globals.vars[NameId(L"push")] = fnPush;
 
                 // table.unpack(t[, from[, to]]) / table.unpackArgs(t) —
                 // expand the array part as extra return values (popen.read,
@@ -7971,7 +8401,7 @@ void Interp::InitBuiltins()
                     return v;
                 });
                 tb->map[L"pop"] = fnPop;
-                globals.vars[L"pop"] = fnPop;
+                globals.vars[NameId(L"pop")] = fnPop;
 
                 auto fnSplice = NF([](vector<Value>& a) -> Value {
                     auto res = std::make_shared<Table>();
@@ -7995,7 +8425,7 @@ void Interp::InitBuiltins()
                     return Value::Table_(res);
                 });
                 tb->map[L"splice"] = fnSplice;
-                globals.vars[L"splice"] = fnSplice;
+                globals.vars[NameId(L"splice")] = fnSplice;
                 // ---- round 43: array ops ----
                 // table.insert(t, val, pos=1) — in official standard library:
                 //   table.insert(t, val) -> inserts val at position 1 (head of table)
@@ -8410,19 +8840,19 @@ void Interp::InitBuiltins()
                 // a function it runs under the lock and returns its results;
                 // without one it acquires the lock until thread.unlock(name).
                 static std::mutex g_lockMapMutex;
-                static std::map<wstring, std::shared_ptr<std::mutex>>
+                static std::map<wstring, std::shared_ptr<std::recursive_mutex>>
                     g_namedLocks;
                 tb->map[L"lock"] = NF([this](vector<Value>& a) -> Value {
                     if (a.empty())
                         return Value();
                     wstring nm = BStr(a[0]);
-                    std::shared_ptr<std::mutex> m;
+                    std::shared_ptr<std::recursive_mutex> m;
                     {
                         std::lock_guard<std::mutex> g(g_lockMapMutex);
                         auto it = g_namedLocks.find(nm);
                         if (it == g_namedLocks.end())
                         {
-                            m = std::make_shared<std::mutex>();
+                            m = std::make_shared<std::recursive_mutex>();
                             g_namedLocks[nm] = m;
                         }
                         else
@@ -8430,7 +8860,7 @@ void Interp::InitBuiltins()
                     }
                     if (a.size() > 1 && a[1].t == Value::Func)
                     {
-                        std::lock_guard<std::mutex> g(*m);
+                        std::lock_guard<std::recursive_mutex> g(*m);
                         vector<Value> args;
                         for (size_t i = 2; i < a.size(); i++)
                             args.push_back(a[i]);
@@ -8448,7 +8878,7 @@ void Interp::InitBuiltins()
                 tb->map[L"unlock"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty())
                         return Value::Bool_(false);
-                    std::shared_ptr<std::mutex> m;
+                    std::shared_ptr<std::recursive_mutex> m;
                     {
                         std::lock_guard<std::mutex> g(g_lockMapMutex);
                         auto it = g_namedLocks.find(BStr(a[0]));
@@ -8497,7 +8927,7 @@ void Interp::InitBuiltins()
                 // "input satisfied" returns WAIT_OBJECT_0+count (the
                 // caller then pumps and retries); without one it is a
                 // plain WaitForMultipleObjects.
-                globals.vars[L"__waitForMultipleObjects"] =
+                globals.vars[NameId(L"__waitForMultipleObjects")] =
                     NF([](vector<Value>& a) -> Value {
                         if (a.size() < 3)
                             return Value::Num_(0xFFFFFFFF);
@@ -8546,6 +8976,19 @@ void Interp::InitBuiltins()
                     tb->map[L"time"] = Value::Num_((double)m.time);
                     tb->map[L"x"] = Value::Num_((double)m.pt.x);
                     tb->map[L"y"] = Value::Num_((double)m.pt.y);
+                    // The message table doubles as a native MSG struct:
+                    // official win.parseMessage hands it to
+                    // win.isDialogMessage(root,msg), whose signature declares
+                    // the 2nd parameter as `struct msg` (passed by value).
+                    // The official pump fills a PLAIN table ({}), so it has no
+                    // struct metadata of its own — without this the FFI has
+                    // no layout to marshal and passes NULL → IsDialogMessageW
+                    // reads address 0 and kills the process on the first key
+                    // press. This is the x64-native MSG layout (48 bytes).
+                    if (tb->map.find(L"_struct") == tb->map.end())
+                        tb->map[L"_struct"] = Value::Str_(
+                            L"addr hwnd;INT message;ADDR wParam;addr lParam;"
+                            L"INT time;int x;int y;");
                     return Value::Table_(tb);
                 };
                 auto msgHwnd = [](vector<Value>& a) -> HWND {
@@ -8564,7 +9007,7 @@ void Interp::InitBuiltins()
                 // returns the MSG table, false when the queue is empty,
                 // null on WM_QUIT (table still filled so callers can read
                 // the exit code)
-                globals.vars[L"__messagePeek"] =
+                globals.vars[NameId(L"__messagePeek")] =
                     NF([fillMsgTable, msgHwnd, msgRange](
                            vector<Value>& a) -> Value {
                         MSG m;
@@ -8581,7 +9024,7 @@ void Interp::InitBuiltins()
                 // getMessage: blocking GetMessageW; an explicit PM_NOREMOVE
                 // option switches to a non-blocking PeekMessageW that
                 // returns false when no message is queued
-                globals.vars[L"__messageGet"] =
+                globals.vars[NameId(L"__messageGet")] =
                     NF([fillMsgTable, msgHwnd, msgRange](
                            vector<Value>& a) -> Value {
                         MSG m;
@@ -8606,7 +9049,7 @@ void Interp::InitBuiltins()
                         return vMsg;
                     });
                 // translate+dispatch a MSG table fetched by peek/get
-                globals.vars[L"__messageTranslateDispatch"] =
+                globals.vars[NameId(L"__messageTranslateDispatch")] =
                     NF([](vector<Value>& a) -> Value {
                         if (a.empty() || a[0].t != Value::TableT ||
                             !a[0].tab)
@@ -8944,8 +9387,19 @@ void Interp::InitBuiltins()
                     int cx = bNoSize ? 0 : (int)BNum(a[3]);
                     int cy = (!bNoSize && a.size() > 4) ? (int)BNum(a[4]) : 0;
                     HWND after = nullptr;
-                    if (a.size() > 5 && a[5].t == Value::Pointer)
-                        after = (HWND)a[5].ptr;
+                    // after 参数（hWndInsertAfter）两种写法都要认：
+                    //   · 指针型：topointer(1) / topointer(0)
+                    //   · 数值型：1 = _HWND_BOTTOM，0 = _HWND_TOP
+                    // 以前只认指针型 → 传数值 1 会被当成「没传」，
+                    // after 退回 nullptr(=HWND_TOP)，
+                    // 「把窗口压到最底」实际变成了「提到最顶」。
+                    if (a.size() > 5)
+                    {
+                        if (a[5].t == Value::Pointer)
+                            after = (HWND)a[5].ptr;
+                        else if (a[5].t == Value::Num)
+                            after = (HWND)(INT_PTR)(long long)BNum(a[5]);
+                    }
                     UINT flag = 0;
                     if (a.size() > 6 && a[6].t == Value::Num)
                         flag = (UINT)(long long)BNum(a[6]);
@@ -9298,6 +9752,7 @@ void Interp::InitBuiltins()
                         }
                         SendMessageW(hC, WM_SETFONT, (WPARAM)hGui, TRUE);
                         fs->hCtrl[nId] = hC;
+                        fs->hCtrlRev[hC] = nId;
                         auto ctrl = std::make_shared<Table>();
                         if (strCls == L"checkbox" || strCls == L"radio")
                         {
@@ -9533,6 +9988,7 @@ void Interp::InitBuiltins()
                         // hook: keep the id in the value so dispatch can
                         // resolve; store id on the control table
                         ctrl->map[L"_id"] = Value::Num_((double)nId);
+                        ctrl->map[L"id"] = Value::Num_((double)nId);
                         fs->callbacks[nId] = NF([fs, nId, this](
                             vector<Value>&) -> Value {
                             auto ic = fs->ctrls.find(nId);
@@ -9577,7 +10033,7 @@ void Interp::InitBuiltins()
             }
 
             // first-class scalar builtins (also reachable via fast paths)
-            globals.vars[L"tostring"] = NF([](vector<Value>& a) {
+            globals.vars[NameId(L"tostring")] = NF([](vector<Value>& a) {
                 if (a.empty()) return Value::Str_(L"null");
                 Interp* it = g_interpCurrent;
                 if (it && a[0].t == Value::TableT && a[0].tab)
@@ -9678,9 +10134,9 @@ void Interp::InitBuiltins()
                 }
                 return Value();
             });
-            globals.vars[L"type"] = vType;
+            globals.vars[NameId(L"type")] = vType;
             roots[L"type"] = vType;
-            globals.vars[L"topointer"] = NF([this](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"topointer")] = NF([this](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t == Value::Null) return Value::Pointer_(nullptr);
                 INT_PTR offset = a.size() > 1 ? (INT_PTR)(long long)BNum(a[1]) : 0;
                 if (a[0].t == Value::Pointer) return Value::Pointer_((char*)a[0].ptr + offset);
@@ -9828,22 +10284,22 @@ void Interp::InitBuiltins()
                 }
                 return Value();
             });
-            globals.vars[L"tonumber"] = fnToNumber;
+            globals.vars[NameId(L"tonumber")] = fnToNumber;
             roots[L"tonumber"] = fnToNumber;
-            globals.vars[L"sleep"] = NF([](vector<Value>& a) {
+            globals.vars[NameId(L"sleep")] = NF([](vector<Value>& a) {
                 if (!a.empty()) Sleep((DWORD)BNum(a[0]));
                 return Value(); });
-            globals.vars[L"_HINSTANCE"] = Value::Pointer_(GetModuleHandleW(nullptr));
-            globals.vars[L"_HAPPICON"] = Value::Pointer_(LoadIconW(nullptr, IDI_APPLICATION));
-            globals.vars[L"_INVALID_HANDLE_VALUE"] = Value::Pointer_(INVALID_HANDLE_VALUE);
-            roots[L"_HINSTANCE"] = globals.vars[L"_HINSTANCE"];
-            roots[L"_HAPPICON"] = globals.vars[L"_HAPPICON"];
-            roots[L"_INVALID_HANDLE_VALUE"] = globals.vars[L"_INVALID_HANDLE_VALUE"];
+            globals.vars[NameId(L"_HINSTANCE")] = Value::Pointer_(GetModuleHandleW(nullptr));
+            globals.vars[NameId(L"_HAPPICON")] = Value::Pointer_(LoadIconW(nullptr, IDI_APPLICATION));
+            globals.vars[NameId(L"_INVALID_HANDLE_VALUE")] = Value::Pointer_(INVALID_HANDLE_VALUE);
+            roots[L"_HINSTANCE"] = globals.vars[NameId(L"_HINSTANCE")];
+            roots[L"_HAPPICON"] = globals.vars[NameId(L"_HAPPICON")];
+            roots[L"_INVALID_HANDLE_VALUE"] = globals.vars[NameId(L"_INVALID_HANDLE_VALUE")];
             {
                 BOOL isWow64 = FALSE;
                 IsWow64Process(GetCurrentProcess(), &isWow64);
                 bool bWin64 = (sizeof(void*) == 8) || (isWow64 != FALSE);
-                globals.vars[L"_WIN_64"] = Value::Bool_(bWin64);
+                globals.vars[NameId(L"_WIN_64")] = Value::Bool_(bWin64);
                 roots[L"_WIN_64"] = Value::Bool_(bWin64);
 
                 typedef void (WINAPI *RtlGetNtVersionNumbersFn)(DWORD*, DWORD*, DWORD*);
@@ -9856,19 +10312,19 @@ void Interp::InitBuiltins()
                         DWORD dwMajor = 0, dwMinor = 0, dwBuild = 0;
                         fnRtl(&dwMajor, &dwMinor, &dwBuild);
                         dwBuild &= 0xFFFF;
-                        globals.vars[L"_WIN_VER_MAJOR"] = Value::Num_(dwMajor);
-                        globals.vars[L"_WIN_VER_MINOR"] = Value::Num_(dwMinor);
-                        globals.vars[L"_WIN_VER_BUILD"] = Value::Num_(dwBuild);
-                        roots[L"_WIN_VER_MAJOR"] = globals.vars[L"_WIN_VER_MAJOR"];
-                        roots[L"_WIN_VER_MINOR"] = globals.vars[L"_WIN_VER_MINOR"];
-                        roots[L"_WIN_VER_BUILD"] = globals.vars[L"_WIN_VER_BUILD"];
+                        globals.vars[NameId(L"_WIN_VER_MAJOR")] = Value::Num_(dwMajor);
+                        globals.vars[NameId(L"_WIN_VER_MINOR")] = Value::Num_(dwMinor);
+                        globals.vars[NameId(L"_WIN_VER_BUILD")] = Value::Num_(dwBuild);
+                        roots[L"_WIN_VER_MAJOR"] = globals.vars[NameId(L"_WIN_VER_MAJOR")];
+                        roots[L"_WIN_VER_MINOR"] = globals.vars[NameId(L"_WIN_VER_MINOR")];
+                        roots[L"_WIN_VER_BUILD"] = globals.vars[NameId(L"_WIN_VER_BUILD")];
 
                         bool bWinXP = (dwMajor < 6);
                         bool bWin7Later = (dwMajor > 6 || (dwMajor == 6 && dwMinor >= 1));
                         bool bWin10Later = (dwMajor >= 10);
-                        globals.vars[L"_WINXP"] = Value::Bool_(bWinXP);
-                        globals.vars[L"_WIN7_LATER"] = Value::Bool_(bWin7Later);
-                        globals.vars[L"_WIN10_LATER"] = Value::Bool_(bWin10Later);
+                        globals.vars[NameId(L"_WINXP")] = Value::Bool_(bWinXP);
+                        globals.vars[NameId(L"_WIN7_LATER")] = Value::Bool_(bWin7Later);
+                        globals.vars[NameId(L"_WIN10_LATER")] = Value::Bool_(bWin10Later);
                         roots[L"_WINXP"] = Value::Bool_(bWinXP);
                         roots[L"_WIN7_LATER"] = Value::Bool_(bWin7Later);
                         roots[L"_WIN10_LATER"] = Value::Bool_(bWin10Later);
@@ -9885,7 +10341,7 @@ void Interp::InitBuiltins()
                         buf.tab->map[L"_meta"] = a[0];
                     return buf;
                 });
-                globals.vars[L"gcdata"] = fnGcData;
+                globals.vars[NameId(L"gcdata")] = fnGcData;
                 roots[L"gcdata"] = fnGcData;
             }
 
@@ -9937,7 +10393,7 @@ void Interp::InitBuiltins()
                     auto it = roots.find(k);
                     if (it != roots.end())
                         return it->second;
-                    auto ig = globals.vars.find(k);
+                    auto ig = globals.vars.find(NameId(k));
                     if (ig != globals.vars.end())
                         return ig->second;
                     {
@@ -9951,7 +10407,7 @@ void Interp::InitBuiltins()
                 gmeta->map[L"_set"] = NF([this](vector<Value>& a) -> Value {
                     if (a.size() < 2 || a[0].t != Value::Str)
                         return Value();
-                    globals.vars[a[0].s] = a[1];
+                    globals.vars[NameId(a[0].s)] = a[1];
                     roots[a[0].s] = a[1];
                     {
                         std::lock_guard<std::recursive_mutex> lk(g_threadSharedMutex);
@@ -9963,8 +10419,8 @@ void Interp::InitBuiltins()
                 gtab->map[L"self"] = Value::Table_(gtab);
                 roots[L"global"] = Value::Table_(gtab);
                 roots[L"self"] = Value::Table_(gtab);
-                globals.vars[L"global"] = Value::Table_(gtab);
-                globals.vars[L"self"] = Value::Table_(gtab);
+                globals.vars[NameId(L"global")] = Value::Table_(gtab);
+                globals.vars[IdSelf()] = Value::Table_(gtab);
 
                 // ---- the (debug) introspection module ----
                 auto dbg = std::make_shared<Table>();
@@ -10004,16 +10460,16 @@ void Interp::InitBuiltins()
             }
 
             // ---- fibers (纤程): create / resume / yield / status ----
-            globals.vars[L"create"] = NF([](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"create")] = NF([](vector<Value>& a) -> Value {
                 return a.empty() ? Value() : FiberCreate(a[0]); });
-            globals.vars[L"resume"] = NF([](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"resume")] = NF([](vector<Value>& a) -> Value {
                 if (a.empty())
                     return Value();
                 vector<Value> args;
                 for (size_t i = 1; i < a.size(); i++)
                     args.push_back(a[i]);
                 return FiberResume(a[0], args, nullptr); });
-            globals.vars[L"yield"] = NF([](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"yield")] = NF([](vector<Value>& a) -> Value {
                 vector<Value> args;
                 for (auto& v : a) args.push_back(v);
                 return FiberYield(args); });
@@ -10094,7 +10550,7 @@ void Interp::InitBuiltins()
                 return f;
             };
             // print(...) — each argument through tostring, then io.print
-            globals.vars[L"print"] = NF([](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"print")] = NF([](vector<Value>& a) -> Value {
                 wstring out;
                 for (size_t i = 0; i < a.size(); i++)
                 {
@@ -10117,7 +10573,7 @@ void Interp::InitBuiltins()
                 return Value(); });
             // assert(value,message,...) — truthy: return all arguments;
             // falsy: throw @message
-            globals.vars[L"assert"] = NF([this](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"assert")] = NF([this](vector<Value>& a) -> Value {
                 if (!a.empty() && a[0].Truthy())
                 {
                     if (a.size() > 1)
@@ -10140,7 +10596,7 @@ void Interp::InitBuiltins()
             // `assert2(2, resume(fib))` yields the resumed values (the
             // fiber.generator iterator relies on this to
             // hand for-in the yielded value, not the ok flag)
-            globals.vars[L"assert2"] = NF([this](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"assert2")] = NF([this](vector<Value>& a) -> Value {
                 if (a.size() > 1 && a[1].Truthy())
                 {
                     if (a.size() > 2)
@@ -10160,7 +10616,7 @@ void Interp::InitBuiltins()
                 (*err) = L"运行错误: " + msg;
                 return Value(); });
             // assertf — inverse assertion: throws when the value is truthy
-            globals.vars[L"assertf"] = NF([this](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"assertf")] = NF([this](vector<Value>& a) -> Value {
                 if (!a.empty() && a[0].Truthy())
                 {
                     wstring msg = a.size() > 1 ? BStr(a[1])
@@ -10170,7 +10626,7 @@ void Interp::InitBuiltins()
                 }
                 return a.empty() ? Value() : a[0]; });
             // eval(codeString) — compiles and runs an expression immediately
-            globals.vars[L"eval"] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"eval")] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t != Value::Str)
                     return Value();
                 wstring src = BStr(a[0]);
@@ -10251,7 +10707,7 @@ void Interp::InitBuiltins()
                     return Value();
                 return r; });
             // loadcode(code|filepath) — a function object, or null + message
-            globals.vars[L"loadcode"] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"loadcode")] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t != Value::Str)
                     return Value();
                 wstring src = BStr(a[0]), text;
@@ -10294,7 +10750,7 @@ void Interp::InitBuiltins()
                 }
                 return MakeVmFunc(fn); });
             // loadcodex(code|filepath|function,...) — run now, return values
-            globals.vars[L"loadcodex"] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"loadcodex")] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
                 if (a.empty())
                     return Value();
                 Value f;
@@ -10345,7 +10801,7 @@ void Interp::InitBuiltins()
                     args.push_back(a[i]);
                 return this->CallVmFunc(f, args); });
             // reduce(array,reducer,initialValue)
-            globals.vars[L"reduce"] = NF([this](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"reduce")] = NF([this](vector<Value>& a) -> Value {
                 if (a.size() < 2 || a[0].t != Value::TableT || !a[0].tab)
                     return Value();
                 auto& arr = a[0].tab->arr;
@@ -10377,7 +10833,7 @@ void Interp::InitBuiltins()
                 }
                 return prev; });
             // switch(switchValue,caseTable,default,...)
-            globals.vars[L"switch"] = NF([this](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"switch")] = NF([this](vector<Value>& a) -> Value {
                 if (a.size() < 2 || a[1].t != Value::TableT || !a[1].tab)
                 {
                     (*err) = L"运行错误: switch 参数@2必须是表对象";
@@ -10405,7 +10861,7 @@ void Interp::InitBuiltins()
                     args.push_back(a[i]);
                 return this->CallVmFunc(fn, args); });
             // invoke(f,owner,...) — call with an explicit owner, errors throw
-            globals.vars[L"invoke"] = NF([this](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"invoke")] = NF([this](vector<Value>& a) -> Value {
                 if (a.empty())
                     return Value();
                 Value owner = a.size() > 1 ? a[1] : Value();
@@ -10414,7 +10870,7 @@ void Interp::InitBuiltins()
                     args.push_back(a[i]);
                 return this->CallOwner(a[0], owner, args); });
             // callex(errHandler, fn, owner, ...) — standard official signature
-            globals.vars[L"callex"] = NF([this](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"callex")] = NF([this](vector<Value>& a) -> Value {
                 if (a.empty())
                     return Value::Bool_(false);
                 Value handler;
@@ -10540,16 +10996,16 @@ void Interp::InitBuiltins()
                 }
                 return vRes;
             });
-            globals.vars[L"rget"] = fnRget;
+            globals.vars[NameId(L"rget")] = fnRget;
             roots[L"rget"] = fnRget;
             // execute(commandLine) — run a system command and wait
-            globals.vars[L"execute"] = NF([](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"execute")] = NF([](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t != Value::Str)
                     return Value();
                 int rc = _wsystem(BStr(a[0]).c_str());
                 return Value::Num_((double)rc); });
             // errput(message) — report without throwing
-            globals.vars[L"errput"] = NF([](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"errput")] = NF([](vector<Value>& a) -> Value {
                 wstring out;
                 for (size_t i = 0; i < a.size(); i++)
                 {
@@ -10570,16 +11026,16 @@ void Interp::InitBuiltins()
                     fflush(stderr);
                 }
                 return Value(); });
-            globals.vars[L"collectgarbage"] = NF([](vector<Value>&) -> Value {
+            globals.vars[NameId(L"collectgarbage")] = NF([](vector<Value>&) -> Value {
                 // run a full mark & sweep cycle now
                 Interp* p = g_interpCurrent;
                 if (p) p->CollectGarbage(nullptr);
                 return Value::Num_((double)(p ? p->nGCRuns : 0));
             });
-            globals.vars[L"__gcdump"] = NF([](vector<Value>&) -> Value {
+            globals.vars[NameId(L"__gcdump")] = NF([](vector<Value>&) -> Value {
                 GcDumpLive();
                 return Value(); });
-            globals.vars[L"setlocale"] = NF([](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"setlocale")] = NF([](vector<Value>& a) -> Value {
                 int cat = LC_ALL;
                 if (a.size() > 1 && a[0].t == Value::Num)
                     cat = (int)a[0].n;
@@ -10592,7 +11048,7 @@ void Interp::InitBuiltins()
                     return Value::Str_(buf);
                 return Value(); });
             // setprivilege(name,enable) — enable/disable a process privilege
-            globals.vars[L"setprivilege"] = NF([](vector<Value>& a) -> Value {
+            globals.vars[NameId(L"setprivilege")] = NF([](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t != Value::Str)
                     return Value::Bool_(false);
                 bool bEnable = !(a.size() > 1 && !a[1].Truthy());
@@ -10619,7 +11075,7 @@ void Interp::InitBuiltins()
                 CloseHandle(hTok);
                 return Value::Bool_(ok && e == ERROR_SUCCESS); });
             // dumpcode — no bytecode emitter yet
-            globals.vars[L"dumpcode"] = NF([](vector<Value>&) -> Value {
+            globals.vars[NameId(L"dumpcode")] = NF([](vector<Value>&) -> Value {
                 return Value(); });
             // Preload builtin (VM preloads builtin on startup)
             {

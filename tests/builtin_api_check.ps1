@@ -20,7 +20,7 @@
 #   D:\aardio\docs\language-reference\operator\arithmetic.md:46  （% 的 floor 语义）
 #
 # 用法: powershell -File builtin_api_check.ps1 [-Exe <nodio.exe>]
-param($Exe = 'D:\Nodio\build-x64\Release\nodio.exe',
+param($Exe = 'C:\Users\QQ\AppData\Local\Temp\nr26\build-x64\Release\nodio.exe',
       [string]$LibDir = 'D:\aardio\lib',
       [string]$OverlayDir = 'D:\Nodio\lib')
 $ErrorActionPreference = 'Stop'

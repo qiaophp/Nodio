@@ -105,7 +105,7 @@ Value Interp::Eval(const PNode& n, Env* env)
             case Node::Ident:
             {
                 if (n->str == L"..") return Value();  // root marker
-                if (Value* v = env->Find(n->str))
+                if (Value* v = env->Find(NameIdOf(n->str, n->nid), n->str))
                     return *v;
                 static auto isBuiltinPrimitive = [](const wstring& name) {
                     return name == L"type" || name == L"call" || name == L"loadcode" ||
@@ -251,6 +251,12 @@ Value Interp::Eval(const PNode& n, Env* env)
                         // Normal text strings return their UTF-8 byte length.
                         if (v.bRawBytes)
                             return Value::Num_((double)v.s.size());
+                        // short strings: arithmetic walk beats the kernel
+                        // API overhead; long strings: WideCharToMultiByte
+                        // is SIMD-vectorized and wins (A/B: 36KB kernel
+                        // 8.6us vs scalar walk ~12us)
+                        if (v.s.size() <= 1024)
+                            return Value::Num_((double)Utf8ByteLenOf(v.s));
                         int cb = WideCharToMultiByte(CP_UTF8, 0,
                                                      v.s.c_str(),
                                                      (int)v.s.size(),
@@ -326,13 +332,13 @@ Value Interp::Eval(const PNode& n, Env* env)
                 {
                     if (!f.thisVal)
                     {
-                        auto itThis = e->vars.find(L"this");
+                        auto itThis = e->vars.find(IdThis());
                         if (itThis != e->vars.end() && itThis->second.t != Value::Null)
                             f.thisVal = std::make_shared<Value>(itThis->second);
                     }
                     if (!f.ownerVal)
                     {
-                        auto itOwner = e->vars.find(L"owner");
+                        auto itOwner = e->vars.find(IdOwner());
                         if (itOwner != e->vars.end() && itOwner->second.t != Value::Null)
                             f.ownerVal = std::make_shared<Value>(itOwner->second);
                     }
@@ -832,7 +838,7 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             // the bare globals jump
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;
-            local->vars[L"owner"] = owner;
+            local->vars[IdOwner()] = owner;
             // the callee frame, the receiver and the call arguments live
             // in C++ locals — the collector needs them as roots
             gcFrames.push_back(local);
@@ -842,21 +848,22 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             rs.add(ths);
             rs.addAll(args);
             if (f.thisVal)
-                local->vars[L"this"] = *f.thisVal;
+                local->vars[IdThis()] = *f.thisVal;
             else
-                local->vars[L"this"] = ths;
+                local->vars[IdThis()] = ths;
             for (size_t i = 0; i < f.params.size(); i++)
             {
+                uint32_t pid = ParamIdAt(f, i);
                 if (i < args.size() && args[i].t != Value::Null)
-                    local->vars[f.params[i]] = args[i];
+                    local->vars[pid] = args[i];
                 else if (f.pdefaults && i < f.pdefaults->size() &&
                          (*f.pdefaults)[i])
-                    local->vars[f.params[i]] =
+                    local->vars[pid] =
                         Eval((*f.pdefaults)[i], local.get());
                 else if (i < args.size())
-                    local->vars[f.params[i]] = args[i];
+                    local->vars[pid] = args[i];
                 else
-                    local->vars[f.params[i]] = Value();
+                    local->vars[pid] = Value();
             }
             if (f.params.size() && f.params.back() == L"..." && f.fn)
             {
@@ -880,21 +887,21 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                     Value vDots = tbV->arr.empty() ? Value()
                                                    : Value::Table_(tbV);
                     if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
-                    local->vars[L"..."] = vDots;
-                    local->vars[L"arg"] = vDots;
+                    local->vars[IdDots()] = vDots;
+                    local->vars[IdArg()] = vDots;
                     // an explicit `arg` parameter (gdip.bitmap's ctor) must
                     // win over the vararg alias — restore it
                     for (size_t i = 0; i + 1 < f.params.size(); i++)
                         if (f.params[i] == L"arg" && i < args.size())
-                            local->vars[L"arg"] = args[i];
+                            local->vars[IdArg()] = args[i];
                 }
                 else
                 {
-                    local->vars[L"..."] = Value();
-                    local->vars[L"arg"] = Value();
+                    local->vars[IdDots()] = Value();
+                    local->vars[IdArg()] = Value();
                     for (size_t i = 0; i < f.params.size(); i++)
                         if (f.params[i] == L"arg" && i < args.size())
-                            local->vars[L"arg"] = args[i];
+                            local->vars[IdArg()] = args[i];
                 }
             }
             Value old = ret;
@@ -1157,7 +1164,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                 if (it != roots.end())
                     return it->second;
                 // ::Name also reaches plain globals (::User32 etc.)
-                auto ig = globals.vars.find(key);
+                auto ig = globals.vars.find(NameId(key));
                 if (ig != globals.vars.end())
                     return ig->second;
 
@@ -1208,7 +1215,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                                 if (dv.t == Value::TableT && dv.tab)
                                 {
                                     roots[key] = dv;
-                                    globals.vars[key] = dv;
+                                    globals.vars[NameId(key)] = dv;
                                     return dv;
                                 }
                             }
@@ -1222,7 +1229,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                 {
                     fwprintf(stderr, L"[ROOTMISS] key=%s roots=%d globals=%d\n",
                              key.c_str(), (int)roots.count(key),
-                             (int)globals.vars.count(key));
+                             (int)globals.vars.count(NameId(key)));
                     fflush(stderr);
                 }
             }
@@ -1271,7 +1278,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
             if (f.tab)
             {
                 classNsEnv->nsTable = f.tab;
-                classNsEnv->vars[L"self"] = f;
+                classNsEnv->vars[IdSelf()] = f;
             }
             shared_ptr<Env> lexicalParent = f.envUp ? f.envUp : globals.self;
             if (f.nsClosure)
@@ -1292,8 +1299,8 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
             local->bInstInit = true;
             local->instTable = inst.get();   // the instance under construction
             if (bMethod)
-                local->vars[L"owner"] = vThis;   // owner = dot-left
-            local->vars[L"this"] = vInst;
+                local->vars[IdOwner()] = vThis;   // owner = dot-left
+            local->vars[IdThis()] = vInst;
             // the instance frame is a GC root while the constructor runs
             gcFrames.push_back(local);
             GcRootScope rsInst;
@@ -1303,20 +1310,23 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
 
             if (f.fn)
             {
-                local->vars[L"this"] = vInst;
+                local->vars[IdThis()] = vInst;
                 for (size_t i = 0; i < f.fn->names.size(); i++)
                 {
+                    uint32_t pid = (i < f.fn->nameIds.size())
+                                       ? f.fn->nameIds[i]
+                                       : NameId(f.fn->names[i]);
                     if (i < args.size() && args[i].t != Value::Null)
-                        local->vars[f.fn->names[i]] = args[i];
+                        local->vars[pid] = args[i];
                     else if (f.pdefaults &&
                              i < f.pdefaults->size() &&
                              (*f.pdefaults)[i])
-                        local->vars[f.fn->names[i]] =
+                        local->vars[pid] =
                             Eval((*f.pdefaults)[i], local.get());
                     else if (i < args.size())
-                        local->vars[f.fn->names[i]] = args[i];
+                        local->vars[pid] = args[i];
                     else
-                        local->vars[f.fn->names[i]] = Value();
+                        local->vars[pid] = Value();
                 }
                 if (f.fn->names.size() && f.fn->names.back() == L"...")
                 {
@@ -1332,19 +1342,19 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                         Value vDots = tbV->arr.empty() ? Value()
                                                        : Value::Table_(tbV);
                         if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
-                        local->vars[L"..."] = vDots;
-                        local->vars[L"arg"] = vDots;
+                        local->vars[IdDots()] = vDots;
+                        local->vars[IdArg()] = vDots;
                         for (size_t i = 0; i + 1 < f.fn->names.size(); i++)
                             if (f.fn->names[i] == L"arg" && i < args.size())
-                                local->vars[L"arg"] = args[i];
+                                local->vars[IdArg()] = args[i];
                     }
                     else
                     {
-                        local->vars[L"..."] = Value();
-                        local->vars[L"arg"] = Value();
+                        local->vars[IdDots()] = Value();
+                        local->vars[IdArg()] = Value();
                         for (size_t i = 0; i < f.fn->names.size(); i++)
                             if (f.fn->names[i] == L"arg" && i < args.size())
-                                local->vars[L"arg"] = args[i];
+                                local->vars[IdArg()] = args[i];
                     }
                 }
                 Value oldRet = ret;
@@ -1380,7 +1390,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                     CleanDeadEnv(local);
                     return ctorRet;
                 }
-                auto itThis = local->vars.find(L"this");
+                auto itThis = local->vars.find(IdThis());
                 if (itThis != local->vars.end() &&
                     itThis->second.t == Value::TableT)
                 {
@@ -1456,7 +1466,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
 
             if (f.classBody)
             {
-                local->vars[L"this"] = vInst;
+                local->vars[IdThis()] = vInst;
                 Value oldRet = ret;
                 int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                 nReturn = nBreak = nContinue = 0;
@@ -1465,7 +1475,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 local->bClassBody = false;
                 nReturn = oldR; nBreak = oldB; nContinue = oldC;
                 ret = oldRet;
-                auto itThis = local->vars.find(L"this");
+                auto itThis = local->vars.find(IdThis());
                 if (itThis != local->vars.end() &&
                     itThis->second.t == Value::TableT)
                     vInst = itThis->second;
@@ -1495,8 +1505,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             if (n->a->k == Node::Ident && n->a->str == L"print")
             {
-                Value* vShadow = env ? env->Find(L"print") : nullptr;
-                auto itGlob = globals.vars.find(L"print");
+                Value* vShadow = env ? env->Find(NameId(L"print"), L"print") : nullptr;
+                auto itGlob = globals.vars.find(NameId(L"print"));
                 Value* pGlob = (itGlob != globals.vars.end()) ? &itGlob->second : nullptr;
                 // Only take the global console print fast path if not shadowed by a local or namespace member
                 if (!vShadow || vShadow == pGlob)
@@ -1776,34 +1786,35 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             if (bMethod)
             {
                 if (f.thisVal)
-                    local->vars[L"this"] = *f.thisVal;
+                    local->vars[IdThis()] = *f.thisVal;
                 else
-                    local->vars[L"this"] = vThis;   // obj.fn() receiver as this
+                    local->vars[IdThis()] = vThis;   // obj.fn() receiver as this
                 // owner = the dot-left object of this call
-                local->vars[L"owner"] = vThis;
+                local->vars[IdOwner()] = vThis;
             }
             else
             {
                 if (f.thisVal)
-                    local->vars[L"this"] = *f.thisVal;
+                    local->vars[IdThis()] = *f.thisVal;
                 if (f.ownerVal)
-                    local->vars[L"owner"] = *f.ownerVal;
+                    local->vars[IdOwner()] = *f.ownerVal;
                 else
-                    local->vars[L"owner"] = Value();
+                    local->vars[IdOwner()] = Value();
             }
             for (size_t i = 0; i < f.params.size(); i++)
             {
+                uint32_t pid = ParamIdAt(f, i);
                 if (i < args.size() && args[i].t != Value::Null)
-                    local->vars[f.params[i]] = args[i];
+                    local->vars[pid] = args[i];
                 else if (f.pdefaults &&
                          i < f.pdefaults->size() &&
                          (*f.pdefaults)[i])
-                    local->vars[f.params[i]] =
+                    local->vars[pid] =
                         Eval((*f.pdefaults)[i], local.get());
                 else if (i < args.size())
-                    local->vars[f.params[i]] = args[i];
+                    local->vars[pid] = args[i];
                 else
-                    local->vars[f.params[i]] = Value();
+                    local->vars[pid] = Value();
             }
             // "..." varargs: leftover arguments as a 1-based table.
             // Spelled `arg` in scripts and `...` at call sites, so
@@ -1824,11 +1835,11 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 Value vDots = tbV->arr.empty() ? Value()
                                                : Value::Table_(tbV);
                 if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
-                local->vars[L"..."] = vDots;
-                local->vars[L"arg"] = vDots;
+                local->vars[IdDots()] = vDots;
+                local->vars[IdArg()] = vDots;
                 for (size_t i = 0; i + 1 < f.params.size(); i++)
                     if (f.params[i] == L"arg" && i < args.size())
-                        local->vars[L"arg"] = args[i];
+                        local->vars[IdArg()] = args[i];
             }
             Value old = ret;
             int oldR = nReturn;
@@ -2074,6 +2085,22 @@ Value Interp::EvalBin(const PNode& n, Env* env)
 // raw byte string holding the joined bytes.
 Value Interp::ConcatStrings(const Value& l, const Value& r)
         {
+            // fast path: both operands already plain-text Str — the general
+            // path below pays up to 4 full-string copies (ToStringMValue
+            // copy + ToString copy per side) before building the result;
+            // here it is one exact reserve + two appends + a move
+            if (l.t == Value::Str && !l.bRawBytes && !l.bUtf16 &&
+                r.t == Value::Str && !r.bRawBytes && !r.bUtf16)
+            {
+                wstring out;
+                out.reserve(l.s.size() + r.s.size());
+                out.append(l.s);
+                out.append(r.s);
+                Value ret;
+                ret.t = Value::Str;
+                ret.s = std::move(out);
+                return ret;
+            }
             Value lv = ToStringMValue(l);
             Value rv = ToStringMValue(r);
             auto isRaw = [](const Value& v) {
@@ -2319,7 +2346,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 Value cur;
                 if (target->k == Node::Ident)
                 {
-                    if (Value* pv = env->Find(target->str))
+                    if (Value* pv = env->Find(NameIdOf(target->str, target->nid), target->str))
                         cur = *pv;
                 }
                 else if (target->k == Node::Member || target->k == Node::Index)
@@ -2332,7 +2359,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 Value cur;
                 if (target->k == Node::Ident)
                 {
-                    if (Value* pv = env->Find(target->str))
+                    if (Value* pv = env->Find(NameIdOf(target->str, target->nid), target->str))
                         cur = *pv;
                 }
                 else if (target->k == Node::Member || target->k == Node::Index)
@@ -2347,9 +2374,13 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 // as a lexical variable in any enclosing env frame (stopping
                 // before globals, which is not a local var frame).
                 Env* eFound = nullptr;
+                // iterator of the slot found below, reused for the write:
+                // one hash probe instead of a second vars[name] lookup
+                std::unordered_map<uint32_t, Value>::iterator itFound;
                 for (Env* e = env; e && e->parent; e = e->parent.get())
                 {
-                    if (e->vars.find(target->str) != e->vars.end())
+                    itFound = e->vars.find(NameIdOf(target->str, target->nid));
+                    if (itFound != e->vars.end())
                     {
                         eFound = e;
                         break;
@@ -2389,7 +2420,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 }
                 else if (eFound)
                 {
-                    eFound->vars[target->str] = val;
+                    itFound->second = val;
                     if (eFound->bNsBody && eFound->nsTable)
                     {
                         eFound->nsTable->map[target->str] = val;
@@ -2407,7 +2438,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                         eFound->modTable->map[target->str] = val;
                         eFound->modTable->scopeVars[target->str] = val;
                         if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
-                            globals.vars[target->str] = val;
+                            globals.vars[NameIdOf(target->str, target->nid)] = val;
                     }
                     else if (eFound->bNsInst && eFound->nsTable && eFound->bClassBody)
                     {
@@ -2437,13 +2468,13 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                             while (eClass && (!eClass->nsTable || eClass->bNsInst)) eClass = eClass->parent.get();
                             if (eClass && eClass->nsTable)
                             {
-                                eClass->vars[target->str] = val;
+                                eClass->vars[NameIdOf(target->str, target->nid)] = val;
                                 eClass->nsTable->map[target->str] = val;
                                 eClass->nsTable->scopeVars[target->str] = val;
                             }
                             else
                             {
-                                eNs->vars[target->str] = val;
+                                eNs->vars[NameIdOf(target->str, target->nid)] = val;
                                 eNs->nsTable->map[target->str] = val;
                                 eNs->nsTable->scopeVars[target->str] = val;
                             }
@@ -2451,11 +2482,11 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                     }
                     else
                     {
-                        eNs->vars[target->str] = val;
+                        eNs->vars[NameIdOf(target->str, target->nid)] = val;
                         eNs->nsTable->map[target->str] = val;
                         eNs->nsTable->scopeVars[target->str] = val;
                         if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
-                            globals.vars[target->str] = val;
+                            globals.vars[NameIdOf(target->str, target->nid)] = val;
                     }
                 }
                 else if (eMod && eMod->modTable)
@@ -2467,15 +2498,15 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                         for (auto& kv : val.tab->map)
                             eMod->modTable->map[kv.first] = kv.second;
                     }
-                    eMod->vars[target->str] = val;
+                    eMod->vars[NameIdOf(target->str, target->nid)] = val;
                     eMod->modTable->map[target->str] = val;
                     eMod->modTable->scopeVars[target->str] = val;
                     if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
-                        globals.vars[target->str] = val;
+                        globals.vars[NameIdOf(target->str, target->nid)] = val;
                 }
                 else
                 {
-                    globals.vars[target->str] = val;   // default global
+                    globals.vars[NameIdOf(target->str, target->nid)] = val;   // default global
                     // engine-provided root namespaces are pre-registered in
                     // `roots`, and NsPath/DoImport consult that map first.
                     // Leaving the two copies apart made `namespace process{}`
@@ -2493,7 +2524,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                     // tab@ = meta — set the metatable
                     if (target->a->k == Node::Ident)
                     {
-                        if (Value* vVar = env->Find(target->a->str))
+                        if (Value* vVar = env->Find(NameIdOf(target->a->str, target->a->nid), target->a->str))
                         {
                             if (vVar->t == Value::Pointer)
                             {
@@ -2626,7 +2657,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 }
                 else if (target->bRoot)
                 {
-                    globals.vars[target->str] = val;   // '..' root
+                    globals.vars[NameIdOf(target->str, target->nid)] = val;   // '..' root
                     roots[target->str] = val;
                 }
             }
@@ -2853,6 +2884,13 @@ Value Interp::ExecBlock(const PNode& blk, Env* env)
             // block and refreshes it after every statement.
             size_t lastRoot = g_gcRoots.size();
             g_gcRoots.push_back(last);
+            // S-2 refresh, hoisted: the env chain is fixed while this block
+            // runs (frames carry their srcFile only from creation), so the
+            // chain walk happens once per block instead of once per
+            // statement. The per-statement strErrFile compare stays — a
+            // nested call frame's ExecBlock overwrites strErrFile and every
+            // statement of THIS block must restore its own file.
+            const wstring* pfBlock = SourceFilePtrOfEnv(env);
             for (auto& st : blk->list)
             {
                 if (st->line > 0)
@@ -2863,10 +2901,9 @@ Value Interp::ExecBlock(const PNode& blk, Env* env)
                 // the frames may already be gone — so the file is kept as a
                 // copy, refreshed whenever the executing frame changes.
                 {
-                    const wstring* pf = SourceFilePtrOfEnv(env);
-                    if (pf)
+                    if (pfBlock)
                     {
-                        if (strErrFile != *pf) strErrFile = *pf;
+                        if (strErrFile != *pfBlock) strErrFile = *pfBlock;
                     }
                     else if (!strErrFile.empty())
                     {
@@ -2932,7 +2969,7 @@ Value Interp::EvalClass(const PNode& n, Env* env)
             classEnv->parent = env ? env->self : globals.self;
             classEnv->nsTable = tb;
             classEnv->bNsBody = true;
-            classEnv->vars[L"self"] = vClass;
+            classEnv->vars[IdSelf()] = vClass;
             GcFrameScope fsClass(*this, classEnv);
             for (auto& st : n->a->list)
             {
@@ -3002,7 +3039,7 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                                  n->names[0].c_str());
                         fflush(stderr);
                     }
-                    globals.vars[n->names[0]] = vClass;
+                    globals.vars[NodeNameIdAt(n, 0)] = vClass;
                     roots[n->names[0]] = vClass;
                 }
             }
@@ -3024,7 +3061,7 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                     }
                     if (ns.t == Value::Null)
                     {
-                        if (Value* pv = env->Find(n->names[0]))
+                        if (Value* pv = env->Find(NodeNameIdAt(n, 0), n->names[0]))
                         {
                             if (pv->t == Value::TableT || pv->t == Value::Class)
                                 ns = *pv;
@@ -3033,7 +3070,7 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                 }
                 if (ns.t == Value::Null)
                 {
-                    auto itG = globals.vars.find(n->names[0]);
+                    auto itG = globals.vars.find(NameId(n->names[0]));
                     if (itG != globals.vars.end() &&
                         (itG->second.t == Value::TableT || itG->second.t == Value::Class))
                         ns = itG->second;
@@ -3041,7 +3078,7 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                     {
                         auto tbN = std::make_shared<Table>();
                         ns = Value::Table_(tbN);
-                        globals.vars[n->names[0]] = ns;
+                        globals.vars[NodeNameIdAt(n, 0)] = ns;
                     }
                 }
                 for (size_t k = 1; k + 1 < n->names.size(); k++)
@@ -3149,12 +3186,110 @@ Value Interp::Exec(const PNode& n, Env* env)
                     }
                     return v;
                 }
+                // Fast path for hot numeric loops: `x = <num expr>` where the
+                // target is a bare identifier already bound in a plain local
+                // frame (no namespace/class frame anywhere on the chain, so
+                // no mirror writes) and the right side is a Num, an
+                // identifier, or an arithmetic Bin over identifiers/nums.
+                // Everything resolves to doubles with no user code in
+                // between, so the read-compute-write collapses into ONE slot
+                // location plus the math. The generic path below pays Eval +
+                // DoAssign: two extra hash probes for the target, a
+                // GcRootScope and a Value copy per iteration. Non-matching
+                // shapes fall through untouched (the probes here are
+                // side-effect-free reads; the generic path re-evaluates).
+                if (n->names.empty() && n->str == L"=" && n->a &&
+                    n->a->k == Node::Ident && n->b)
+                {
+                    bool bNoNs = true;
+                    for (Env* e = env; e; e = e->parent.get())
+                        if (e->nsTable) { bNoNs = false; break; }
+                    if (bNoNs)
+                    {
+                        Env* eFound = nullptr;
+                        std::unordered_map<uint32_t, Value>::iterator itFound;
+                        for (Env* e = env; e && e->parent; e = e->parent.get())
+                        {
+                            itFound = e->vars.find(NameIdOf(n->a->str, n->a->nid));
+                            if (itFound != e->vars.end())
+                            {
+                                eFound = e;
+                                break;
+                            }
+                            if (e->bNsBody && (e->nsTable || e->modTable))
+                                break;
+                        }
+                        if (eFound && !eFound->bNsBody)
+                        {
+                            // read one operand as a pure double; anything
+                            // else (string, member load, call) fails fast
+                            auto rdNum = [&](const PNode& nd, double& out)
+                                         -> bool
+                            {
+                                if (nd->k == Node::Num)
+                                {
+                                    out = nd->num;
+                                    return true;
+                                }
+                                if (nd->k == Node::Ident && nd->str != L"..")
+                                {
+                                    Value* pv = env->Find(NameIdOf(nd->str, nd->nid), nd->str);
+                                    if (pv && pv->t == Value::Num)
+                                    {
+                                        out = pv->n;
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            };
+                            double dVal = 0;
+                            bool bFast = false;
+                            const PNode& rv = n->b;
+                            if (rv->k == Node::Num)
+                            {
+                                dVal = rv->num;
+                                bFast = true;
+                            }
+                            else if (rv->k == Node::Ident)
+                            {
+                                bFast = rdNum(rv, dVal);
+                            }
+                            else if (rv->k == Node::Bin && rv->a && rv->b)
+                            {
+                                const wstring& opB = rv->str;
+                                bool bArith =
+                                    opB == L"+" || opB == L"-" ||
+                                    opB == L"*" || opB == L"/" ||
+                                    opB == L"%" || opB == L"**" ||
+                                    opB == L"^" || opB == L"&" ||
+                                    opB == L"|" || opB == L"<<" ||
+                                    opB == L">>" || opB == L">>>";
+                                double a, b;
+                                if (bArith && rdNum(rv->a, a) && rdNum(rv->b, b))
+                                {
+                                    // ApplyOp's Num lane owns the exact double
+                                    // semantics (div-by-zero, AardioMod, 32-bit
+                                    // shifts); two Num inputs hit no metatable
+                                    dVal = BNum(ApplyOp(opB, Value::Num_(a),
+                                                        Value::Num_(b)));
+                                    bFast = true;
+                                }
+                            }
+                            if (bFast)
+                            {
+                                Value vOut = Value::Num_(dVal);
+                                itFound->second = vOut;
+                                return vOut;
+                            }
+                        }
+                    }
+                }
                 if (n->str == L":=" || n->str == L"::=")
                 {
                     Value cur;
                     if (n->a->k == Node::Ident)
                     {
-                        if (Value* pv = env->Find(n->a->str))
+                        if (Value* pv = env->Find(NameIdOf(n->a->str, n->a->nid), n->a->str))
                             cur = *pv;
                     }
                     else if (n->a->k == Node::Member || n->a->k == Node::Index)
@@ -3174,12 +3309,12 @@ Value Interp::Exec(const PNode& n, Env* env)
                 // code in other modules see it; the env slot keeps the
                 // local read/write fast path. Function-call envs have
                 // bNsBody=false — their locals stay local.
-                auto BindVar = [env](const wstring& name, const Value& v)
+                auto BindVar = [env](const wstring& name, uint32_t id, const Value& v)
                 {
                     if (name.empty()) return;
                     Value val = v;
                     val.mrets = nullptr;
-                    env->vars[name] = val;
+                    env->vars[id] = val;
                     if (env->bNsBody)
                     {
                         if (env->nsTable)
@@ -3219,7 +3354,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                         pushFlow(Eval(eN, env));
                     for (size_t k = 0; k < n->names.size(); k++)
                         if (!n->names[k].empty())
-                            BindVar(n->names[k],
+                            BindVar(n->names[k], NodeNameIdAt(n, k),
                                 k < flow.size() ? flow[k] : Value());
                     return flow.empty() ? Value() : flow.front();
                 }
@@ -3229,10 +3364,10 @@ Value Interp::Exec(const PNode& n, Env* env)
                     if (v.bDots && v.mrets)
                     {
                         Value firstDot = v.mrets->empty() ? Value() : (*v.mrets)[0];
-                        BindVar(n->names[0], firstDot);
+                        BindVar(n->names[0], NodeNameIdAt(n, 0), firstDot);
                         return firstDot;
                     }
-                    BindVar(n->names[0], v);
+                    BindVar(n->names[0], NodeNameIdAt(n, 0), v);
                     return v;
                 }
                 // var a,b = f() — multi-return unpack. A packed
@@ -3241,21 +3376,21 @@ Value Interp::Exec(const PNode& n, Env* env)
                 // return in v with mrets listing the extras.
                 size_t dotsOff = v.bDots ? 0 : 1;
                 if (v.bDots && v.mrets && !v.mrets->empty())
-                    BindVar(n->names[0], (*v.mrets)[0]);
+                    BindVar(n->names[0], NodeNameIdAt(n, 0), (*v.mrets)[0]);
                 else if (!n->names[0].empty())
-                    BindVar(n->names[0], v);
+                    BindVar(n->names[0], NodeNameIdAt(n, 0), v);
                 if (v.mrets)
                 {
                     for (size_t k = 1; k < n->names.size(); k++)
                         if (!n->names[k].empty())
-                            BindVar(n->names[k],
+                            BindVar(n->names[k], NodeNameIdAt(n, k),
                                 (k - dotsOff) < v.mrets->size()
                                     ? (*v.mrets)[k - dotsOff] : Value());
                 }
                 else
                     for (size_t k = 1; k < n->names.size(); k++)
                         if (!n->names[k].empty())
-                            BindVar(n->names[k], Value());
+                            BindVar(n->names[k], NodeNameIdAt(n, k), Value());
                 return v;
             }
             case Node::Import:
@@ -3280,13 +3415,13 @@ Value Interp::Exec(const PNode& n, Env* env)
                 nsEnv->parent = env ? env->self : globals.self;
                 nsEnv->nsTable = ns.tab;
                 nsEnv->bNsBody = true;
-                nsEnv->vars[L"self"] = ns;
+                nsEnv->vars[IdSelf()] = ns;
                 for (auto& kv : ns.tab->scopeVars)
-                    nsEnv->vars[kv.first] = kv.second;
+                    nsEnv->vars[NameId(kv.first)] = kv.second;
                 GcFrameScope fsNs(*this, nsEnv);
                 Value r = ExecBlock(n->a, nsEnv.get());
                 for (auto& kv : nsEnv->vars)
-                    ns.tab->scopeVars[kv.first] = kv.second;
+                    ns.tab->scopeVars[NameOf(kv.first)] = kv.second;
                 return r;
             }
             case Node::Class:
@@ -3303,7 +3438,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 local->parent = env ? env->self : globals.self;
                 if (v.t == Value::TableT && v.tab)
                     local->nsTable = v.tab;
-                local->vars[L"owner"] = v;
+                local->vars[IdOwner()] = v;
                 GcFrameScope fs(*this, local);
                 return ExecBlock(n->b, local.get());
             }
@@ -3432,19 +3567,22 @@ Value Interp::Exec(const PNode& n, Env* env)
                 // Loop variable is strictly local to the for loop.
                 // It does not mutate outer variables with the same name.
                 wstring loopVarName;
+                uint32_t loopVarId = 0;   // interned once per LOOP (not per iteration)
                 if (n->a && n->a->k == Node::Assign && n->a->a && n->a->a->k == Node::Ident)
                 {
                     loopVarName = n->a->a->str;
+                    loopVarId = NameIdOf(loopVarName, n->a->a->nid);
                     Value initVal = Eval(n->a->b, env);
-                    loopEnv->vars[loopVarName] = initVal;
+                    loopEnv->vars[loopVarId] = initVal;
                 }
                 else if (n->a && n->a->k == Node::VarDecl && !n->a->names.empty())
                 {
                     loopVarName = n->a->names[0];
+                    loopVarId = NodeNameIdAt(n->a, 0);
                     Value initVal;
                     if (!n->a->defaults.empty() && n->a->defaults[0])
                         initVal = Eval(n->a->defaults[0], env);
-                    loopEnv->vars[loopVarName] = initVal;
+                    loopEnv->vars[loopVarId] = initVal;
                 }
                 else
                 {
@@ -3468,24 +3606,46 @@ Value Interp::Exec(const PNode& n, Env* env)
                                   !bCmpCond;
                 double dStep = 1;
                 int nDir = 1;
+                // step slot: ParseStatement wraps bare expressions in
+                // ExprStmt but returns assignments BARE (`k--` desugars to
+                // Assign directly on the statement path). Normalize to the
+                // inner expression before shape-matching, or every Assign
+                // step form silently misses its fast branch.
+                PNode stExpr;
+                if (n->c && n->c->k == Node::ExprStmt)
+                    stExpr = n->c->a;
+                else
+                    stExpr = n->c;
                 // A literal numeric step ("for i=1;10;2") is folded; anything
                 // else (a variable, i++, i+=2) is executed as a statement
                 // AFTER the body — but the loop variable must still advance,
                 // so a non-literal step is applied as an explicit +=.
-                bool bNumStep = n->c && n->c->k == Node::ExprStmt &&
-                                n->c->a && n->c->a->k == Node::Num;
-                bool bUnaryStep = n->c && n->c->k == Node::ExprStmt &&
-                                  n->c->a && n->c->a->k == Node::Un &&
-                                  n->c->a->str == L"-";
+                bool bNumStep = stExpr && stExpr->k == Node::Num;
+                bool bUnaryStep = stExpr && stExpr->k == Node::Un &&
+                                  stExpr->str == L"-";
                 if (bNumStep)
                 {
-                    dStep = n->c->a->num;
+                    dStep = stExpr->num;
                     if (dStep < 0) nDir = -1;
                 }
                 else if (bUnaryStep)
                 {
-                    dStep = -BNum(Eval(n->c->a->a, loopEnv.get()));
+                    dStep = -BNum(Eval(stExpr->a, loopEnv.get()));
                     if (dStep < 0) nDir = -1;
+                }
+                // `k--` / `k -= lit` (parser-desugared to Assign "-=" Num) is
+                // a NEGATIVE step: flip the direction BEFORE the first
+                // condition check. The cond slot of the 2-expr form is a
+                // terminal VALUE, so `for(k=10;1;k--)` must compare with the
+                // downward rule (k>=1) and count down — official aardio
+                // for(k=10;1;-1). Decided here because the per-iteration
+                // step handling runs only AFTER the first condition check.
+                else if (stExpr && stExpr->k == Node::Assign &&
+                         stExpr->str == L"-=" &&
+                         stExpr->a && stExpr->a->k == Node::Ident &&
+                         stExpr->b && stExpr->b->k == Node::Num)
+                {
+                    nDir = -1;
                 }
                 // The loop variable must be looked up BY KEY on every access.
                 // `loopEnv->vars` is an unordered_map: a `var` declared inside
@@ -3497,8 +3657,8 @@ Value Interp::Exec(const PNode& n, Env* env)
                 // keeps the counter correct no matter how the body mutates
                 // the environment.
                 auto findLoopVar = [&]() -> Value* {
-                    if (loopVarName.empty()) return nullptr;
-                    auto it = loopEnv->vars.find(loopVarName);
+                    if (loopVarId == 0) return nullptr;
+                    auto it = loopEnv->vars.find(loopVarId);
                     return (it == loopEnv->vars.end()) ? nullptr : &it->second;
                 };
                 bool bConstLimit = bLimitForm && n->b && n->b->k == Node::Num;
@@ -3523,7 +3683,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     if (n->a && n->a->k == Node::Assign &&
                         n->a->a && n->a->a->k == Node::Ident)
                     {
-                        Value* pv = loopEnv->Find(n->a->a->str);
+                        Value* pv = loopEnv->Find(NameIdOf(n->a->a->str, n->a->a->nid), n->a->a->str);
                         if (pv && pv->t == Value::Num)
                         {
                             double lim = bConstLimit ? dConstLimit : BNum(Eval(n->b, loopEnv.get()));
@@ -3544,14 +3704,14 @@ Value Interp::Exec(const PNode& n, Env* env)
                     // (`for x=x1;x2;step`) is the step VALUE, not a
                     // statement — evaluate it and advance. Everything else
                     // (i++, i+=2) already mutates the variable itself.
-                    bool bIdentStep = n->c && n->c->k == Node::ExprStmt &&
-                                      n->c->a && n->c->a->k == Node::Ident;
+                    bool bIdentStep = stExpr && stExpr->k == Node::Ident;
                     if (bNumStep || bUnaryStep || bIdentStep)
                     {
                         if (bIdentStep)
                         {
-                            Value vS = Eval(n->c->a, loopEnv.get());
+                            Value vS = Eval(stExpr, loopEnv.get());
                             if (vS.t == Value::Num) dStep = vS.n;
+                            if (dStep < 0) nDir = -1;
                         }
                         Value* pLoopVar = findLoopVar();
                         if (pLoopVar)
@@ -3562,18 +3722,43 @@ Value Interp::Exec(const PNode& n, Env* env)
                         else if (n->a && n->a->k == Node::Assign && n->a->a &&
                             n->a->a->k == Node::Ident)
                         {
-                            Value* pv = loopEnv->Find(n->a->a->str);
+                            Value* pv = loopEnv->Find(NameIdOf(n->a->a->str, n->a->a->nid), n->a->a->str);
                             if (pv && pv->t == Value::Num)
                                 pv->n += dStep;
                         }
                     }
                     else if (n->c)
                     {
-                        Exec(n->c, loopEnv.get());
+                        // fast step: `i++`/`i--` (desugared by the parser to
+                        // Assign "+="/"-=" Num 1) and `i += lit`/`i -= lit`
+                        // on the loop variable itself — apply the increment
+                        // through the loop env slot (1 hash) instead of the
+                        // full DoAssign round trip (2 extra hashes + a
+                        // wstring substr alloc per iteration). Non-numeric
+                        // var falls back to the generic statement so
+                        // ApplyOp's ToNum coercion behavior is preserved.
+                        bool bFastStep = !loopVarName.empty() &&
+                                         stExpr && stExpr->k == Node::Assign &&
+                                         (stExpr->str == L"+=" || stExpr->str == L"-=") &&
+                                         stExpr->a && stExpr->a->k == Node::Ident &&
+                                         stExpr->a->str == loopVarName &&
+                                         stExpr->b && stExpr->b->k == Node::Num;
+                        if (bFastStep)
+                        {
+                            Value* pLoopVar = findLoopVar();
+                            if (pLoopVar && pLoopVar->t == Value::Num)
+                                pLoopVar->n += (stExpr->str == L"+=")
+                                                   ? stExpr->b->num
+                                                   : -stExpr->b->num;
+                            else
+                                Exec(n->c, loopEnv.get());
+                        }
+                        else
+                            Exec(n->c, loopEnv.get());
                     }
                     else if (!loopVarName.empty())
                     {
-                        Value* pv = loopEnv->Find(loopVarName);
+                        Value* pv = loopEnv->Find(loopVarId, loopVarName);
                         if (pv && pv->t == Value::Num)
                             *pv = Value::Num_(pv->n + dStep);
                     }
@@ -3581,7 +3766,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                              n->a->a->k == Node::Ident)
                     {
                         // 2-expr form: no step slot, derive from direction
-                        Value* pv = loopEnv->Find(n->a->a->str);
+                        Value* pv = loopEnv->Find(NameIdOf(n->a->a->str, n->a->a->nid), n->a->a->str);
                         if (pv && pv->t == Value::Num)
                             *pv = Value::Num_(pv->n + dStep);
                     }
@@ -3617,14 +3802,14 @@ Value Interp::Exec(const PNode& n, Env* env)
                         iterEnv->parent = env ? env->self : globals.self;
                         Value r0 = r;
                         r0.mrets = nullptr;
-                        iterEnv->vars[n->names[0]] = r0;
+                        iterEnv->vars[NodeNameIdAt(n, 0)] = r0;
                         for (size_t ni = 1; ni < n->names.size(); ni++)
                         {
                             size_t mi = ni - 1;
                             Value rm = (r.mrets && mi < r.mrets->size())
                                     ? (*r.mrets)[mi] : Value();
                             rm.mrets = nullptr;
-                            iterEnv->vars[n->names[ni]] = rm;
+                            iterEnv->vars[NodeNameIdAt(n, ni)] = rm;
                         }
                         GcFrameScope fsIter(*this, iterEnv);
                         Value rb = ExecBlock(n->b, iterEnv.get());
@@ -3639,9 +3824,9 @@ Value Interp::Exec(const PNode& n, Env* env)
                     auto iterEnv = std::make_shared<Env>();
                     iterEnv->self = iterEnv;
                     iterEnv->parent = env ? env->self : globals.self;
-                    iterEnv->vars[n->names[0]] = Value::Str_(k);
+                    iterEnv->vars[NodeNameIdAt(n, 0)] = Value::Str_(k);
                     if (n->names.size() > 1)
-                        iterEnv->vars[n->names[1]] = v;
+                        iterEnv->vars[NodeNameIdAt(n, 1)] = v;
                     GcFrameScope fsStep(*this, iterEnv);
                     Value r = ExecBlock(n->b, iterEnv.get());
                     if (nBreak) { nBreak--; return 1; }
@@ -3684,9 +3869,9 @@ Value Interp::Exec(const PNode& n, Env* env)
                             auto iterEnv = std::make_shared<Env>();
                             iterEnv->self = iterEnv;
                             iterEnv->parent = env ? env->self : globals.self;
-                            iterEnv->vars[n->names[0]] = vk;
+                            iterEnv->vars[NodeNameIdAt(n, 0)] = vk;
                             if (n->names.size() > 1)
-                                iterEnv->vars[n->names[1]] = v;
+                                iterEnv->vars[NodeNameIdAt(n, 1)] = v;
                             GcFrameScope fsKey(*this, iterEnv);
                             Value r = ExecBlock(n->b, iterEnv.get());
                             if (nBreak) { nBreak--; return Value(); }
@@ -3720,7 +3905,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     cEnv->self = cEnv;
                     cEnv->parent = env ? env->self : globals.self;
                     if (!n->names.empty())
-                        cEnv->vars[n->names[0]] = Value::Str_(msg);
+                        cEnv->vars[NodeNameIdAt(n, 0)] = Value::Str_(msg);
                     GcFrameScope fsCatch(*this, cEnv);
                     ExecBlock(n->b, cEnv.get());
                 }
@@ -3803,7 +3988,7 @@ Value Interp::GetRoot(const wstring& name)
             auto tb = std::make_shared<Table>();
             Value v = Value::Table_(tb);
             roots[name] = v;
-            globals.vars[name] = v;   // bare name resolves to root namespace
+            globals.vars[NameId(name)] = v;   // bare name resolves to root namespace
             return v;
         }
 
@@ -3859,7 +4044,7 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
                     cand = ir->second;
                 else
                 {
-                    auto ig = globals.vars.find(names[0]);
+                    auto ig = globals.vars.find(NameId(names[0]));
                     if (ig != globals.vars.end())
                         cand = ig->second;
                 }
@@ -3879,14 +4064,14 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
                 {
                     ns = cand;
                     roots[names[0]] = ns;
-                    globals.vars[names[0]] = ns;
+                    globals.vars[NameId(names[0])] = ns;
                 }
                 else
                 {
                     auto tb = std::make_shared<Table>();
                     ns = Value::Table_(tb);
                     roots[names[0]] = ns;
-                    globals.vars[names[0]] = ns;
+                    globals.vars[NameId(names[0])] = ns;
                 }
             }
             for (size_t i = 1; i < names.size() && ns.tab; i++)
@@ -3922,7 +4107,7 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             local->self = local;
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;
-            local->vars[L"owner"] = Value();   // native-side call: no owner
+            local->vars[IdOwner()] = Value();   // native-side call: no owner
             // the callee frame and the call arguments live in C++ locals
             // — the collector needs them as roots
             gcFrames.push_back(local);
@@ -3931,17 +4116,18 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             rs.addAll(args);
             for (size_t i = 0; i < f.params.size(); i++)
             {
+                uint32_t pid = ParamIdAt(f, i);
                 if (i < args.size() && args[i].t != Value::Null)
-                    local->vars[f.params[i]] = args[i];
+                    local->vars[pid] = args[i];
                 else if (f.pdefaults &&
                          i < f.pdefaults->size() &&
                          (*f.pdefaults)[i])
-                    local->vars[f.params[i]] =
+                    local->vars[pid] =
                         Eval((*f.pdefaults)[i], local.get());
                 else if (i < args.size())
-                    local->vars[f.params[i]] = args[i];
+                    local->vars[pid] = args[i];
                 else
-                    local->vars[f.params[i]] = Value();
+                    local->vars[pid] = Value();
             }
             if (f.params.size() && f.params.back() == L"..." && f.fn)
             {
@@ -3957,11 +4143,11 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
                 Value vDots = Value::Table_(tbV);
                 vDots.mrets = vargs;
                 vDots.bDots = true;
-                local->vars[L"..."] = vDots;
-                local->vars[L"arg"] = vDots;
+                local->vars[IdDots()] = vDots;
+                local->vars[IdArg()] = vDots;
                 for (size_t i = 0; i + 1 < f.params.size(); i++)
                     if (f.params[i] == L"arg" && i < args.size())
-                        local->vars[L"arg"] = args[i];
+                        local->vars[IdArg()] = args[i];
             }
             Value oldRet = ret;
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;

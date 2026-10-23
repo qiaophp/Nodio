@@ -299,14 +299,14 @@ namespace NodioVM
             }
             // where does this table still live?
             for (auto& kv : I.globals.vars)
-                if (kv.second.tab.get() == t) { where += L" global." + kv.first; }
+                if (kv.second.tab.get() == t) { where += L" global." + NameOf(kv.first); }
             for (auto& kv : I.roots)
                 if (kv.second.tab.get() == t) { where += L" root." + kv.first; }
             for (auto& kv : I.modules)
                 if (kv.second.tab.get() == t) { where += L" module." + kv.first; }
             // what does the root namespace map point at?
             for (auto& kv : I.globals.vars)
-                if (kv.first == L"gdip")
+                if (kv.first == NameId(L"gdip"))
                 {
                     wchar_t buf[64];
                     swprintf_s(buf, 64, L" [globals.gdip=%p]", (void*)kv.second.tab.get());
@@ -564,7 +564,7 @@ namespace NodioVM
                     // which known root does it look like?
                     for (auto& kv : I.globals.vars)
                         if (kv.second.tab.get() == t)
-                            fwprintf(stderr, L" ==globals.%s", kv.first.c_str());
+                            fwprintf(stderr, L" ==globals.%s", NameOf(kv.first).c_str());
                     for (auto& kv : I.roots)
                         if (kv.second.tab.get() == t)
                             fwprintf(stderr, L" ==root.%s", kv.first.c_str());
