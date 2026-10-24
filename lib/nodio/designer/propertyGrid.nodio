@@ -1,0 +1,388 @@
+// nodio.designer.propertyGrid — 属性格（自绘，带**分组带**）。
+//
+// 用法：
+//   pg = nodio.designer.propertyGrid(winform, {left=0;top=0;right=240;bottom=200})
+//   pg.setItems({ {name="标题";value="按钮";type="string";cat="外观"} })
+//   pg.onChange = function(index, value){ ... }
+//
+// 为什么自绘而不是用原生 listview：
+//   ① 官方 IDE 的「属性」页就是自绘的（截图里是分组带 + 两列纯色表，
+//      没有系统 listview 的网格线和选中虚线框）；
+//   ② 引擎的原生控件表没有 listview 的 addItem/setItem。
+//
+// 分组带（VS WinForms 属性窗口的「分类」）：
+//   属性按 **分类** 分成若干带，每带一个折叠箭头：
+//     外观 / 样式 / 数据 / 位置 / 基本
+//     （顺序跟 VS 一致：Appearance / Behavior / Data / Layout / Misc）
+//   分类由属性**键**决定（见 nodio.designer.registry.categoryOf），
+//   属性自己带 `cat` 字段时以它为准（自定义组件可以自己分组）。
+//   没有属性的分类**不画**（VS 也不会给空分类画一条带）。
+//
+// 改值：点「值」列 → 在单元格里落一个 edit 控件（就地编辑），
+// 输入即时回写并触发 onChange；点别处收起。
+//
+// ⚠ onChange 的第一个参数是**属性在 items 里的序号**（不是显示行号）——
+//   显示行里还夹着分组带，两者不是一回事。
+//
+// 几何说明：自绘板（board）是页面里的一个 plus 控件，编辑框是另一个控件，
+// 两者的 z 序要分开 —— 编辑框必须 z 更高，否则会被自绘板盖住。
+namespace nodio.designer{
+import nodio.ui.board;
+import nodio.ui.rect;
+import nodio.ui.theme;
+import nodio.ui.dpi;
+import nodio.designer.registry;
+
+var __pgSeq = 0;
+
+propertyGrid = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	var self = {
+		winform = winform;
+		board = null;
+		editCtrl = null;
+		editName = null;
+		rect = opt.rect;
+		items = {};
+		// 显示行表：{type="cat"; cat} 或 {type="item"; cat; index}
+		// （显示行 ≠ 属性序号：中间夹着分组带）
+		rows = {};
+		collapsed = {};        // 分类名 → true（折叠中）
+		// 行高、列宽是**逻辑像素**（按 DPI 换算成物理像素）
+		rowH = ..nodio.ui.px(20);
+		nameW = ..nodio.ui.px(90);
+		selIndex = 0;         // 选中的**属性序号**
+		editIndex = 0;        // 正在编辑的属性序号
+		onChange = null;
+		// 配色（默认取当前主题 nodio.ui.theme）
+		// 表头跟面板同色（只靠一条分隔线区分），
+		// 分组带用更亮一档的次级色 —— 这样带子在深色主题下才看得出是一条带。
+		bgColor     = opt.bgColor : th.panel;
+		headColor   = opt.headColor : th.panel;
+		bandColor   = opt.bandColor : th.panel2;
+		bandText    = opt.bandText : th.text;
+		textColor   = opt.textColor : th.text;
+		headText    = opt.headText : th.textDim;
+		valueColor  = opt.valueColor : th.text;
+		selColor    = opt.selColor : th.selBg;
+		lineColor   = opt.lineColor : th.border;
+		headText1   = opt.headText1 : "属性";
+		headText2   = opt.headText2 : "值";
+	};
+
+	__pgSeq = __pgSeq + 1;
+	var r = opt.rect : {left=0; top=0; right=240; bottom=200};
+
+	self.board = nodio.ui.board(winform, {
+		left = r.left; top = r.top; right = r.right; bottom = r.bottom;
+	});
+	self.board.onDraw = function(graphics, rc, bd){
+		self.__draw(graphics, rc, bd);
+	}
+	// 兼容旧接口：宿主拿到的控件句柄
+	self.ctrl = self.board.ctrl;
+	self.board.onMouseClick = function(x, y, bd){
+		self.__click(x, y);
+	}
+
+	// ---------- 分类 ----------
+	// 属性属于哪个分类：属性自己带 cat 就用它，否则按 key 查表。
+	self.__catOf = function(it){
+		if(!it) return "基本";
+		var c = it.cat;
+		if(type(c) == "string" && #c) return c;
+		return ..nodio.designer.registry.categoryOf(it.key);
+	}
+
+	// 重建显示行表。
+	//
+	// 分类顺序：跟 VS WinForms 属性窗口一致 ——
+	// 外观(Appearance) → 样式(Behavior) → 数据(Data) → 位置(Layout) → 基本(Misc)。
+	// 规范表里没有的分类按**首次出现**顺序接在后面 ——
+	// 自定义组件可以带自己的分类名，不该被塞到末尾以外的地方。
+	self.__buildRows = function(){
+		self.rows = {};
+		var cats = {};
+		var order = {};
+		for(i=1;#self.items;1){
+			var c = self.__catOf(self.items[i]);
+			if(!cats[c]){
+				cats[c] = true;
+				..table.push(order, c);
+			}
+		}
+		var canonical = {"外观";"样式";"数据";"位置";"基本"};
+		var ordered = {};
+		for(i=1;#canonical;1){
+			if(cats[canonical[i]]){
+				..table.push(ordered, canonical[i]);
+				cats[canonical[i]] = null;
+			}
+		}
+		for(i=1;#order;1){
+			if(cats[order[i]]) ..table.push(ordered, order[i]);
+		}
+		for(i=1;#ordered;1){
+			var c = ordered[i];
+			// 分组带本身永远占一行（哪怕是空的分类也不画）
+			if(!self.__catHas(c)) continue;
+			..table.push(self.rows, {type="cat"; cat=c});
+			if(self.collapsed[c]) continue;
+			for(k=1;#self.items;1){
+				if(self.__catOf(self.items[k]) == c){
+					..table.push(self.rows, {type="item"; cat=c; index=k});
+				}
+			}
+		}
+		return #self.rows;
+	}
+	// 这个分类下有没有属性（空分类不画带）
+	self.__catHas = function(c){
+		for(i=1;#self.items;1){
+			if(self.__catOf(self.items[i]) == c) return true;
+		}
+		return false;
+	}
+
+	// 填充
+	self.setItems = function(items){
+		self.items = items : {};
+		self.selIndex = 0;
+		self.__endEdit();
+		self.__buildRows();
+		self.board.redraw();
+		return #self.items;
+	}
+
+	self.getItems = function(){
+		return self.items;
+	}
+
+	// 改某一行的值
+	self.setValue = function(index, value){
+		if(index < 1 || index > #self.items) return;
+		self.items[index].value = value;
+		self.board.redraw();
+	}
+
+	// 折叠 / 展开某个分类
+	self.collapseCategory = function(cat, flag){
+		if(!cat) return;
+		if(flag === null || flag === undefined) flag = !self.collapsed[cat];
+		if(flag) self.collapsed[cat] = true;
+		else self.collapsed[cat] = null;
+		self.__buildRows();
+		self.board.redraw();
+	}
+	// 分类是不是折叠着
+	self.isCollapsed = function(cat){
+		return self.collapsed[cat] ? true : false;
+	}
+
+	// 显示行号 → 显示行（1 基；0 = 表头）
+	self.__rowOf = function(y){
+		if(y < self.rowH) return 0;
+		var idx = (y - self.rowH) / self.rowH + 1;
+		if(idx < 1 || idx > #self.rows) return 0;
+		return idx;
+	}
+
+	// 点哪一格
+	self.__click = function(x, y){
+		var ri = self.__rowOf(y);
+		if(!ri){
+			self.__endEdit();
+			return;
+		}
+		var row = self.rows[ri];
+		if(!row) return;
+		if(row.type == "cat"){
+			// 点分组带 → 折叠 / 展开
+			self.collapseCategory(row.cat);
+			return;
+		}
+		var idx = row.index;
+		self.selIndex = idx;
+		if(x >= self.nameW){
+			// 值列 → 就地编辑
+			self.__beginEdit(idx, ri);
+		}
+		else{
+			self.__endEdit();
+		}
+		self.board.redraw();
+	}
+
+	// 自绘板在宿主窗体客户区里的位置（编辑框要按它来摆）
+	self.__boardRect = function(){
+		try{
+			var br = self.board.ctrl.getRect();
+			if(br && br.left !== null) return br;
+		}
+		catch(e){}
+		return self.rect : {left=0; top=0; right=240; bottom=200};
+	}
+
+	// index = 属性序号；ri = 显示行号（两者不是一回事）
+	self.__beginEdit = function(index, ri){
+		if(index < 1 || index > #self.items) return;
+		self.editIndex = index;
+		if(!self.editCtrl){
+			// 就地编辑用的 edit（后建 → z 更高，盖在自绘板上面）
+			var ename = "propEdit" + __pgSeq;
+			self.editCtrl = ..nodio.ui.addCtrl(winform, ename, {
+				cls="edit";left=0;top=0;right=0;bottom=0;z=40
+			});
+			self.editName = ename;
+			var onChanged = function(){
+				if(!self.editIndex) return;
+				var v = ..nodio.ui.getCtrlText(self.editCtrl);
+				self.items[self.editIndex].value = v;
+				self.board.redraw();
+				if(self.onChange) self.onChange(self.editIndex, v);
+			}
+			// 官方控件的事件名是 onChange，引擎原生控件是 onchange，两个都挂
+			self.editCtrl.onChange = onChanged;
+			self.editCtrl.onchange = onChanged;
+		}
+		var br = self.__boardRect();
+		// ⚠ 编辑框要落在**显示行**上（中间夹着分组带，不能用属性序号算 y）
+		var cellY = br.top + self.rowH + (ri - 1) * self.rowH;
+		var x = br.left + self.nameW + 2;
+		var w = (br.right - br.left) - self.nameW - 4;
+		..nodio.ui.setRect(self.editCtrl, x, cellY, x + w, cellY + self.rowH - 2);
+		..nodio.ui.setCtrlText(self.editCtrl, self.items[index].value : "");
+		self.editCtrl.show(true);
+	}
+
+	self.__endEdit = function(){
+		self.editIndex = 0;
+		if(self.editCtrl){
+			try{ self.editCtrl.show(false) }catch(e){}
+		}
+	}
+
+	// 折叠箭头：▸ 折叠 / ▾ 展开
+	// 自己用矩形拼，不依赖字体里有没有 ▶▼ 这些字形。
+	// brush 由调用方传入 —— 箭头颜色跟分类标题一致。
+	self.__drawArrow = function(graphics, brush, x, y, size, collapsed){
+		var i;
+		if(collapsed){
+			// 指向右
+			for(i=0;size;1){
+				var hh = size - (i * 2);
+				if(hh < 1) hh = 1;
+				graphics.fillRect(brush, x + i, y + (size - hh) / 2, 1, hh);
+			}
+		}
+		else{
+			// 指向下
+			for(i=0;size;1){
+				var ww = size - (i * 2);
+				if(ww < 1) ww = 1;
+				graphics.fillRect(brush, x + (size - ww) / 2, y + i, ww, 1);
+			}
+		}
+	}
+
+	// 绘制
+	self.__draw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var pPad = ..nodio.ui.px(6);
+		// 背景
+		var bg = ..gdip.solidBrush(self.bgColor);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		// 表头
+		var hb = ..gdip.solidBrush(self.headColor);
+		graphics.fillRect(hb, rc.left, rc.top, w, self.rowH);
+		hb.delete();
+		var headBrush = ..gdip.solidBrush(self.headText);
+		graphics.drawString(self.headText1, font,
+			::RECTF(rc.left + pPad, rc.top, self.nameW, self.rowH), fmt, headBrush);
+		graphics.drawString(self.headText2, font,
+			::RECTF(rc.left + self.nameW + pPad, rc.top, w - self.nameW, self.rowH),
+			fmt, headBrush);
+		headBrush.delete();
+		// 表头下边线
+		var hpen = ..gdip.pen(self.lineColor, 1);
+		graphics.drawLine(hpen, rc.left, rc.top + self.rowH - 1, rc.right, rc.top + self.rowH - 1);
+		hpen.delete();
+		// 列分隔线（先画：分组带的底色会盖住它 —— 带是通栏的）
+		var pen2 = ..gdip.pen(self.lineColor, 1);
+		graphics.drawLine(pen2, rc.left + self.nameW, rc.top, rc.left + self.nameW, rc.bottom);
+		pen2.delete();
+		// 行
+		var arrowSize = ..nodio.ui.px(7);
+		for(i=1;#self.rows;1){
+			var row = self.rows[i];
+			var y = rc.top + self.rowH + (i - 1) * self.rowH;
+			if(y + self.rowH > rc.bottom) break;
+			if(row.type == "cat"){
+				// ---------- 分组带 ----------
+				var cb = ..gdip.solidBrush(self.bandColor);
+				graphics.fillRect(cb, rc.left, y, w, self.rowH);
+				cb.delete();
+				// 折叠箭头
+				var ab = ..gdip.solidBrush(self.bandText);
+				self.__drawArrow(graphics, ab, rc.left + pPad, y + (self.rowH - arrowSize) / 2,
+					arrowSize, self.collapsed[row.cat] ? true : false);
+				ab.delete();
+				// 分类名
+				var tb = ..gdip.solidBrush(self.bandText);
+				graphics.drawString(row.cat, font,
+					::RECTF(rc.left + pPad + arrowSize + 4, y, w - self.nameW, self.rowH),
+					fmt, tb);
+				tb.delete();
+				// 带的下边线
+				var cpen = ..gdip.pen(self.lineColor, 1);
+				graphics.drawLine(cpen, rc.left, y + self.rowH - 1, rc.right, y + self.rowH - 1);
+				cpen.delete();
+				continue;
+			}
+			// ---------- 普通属性行 ----------
+			var it = self.items[row.index];
+			if(!it) continue;
+			if(row.index == self.selIndex){
+				var sb = ..gdip.solidBrush(self.selColor);
+				graphics.fillRect(sb, rc.left, y, w, self.rowH);
+				sb.delete();
+			}
+			var brush = ..gdip.solidBrush(self.textColor);
+			graphics.drawString(tostring(it.name : ""), font,
+				::RECTF(rc.left + pPad, y, self.nameW, self.rowH), fmt, brush);
+			brush.delete();
+			// 值列正在编辑时不画（edit 控件盖在上面）
+			if(row.index != self.editIndex){
+				var vb = ..gdip.solidBrush(self.valueColor);
+				graphics.drawString(tostring(it.value : ""), font,
+					::RECTF(rc.left + self.nameW + pPad, y, w - self.nameW, self.rowH),
+					fmt, vb);
+				vb.delete();
+			}
+			// 行分隔线
+			var pen = ..gdip.pen(self.lineColor, 1);
+			graphics.drawLine(pen, rc.left, y + self.rowH - 1, rc.right, y + self.rowH - 1);
+			pen.delete();
+		}
+	}
+
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		self.board.layout(l, t, r, b);
+	}
+
+	self.layout();
+	return self;
+}
+
+}

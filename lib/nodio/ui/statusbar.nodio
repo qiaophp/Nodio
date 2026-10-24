@@ -48,6 +48,17 @@ statusbar = function(winform, opt){
 	self.board.onDraw = function(graphics, rc, bd){
 		self.__draw(graphics, rc, bd);
 	}
+	self.board.onMouseClick = function(x, y){
+		var curX = 0;
+		for(i=1;#self.panels;1){
+			var p = self.panels[i];
+			if(x >= curX && x < curX + p.width){
+				if(self.onPanelClick) self.onPanelClick(i, p.name);
+				break;
+			}
+			curX = curX + p.width;
+		}
+	}
 
 	// 加一段（宽度是逻辑像素）
 	self.addPanel = function(name, width){
@@ -72,6 +83,10 @@ statusbar = function(winform, opt){
 	self.setText = function(i, text){
 		var k = self.__index(i);
 		if(!k || !self.panels[k]) return;
+		// 文字没变就**不要重画**：状态栏是整条宽的自绘板，
+		// 心跳每 300ms 写一次「就绪」，每次都整条重画一遍 ——
+		// 这就是「鼠标一动就卡一下」的主要来源之一。
+		if(self.panels[k].text === text) return;
 		self.panels[k].text = text;
 		self.board.invalidate();
 	}

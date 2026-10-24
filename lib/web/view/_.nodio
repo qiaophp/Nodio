@@ -914,7 +914,7 @@ Object.defineProperty(window, 'aardio', {
 	}
 	
 
-	shared = function(params,createBrowserOptions){
+	renamed = function(params,createBrowserOptions){
 		if(sharedInstance && sharedInstance.valid){
 			sharedInstance.visible = true;
 			return sharedInstance;
@@ -961,7 +961,7 @@ Object.defineProperty(window, 'aardio', {
 		})
 		
 		
-		return shared(params,createBrowserOptions);
+		return renamed(params,createBrowserOptions);
 	}
 	
 	loadPreferences = function(userDataDir){

@@ -162,6 +162,41 @@ dsg = {
 		sb = sb ++ ')\r\n/*}}*/\r\n';
 		return sb;
 	}
+
+	// 从源码里**取出** DSG 块（没有就返回空串）
+	//
+	// 官方 aardio 的窗体源码里，设计标记就是这两个注释之间的一段：
+	//   /*DSG{{*/ ... /*}}*/
+	// 设计器打开时读它 → 画布；画布改完再写回去 → 源码。
+	extractBlock = function(src){
+		if(!src) return "";
+		var a = ..string.indexOf(src, '/*DSG{{*/');
+		if(a === null) return "";
+		var b = ..string.indexOf(src, '/*}}*/');
+		if(b === null || b < a) return "";
+		return ..string.mid(src, a, b - a);
+	}
+
+	// 把源码里的 DSG 块**替换**成新块（原来没有就追加到末尾）
+	//
+	// 返回新源码；调用方负责写回（编辑器 setText + 标脏）。
+	replaceBlock = function(src, block){
+		src = src : "";
+		block = block : "";
+		var a = ..string.indexOf(src, '/*DSG{{*/');
+		var b = ..string.indexOf(src, '/*}}*/');
+		if(a === null){
+			// 原来没有设计块 → 追加到源码末尾
+			if(!#src) return block;
+			if(..string.sub(src, #src, #src) != '\n') src = src ++ '\r\n';
+			return src ++ block;
+		}
+		if(b === null || b < a){
+			// 有开始标记没有结束标记（源码写坏了）→ 只替换开始标记之后的部分
+			return ..string.left(src, a - 1) ++ block;
+		}
+		return ..string.left(src, a - 1) ++ block ++ ..string.mid(src, b);
+	}
 }
 
 }

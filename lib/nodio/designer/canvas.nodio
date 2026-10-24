@@ -1,0 +1,1211 @@
+// nodio.designer.canvas — 设计画布。
+//
+// 画布是**主窗体上的一组控件**：一块自绘底板（灰底 + 网格 + 选中框 + 8 个
+// 手柄）+ 组件控件（真实控件，所见即所得）。
+// 没有用子窗体：
+//   官方 win.form 的子窗体（mode="child"）带标题栏，而 border="none" 又会
+//   把 WS_CHILD 覆盖成 WS_POPUP（变成浮在 IDE 上面的独立窗口）。
+//   直接挂在主窗体上，被裁剪、层级正确、打印/截图都能拿到。
+//
+// 选中框与手柄画在**底板**上（底板在组件下面），所以手柄一律放在组件
+// **外侧**，不会被组件挡住；选中框画在组件外扩 1px 的位置。
+//
+// 交互：
+//   · 点组件 → 选中；拖组件 → 移动（组件自己的窗口过程）
+//   · 拖手柄 → 改尺寸（手柄在组件外侧，命中的是底板，由底板处理）
+//   · 拖拽一律用**屏幕坐标**算增量：控件在拖动过程中会跟着鼠标走，
+//     lParam（客户区坐标）会跟着变，用它算增量会漂移。
+//
+// 用法：
+//   cv = nodio.designer.canvas(winform, {left=0;top=0;right=400;bottom=300})
+//   item = cv.add(spec, {x=20;y=20;w=120;h=30})
+//   cv.select(item.name)
+//   text = cv.toDSG()
+//
+// 组件的替身类取 spec.drawAs（对应官方 ide.customCtrl 的映射）：
+// 画不出来的控件用一个可画的类代画，DSG 里仍然写真实类名。
+namespace nodio.designer{
+import nodio.designer.dsg;
+import nodio.designer.registry;
+import nodio.ui.board;
+import nodio.ui.subclass;
+import nodio.ui.rect;
+import nodio.ui.dpi;
+
+var __cvSeq = 0;
+
+// 手柄尺寸与序号：0=左上 1=上 2=右上 3=右 4=右下 5=下 6=左下 7=左
+// 尺寸是**逻辑像素**（按 DPI 换算成物理像素）
+var HANDLE_SIZE = 6;
+var MIN_SIZE    = 8;      // 组件最小宽高（逻辑像素）
+var GRID_SIZE   = 16;     // 网格间距（逻辑像素）
+
+canvas = function(winform, opt){
+	opt = opt : {};
+	var self = {
+		winform  = winform;
+		bg       = null;     // 画布底板（自绘：灰底 + 网格 + 选中框 + 手柄）
+		items    = {};
+		selected = null;
+		rect     = opt.rect;
+		origin   = {left=0; top=0};   // 画布左上角在主窗体里的位置
+		onSelect = null;
+		onChange = null;
+		onContextMenu = null;   // function(item, x, y) —— x,y 是**屏幕坐标**
+		onDoubleClick = null;   // function(item) —— 双击组件（官方 IDE 用它生成事件代码）
+		// 窗体设置（DSG 头 win.form 的 标题/宽度/高度，设计坐标=逻辑像素）
+		// ⚠ 改它走 applyFormProps()，别直接赋值 —— 要连带重画。
+		form    = { text = "窗体"; w = 759; h = 469 };
+		// 对齐网格：拖动/缩放时把坐标吸附到 GRID_SIZE 的整数倍
+		// （官方 USR.CFG 的 dlg_restraint；属性格改的精确值不吸附）
+		snap    = true;
+		// 网格线显示开关（官方 USR.CFG 的 dlg_grid）
+		showGrid = (opt.showGrid !== false);
+		// 控件吸附对齐开关（官方 USR.CFG 的 dlg_snap：拖拽时磁性吸附相邻控件边界）
+		alignSnap = (opt.alignSnap !== false);
+		// 设计器缩放（百分比，默认 100；官方 USR.CFG 的 dlg_zoom_defalut）
+		zoom = opt.zoom : 100;
+		// 动态对齐参考线（拖拽时生成，松手清空）
+		__guideLines = {};
+		// 多选与撤销
+		selection = {};
+		undoStack = {};
+		redoStack = {};
+		// 边距参考线（设计坐标；null = 不画。官方 USR.CFG 的 dlg_margin_*）
+		margins = null;
+		__formSel = false;      // 当前选中的是「窗体本身」（画布四周画框）
+		visible  = false;
+		__drag   = null;
+		__resize = null;
+		// 配色
+		//
+		// 画布是「**表单表面**」，不是 IDE 面板：参考 IDE（aar.chengxu.online
+		// /thread-903.htm）里设计面就是一块白色表单，摆在浅灰工作区中间。
+		// 画布上摆的是**原生控件**（浅灰 3D 外观），深色画布会和它们打架，
+		// 所以这里保持浅色；IDE 自己的深色 chrome 在画布外面。
+		frameColor = opt.frameColor : 0xFF1F6FB2;
+		handleColor = opt.handleColor : 0xFF1F6FB2;
+		gridColor = opt.gridColor : 0xFFE0E0E0;
+		bgColor   = opt.bgColor : 0xFFFFFFFF;
+	};
+
+	self.zoomScale = function(){
+		var z = tonumber(self.zoom);
+		if(!z || z <= 10) return 1.0;
+		return z / 100.0;
+	};
+	self.setZoom = function(z){
+		var nz = tonumber(z);
+		if(!nz || nz < 25) nz = 25;
+		if(nz > 400) nz = 400;
+		self.zoom = nz;
+		for(i=1;#self.items;1){
+			self.__place(self.items[i]);
+		}
+		self.__refresh();
+	};
+
+	__cvSeq = __cvSeq + 1;
+	var r = opt.rect : {left=0; top=0; right=400; bottom=300};
+
+	// ---------- 底板 ----------
+	self.bg = nodio.ui.board(winform, {
+		left = r.left; top = r.top; right = r.right; bottom = r.bottom;
+	});
+	self.bg.onDraw = function(graphics, rc, bd){
+		self.__draw(graphics, rc, bd);
+	}
+	// 点空白处：选中**窗体本身**（官方设计器行为 —— 属性格改 标题/宽度/高度）；
+	// 点手柄 → 开始改尺寸
+	self.bg.onMouseDown = function(x, y, bd, lp){
+		var hi = self.__hitHandle(x, y);
+		if(hi && self.selected){
+			var m = ..nodio.ui.mouseScreen(self.bg.ctrl.hwnd, lp);
+			if(m){
+				var it = self.selected;
+				self.__resize = {
+					index = hi - 1; item = it; m0 = m;
+					ox = it.x; oy = it.y; ow = it.w; oh = it.h;
+				};
+			}
+			return;
+		}
+		self.selectForm();
+	}
+	self.bg.onMouseMove = function(x, y, bd, lp){
+		if(!self.__resize) return;
+		var m = ..nodio.ui.mouseScreen(self.bg.ctrl.hwnd, lp);
+		if(m) self.__doResize(m.x - self.__resize.m0.x, m.y - self.__resize.m0.y);
+	}
+	self.bg.onMouseUp = function(x, y, bd, lp){
+		if(self.__resize){
+			self.__resize = null;
+			if(self.onChange) self.onChange(self.selected);
+		}
+	}
+	self.bg.show(false);
+
+	// ---------- 几何工具 ----------
+	// 画布的坐标是**设计坐标（逻辑像素）**：和 DSG 里的 left/top/width/height
+	// 一致，运行时由官方窗体按 DPI 缩放 —— 设计器所见即所得。
+	// 下面凡是落到屏幕上的量都先 px() 换算成物理像素。
+	//
+	// 手柄的位置（相对画布左上角，一律在组件**外侧**，按缩放计算）
+	self.__handlePos = function(index, it){
+		var zs = self.zoomScale ? self.zoomScale() : 1.0;
+		var s = ..nodio.ui.px(HANDLE_SIZE);
+		var x = math.round(..nodio.ui.px(it.x) * zs), y = math.round(..nodio.ui.px(it.y) * zs);
+		var w = math.round(..nodio.ui.px(it.w) * zs), h = math.round(..nodio.ui.px(it.h) * zs);
+		if(index == 0) return {x = x - s - 1; y = y - s - 1};
+		if(index == 1) return {x = x + (w - s) / 2; y = y - s - 1};
+		if(index == 2) return {x = x + w + 1; y = y - s - 1};
+		if(index == 3) return {x = x + w + 1; y = y + (h - s) / 2};
+		if(index == 4) return {x = x + w + 1; y = y + h + 1};
+		if(index == 5) return {x = x + (w - s) / 2; y = y + h + 1};
+		if(index == 6) return {x = x - s - 1; y = y + h + 1};
+		if(index == 7) return {x = x - s - 1; y = y + (h - s) / 2};
+		return {x=x; y=y};
+	}
+
+	// 命中某个手柄？返回手柄序号（0=没命中）
+	self.__hitHandle = function(x, y){
+		var it = self.selected;
+		if(!it) return 0;
+		var hs = ..nodio.ui.px(HANDLE_SIZE);
+		for(i=0;8;1){
+			var p = self.__handlePos(i, it);
+			if(x >= p.x - 2 && x <= p.x + hs + 2
+				&& y >= p.y - 2 && y <= p.y + hs + 2) return i + 1;
+		}
+		return 0;
+	}
+
+	// 重画底板（选中框/手柄变了要重画）
+	//
+	// ⚠ 底板是 plus 自绘板，它的内容会**直绘到窗体背景上**，
+	//   绘制顺序在子控件之后 —— 底板一重画，组件区域的像素就被底板盖掉，
+	//   组件不会自动重绘（子窗口只有在自己失效时才重绘），
+	//   结果就是「画布上只看得见网格，看不见控件」。
+	//   所以底板刷完要把组件区域**再刷一遍**。
+	self.__refresh = function(){
+		self.bg.redraw();
+		for(i=1;#self.items;1){
+			var it = self.items[i];
+			if(!it || !it.ctrl || !it.ctrl.hwnd) continue;
+			try{
+				it.ctrl.invalidate();
+				::UpdateWindow(it.ctrl.hwnd);
+			}
+			catch(e){}
+		}
+	}
+
+	// 对齐网格：把一个设计坐标吸附到 GRID_SIZE 的整数倍
+	// （self.snap 关掉时原样返回 —— 官方 USR.CFG 的 dlg_snap）
+	self.__snap = function(v){
+		if(!self.snap) return v;
+		if(v === null || v === undefined) return v;
+		return math.round(v / GRID_SIZE) * GRID_SIZE;
+	}
+
+	// 按手柄序号算新的矩形（dx/dy 是屏幕坐标增量，物理像素）
+	// 换算成设计坐标（逻辑像素）再改组件矩形
+	self.__doResize = function(dx, dy){
+		var d = self.__resize;
+		if(!d) return;
+		var sc = ..nodio.ui.dpiScale();
+		var ldx = math.round(dx / sc), ldy = math.round(dy / sc);
+		var it = d.item;
+		var x = d.ox, y = d.oy, w = d.ow, h = d.oh;
+		var i = d.index;
+		if(i == 0 || i == 6 || i == 7) x = d.ox + ldx;          // 左边的手柄
+		if(i == 0 || i == 2 || i == 1) y = d.oy + ldy;          // 上边的手柄
+		if(i == 2 || i == 4 || i == 3) w = d.ow + ldx;          // 右边的手柄
+		if(i == 4 || i == 6 || i == 5) h = d.oh + ldy;          // 下边的手柄
+		if(i == 0 || i == 6 || i == 7) w = d.ow - ldx;
+		if(i == 0 || i == 2 || i == 1) h = d.oh - ldy;
+		// 最小尺寸（被拖过头时钉住对边）
+		if(w < MIN_SIZE){
+			if(i == 0 || i == 6 || i == 7) x = d.ox + d.ow - MIN_SIZE;
+			w = MIN_SIZE;
+		}
+		if(h < MIN_SIZE){
+			if(i == 0 || i == 2 || i == 1) y = d.oy + d.oh - MIN_SIZE;
+			h = MIN_SIZE;
+		}
+		// 对齐网格（位置与尺寸一起吸附，官方 dlg_restraint 语义）
+		x = self.__snap(x); y = self.__snap(y);
+		w = self.__snap(w); h = self.__snap(h);
+		it.x = x; it.y = y; it.w = w; it.h = h;
+		self.__syncGeomProps(it);
+		self.__place(it);
+		self.__refresh();
+	}
+
+	// 把组件摆到画布里的位置
+	// 组件矩形是**设计坐标**（逻辑像素），摆到屏幕上要按 DPI 与设计器缩放换算
+	self.__place = function(item){
+		if(!item || !item.ctrl) return;
+		var zs = self.zoomScale ? self.zoomScale() : 1.0;
+		var l = self.origin.left + math.round(..nodio.ui.px(item.x) * zs);
+		var t = self.origin.top + math.round(..nodio.ui.px(item.y) * zs);
+		var r = l + math.round(..nodio.ui.px(item.w) * zs);
+		var b = t + math.round(..nodio.ui.px(item.h) * zs);
+		..nodio.ui.setRect(item.ctrl, l, t, r, b);
+		// 组件提到**画布底板之上**（官方 win.ui 的 add 只在同一次调用内部
+		// 按 z 排序，跨调用只有创建顺序；底板是自绘板，层次容易反）。
+		// 和 editor 的浮条/行号栏同一个做法。
+		try{
+			..win.setPos(item.ctrl.hwnd, l, t, r - l, b - t,
+				0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+		}catch(e){}
+	}
+
+	// 几何变了 → 同步属性格里的 左/上/宽/高
+	self.__syncGeomProps = function(item){
+		if(!item) return;
+		for(i=1;#item.props;1){
+			var key = item.props[i].key;
+			if(key == "left") item.props[i].value = item.x;
+			elseif(key == "top") item.props[i].value = item.y;
+			elseif(key == "width") item.props[i].value = item.w;
+			elseif(key == "height") item.props[i].value = item.h;
+		}
+	}
+
+	// ---------- 组件 ----------
+	// 加一个组件（保留 DSG 原生变量名或自动递增）
+	self.add = function(spec, rect, name){
+		if(!spec) return null;
+		rect = rect : {x=0; y=0; w=120; h=30};
+		var n = #self.items + 1;
+		if(!name || #name == 0) name = (spec.cls : "ctrl") ++ n;
+		// 属性描述 → 初始值
+		// 首项放「变量名」（在属性格里可查看/重命名）
+		var props = {};
+		..table.push(props, {key="name"; name="变量名"; value=name; type="string"; cat="基本"});
+		var defs = spec.props : {};
+		for(i=1;#defs;1){
+			var d = defs[i];
+			var key = d[1];
+			if(key == "name") continue;
+			var label = d[2] : key;
+			var ptype = d[3] : "string";
+			var pcat = d[4] : "";
+			if(!pcat) pcat = ..nodio.designer.registry.categoryOf(key);
+			..table.push(props, {key=key; name=label; value=""; type=ptype; cat=pcat});
+		}
+		// 建控件
+		// 创建矩形给**逻辑坐标**（官方 win.ui 的 add 会按 DPI 缩放），
+		// 建完立刻用 __place 摆到物理位置，两条路径都对得上。
+		var sc = ..nodio.ui.dpiScale();
+		var ox = self.origin.left / sc, oy = self.origin.top / sc;
+		var tParam = {
+			cls = spec.drawAs : (spec.cls : "static");
+			left = ox + rect.x; top = oy + rect.y;
+			right = ox + rect.x + rect.w;
+			bottom = oy + rect.y + rect.h;
+		};
+		for(i=1;#props;1){
+			var pk = props[i].key;
+			if(pk == "text"){
+				// 标题类属性默认取组件名（VS 里 Button 的 Text 默认就是控件名）
+				if(type(props[i].value) == "string" && #props[i].value == 0){
+					props[i].value = spec.name;
+				}
+				tParam.text = props[i].value;
+			}
+			// 几何属性的初值 = 组件在画布里的矩形
+			if(pk == "left") props[i].value = rect.x;
+			elseif(pk == "top") props[i].value = rect.y;
+			elseif(pk == "width") props[i].value = rect.w;
+			elseif(pk == "height") props[i].value = rect.h;
+		}
+		// 自定义构造器组件（spec.ctor）：nodio.gui 这类**自绘控件**不是官方
+		// win.ui.ctrl 类，没法走 form.add —— 由组件自己提供「怎么建」。
+		// 约定：ctor(winform, rect) 收到**物理像素**矩形（自绘控件不吃官方
+		// DPI 缩放），返回一个门面表：
+		//   { ctrl = {hwnd=..;show=..;invalidate=..};      ← 画布要用的控件
+		//     setProp = function(key, value){ return true } ← 属性格回写
+		//     dispose = function(){} }                      ← 移除时释放
+		var face = null;
+		var ctrl = null;
+		if(spec.ctor){
+			var pt = {
+				left = self.origin.left + ..nodio.ui.px(rect.x);
+				top = self.origin.top + ..nodio.ui.px(rect.y);
+				right = self.origin.left + ..nodio.ui.px(rect.x + rect.w);
+				bottom = self.origin.top + ..nodio.ui.px(rect.y + rect.h);
+				text = tParam.text;
+			};
+			face = spec.ctor(self.winform, pt);
+			if(!face) return null;
+			ctrl = face.ctrl;
+		}
+		else{
+			ctrl = ..nodio.ui.addCtrl(self.winform, name, tParam);
+		}
+		if(!ctrl) return null;
+		// 官方控件**建的时候不吃 tParam.text** —— 标题要在建好后再写一次，
+		// 否则画布上的按钮是个空壳（属性格里却有标题）。
+		if(tParam.text !== null && tParam.text !== undefined){
+			if(face && face.setProp){
+				face.setProp("text", tParam.text);
+			}
+			else{
+				..nodio.ui.setCtrlText(ctrl, tParam.text);
+			}
+		}
+		var item = {
+			name = name; spec = spec; face = face;
+			x = rect.x; y = rect.y; w = rect.w; h = rect.h;
+			props = props; ctrl = ctrl;
+		};
+		..table.push(self.items, item);
+		ctrl.show(self.visible);
+		self.__place(item);
+		self.__hook(item);
+		return item;
+	}
+
+	// 组件自己的窗口过程：选中 + 拖动
+	// 子类化用 nodio.ui.subclass：所有控件共用一个原生 trampoline，
+	// 窗口销毁时自动还原并删记录 —— 组件加多少都不会把画布钉住不放。
+	self.__hook = function(item){
+		try{
+			var sub = ..nodio.ui.subclass(item.ctrl.hwnd, function(hwnd,msg,wp,lp){
+				if(msg == 0x201){        // WM_LBUTTONDOWN
+					var isCtrl = (::User32.GetKeyState(0x11/*VK_CONTROL*/) & 0x8000) != 0;
+					var isShift = (::User32.GetKeyState(0x10/*VK_SHIFT*/) & 0x8000) != 0;
+					self.select(item.name, isCtrl || isShift);
+					var m = ..nodio.ui.mouseScreen(hwnd, lp);
+					if(m){
+						self.pushUndo();
+						self.__drag = {item=item; m0=m; ox=item.x; oy=item.y};
+					}
+				}
+				elseif(msg == 0x200){   // WM_MOUSEMOVE
+					if(self.__drag && self.__drag.item == item){
+						var m2 = ..nodio.ui.mouseScreen(hwnd, lp);
+						if(!m2) return null;
+						// 屏幕增量是物理像素 → 换算成设计坐标（逻辑像素，考虑缩放）
+						var zs = self.zoomScale ? self.zoomScale() : 1.0;
+						var sc = ..nodio.ui.dpiScale() * zs;
+						var nx = self.__drag.ox + math.round((m2.x - self.__drag.m0.x) / sc);
+						var ny = self.__drag.oy + math.round((m2.y - self.__drag.m0.y) / sc);
+						if(nx != item.x || ny != item.y){
+							// 控件间对齐吸附（dlg_snap）：在 5 逻辑像素范围内磁性吸附
+							var snappedX = nx;
+							var snappedY = ny;
+							var guides = {};
+							if(self.alignSnap){
+								var threshold = 5;
+								var matchedX = false;
+								var matchedY = false;
+								for(i=1;#self.items;1){
+									var other = self.items[i];
+									if(other == item) continue;
+									// X 方向吸附
+									if(!matchedX){
+										// 左对齐 (Left to Left)
+										if(math.abs(nx - other.x) <= threshold){
+											snappedX = other.x;
+											..table.push(guides, {type="v"; pos=other.x});
+											matchedX = true;
+										}
+										// 右对齐 (Right to Right)
+										elseif(math.abs((nx + item.w) - (other.x + other.w)) <= threshold){
+											snappedX = other.x + other.w - item.w;
+											..table.push(guides, {type="v"; pos=other.x + other.w});
+											matchedX = true;
+										}
+										// 居中对齐 (Center X)
+										elseif(math.abs((nx + item.w/2) - (other.x + other.w/2)) <= threshold){
+											snappedX = math.round(other.x + (other.w - item.w)/2);
+											..table.push(guides, {type="v"; pos=math.round(other.x + other.w/2)});
+											matchedX = true;
+										}
+										// 紧贴右边 (Left to Right)
+										elseif(math.abs(nx - (other.x + other.w)) <= threshold){
+											snappedX = other.x + other.w;
+											..table.push(guides, {type="v"; pos=other.x + other.w});
+											matchedX = true;
+										}
+										// 紧贴左边 (Right to Left)
+										elseif(math.abs((nx + item.w) - other.x) <= threshold){
+											snappedX = other.x - item.w;
+											..table.push(guides, {type="v"; pos=other.x});
+											matchedX = true;
+										}
+									}
+									// Y 方向吸附
+									if(!matchedY){
+										// 顶对齐 (Top to Top)
+										if(math.abs(ny - other.y) <= threshold){
+											snappedY = other.y;
+											..table.push(guides, {type="h"; pos=other.y});
+											matchedY = true;
+										}
+										// 底对齐 (Bottom to Bottom)
+										elseif(math.abs((ny + item.h) - (other.y + other.h)) <= threshold){
+											snappedY = other.y + other.h - item.h;
+											..table.push(guides, {type="h"; pos=other.y + other.h});
+											matchedY = true;
+										}
+										// 居中对齐 (Center Y)
+										elseif(math.abs((ny + item.h/2) - (other.y + other.h/2)) <= threshold){
+											snappedY = math.round(other.y + (other.h - item.h)/2);
+											..table.push(guides, {type="h"; pos=math.round(other.y + other.h/2)});
+											matchedY = true;
+										}
+										// 紧贴下边 (Top to Bottom)
+										elseif(math.abs(ny - (other.y + other.h)) <= threshold){
+											snappedY = other.y + other.h;
+											..table.push(guides, {type="h"; pos=other.y + other.h});
+											matchedY = true;
+										}
+										// 紧贴上边 (Bottom to Top)
+										elseif(math.abs((ny + item.h) - other.y) <= threshold){
+											snappedY = other.y - item.h;
+											..table.push(guides, {type="h"; pos=other.y});
+											matchedY = true;
+										}
+									}
+									if(matchedX && matchedY) break;
+								}
+								if(!matchedX) snappedX = self.__snap(nx);
+								if(!matchedY) snappedY = self.__snap(ny);
+							}
+							else{
+								snappedX = self.__snap(nx);
+								snappedY = self.__snap(ny);
+							}
+							self.__guideLines = guides;
+							item.x = snappedX;
+							item.y = snappedY;
+							self.__syncGeomProps(item);
+							self.__place(item);
+							self.__refresh();
+							if(self.onChange) self.onChange(item);
+						}
+					}
+				}
+				elseif(msg == 0x202){   // WM_LBUTTONUP
+					self.__drag = null;
+					if(self.__guideLines && #self.__guideLines > 0){
+						self.__guideLines = {};
+						self.__refresh();
+					}
+				}
+				elseif(msg == 0x203){   // WM_LBUTTONDBLCLK：双击组件
+					// 官方 IDE 的行为：双击控件 → 切到代码视图生成/跳到事件函数。
+					// 常用标准控件类（button/edit/static/listbox/combobox）都带
+					// CS_DBLCLKS，双击消息能到；收不到的控件走右键「查看事件代码」。
+					self.select(item.name);
+					if(self.onDoubleClick) self.onDoubleClick(item);
+				}
+				elseif(msg == 0x7B){    // WM_CONTEXTMENU
+					// 右键：官方 win.ui.tracker 的 onContextMenu 语义 ——
+					// x,y 是**屏幕坐标**；lParam == -1（菜单键 / Shift+F10）
+					// 时退回真实光标位置（tracker.aardio:162-166）
+					var cx,cy = ..win.getMessagePos(lp);
+					if(cx == -1 && cy == -1) cx,cy = ..win.getMessagePos();
+					if(self.onContextMenu){
+						self.onContextMenu(item, cx, cy);
+					}
+				}
+				return null;
+			});
+			if(sub) item.__sub = sub;
+		}
+		catch(e){
+			// 子类化失败时仍可通过属性格操作
+		}
+	}
+
+	// 解除子类化（移除组件 / 清空 / 释放画布时都要走这里）
+	self.__unhook = function(item){
+		if(item && item.__sub){
+			try{ item.__sub.free() }catch(e){}
+			item.__sub = null;
+		}
+	}
+
+	// ---------- 多选集合维护 ----------
+	self.isSelected = function(item){
+		if(!item) return false;
+		var name = item.name : item;
+		if(self.selection && self.selection[name]) return true;
+		return (self.selected && self.selected.name == name);
+	}
+	self.selectItem = function(item, multi){
+		if(!item){
+			self.selected = null;
+			self.selection = {};
+			self.__formSel = false;
+			self.__refresh();
+			if(self.onSelect) self.onSelect(null);
+			return;
+		}
+		var name = item.name : item;
+		if(multi){
+			if(self.selection[name]){
+				self.selection[name] = null;
+				if(self.selected && self.selected.name == name){
+					self.selected = null;
+					for(i=1;#self.items;1){
+						if(self.selection[self.items[i].name]){
+							self.selected = self.items[i];
+							break;
+						}
+					}
+				}
+			}
+			else{
+				self.selection[name] = true;
+				self.selected = item;
+			}
+		}
+		else{
+			self.selection = { [name] = true };
+			self.selected = item;
+		}
+		self.__formSel = false;
+		self.__refresh();
+		if(self.onSelect) self.onSelect(self.selected);
+	}
+	self.selectAll = function(){
+		self.selection = {};
+		for(i=1;#self.items;1){
+			self.selection[self.items[i].name] = true;
+		}
+		if(#self.items) self.selected = self.items[1];
+		self.__refresh();
+	}
+	self.selectedItems = function(){
+		var out = {};
+		for(i=1;#self.items;1){
+			var it = self.items[i];
+			if(self.selection && self.selection[it.name]){
+				..table.push(out, it);
+			}
+		}
+		if(!#out && self.selected) ..table.push(out, self.selected);
+		return out;
+	}
+
+	// 选中（name 为 null 表示取消选中；multi 为 true 表示多选切换）
+	self.select = function(name, multi){
+		var item = null;
+		if(name){
+			for(i=1;#self.items;1){
+				if(self.items[i].name == name){ item = self.items[i]; break }
+			}
+		}
+		self.selectItem(item, multi);
+		return item;
+	}
+
+	// ---------- 批量对齐 ----------
+	// 左对齐 (Align Left)
+	self.alignLeft = function(){
+		var items = self.selectedItems();
+		if(#items < 2) return false;
+		self.pushUndo();
+		var target = self.selected ? self.selected.x : items[1].x;
+		for(i=1;#items;1){
+			items[i].x = target;
+			self.__place(items[i]);
+		}
+		self.__refresh();
+		if(self.onChange) self.onChange(self.selected);
+		return true;
+	}
+	// 右对齐 (Align Right)
+	self.alignRight = function(){
+		var items = self.selectedItems();
+		if(#items < 2) return false;
+		self.pushUndo();
+		var target = self.selected ? (self.selected.x + self.selected.w) : (items[1].x + items[1].w);
+		for(i=1;#items;1){
+			items[i].x = target - items[i].w;
+			self.__place(items[i]);
+		}
+		self.__refresh();
+		if(self.onChange) self.onChange(self.selected);
+		return true;
+	}
+	// 顶对齐 (Align Top)
+	self.alignTop = function(){
+		var items = self.selectedItems();
+		if(#items < 2) return false;
+		self.pushUndo();
+		var target = self.selected ? self.selected.y : items[1].y;
+		for(i=1;#items;1){
+			items[i].y = target;
+			self.__place(items[i]);
+		}
+		self.__refresh();
+		if(self.onChange) self.onChange(self.selected);
+		return true;
+	}
+	// 底对齐 (Align Bottom)
+	self.alignBottom = function(){
+		var items = self.selectedItems();
+		if(#items < 2) return false;
+		self.pushUndo();
+		var target = self.selected ? (self.selected.y + self.selected.h) : (items[1].y + items[1].h);
+		for(i=1;#items;1){
+			items[i].y = target - items[i].h;
+			self.__place(items[i]);
+		}
+		self.__refresh();
+		if(self.onChange) self.onChange(self.selected);
+		return true;
+	}
+	// 水平居中对齐 (Center Horizontal)
+	self.alignCenterH = function(){
+		var items = self.selectedItems();
+		if(#items < 2) return false;
+		self.pushUndo();
+		var midX = self.selected ? (self.selected.x + math.round(self.selected.w / 2)) : (items[1].x + math.round(items[1].w / 2));
+		for(i=1;#items;1){
+			items[i].x = midX - math.round(items[i].w / 2);
+			self.__place(items[i]);
+		}
+		self.__refresh();
+		if(self.onChange) self.onChange(self.selected);
+		return true;
+	}
+	// 垂直居中对齐 (Center Vertical)
+	self.alignCenterV = function(){
+		var items = self.selectedItems();
+		if(#items < 2) return false;
+		self.pushUndo();
+		var midY = self.selected ? (self.selected.y + math.round(self.selected.h / 2)) : (items[1].y + math.round(items[1].h / 2));
+		for(i=1;#items;1){
+			items[i].y = midY - math.round(items[i].h / 2);
+			self.__place(items[i]);
+		}
+		self.__refresh();
+		if(self.onChange) self.onChange(self.selected);
+		return true;
+	}
+	// 相同宽度 (Same Width)
+	self.sameWidth = function(){
+		var items = self.selectedItems();
+		if(#items < 2) return false;
+		self.pushUndo();
+		var targetW = self.selected ? self.selected.w : items[1].w;
+		for(i=1;#items;1){
+			items[i].w = targetW;
+			self.__place(items[i]);
+		}
+		self.__refresh();
+		if(self.onChange) self.onChange(self.selected);
+		return true;
+	}
+	// 相同高度 (Same Height)
+	self.sameHeight = function(){
+		var items = self.selectedItems();
+		if(#items < 2) return false;
+		self.pushUndo();
+		var targetH = self.selected ? self.selected.h : items[1].h;
+		for(i=1;#items;1){
+			items[i].h = targetH;
+			self.__place(items[i]);
+		}
+		self.__refresh();
+		if(self.onChange) self.onChange(self.selected);
+		return true;
+	}
+
+	// ---------- 画布专属 Undo/Redo 事务 ----------
+	self.__snapshot = function(){
+		var st = {
+			form = { text = self.form.text; w = self.form.w; h = self.form.h };
+			items = {};
+		};
+		for(i=1;#self.items;1){
+			var it = self.items[i];
+			var propsCopy = {};
+			if(it.props){
+				for(k,v in it.props){ propsCopy[k] = v; }
+			}
+			..table.push(st.items, {
+				name = it.name;
+				cls = it.spec ? it.spec.cls : "static";
+				rect = { x = it.x; y = it.y; w = it.w; h = it.h };
+				props = propsCopy;
+			});
+		}
+		return st;
+	}
+	self.pushUndo = function(){
+		..table.push(self.undoStack, self.__snapshot());
+		if(#self.undoStack > 50) ..table.remove(self.undoStack, 1);
+		self.redoStack = {};
+	}
+	self.undo = function(){
+		if(!#self.undoStack) return false;
+		..table.push(self.redoStack, self.__snapshot());
+		var prev = ..table.pop(self.undoStack);
+		self.__restoreSnapshot(prev);
+		return true;
+	}
+	self.redo = function(){
+		if(!#self.redoStack) return false;
+		..table.push(self.undoStack, self.__snapshot());
+		var nxt = ..table.pop(self.redoStack);
+		self.__restoreSnapshot(nxt);
+		return true;
+	}
+	self.__restoreSnapshot = function(st){
+		if(!st) return;
+		self.form = { text = st.form.text; w = st.form.w; h = st.form.h };
+		for(i=#self.items;1;-1){
+			self.__unhook(self.items[i]);
+			try{ self.items[i].ctrl.close() }catch(e){}
+		}
+		self.items = {};
+		self.selected = null;
+		self.selection = {};
+		for(i=1;#st.items;1){
+			var it = st.items[i];
+			var spec = ..nodio.designer.registry.find(it.cls);
+			if(spec){
+				self.add(spec, it.rect, it.name);
+				var cur = self.items[#self.items];
+				if(cur && it.props){
+					for(k,v in it.props){ cur.props[k] = v; }
+					self.applyProps(cur);
+				}
+			}
+		}
+		self.__refresh();
+		if(self.onChange) self.onChange(self.selected);
+	}
+
+	// 窗体本身的「属性行」（属性格要的四元组形状）
+	// 分类带与属性格规范一致：外观 / 位置
+	self.__formItem = function(){
+		return {
+			name = "窗体"; isForm = true; spec = null;
+			props = {
+				{key="text";   name="标题"; value=self.form.text; type="string"; cat="外观"};
+				{key="width";  name="宽度"; value=self.form.w;    type="number"; cat="位置"};
+				{key="height"; name="高度"; value=self.form.h;    type="number"; cat="位置"};
+			};
+		};
+	}
+
+	// 选中窗体本身（点画布空白处 / 「设计」菜单的「窗体设置」）：
+	// 属性格改 标题/宽度/高度 → applyFormProps → DSG 头的 win.form(...) 跟着变
+	self.selectForm = function(){
+		self.selected = null;
+		self.__drag = null;
+		self.__formSel = true;
+		self.__refresh();
+		if(self.onSelect) self.onSelect(self.__formItem());
+	}
+
+	// 把属性格改的窗体设置写回 form 状态（下次 toDSG 生成到 DSG 头）
+	self.applyFormProps = function(props){
+		if(!props) return 0;
+		var n = 0;
+		for(i=1;#props;1){
+			var p = props[i];
+			if(p.key == "text"){
+				if(p.value !== null && p.value !== "" && p.value != self.form.text){
+					self.form.text = tostring(p.value); n = n + 1;
+				}
+			}
+			elseif(p.key == "width" || p.key == "height"){
+				var nv = tonumber(p.value);
+				// 窗体太小就没有设计空间了（官方最小窗体也是百余像素）
+				if(nv !== null && nv >= 60){
+					if(p.key == "width" && nv != self.form.w){ self.form.w = nv; n = n + 1 }
+					elseif(p.key == "height" && nv != self.form.h){ self.form.h = nv; n = n + 1 }
+				}
+			}
+		}
+		self.__refresh();
+		return n;
+	}
+
+	// 移除
+	self.remove = function(name){
+		for(i=1;#self.items;1){
+			if(self.items[i].name == name){
+				self.__unhook(self.items[i]);
+				// 自定义构造器组件先释放门面（宿主画板要从全局登记表摘掉）
+				if(self.items[i].face && self.items[i].face.dispose){
+					try{ self.items[i].face.dispose() }catch(eF){}
+				}
+				self.items[i].ctrl.show(false);
+				..table.remove(self.items, i);
+				if(self.selected == self.items[i]) self.selected = null;
+				self.__refresh();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// 删除当前选中的控件（支持单选与批量多选，带 Undo 事务）
+	self.deleteSelected = function(){
+		var selItems = self.selectedItems();
+		if(!#selItems) return 0;
+		self.pushUndo();
+		var count = 0;
+		for(k=1;#selItems;1){
+			var cur = selItems[k];
+			for(i=#self.items;1;-1){
+				if(self.items[i] == cur){
+					self.__unhook(cur);
+					if(cur.face && cur.face.dispose){
+						try{ cur.face.dispose() }catch(eF){}
+					}
+					try{ cur.ctrl.close() }catch(eC){
+						try{ cur.ctrl.show(false) }catch(eS){}
+					}
+					..table.remove(self.items, i);
+					count = count + 1;
+					break;
+				}
+			}
+		}
+		self.selected = null;
+		self.selection = {};
+		self.__refresh();
+		if(self.onChange) self.onChange(null);
+		return count;
+	}
+
+	// 清空
+	self.clear = function(){
+		for(i=1;#self.items;1){
+			self.__unhook(self.items[i]);
+			if(self.items[i].face && self.items[i].face.dispose){
+				try{ self.items[i].face.dispose() }catch(eF2){}
+			}
+			self.items[i].ctrl.show(false);
+		}
+		self.items = {};
+		self.selected = null;
+		self.__formSel = false;
+		self.__refresh();
+	}
+
+	// 释放画布：解除所有子类化
+	// （不做这一步，子类化记录会一直钉住整张画布）
+	self.dispose = function(){
+		self.clear();
+		self.__drag = null;
+		self.__resize = null;
+		if(self.bg){
+			try{ self.bg.dispose() }catch(e){}
+			self.bg = null;
+		}
+	}
+
+	// ---------- 属性回写 ----------
+	// 把属性值真正写到控件上（官方控件的属性表 vs 引擎原生控件的函数）
+	// 几何属性（left/top/width/height）改的是**组件在画布里的矩形**，
+	// 写完要把控件真的挪过去/改大小。
+	self.applyProps = function(item){
+		if(!item || !item.ctrl) return false;
+		var ctrl = item.ctrl;
+		// 自定义构造器组件（nodio.gui 等）：属性要写给**控件本体**（widget），
+		// 不是给它宿主的画板 —— 门面表的 setProp 负责翻译。
+		var faceSet = (item.face && item.face.setProp) ? item.face.setProp : null;
+		var n = 0;
+		var geo = false;
+		for(i=1;#item.props;1){
+			var p = item.props[i];
+			var key = p.key;
+			var v = p.value;
+			if(key == "name"){
+				if(v && #v > 0 && v != item.name){
+					item.name = tostring(v);
+					n = n + 1;
+				}
+				continue;
+			}
+			if(key == "text"){
+				if(faceSet && faceSet(key, v : "")){ n = n + 1; continue }
+				..nodio.ui.setCtrlText(ctrl, v : "");
+				n = n + 1;
+				continue;
+			}
+			// 几何属性 → 改组件矩形
+			if(key == "left" || key == "top" || key == "width" || key == "height"){
+				var nv = tonumber(v);
+				if(nv === null) continue;
+				if(key == "left") item.x = nv;
+				elseif(key == "top") item.y = nv;
+				elseif(key == "width") item.w = nv;
+				elseif(key == "height") item.h = nv;
+				geo = true;
+				n = n + 1;
+				continue;
+			}
+			if(v === null || v === "") continue;
+			// 按类型转换
+			if(p.type == "bool"){
+				var bv = (v === true) || (v == "true") || (v == "1");
+				if(faceSet && faceSet(key, bv)){ n = n + 1; continue }
+				if(..nodio.ui.setCtrlProp(ctrl, key, bv)) n = n + 1;
+				continue;
+			}
+			if(p.type == "number"){
+				var nv2 = tonumber(v);
+				if(nv2 === null) continue;
+				if(faceSet && faceSet(key, nv2)){ n = n + 1; continue }
+				if(..nodio.ui.setCtrlProp(ctrl, key, nv2)) n = n + 1;
+				continue;
+			}
+			if(faceSet && faceSet(key, v)){ n = n + 1; continue }
+			if(..nodio.ui.setCtrlProp(ctrl, key, v)) n = n + 1;
+		}
+		if(geo){
+			if(item.w < MIN_SIZE) item.w = MIN_SIZE;
+			if(item.h < MIN_SIZE) item.h = MIN_SIZE;
+			self.__place(item);
+			self.__refresh();
+		}
+		try{ ctrl.invalidate() }catch(e){}
+		return n;
+	}
+
+	// 生成 DSG（窗体头用 self.form 的 标题/宽度/高度 —— 官方 DSG 的
+	// win.form(text=..;right=..;bottom=..) 就是这么来的）
+	self.toDSG = function(){
+		var arr = {};
+		for(i=1;#self.items;1){
+			var it = self.items[i];
+			var props = {};
+			for(k=1;#it.props;1){
+				var p = it.props[k];
+				if(p.value === null || p.value === "") continue;
+				// 变量名和几何单独输出，不在这里作为普通属性输出
+				if(p.key == "name" || p.key == "left" || p.key == "top" || p.key == "width" || p.key == "height") continue;
+				props[p.key] = p.value;
+			}
+			..table.push(arr, {
+				name = it.name; cls = it.spec.cls : "static";
+				props = props; x = it.x; y = it.y; w = it.w; h = it.h;
+			});
+		}
+		return ..nodio.designer.dsg.generate(arr,
+			self.form.text, self.form.w, self.form.h);
+	}
+
+	// 从 DSG 载入（窗体头一并解析 —— 设计视图里改窗体设置，关设计器写回）
+	self.fromDSG = function(text){
+		self.clear();
+		// win.form(text="..";right=..;bottom=..)：属性顺序不保证，
+		// 各自独立匹配；匹配不到保持默认（空画布/普通脚本不受影响）
+		var ft = ..string.match(text, 'win\.form\(text="([^"]*)"');
+		var fr = tonumber(..string.match(text, ';right=(\d+)'));
+		var fb = tonumber(..string.match(text, ';bottom=(\d+)'));
+		self.form = {
+			text = ft : self.form.text;
+			w = fr : self.form.w;
+			h = fb : self.form.h;
+		};
+		var items = ..nodio.designer.dsg.parse(text);
+		for(i=1;#items;1){
+			var it = items[i];
+			var spec = ..nodio.designer.__findSpec(it.cls);
+			var props = it.props : {};
+			var x = tonumber(props.left) : 0;
+			var y = tonumber(props.top) : 0;
+			var w = (tonumber(props.right) : 100) - x;
+			var h = (tonumber(props.bottom) : 30) - y;
+			var item = self.add(spec, {x=x; y=y; w=w; h=h}, it.name);
+			if(item){
+				for(k=1;#item.props;1){
+					var key = item.props[k].key;
+					if(key == "name") item.props[k].value = it.name;
+					elseif(key == "left") item.props[k].value = x;
+					elseif(key == "top") item.props[k].value = y;
+					elseif(key == "width") item.props[k].value = w;
+					elseif(key == "height") item.props[k].value = h;
+					elseif(props[key] !== null) item.props[k].value = props[key];
+				}
+				self.applyProps(item);
+			}
+		}
+		return #self.items;
+	}
+
+	// ---------- 绘制 ----------
+	// 画布底色 + 网格 + 边距线 + 吸附参考线 + 选中框 + 8 个手柄
+	self.__draw = function(graphics, rc, bd){
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var bg = ..gdip.solidBrush(self.bgColor);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		// 网格（官方 USR.CFG 的 dlg_grid：可开关，间距按 DPI 和设计器缩放计算）
+		if(self.showGrid){
+			var zs = self.zoomScale ? self.zoomScale() : 1.0;
+			var step = math.round(..nodio.ui.px(GRID_SIZE) * zs);
+			if(step >= 4){
+				var pen = ..gdip.pen(self.gridColor, 1);
+				for(x=rc.left;x<rc.right;x+=step){
+					graphics.drawLine(pen, x, rc.top, x, rc.bottom);
+				}
+				for(y=rc.top;y<rc.bottom;y+=step){
+					graphics.drawLine(pen, rc.left, y, rc.right, y);
+				}
+				pen.delete();
+			}
+		}
+		// 边距参考线（官方 dlg_margin_*：表单内容区离窗体边缘的距离）
+		if(self.margins){
+			var m = self.margins;
+			var mpen = ..gdip.pen(self.frameColor, 1);
+			var ml = ..nodio.ui.px(m.left : 0), mt = ..nodio.ui.px(m.top : 0);
+			var mr = ..nodio.ui.px(m.right : 0), mb = ..nodio.ui.px(m.bottom : 0);
+			graphics.drawLine(mpen, rc.left + ml, rc.top + mt,
+				rc.right - mr, rc.top + mt);            // 上
+			graphics.drawLine(mpen, rc.left + ml, rc.bottom - mb,
+				rc.right - mr, rc.bottom - mb);         // 下
+			graphics.drawLine(mpen, rc.left + ml, rc.top + mt,
+				rc.left + ml, rc.bottom - mb);          // 左
+			graphics.drawLine(mpen, rc.right - mr, rc.top + mt,
+				rc.right - mr, rc.bottom - mb);         // 右
+			mpen.delete();
+		}
+		// 动态吸附对齐参考线（拖拽时生成，松手消失）
+		if(self.__guideLines && #self.__guideLines > 0){
+			var gpen = ..gdip.pen(0xFFFF6600, 1);
+			var zs = self.zoomScale ? self.zoomScale() : 1.0;
+			for(i=1;#self.__guideLines;1){
+				var g = self.__guideLines[i];
+				if(g.type == "v"){
+					var gx = rc.left + math.round(..nodio.ui.px(g.pos) * zs);
+					graphics.drawLine(gpen, gx, rc.top, gx, rc.bottom);
+				}
+				elseif(g.type == "h"){
+					var gy = rc.top + math.round(..nodio.ui.px(g.pos) * zs);
+					graphics.drawLine(gpen, rc.left, gy, rc.right, gy);
+				}
+			}
+			gpen.delete();
+		}
+		// 选中「窗体本身」：画布四周一圈框（没有手柄 —— 尺寸在属性格改）
+		if(self.__formSel){
+			var fpen2 = ..gdip.pen(self.frameColor, 1);
+			graphics.drawRectangle(fpen2, 0, 0, w - 1, h - 1);
+			fpen2.delete();
+			return;
+		}
+		// 选中框（画在组件外扩 1px 的位置，才不会被组件盖住）
+		var zs = self.zoomScale ? self.zoomScale() : 1.0;
+		var selItems = self.selectedItems();
+		if(!#selItems) return;
+		for(k=1;#selItems;1){
+			var curIt = selItems[k];
+			var sx = math.round(..nodio.ui.px(curIt.x) * zs);
+			var sy = math.round(..nodio.ui.px(curIt.y) * zs);
+			var sw = math.round(..nodio.ui.px(curIt.w) * zs);
+			var sh = math.round(..nodio.ui.px(curIt.h) * zs);
+			var isPrimary = (curIt == self.selected);
+			var color = isPrimary ? self.frameColor : 0xFF569CD6;
+			var fpen = ..gdip.pen(color, 1);
+			graphics.drawRectangle(fpen,
+				sx - 1, sy - 1,
+				sw + 2, sh + 2);
+			fpen.delete();
+			// 只有主选中控件画 8 个手柄（避免多选手柄重叠打架）
+			if(isPrimary){
+				var brush = ..gdip.solidBrush(self.handleColor);
+				var hs = ..nodio.ui.px(HANDLE_SIZE);
+				for(i=0;8;1){
+					var p = self.__handlePos(i, curIt);
+					graphics.fillRect(brush, p.x, p.y, hs, hs);
+				}
+				brush.delete();
+			}
+		}
+	}
+
+	// 画布位置
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		self.origin = {left=l; top=t};
+		self.bg.layout(l, t, r, b);
+		for(i=1;#self.items;1){
+			self.__place(self.items[i]);
+		}
+		self.__refresh();
+	}
+
+	self.show = function(flag){
+		self.visible = flag ? true : false;
+		self.bg.show(self.visible);
+		// 画布底板必须**显式提到 z 序最前**：
+		// 官方 form.add 一次只加一个控件，控件之间的层次只等于**创建顺序**；
+		// 背景板是最早建的（铺满整个客户区），画布虽然后建，
+		// 但官方那套 DPI/自适应重排会把层次弄乱 ——
+		// 结果就是画布被背景板整片盖住：画布在、可见、却一块黑。
+		// 组件（画布上的控件）由 __place 各自提到画布之上，不受影响。
+		if(self.visible){
+			try{
+				var r = self.rect;
+				if(r){
+					..win.setPos(self.bg.ctrl.hwnd, r.left, r.top,
+						r.right - r.left, r.bottom - r.top,
+						0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+				}
+			}catch(e0){}
+		}
+		for(i=1;#self.items;1){
+			self.items[i].ctrl.show(self.visible);
+		}
+		self.__refresh();
+	}
+
+	self.layout();
+	return self;
+}
+
+// 按控件类找一个已注册的组件（fromDSG 用）
+//
+// 匹配顺序：
+//   1. 注册表精确匹配（Nodio 能直接画的类，如 radio —— 优先原样画）
+//   2. 官方 ide.customCtrl 替身映射（nodio.designer.registry.customCtrl）：
+//      **DSG 仍写真实类名**（spec.cls = 原始 cls），只把「实际建的控件类」
+//      换成替身（drawAs）—— 官方工程的 textbox/vlistview 到 Nodio 能画，
+//      写回的 DSG 官方 IDE 也认。
+//   3. 兜底：原样画（drawAs = cls），属性表为空
+__findSpec = function(cls){
+	var specs = ..nodio.designer.registry.list();
+	for(i=1;#specs;1){
+		if(specs[i].cls == cls) return specs[i];
+	}
+	var dbl = null;
+	var mp = ..nodio.designer.registry.customCtrl;
+	if(mp) dbl = mp[cls];
+	if(dbl){
+		// 借替身类的属性表（属性格有东西可改），类名保持真实
+		for(i=1;#specs;1){
+			if(specs[i].cls == dbl){
+				return {name = specs[i].name; cls = cls; category = specs[i].category;
+					props = specs[i].props; drawAs = dbl};
+			}
+		}
+		return {name = cls; cls = cls; category = "标准控件"; props = {}; drawAs = dbl};
+	}
+	return {name=cls; cls=cls; category="标准控件"; props={}; drawAs=cls};
+}
+
+}

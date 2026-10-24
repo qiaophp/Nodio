@@ -1,0 +1,4030 @@
+// nodio.ui.editor — 代码编辑器组件。
+//
+// 底座是官方 `richedit` 控件：选区、剪贴板、IME、撤销栈都白送，
+// 自己再造一个文本视图（光标/选区/IME/撤销）代价太大。
+// 但 richedit 只是「一块白板」，标准 IDE 该有的东西都自己加：
+//
+//   · 行号栏      —— 自绘画板，与 richedit 的行位置严格对齐
+//   · 语法着色    —— aardio 词法（注释/字符串/数字/关键字/函数调用）
+//   · 当前行高亮  —— 行号栏标记 + 当前行文字底色
+//   · 光标行列号  —— 回调给状态栏
+//   · Tab/Shift+Tab 缩进、Ctrl+/ 注释切换
+//   · 查找替换条  —— 编辑器右上角浮层（VS Code 式）
+//   · 撤销重做 / 转到行 / 脏标记
+//
+// ── 坐标系 ────────────────────────────────────────────────
+// 绘制与摆放一律**物理像素**（系统 150% DPI）。
+// 设计常量（字号/行高/内边距）按逻辑像素写，用 nodio.ui.px() 换算。
+//
+// ── 位置单位（最容易踩的坑）─────────────────────────────
+//   · richedit 的位置 = **UTF-16 码元**（1-based，CRLF 占 1 个码元）
+//   · aardio 的 `..string.len(s)` = **UTF-16 码元数**（两者同单位！）
+//   · aardio 的 `#s` / `s[i]` / `string.sub` / `string.indexOf` = **UTF-8 字节**
+// 所以「字节偏移 → richedit 位置」必须换算。
+//   行首位置直接用官方 `lineToChar(line)`（EM_LINEINDEX，精确）；
+//   行内偏移用本组件按 UTF-8 首字节推算的 UTF-16 码元数。
+//
+// ── 官方控件 API 的几个坑（实测）────────────────────────
+//   · `getSel()`：**无选区时只返回 1 个值**（0-based 插入点）；
+//     有选区时返回 2 个值（1-based、首尾都含）。
+//   · `setSel(a,b)`：选 1-based 闭区间 [a,b]；
+//     `setSel(x)`（单参数）：把插入点放到 **0-based** 索引 x。
+//   · `lineToChar(line)` → 1-based 行首字符位置；`lineFromChar(pos)` 收 0-based。
+//   · `string.replace` 是**正则**（模式）匹配！字面替换要用 `string.replaceLiteral`。
+//   · aardio 里**双引号是原样串**：`"\n"` 是反斜杠+n，不是换行；要转义就用单引号。
+//   · **表成员函数必须写 `self.xxx()`**：裸名调用成员函数在本引擎上会死循环。
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.subclass;
+import nodio.ui.rect;
+import nodio.ui.dpi;
+import nodio.ui.theme;
+import gdip;
+import raw;
+import win.api;
+
+// ── 原生 RICHEDIT50W 的 CHARFORMAT2 ────────────────────────
+//
+// ⚠ 这里**自己**定义结构体直接发 EM_SETCHARFORMAT，不要用官方 richedit.setCharformat：
+//
+//   ① 官方 setCharformat 的 mask 里**只加 CFM_UNDERLINE，从不加 CFM_UNDERLINETYPE**
+//      → 控件按规范忽略 underlineType 字段 → 永远只画单线，出不来波浪线。
+//      （实测：官方 API 写 underlineType=4，回读恒为 1，渲染恒为实线）
+//   ② 官方用 `if(textColor)` 决定要不要设颜色，而 aardio 里 **0 是真值**
+//      → 只传 underline 也会连带把文字色刷成 0（黑）。
+//
+// 布局 = MS richedit.h 的 CHARFORMAT2W（total = 116，与 aardio 官方类一致）：
+//   cbSize@0 mask@4 effects@8 yHeight@12 yOffset@16 textColor@20
+//   charSet@24 pitchAndFamily@25 faceName[32]@26 pad@90 weight@92
+//   spacing@94 backColor@96 lcid@100 reserved@104 style@108 kerning@110
+//   underlineType@112 animation@113 revAuthor@114
+var CHARFORMAT2 = class {
+	INT cbSize = 116;
+	INT mask;
+	INT effects;
+	int yHeight;
+	int yOffset;
+	INT textColor;
+	BYTE charSet;
+	BYTE pitchAndFamily;
+	WORD faceName[0x20];
+	WORD weight;
+	word spacing;
+	INT backColor;
+	INT lcid;
+	INT reserved;
+	word style;
+	WORD kerning;
+	BYTE underlineType;
+	BYTE animation;
+	BYTE revAuthor;
+	BYTE bReserved1;
+}
+
+// 掩码位 / 效果位（MS richedit.h）
+var __CFM_UNDERLINE = 0x4;          // CFM_UNDERLINE
+var __CFM_UNDERLINETYPE = 0x800000;  // CFM_UNDERLINETYPE = 0x00800000
+var __CFM_COLOR = 0x40000000;        // CFM_COLOR
+var __CFE_UNDERLINE = 4;             // CFE_UNDERLINE
+// 下划线类型（CFU 枚举）
+var __CFU_NONE = 0;
+var __CFU_SINGLE = 1;
+var __CFU_DOUBLE = 3;
+var __CFU_DOTTED = 4;
+var __CFU_WAVE = 8;                  // CFU_UNDERLINEWAVE
+var __CFU_HEAVYWAVE = 0x0c;          // CFU_UNDERLINEHEAVYWAVE
+
+var __edSeq = 0;
+
+// LSP CompletionItemKind → 中文短标签（补全浮层右侧显示）
+var __compKindText = function(kind){
+	if(!kind) return "";
+	if(kind == 1) return "文本";
+	if(kind == 2) return "方法";
+	if(kind == 3) return "函数";
+	if(kind == 4) return "构造";
+	if(kind == 5) return "字段";
+	if(kind == 6) return "变量";
+	if(kind == 7) return "类";
+	if(kind == 8) return "接口";
+	if(kind == 9) return "模块";
+	if(kind == 10) return "属性";
+	if(kind == 11) return "单元";
+	if(kind == 12) return "值";
+	if(kind == 13) return "枚举";
+	if(kind == 14) return "关键字";
+	if(kind == 15) return "片段";
+	if(kind == 16) return "颜色";
+	if(kind == 17) return "文件";
+	if(kind == 18) return "引用";
+	if(kind == 19) return "文件夹";
+	if(kind == 20) return "枚举成员";
+	if(kind == 21) return "常量";
+	if(kind == 22) return "结构";
+	if(kind == 23) return "事件";
+	if(kind == 24) return "运算符";
+	if(kind == 25) return "类型参数";
+	return "";
+}
+
+// aardio 关键字（与 engine/common.h 的 KEYWORDS 表一致）
+var __keywords = {
+	"var"=true; "function"=true; "if"=true; "else"=true; "elseif"=true;
+	"while"=true; "for"=true; "in"=true; "break"=true; "continue"=true;
+	"return"=true; "null"=true; "true"=true; "false"=true; "and"=true;
+	"or"=true; "not"=true; "do"=true; "import"=true; "namespace"=true;
+	"try"=true; "catch"=true; "class"=true; "lambda"=true; "select"=true;
+	"case"=true; "with"=true;
+};
+
+// ── UTF-8 首字节 → 字符占用的字节数 ──
+var __cb = function(b){
+	if(b < 0x80) return 1;
+	if(b < 0xC0) return 1;   // 续接字节（不会作为字符起点）
+	if(b < 0xE0) return 2;
+	if(b < 0xF0) return 3;
+	return 4;
+}
+// ── UTF-8 首字节 → UTF-16 码元数（4 字节 = 代理对 = 2 码元）──
+var __cu = function(b){
+	if(b < 0x80) return 1;
+	if(b < 0xC0) return 1;
+	if(b < 0xF0) return 1;
+	return 2;
+}
+// 字节区间 [from,to) 的 UTF-16 码元数（from/to 必须落在字符边界）
+var __unitsOf = function(bytes, from, to){
+	var u = 0;
+	var i = from;
+	while(i < to){
+		var b = bytes[i];
+		u = u + __cu(b);
+		i = i + __cb(b);
+	}
+	return u;
+}
+// 颜色明暗调整（ARGB）
+var __shade = function(argb, d){
+	var r = (argb >> 16) & 0xFF;
+	var g = (argb >> 8) & 0xFF;
+	var b = argb & 0xFF;
+	r = r + d; if(r < 0) r = 0; if(r > 255) r = 255;
+	g = g + d; if(g < 0) g = 0; if(g > 255) g = 255;
+	b = b + d; if(b < 0) b = 0; if(b > 255) b = 255;
+	return (argb & 0xFF000000) | (r << 16) | (g << 8) | b;
+}
+
+// 诊断集合的指纹（诊断没变就不用重刷槽内标记）
+var __diagSig = function(list){
+	if(!list || !#list) return "";
+	var s = "";
+	for(i=1;#list;1){
+		var d = list[i];
+		s = s ++ (d.line : 0) ++ "," ++ (d.col : 0) ++ "," ++ (d.endLine : 0) ++ ","
+			++ (d.endCol : 0) ++ "," ++ (d.sev : 1) ++ ";";
+	}
+	return s;
+}
+
+editor = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	var self = {
+		winform = winform;
+		ctrl = null;          // richedit
+		gutter = null;        // 行号栏画板
+		find = null;          // 查找条画板
+		findEd = null;        // 查找输入框
+		replEd = null;        // 替换输入框
+		sub = null;           // richedit 子类化（按键）
+		subFind = null;
+		subRepl = null;
+		pollTimer = null;
+		syncTimer = null;
+		colorTimer = null;
+		rect = opt.rect;
+		fontSize = opt.fontSize : 11;      // 逻辑 pt
+		fontName = opt.fontName : "Consolas";
+		// 自绘浮层（导航栏/补全/悬停）的字号单位是**逻辑像素**（画板按 px() 换算），
+		// 而 fontSize 是 **pt**：11pt = 11 × 96/72 = 14.67 逻辑像素。
+		// 不换算的话，浮层文字会比代码小一圈（150% 下 16.5 vs 22 物理像素）。
+		uiFontSize = (opt.fontSize : 11) * 4 / 3;
+		lineHeight = 0;                    // 物理像素
+		gutterFont = null;
+		gutterFontPx = 0;
+		text = "";                         // 当前文档（与控件内容一致）
+		diags = {};                        // 诊断：{line=1基; col=0基; endLine; endCol; msg; sev}
+		__diagSigApplied = "";            // 上次刷进控件的诊断指纹（变了才重刷）
+		__foldsDirty = true;                   // 折叠区表是不是过期了（过期才重扫）
+		__diagMarksOn = false;            // 控件里当前是否带着诊断标记
+		highlights = {};                  // 引用标记：{line=1基; col=0基; len}
+		__hlSigApplied = "";              // 上次刷进控件的高亮指纹（变了才重刷）
+		__hlMarksOn = false;              // 控件里当前是否带着高亮背景
+		__hlApplied = {};                 // 已刷进控件的高亮位置（清除用）
+		__hlTimer = null;                 // 光标停留触发器
+		__hlWord = "";                    // 上次触发高亮的词（没换词就不重问）
+		// ---------- 代码折叠 ----------
+		folds = {};                        // 已折叠的区：{start=折叠头行; end=正文最后一行}
+		foldRegions = {};                  // 所有可折叠区（行号栏画标记用）
+		lineStarts = {};                   // lineStarts[i] = 第 i 行的起始字符位置
+		lineLens = {};                     // lineLens[i] = 第 i 行的内容长度（UTF-16 码元）
+		visLines = {};                     // 可见的文档行号（折叠后跳过隐藏行）
+		__splitLines = {};                 // 拆行缓存（__buildLineStarts 拆出来的行）
+		__splitLinesText = "";             // 上面那份缓存对应的文本
+		__foldRegionsText = null;          // 上次扫描折叠区时的文本（变了要重扫）
+		eol = '\r\n';                      // 保存时使用的换行符
+		dirty = false;
+		savedText = "";                    // 「已保存」时的文本（脏标记的基准）
+		undoStack = {};                    // 撤销栈：{text; sel}
+		redoStack = {};
+		__pendingUndo = false;             // 已经为「这次改动」存过快照了
+		findOpen = false;
+		findHover = null;
+		curLine = 1;
+		hlLine = 0;                        // 已着色的当前行
+		colors = {
+			comment    = 0xFF6A9955;
+			string     = 0xFFCE9178;
+			number     = 0xFFB5CEA8;
+			keyword    = 0xFF569CD6;
+			func       = 0xFFDCDCAA;
+			ident      = th.text;
+			lineNum    = 0xFF858585;
+			lineNumCur = 0xFFC6C6C6;
+			curLineBg  = __shade(th.bg, 10);
+		};
+		onCursor = null;     // function(line, col)
+		onChange = null;     // function(text) —— 文档内容变了
+		onDirty = null;      // function(dirty)
+		onGotoLine = null;   // function() —— Ctrl+G（由 IDE 弹输入框）
+		// ---------- 断点 ----------
+		// 点行号打/消断点（VS 的基本操作，调试功能的前提）。
+		// 断点集合放在编辑器组件里（按**文档行号**，1 基），
+		// IDE 通过 onToggleBreakpoint 回调把它转给 DAP 适配器。
+		breakpoints = {};    // {行号 = true}
+		onToggleBreakpoint = null;   // function(line, on)
+		// ---------- 书签 ----------
+		bookmarks = {};              // {行号 = true}
+		onBookmarkChange = null;     // function()
+		// ---------- 差异对比行标记 ----------
+		diffLines = {};              // {行号 = "add"|"del"|"mod"}
+		// ---------- 代码片段 (Snippets) ----------
+		snippets = {
+			["for"] = 'for(i=1;10;1){\r\n\t$0\r\n}';
+			["forin"] = 'for(k,v in table){\r\n\t$0\r\n}';
+			["func"] = 'var myFunc = function(){\r\n\t$0\r\n};';
+			["function"] = 'function(){\r\n\t$0\r\n}';
+			["try"] = 'try{\r\n\t$0\r\n}\r\ncatch(e){\r\n\t\r\n}';
+			["class"] = 'class MyClass{\r\n\tctor(  ){\r\n\t\t$0\r\n\t};\r\n}';
+			["if"] = 'if(  ){\r\n\t$0\r\n}';
+			["ife"] = 'if(  ){\r\n\t$0\r\n}\r\nelse{\r\n\t\r\n}';
+			["winform"] = 'var winform = win.form(text="窗体";right=600;bottom=400);\r\n$0\r\nwinform.show();\r\nwin.loopMessage();';
+		};
+		// ---------- 参数信息 (Signature Help) ----------
+		sigHelpBoard = null;
+		sigHelpOpen = false;
+		sigHelpRows = {};
+		sigHelpActiveIdx = 1;
+		// ---------- 导航栏（面包屑）----------
+		// VS 的「导航栏」：编辑区正上方一条，跟着光标显示
+		// 「工程 › 目录 › 文件 › 命名空间 › 函数」，点一下就跳过去。
+		// 一眼看出自己在**整个项目**的哪个位置 —— 这是 VS 感的关键一环。
+		navBar = null;        // 自绘画板
+		navChain = {};        // 段：{text; kind; line; col; path}
+		navHits = {};         // 命中区：{i; x; w}（x/w 是画板本地坐标）
+		navHover = 0;         // 悬停的段序号（1 基；0 = 无）
+		onNavClick = null;    // function(seg) —— 点导航栏某一段
+	};
+
+	__edSeq = __edSeq + 1;
+
+	// ---------- 编辑控件 ----------
+	if(opt.ctrl){
+		self.ctrl = opt.ctrl;
+	}
+	else{
+		self.ctrl = ..nodio.ui.addCtrl(winform, "editor" ++ __edSeq, {
+			cls="richedit";left=0;top=0;right=600;bottom=400;
+			multiline=true;vscroll=true;hscroll=false;noscroll=true;
+		});
+	}
+	var ctrl = self.ctrl;
+	try{ ::User32.ShowScrollBar(ctrl.hwnd, 0/*_SB_HORZ*/, 0) }catch(e){};
+
+	// 深色化：滚动条 + 文字色 + 文字背景色
+	try{
+		var uxtheme = ..raw.loadDll("uxtheme.dll");
+		var setAppMode = uxtheme.api(135, "int(int mode)");
+		if(setAppMode) setAppMode(2/*ForceDark*/);
+		var setTheme = uxtheme.api("SetWindowTheme", "int(addr hwnd,ustring subAppName,ustring subIdList)");
+		if(setTheme) setTheme(ctrl.hwnd, "DarkMode_Explorer", null);
+	}catch(eUx){}
+	try{
+		ctrl.setCharformat({textColor=..nodio.ui.themeRef(th.text)}, 1);
+	}catch(e){}
+	try{
+		::SendMessage(ctrl.hwnd, 0x443/*_EM_SETBKGNDCOLOR*/, 0,
+			..nodio.ui.themeRef(th.bg));
+	}catch(e2){}
+	// 编辑器字号：直接传逻辑 pt（self.fontSize）给 setFont。
+	// 官方 stripPoint + richEdit 会按当前 DPI 计算物理高度，
+	// 11pt 在 150% 下为 22px 物理高度，行高 25px，与周边 18px UI 完美协调。
+	// 严禁在此处乘 dpiScale（否则产生二次放大，字号膨胀到 33-40px）。
+	try{
+		ctrl.setFont({faceName=self.fontName; point=self.fontSize});
+	}catch(e3){}
+
+	// ---------- 行号栏 ----------
+	self.gutter = nodio.ui.board(winform, {
+		left = 0; top = 0; right = 60; bottom = 400;
+		fontSize = self.fontSize;
+		z = 50;
+	});
+	self.gutter.onDraw = function(graphics, rc, bd){
+		self.__drawGutter(graphics, rc, bd);
+	}
+	// 点折叠标记 → 折叠/展开那一段
+	// 点行号 → 打/消断点
+	self.gutter.onMouseDown = function(x, y, bd){
+		var ln = self.__hitFold(x, y);
+		if(ln){ self.toggleFold(ln); return }
+		// 行号区（折叠标记左边）→ 断点
+		var gr = self.gutter ? self.gutter.rect : null;
+		if(!gr) return;
+		var gw = gr.right - gr.left;
+		if(x > gw - ..nodio.ui.px(20)) return;      // 折叠标记那一列不算
+		var d = self.__lineAtY(y);
+		if(!d) return;
+		self.toggleBreakpoint(d);
+	}
+
+	// ---------- 导航栏（面包屑）----------
+	//
+	// VS 的导航栏长在编辑区**正上方**：显示当前位置的层级
+	// （工程 › 目录 › 文件 › 命名空间 › 函数），点哪一段就跳到哪一段。
+	//
+	// 组件只负责「画 + 命中 + 上报」，**内容由 IDE 算好塞进来**
+	// （setNavChain）—— 层级链要问 LSP 的 documentSymbol，
+	// 那是 IDE 那边的活。
+	self.navBar = nodio.ui.board(winform, {
+		left = 0; top = 0; right = 600; bottom = 24;
+		fontSize = self.uiFontSize;
+		z = 55;
+	});
+	self.navBar.onDraw = function(graphics, rc, bd){
+		self.__drawNav(graphics, rc, bd);
+	}
+	self.navBar.onMouseDown = function(x, y, bd){
+		var i = self.__hitNav(x, y);
+		if(!i) return;
+		var seg = self.navChain[i];
+		if(seg && self.onNavClick) self.onNavClick(seg);
+	}
+	self.navBar.onMouseMove = function(x, y, bd){
+		var i = self.__hitNav(x, y);
+		if(i == self.navHover) return;
+		self.navHover = i;
+		self.navBar.redraw();
+	}
+	self.navBar.onMouseLeave = function(bd){
+		if(!self.navHover) return;
+		self.navHover = 0;
+		self.navBar.redraw();
+	}
+	// 设置导航栏内容。chain 是段数组：{text; kind; line; col; path}
+	// kind: "dir"（目录）/ "file"（文件）/ "symbol"（符号）
+	self.setNavChain = function(chain){
+		self.navChain = chain ? chain : {};
+		self.navHover = 0;
+		// ⚠ 必须用 redraw()（整块 InvalidateRect + UpdateWindow），
+		//   不能只用 invalidate()：后者只置脏位，更新区域（rcPaint）
+		//   可能是残缺的，GDI+ 会按裁剪区把自绘内容裁掉一块 ——
+		//   表现是「导航栏永远停第一次画出来的样子」。
+		if(self.navBar) self.navBar.redraw();
+	}
+	// 导航栏高度（物理像素）—— 布局要给它让出位置
+	self.navHeight = function(){
+		return ..nodio.ui.px(24);
+	}
+
+	// 显示/隐藏整个编辑器（含编辑框、行号栏、导航条、浮层）
+	self.show = function(flag){
+		var v = flag ? true : false;
+		if(self.ctrl) self.ctrl.show(v);
+		if(self.gutter) self.gutter.show(v);
+		if(self.navBar) self.navBar.show(v);
+		if(!v){
+			if(self.find) self.find.show(false);
+			if(self.findEd) self.findEd.show(false);
+			if(self.replEd) self.replEd.show(false);
+			if(self.compBoard) self.compBoard.show(false);
+			if(self.hoverBoard) self.hoverBoard.show(false);
+			if(self.sigHelpBoard) self.sigHelpBoard.show(false);
+		}
+	}
+
+	// ---------- 文本模型 ----------
+	// 控件内部一律 CRLF（richedit 按 Enter 插入的就是 CRLF）。
+	// 载入时把 LF 统一成 CRLF，保存时再按文档原始换行符还原 ——
+	// 这样「刚打开就显示为已修改」不会发生，行号/列号也和行结构严格对齐。
+	self.__toCRLF = function(s){
+		if(!s) return "";
+		s = ..string.replaceLiteral(s, '\r\n', '\n');
+		s = ..string.replaceLiteral(s, '\r', '\n');
+		return ..string.replaceLiteral(s, '\n', '\r\n');
+	}
+	self.__toEOL = function(s){
+		if(!s) return "";
+		s = ..string.replaceLiteral(s, '\r\n', '\n');
+		s = ..string.replaceLiteral(s, '\r', '\n');
+		if(self.eol == '\n') return s;
+		return ..string.replaceLiteral(s, '\n', '\r\n');
+	}
+	// 猜文件的换行符（出现 CRLF 即认为是 CRLF 文件）
+	self.__detectEOL = function(s){
+		if(!s) return '\r\n';
+		if(..string.indexOf(s, '\r\n')) return '\r\n';
+		return '\n';
+	}
+
+	self.setText = function(s, markDirty){
+		if(s === null || s === undefined) s = "";
+		self.eol = self.__detectEOL(s);
+		var t = self.__toCRLF(s);
+		// ⚠ 顺序要紧：**先**更新 self.text，**再**写控件。
+		//   写 ctrl.text 会让 richedit 发 EN_CHANGE，官方 form 的 WM_COMMAND
+		//   处理器**同步**调 ctrl.onChange —— 那一刻 ctrl.text 已经是新的，
+		//   而 self.text 还是旧的 ⇒ __syncText 会把它当成「用户改的」，
+		//   推一条撤销快照 + 回调 onChange（文档被标成已修改）。
+		//   先更新 self.text 就没这个坑：__syncText 读到相同内容，直接返回。
+		self.text = t;
+		try{ ctrl.text = t }catch(e){}
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG editor setText bytes=" ++ tostring(#t));
+		}
+		self.hlLine = 0;
+		self.curLine = 1;
+		// 换文档：撤销栈清空（新内容没有「上一步」）
+		self.undoStack = {};
+		self.redoStack = {};
+		self.__pendingUndo = false;
+		// 换文档：折叠状态作废，行首表重建
+		self.folds = {};
+		self.__foldMaintain();
+		// ⚠⚠ **立刻把正文色刷上去**（不能等 __color）：
+		//   新写入的文本用的是 richedit 的**默认字符色（黑）**，
+		//   深色底上等于隐形 —— 用户看到的是「打开文件先黑一片，
+		//   过 0.3 秒才蹦出带颜色的代码」，这就是「刷新不及时」的观感来源。
+		//   这里给**全文**刷一次正文色（一条 EM_SETCHARFORMAT，O(1) 条消息），
+		//   语法色留给防抖后的 __color（只做可见范围）。
+		//   ⚠ 用自己的 CHARFORMAT2 + 裸 SendMessageByStruct：
+		//   官方 setCharformat 每次新建结构体（0.78ms/次），
+		//   而且官方那套 mask 判断在 aardio 里会把没传的字段也带进去（见文件头注释）。
+		try{
+			var nLines = self.__lineCount();
+			if(nLines){
+				var a0 = self.__lineStart(1);
+				var b0 = self.__lineEnd(nLines);
+				if(a0 && b0 && b0 >= a0){
+					ctrl.setSel(a0, b0);
+					self.__applyColor(..nodio.ui.themeRef(self.colors.ident));
+				}
+			}
+		}catch(e0){}
+		self.__measureLineHeight();
+		self.__updateGutter();
+		self.updateCursor();
+		self.__scheduleColor();
+		if(markDirty !== false) self.markDirty(false);
+		return true;
+	}
+	self.getText = function(){
+		return self.text;
+	}
+	// 保存用文本（按文档的换行符规范化）
+	self.getTextForSave = function(){
+		return self.__toEOL(self.text);
+	}
+	self.setEOL = function(eol){
+		if(eol == '\n' || eol == '\r\n') self.eol = eol;
+	}
+	// 脏标记：**由内容推导**（当前文本 vs 上次保存的文本）。
+	// 这样「撤销回保存时的状态」会自动变回干净，单纯的开关做不到。
+	self.markDirty = function(v){
+		if(v === false){
+			self.savedText = self.text;
+		}
+		else{
+			// 标记为「已修改」：基准不可能等于当前内容
+			if(self.savedText == self.text) self.savedText = null;
+		}
+		self.__updateDirty();
+	}
+	// 记为「已保存」
+	self.markSaved = function(){
+		self.savedText = self.text;
+		self.__updateDirty();
+	}
+	// 设定「已保存」基准（切页签时用：每个文档各有一份基准）
+	self.setSavedText = function(s){
+		self.savedText = s : "";
+		self.__updateDirty();
+	}
+	self.__updateDirty = function(){
+		var d = (self.text != self.savedText) ? true : false;
+		if(d == self.dirty) return;
+		self.dirty = d;
+		if(self.onDirty) self.onDirty(d);
+	}
+	self.isDirty = function(){
+		return self.dirty;
+	}
+
+	// ---------- 撤销栈 ----------
+	//
+	// 为什么自己实现：richedit 的撤销栈**只收键盘输入**，
+	// 程序化的 EM_REPLACESEL（缩进/注释/替换全都走它）**不进撤销栈**
+	// （实测：改完文本 EM_CANUNDO 仍是 0，EM_UNDO 什么也不做）。
+	// 所以这里自己存文本快照：
+	//   · 键盘输入：在 WM_CHAR / Delete / 粘贴 / 剪切**之前**存快照（撤销粒度=一次按键）
+	//   · 程序改动：改之前存快照
+	//   · 轮询发现「没存过快照的改动」：补一个快照
+	var UNDO_MAX = 200;
+	var lastUndoTick = 0;
+	var lastUndoKind = "";
+	self.__selSnapshot = function(){
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		if(mn === null || mn === undefined) mn = 0;
+		if(mx === null || mx === undefined) return {a=mn; b=mn};
+		return {a=mn; b=mx};
+	}
+	self.__pushUndo = function(text, sel, kind){
+		var now = ..time.tick();
+		kind = kind : "edit";
+		if(kind == "typing" && lastUndoKind == "typing" && (now - lastUndoTick < 800)){
+			// 连续打字：合并为一个撤销单元，避免每次按键都全量克隆大字符串
+			lastUndoTick = now;
+			return true;
+		}
+		lastUndoTick = now;
+		lastUndoKind = kind;
+		..table.push(self.undoStack, {text=text; sel=sel});
+		if(#self.undoStack > UNDO_MAX) ..table.remove(self.undoStack, 1);
+		self.redoStack = {};
+		return true;
+	}
+	// 程序改文本前调用：先存快照
+	self.__beginEdit = function(){
+		self.__pushUndo(self.text, self.__selSnapshot());
+		self.__pendingUndo = true;
+	}
+	self.__restore = function(st){
+		self.__pendingUndo = true;
+		self.text = st.text;
+		try{ ctrl.text = st.text }catch(e){}
+		try{
+			if(st.sel && st.sel.b !== null && st.sel.b !== undefined
+				&& st.sel.b != st.sel.a){
+				ctrl.setSel(st.sel.a, st.sel.b);
+			}
+			else{
+				ctrl.setSel(st.sel.a);
+			}
+		}catch(e2){}
+		self.__changed();
+		return true;
+	}
+
+	// ---------- 变更检测（EN_CHANGE 事件） ----------
+	//
+	// 官方 win.ui 的窗体 WM_COMMAND 处理器会把 EN_CHANGE 派发到控件的 onChange：
+	//     var funcname = ctrl[["_commandFuncnames"]][[wmEvent]];
+	//     if(#funcname && ctrl[[funcname]]) invoke(ctrl[funcname],ctrl);
+	//   （win/ui/_.aardio:745-746）
+	// 官方 richedit 的映射表：{0x300:"onChange"; 0x100:"onFocusGot"; 0x200:"onFocusLost"}
+	//   （win/ui/ctrl/richedit.aardio:97）
+	//
+	// ⚠⚠ 以前这里用 **250ms 轮询**读 ctrl.text 跟快照比，注释写着
+	//   「官方控件的 EN_CHANGE 事件路由在 Nodio 里不通（控件级事件装不上窗口过程）」
+	//   —— **这个结论是错的**：
+	//     · 「控件级事件装不上窗口过程」说的是 `win.ui.ctrl` 给**控件自己**装
+	//       窗口过程那一套（SetWindowPointer）在 Nodio 里装不上；
+	//     · 但 EN_CHANGE 本来就是**父窗体**收到的 WM_COMMAND 通知，
+	//       官方 form 的 WM_COMMAND 处理器（win/ui/_.aardio:733）一直都在。
+	//   实测（tests/probe_enchange.aardio）：Nodio 里 `ctrl.onChange` 能触发，
+	//   而且触发时控件里的 text **已经是新的**（appendText → text=[hello]）。
+	//
+	// 轮询的代价是实打实的延迟：打完字，行号栏 / 语法着色 / 脏标记 / LSP 同步
+	// 最多晚 250ms，语法着色再叠一个 250ms ⇒ 半秒才上色。
+	// 用户说的「刷新不及时」主要就是这 250ms + 250ms。
+	//
+	// 现在：EN_CHANGE 到了就同步；轮询降级成慢速兜底。
+	self.__syncText = function(){
+		var t = null;
+		try{ t = ctrl.text }catch(e){ return }
+		if(t === null || t === undefined) return;
+		if(t == self.text) return;
+		var old = self.text;
+		self.text = t;
+		// 没人为这次改动存过快照（程序改的）→ 补一个
+		if(!self.__pendingUndo){
+			self.__pushUndo(old, self.__selSnapshot());
+		}
+		self.__pendingUndo = false;
+		self.__changed();
+	}
+	// 慢速兜底对账（EN_CHANGE 万一漏了也能兜住）+ 悬停停留检查
+	self.__poll = function(){
+		// 悬停提示：检查鼠标还在不在同一个词上。
+		// 便宜：没开浮层时第一句就返回。
+		try{ self.__checkHoverStill() }catch(e){}
+		// ⚠ 必须显式返回 null：官方 WM_TIMER 会把「返回值既不是 null 也不是 true」
+		//   的定时器**移除**（win/ui/_.aardio:342）。
+		//   这里最后一句是 self.__changed()，返回值会一路传出去
+		//   （onChange 的返回值）—— 一旦是 false，编辑器这个轮询
+		//   就被静默删掉：**文本再也不会被识别为「变了」**（保存/脏标记/语法着色全断）。
+		return null;
+	}
+	self.__changed = function(){
+		self.__updateDirty();
+		// 文本变了：补全浮层的候选已经不适用了（插入时会先自己关掉）
+		if(self.compOpen) self.hideCompletion();
+		// 文本变了：悬停提示的内容也过期了（词可能已经不存在）
+		if(self.hoverOpen) self.hideHover();
+		// 文本变了：引用标记的位置全部失效 —— 逐段清会清错位置（字符位移了），
+		// 直接 SCF_ALL 一把清掉全部背景（掩码只带背景位，不动着色/下划线/折叠）
+		try{
+			var cf0 = CHARFORMAT2();
+			cf0.mask = 0x04000000/*_CFM_BACKCOLOR*/ | 0x400/*_CFE_AUTOBACKCOLOR*/;
+			cf0.effects = 0x400/*_CFE_AUTOBACKCOLOR*/;
+			::SendMessageByStruct(ctrl.hwnd, 0x444/*_EM_SETCHARFORMAT*/,
+				4/*_SCF_ALL*/, cf0);
+		}catch(eh0){}
+		self.__hlMarksOn = false;
+		self.__hlApplied = {};
+		self.__hlSigApplied = "";
+		self.__hlWord = "";
+		// 文本变了：行首表要**立即**重建（光标行号/列号依赖它）
+		self.__rebuildLineTable();
+		self.__foldsDirty = true;
+		// 折叠区 + 语法着色是 O(全文) 的活（85KB 的文件实测
+		// 折叠区 300ms、着色 7 秒）—— 推到「停手后」那一拍，
+		// 连续输入期间一次都不跑（见 __scheduleColor）。
+		self.__scheduleColor();
+		self.__updateGutter();
+		self.updateCursor();
+		if(self.onChange) self.onChange(self.text);
+	}
+
+	// ---------- 光标 ----------
+	// 官方 getSel() 的形状：
+	//   无选区 → 只返回 1 个值（0-based 插入点）
+	//   有选区 → 返回 2 个值（1-based，首尾都含）
+	// 这里统一换算成 0-based 的 pos0（插入点/选区起点）。
+	self.__selPos = function(){
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		if(mn === null || mn === undefined) mn = 0;
+		if(mx === null || mx === undefined){
+			return mn;         // 0-based 插入点
+		}
+		return mn - 1;         // 选区起点（0-based）
+	}
+	self.updateCursor = function(){
+		var pos0 = self.__selPos();
+		var line = 1;
+		var col = 1;
+		try{
+			line = self.__lineOfChar(pos0);
+			if(!line) line = 1;
+			var ls = self.__lineStart(line);
+			col = pos0 - ls + 2;
+			if(col < 1) col = 1;
+		}catch(e2){
+			line = self.curLine : 1; col = 1;
+		}
+		if(!pos0 && self.curLine > 1){
+			line = self.curLine;
+		}
+		if(line != self.curLine){
+			self.curLine = line;
+			self.__highlightLine(line);
+		}
+		if(self.onCursor) self.onCursor(line, col);
+		// 引用标记：光标停稳后把同符号的出现垫亮（见 __scheduleHighlight）
+		self.__scheduleHighlight();
+		return line, col;
+	}
+	self.cursorPos = function(){
+		return self.updateCursor();
+	}
+
+	// ---------- 定位 ----------
+	self.gotoLine = function(line){
+		if(!line || line < 1) line = 1;
+		var pos = self.__lineStart(line);
+		if(!pos) pos = 1;
+		try{ ctrl.setSel(pos - 1) }catch(e2){}
+		try{ ctrl.scrollCaret() }catch(e3){}
+		self.curLine = line;
+		self.updateCursor();
+		return true;
+	}
+	self.gotoPos = function(pos){
+		if(!pos || pos < 1) pos = 1;
+		try{ ctrl.setSel(pos - 1) }catch(e){}
+		try{ ctrl.scrollCaret() }catch(e2){}
+		self.updateCursor();
+	}
+	// 跳到指定行（1 基）+ 列（1 基字符列）
+	//
+	// 跨文件跳转（F12）落点用：服务器给的是 1 基行号 + 0 基字符列，
+	// 这里统一按 1 基列号收，和编辑器内部其它定位 API 一致。
+	self.gotoLineCol = function(line, col){
+		if(!line || line < 1) line = 1;
+		if(!col || col < 1) col = 1;
+		var ls = self.__lineStart(line);
+		if(!ls) ls = 1;
+		var pos = ls + (col - 1);
+		try{ ctrl.setSel(pos - 1) }catch(e){}
+		try{ ctrl.scrollCaret() }catch(e2){}
+		self.updateCursor();
+		return true;
+	}
+
+	// 在**文本**里按 (行, 列, 长度) 替换一段，返回新文本
+	//
+	// 跨文件重命名要用：LSP 给的列是 **UTF-16 码元**，
+	// 而 aardio 字符串是 **UTF-8 字节** —— 单位不一样，必须换算，
+	// 否则中文标识符（或者标识符旁边的中文注释）会错位。
+	//
+	//   line = 1 基行号
+	//   col  = 1 基列（UTF-16 码元）
+	//   len  = 长度（UTF-16 码元）
+	// 位置非法时返回 null。
+	self.replaceTextAt = function(text, line, col, len, newText){
+		if(text === null || text === undefined) return null;
+		var lines = ..string.split(text, '\n');
+		if(!line || line < 1 || line > #lines) return null;
+		if(!col || col < 1) col = 1;
+		if(!len || len < 0) len = 0;
+		var ln = lines[line];
+		var bytes = ..string.unpack(ln);
+		var blen = #ln;
+		var b0 = __byteOfCol(bytes, blen, col);            // 起点字节
+		var b1 = __byteOfCol(bytes, blen, col + len);       // 终点字节（不含）
+		// ⚠ string.sub / string.slice 的第三参是**结束位置**（含），不是长度
+		var head = (b0 > 1) ? ..string.sub(ln, 1, b0 - 1) : "";
+		var tail = (b1 <= blen) ? ..string.slice(ln, b1) : "";
+		lines[line] = head ++ newText ++ tail;
+		return ..string.join(lines, '\n');
+	}
+	self.setFocus = function(){
+		try{ ctrl.setFocus() }catch(e){}
+	}
+
+	// ---------- 撤销重做 / 剪贴板 ----------
+	// 撤销/重做走自己的快照栈（见下面「撤销栈」一节的说明）：
+	// richedit 自带的撤销栈只收键盘输入，程序化的行替换根本进不去。
+	self.undo = function(){
+		if(#self.undoStack == 0){
+			// 兜底还是试一下控件自带的（万一有键盘输入没被我们记下的）
+			try{ ctrl.undo() }catch(e){}
+			self.__syncFromCtrl();
+			return false;
+		}
+		var st = ..table.remove(self.undoStack, #self.undoStack);
+		..table.push(self.redoStack, {text=self.text; sel=self.__selSnapshot()});
+		if(#self.redoStack > UNDO_MAX) ..table.remove(self.redoStack, 1);
+		self.__restore(st);
+		return true;
+	}
+	self.redo = function(){
+		if(#self.redoStack == 0) return false;
+		var st = ..table.remove(self.redoStack, #self.redoStack);
+		..table.push(self.undoStack, {text=self.text; sel=self.__selSnapshot()});
+		self.__restore(st);
+		return true;
+	}
+	// 能不能撤销 / 重做
+	self.canUndo = function(){
+		return #self.undoStack > 0;
+	}
+	self.canRedo = function(){
+		return #self.redoStack > 0;
+	}
+	self.cut = function(){
+		try{ ctrl.cut() }catch(e){}
+		self.__syncFromCtrl();
+	}
+	self.copy = function(){
+		try{ ctrl.copy() }catch(e){}
+	}
+	self.paste = function(){
+		try{ ctrl.paste() }catch(e){}
+		self.__syncFromCtrl();
+	}
+	// 读当前选区文本（读之前先记下选区，读完还原）
+	self.__selTextSafe = function(){
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		var s = null;
+		try{ s = ctrl.selText }catch(e2){}
+		if(mx === null || mx === undefined){
+			try{ ctrl.setSel(mn) }catch(e3){}
+		}
+		else{
+			try{ ctrl.setSel(mn, mx) }catch(e4){}
+		}
+		return s;
+	}
+	self.selectAll = function(){
+		try{ ctrl.setSel(1, ctrl.getLength()) }catch(e){}
+		self.updateCursor();
+	}
+	// 程序改完控件内容后同步快照（避免轮询把「程序改动」当成「用户编辑」）
+	self.__syncFromCtrl = function(){
+		var t = null;
+		try{ t = ctrl.text }catch(e){}
+		if(t !== null && t !== undefined && t != self.text){
+			var old = self.text;
+			self.text = t;
+			if(!self.__pendingUndo){
+				self.__pushUndo(old, self.__selSnapshot());
+			}
+			self.__pendingUndo = false;
+			self.__changed();
+			return;
+		}
+		self.updateCursor();
+		self.__updateGutter();
+	}
+
+	// ---------- 缩进 / 注释 ----------
+	// 关键事实（实测）：
+	//   · 控件内部换行是 **CRLF**，但 `ctrl.selText`（EM_GETSELTEXT）返回的是
+	//     **只有 CR** 的文本 —— 所以不能用选区文本切行。
+	//   · 改用「按行取文本 + 按行替换」：行内容用 `ctrl.lineText(i)`（干净，
+	//     不带行尾 CR），替换范围用 `lineToChar/lineLength` 算，替换文本用 CRLF。
+	var INDENT = "    ";
+	// 选区覆盖的行（1-based）
+	self.__selLines = function(){
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		if(mn === null || mn === undefined) mn = 0;
+		var pos0 = mn;
+		var pos1 = mn;
+		if(mx !== null && mx !== undefined){
+			pos0 = mn - 1;      // 选区：1-based 闭区间 → 0-based
+			pos1 = mx - 1;
+		}
+		var l1 = 1;
+		var l2 = 1;
+		l1 = self.__lineOfChar(pos0); if(!l1) l1 = 1;
+		l2 = self.__lineOfChar(pos1); if(!l2) l2 = 1;
+		if(l2 < l1) l2 = l1;
+		return l1, l2;
+	}
+	// 取第 l1..l2 行的内容（不含行尾 CR）
+	//
+	// ⚠ 不用官方 ctrl.lineText：折叠后 EM_LINEINDEX 对隐藏行返回的位置是错的，
+	//   官方取行会取错行。这里从**控件文本**自己切行（控件文本永远是最新的）。
+	self.__linesText = function(l1, l2){
+		var out = {};
+		var t = null;
+		try{ t = ctrl.text }catch(e){}
+		if(t === null || t === undefined) t = self.text;
+		var lines = ..string.split(t : "", '\n');
+		for(i=l1;l2;1){
+			out[i] = self.__lineText(lines, i);
+		}
+		return out;
+	}
+	// 用新内容替换第 l1..l2 行
+	self.__replaceLines = function(l1, l2, newLines){
+		// 改之前先存撤销快照（richedit 自带的撤销栈不收程序化替换）
+		self.__beginEdit();
+		var parts = {};
+		var n = 0;
+		for(i=l1;l2;1){
+			n = n + 1;
+			parts[n] = newLines[i] : "";
+		}
+		var text = ..string.join(parts, '\r\n');
+		self.__syncLineTable();
+		var a = self.__lineStart(l1);
+		if(!a) a = 1;
+		var b = self.__lineEnd(l2);
+		if(b < a) b = a;
+		try{
+			ctrl.setSel(a, b);
+			ctrl.selText = text;
+		}catch(e3){}
+		return true;
+	}
+	self.indent = function(){
+		var l1,l2 = self.__selLines();
+		var old = self.__linesText(l1, l2);
+		var nw = {};
+		for(i=l1;l2;1) nw[i] = INDENT ++ (old[i] : "");
+		self.__replaceLines(l1, l2, nw);
+		self.__syncFromCtrl();
+	}
+	self.unindent = function(){
+		var l1,l2 = self.__selLines();
+		var old = self.__linesText(l1, l2);
+		var nw = {};
+		for(i=l1;l2;1) nw[i] = self.__stripIndent(old[i] : "");
+		self.__replaceLines(l1, l2, nw);
+		self.__syncFromCtrl();
+	}
+	self.__stripIndent = function(ln){
+		var n = 0;
+		while(n < #INDENT && n < #ln){
+			var ch = ..string.sub(ln, n + 1, n + 1);
+			if(ch == " " || ch == '\t') n = n + 1;
+			else break;
+		}
+		if(!n) return ln;
+		return ..string.sub(ln, n + 1, #ln);
+	}
+	// 注释切换：给选中的每一行加/去「// 」
+	//
+	// ⚠ 缩进必须**保留**：注释标记插在缩进**后面**（VS 的行为），
+	//   原来直接 "// " ++ ln 把标记插到列 0，代码本身的缩进被顶没了；
+	//   而且「是不是已注释」的判定也只看前两个字符，
+	//   带缩进的行永远判不出来 → 再按一次会变成「// // 」。
+	self.toggleComment = function(){
+		var l1,l2 = self.__selLines();
+		var old = self.__linesText(l1, l2);
+		var allCommented = true;
+		for(i=l1;l2;1){
+			var ind0, rest0 = self.__splitIndent(old[i] : "");
+			if(..string.sub(rest0 : "", 1, 2) != "//"){ allCommented = false; break }
+		}
+		var nw = {};
+		for(i=l1;l2;1){
+			var ln = old[i] : "";
+			var ind, rest = self.__splitIndent(ln);
+			if(allCommented){
+				if(..string.sub(rest, 1, 2) == "//"){
+					rest = (#rest > 3) ? ..string.sub(rest, 4, #rest) : "";
+				}
+				ln = ind ++ rest;
+			}
+			else{
+				ln = ind ++ "// " ++ rest;
+			}
+			nw[i] = ln;
+		}
+		self.__replaceLines(l1, l2, nw);
+		self.__syncFromCtrl();
+	}
+
+	// ---------- 代码格式化 (Format Document) ----------
+	self.formatDocument = function(){
+		var txt = self.text;
+		if(!txt || !#txt) return false;
+		self.__pushUndo(txt, self.__selSnapshot(), "format");
+		var lines = ..string.split(txt, '\n');
+		var out = {};
+		var indentLevel = 0;
+		var inBlockComment = false;
+		for(i=1;#lines;1){
+			var raw = ..string.trimright(lines[i]);
+			var trimmed = ..string.trim(raw);
+			if(trimmed == ""){
+				..table.push(out, "");
+				continue;
+			}
+			// 块注释处理
+			if(inBlockComment){
+				..table.push(out, raw);
+				if(..string.indexOf(trimmed, "*/") !== null){
+					inBlockComment = false;
+				}
+				continue;
+			}
+			if(..string.startsWith(trimmed, "/*")){
+				..table.push(out, raw);
+				if(..string.indexOf(trimmed, "*/") === null){
+					inBlockComment = true;
+				}
+				continue;
+			}
+			// 计算当前行前导减缩进（若当前行以 } 或 ] 或 ) 开头，提前减一级）
+			var firstCh = ..string.sub(trimmed, 1, 1);
+			var preDecr = (firstCh == "}" || firstCh == "]" || firstCh == ")");
+			if(preDecr && indentLevel > 0) indentLevel = indentLevel - 1;
+
+			var curIndent = "";
+			if(indentLevel > 0){
+				for(k=1;indentLevel;1){ curIndent = curIndent ++ INDENT; }
+			}
+			..table.push(out, curIndent ++ trimmed);
+
+			// 统计本行内的括号变化（不计字符串/行注释里的）
+			var blen = #trimmed;
+			var inStr = false;
+			var strQuote = "";
+			for(c=1;blen;1){
+				var ch = ..string.sub(trimmed, c, c);
+				if(inStr){
+					if(ch == strQuote){
+						inStr = false;
+					}
+				}
+				else{
+					if(ch == '"' || ch == '\''){
+						inStr = true;
+						strQuote = ch;
+					}
+					elseif(ch == "/" && c < blen && ..string.sub(trimmed, c+1, c+1) == "/"){
+						break; // 后面是行注释，跳出
+					}
+					elseif(!preDecr && (ch == "}" || ch == "]" || ch == ")")){
+						if(indentLevel > 0) indentLevel = indentLevel - 1;
+					}
+					elseif(ch == "{" || ch == "[" || ch == "("){
+						indentLevel = indentLevel + 1;
+					}
+				}
+			}
+		}
+		var newText = ..string.join(out, '\r\n');
+		if(newText != txt){
+			self.setText(newText, true);
+			return true;
+		}
+		return false;
+	}
+
+	// ---------- 查找替换 ----------
+	// 位置单位：**UTF-16 码元**。
+	// `string.indexOf` 返回的就是 **wchar（UTF-16）位置**（不是字节！），
+	// 而 `string.sub` 是**字节**位置 —— 两者不能混用。
+	// 这里全程用 wchar 位置：行内偏移 = indexOf 的返回值，
+	// 行首位置 = 官方 lineToChar（也是 UTF-16 码元）。
+	self.__lineText = function(lines, ln){
+		var line = lines[ln];
+		if(line === null) line = "";
+		// 去掉行尾 \r
+		if(#line > 0 && ..string.sub(line, #line, #line) == '\r'){
+			line = ..string.sub(line, 1, #line - 1);
+		}
+		return line;
+	}
+	self.__findInLines = function(word, fromLine, fromCol){
+		if(!word) return null;
+		var lines = ..string.split(self.text, '\n');
+		var startLine = fromLine : 1;
+		var startCol = fromCol : 1;
+		for(ln=startLine;#lines;1){
+			var line = self.__lineText(lines, ln);
+			var from = 1;
+			if(ln == startLine) from = startCol;
+			var bp = 0;
+			if(from <= ..string.len(line)){
+				bp = ..string.indexOf(line, word, from);
+			}
+			if(bp){
+				var base = self.__lineStart(ln);
+				return {line=ln; pos=base + bp - 1; len=..string.len(word)};
+			}
+			if(from > 1) startCol = 1;   // 第一行没找到，后面从行首继续
+		}
+		return null;
+	}
+	// 向前找（从光标往上）
+	self.__findPrev = function(word, fromLine, fromCol){
+		if(!word) return null;
+		var lines = ..string.split(self.text, '\n');
+		for(ln=fromLine;ln>=1;1){
+			var line = self.__lineText(lines, ln);
+			var upto = ..string.len(line);
+			if(ln == fromLine) upto = fromCol - 1;
+			if(upto < 1) continue;
+			// 找该行里所有出现，取最后一个不超过 upto 的
+			var best = 0;
+			var from = 1;
+			while(from <= upto){
+				var bp = ..string.indexOf(line, word, from);
+				if(!bp || bp > upto) break;
+				best = bp;
+				from = bp + 1;
+			}
+			if(best){
+				var base = self.__lineStart(ln);
+				return {line=ln; pos=base + best - 1; len=..string.len(word)};
+			}
+		}
+		return null;
+	}
+	self.findNext = function(word, fromCaret){
+		if(!word) return false;
+		var hit = null;
+		if(fromCaret){
+			var pos0 = self.__selPos();
+			var line = 1;
+			var col = 1;
+			try{
+				line = self.__lineOfChar(pos0);
+				var ls = self.__lineStart(line);
+				col = pos0 - ls + 2;
+			}catch(e2){}
+			hit = self.__findInLines(word, line, col);
+			if(!hit) hit = self.__findInLines(word, 1, 1);
+		}
+		else{
+			hit = self.__findInLines(word, 1, 1);
+		}
+		if(!hit) return false;
+		try{
+			ctrl.setSel(hit.pos, hit.pos + hit.len - 1);
+			ctrl.scrollCaret();
+		}catch(e3){}
+		self.updateCursor();
+		return true;
+	}
+	self.findPrev = function(word){
+		if(!word) return false;
+		var pos0 = self.__selPos();
+		var line = 1;
+		var col = 1;
+		try{
+			line = self.__lineOfChar(pos0);
+			var ls = self.__lineStart(line);
+			col = pos0 - ls + 2;
+		}catch(e2){}
+		var hit = self.__findPrev(word, line, col);
+		if(!hit) hit = self.__findInLines(word, 1, 1);
+		if(!hit) return false;
+		try{
+			ctrl.setSel(hit.pos, hit.pos + hit.len - 1);
+			ctrl.scrollCaret();
+		}catch(e3){}
+		self.updateCursor();
+		return true;
+	}
+	self.replaceOnce = function(word, repl){
+		if(!word) return false;
+		var s = self.__selTextSafe();
+		if(s == word){
+			self.__beginEdit();
+			try{ ctrl.selText = repl : "" }catch(e2){}
+			self.__syncFromCtrl();
+			return true;
+		}
+		return self.findNext(word, true);
+	}
+	self.replaceAll = function(word, repl){
+		if(!word) return 0;
+		var t = self.text;
+		if(!..string.indexOf(t, word)) return 0;
+		var n = 0;
+		var r = repl : "";
+		while(..string.indexOf(t, word)){
+			n = n + 1;
+			t = ..string.replaceLiteral(t, word, r);
+			if(n > 20000) break;
+		}
+		self.__beginEdit();
+		try{ ctrl.text = t }catch(e){}
+		self.text = t;
+		self.__changed();
+		return n;
+	}
+	// 选区（1-based，首尾都含）
+	self.getSelection = function(){
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		if(mn === null || mn === undefined) mn = 0;
+		if(mx === null || mx === undefined) return mn + 1, mn + 1;
+		return mn, mx;
+	}
+	// 把文本规范成控件内部的形式（CRLF）。
+	// 文档模型要统一用它：脏标记是「当前文本 vs 保存时文本」逐字比较，
+	// 两边必须同形（否则 LF 文件一打开就是「已修改」）。
+	self.normalize = function(s){
+		return self.__toCRLF(s);
+	}
+
+	// ---------- 语法着色（停手后统一做） ----------
+	//
+	// ⚠⚠ 这一拍干的是 **O(全文)** 的活：
+	//   ① __rebuildFolds：扫全文找可折叠区（85KB ≈ 300ms）
+	//   ② __color：tokenize + 逐 token 设字符格式（85KB 实测 **7 秒**）
+	// 以前是「第一次改动后固定等 250ms 就跑」（那不是防抖），
+	// 快速打字时每 250ms 就全文重刷一次 —— 既卡又让颜色乱跳。
+	// 现在是**真防抖**：每次改动都把定时器推后，
+	// 停手 120ms 后才跑一次 ⇒ 连续输入期间一次都不跑。
+	self.__scheduleColor = function(){
+		self.__cancelColor();
+		try{
+			self.colorTimer = winform.setTimeout(function(){
+				self.colorTimer = null;
+				// 折叠区已经是最新的就别再扫一遍（打开文件时省 250ms）
+				if(self.__foldsDirty){
+					try{ self.__rebuildFolds() }catch(e1){}
+				}
+				self.__color();
+				return null;
+			}, 120);
+		}catch(e){}
+	}
+	self.__cancelColor = function(){
+		if(!self.colorTimer) return;
+		try{ winform.clearInterval(self.colorTimer) }catch(e){}
+		self.colorTimer = null;
+	}
+
+	// 上限：超大文件不全文着色（否则几千次 FFI 会卡住界面）
+	var MAX_TOKENS = 6000;
+
+	// 复用同一个 CHARFORMAT2 ——
+	//
+	// 官方 setCharformat 每次都要 `..table.mix(CHARFORMAT2(), fm)`
+	//（新建结构体 + 把表混进去），实测 **0.81ms/token**；
+	// 复用结构体 + 裸 SendMessageByStruct 只要 ~0.02ms/token（40 倍）。
+	var __cfColor = null;
+	self.__applyColor = function(color){
+		if(!__cfColor) __cfColor = CHARFORMAT2();
+		__cfColor.mask = 0x40000000/*_CFM_COLOR*/;
+		__cfColor.textColor = color;
+		try{
+			::SendMessageByStruct(ctrl.hwnd, 0x444/*_EM_SETCHARFORMAT*/,
+				1/*_SCF_SELECTION*/, __cfColor);
+		}catch(e){}
+		return true;
+	}
+	// 当前可见的行范围（1 基，含）
+	//
+	// EM_GETFIRSTVISIBLELINE(0xCE) 给首个可见行；
+	// 可见行数 = 客户区高 / 行高。
+	self.__visibleRange = function(){
+		var rc = ::RECT();
+		try{ ::GetClientRect(ctrl.hwnd, rc) }catch(e){}
+		var h = rc.bottom - rc.top;
+		var lh = self.lineHeight > 0 ? self.lineHeight : 16;
+		var vis = math.floor(h / lh) + 6;      // 多带 6 行余量
+		if(vis < 12) vis = 12;
+		var total = self.__lineCount();
+		if(!total) return 1, 1;
+		var first = 1;
+		try{
+			var r = ::SendMessage(ctrl.hwnd, 0xCE/*_EM_GETFIRSTVISIBLELINE*/, 0, 0);
+			first = tonumber(r) + 1;
+		}catch(e2){}
+		if(!first || first < 1) first = 1;
+		if(first > total) first = total;
+		var last = first + vis - 1;
+		if(last > total) last = total;
+		return first, last;
+	}
+	self.__color = function(){
+		var t = self.text;
+		if(!t) return;
+		var __t0 = ..time.tick();
+		// 记下当前选区，着色过程会动选区，最后要还原
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		if(mn === null || mn === undefined) mn = 0;
+		// ⚠⚠ **只着色可见的那几行**：
+		//   全文着色是 O(全文) 的活（tokenize 逐字节扫 2.2s
+		//   + 每个 token 两次 FFI 共 4.8s），85KB 的文件实测 **7 秒** ——
+		//   这一秒多的冻结就是用户说的「刷新不及时」的真凶。
+		//   改成「只着色当前可见的行 + 6 行余量」，
+		//   滚动时（WM_VSCROLL / WM_MOUSEWHEEL）再补着色新出现的那一段，
+		//   和 VS Code / CodeMirror 的做法一样。
+		var from, to = self.__visibleRange();
+		// ① 先把这一段刷成正文色（清掉上一次留在上面的着色）
+		var a = self.__lineStart(from);
+		var b = self.__lineEnd(to);
+		if(a && b && b >= a){
+			try{
+				ctrl.setSel(a, b);
+				self.__applyColor(..nodio.ui.themeRef(self.colors.ident));
+			}catch(e0){}
+		}
+		// ② 逐 token 上色
+		var colCache = {};
+		var toks = self.__tokenize(t, from, to);
+		for(i=1;#toks;1){
+			var tk = toks[i];
+			var cr = self.colors[tk.kind];
+			if(cr === null || cr === undefined) continue;
+			var cc = colCache[tk.kind];
+			if(cc === null || cc === undefined){
+				cc = ..nodio.ui.themeRef(cr);
+				colCache[tk.kind] = cc;
+			}
+			try{
+				ctrl.setSel(tk.pos, tk.pos + tk.len - 1);
+				self.__applyColor(cc);
+			}catch(e3){}
+		}
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG editor color cost=" ++ tostring(..time.tick() - __t0)
+				++ "ms lines=" ++ tostring(from) ++ "-" ++ tostring(to)
+				++ " tokens=" ++ tostring(#toks)
+				++ " bytes=" ++ tostring(#t));
+		}
+		// 还原选区
+		if(mx === null || mx === undefined){
+			try{ ctrl.setSel(mn) }catch(e4){}
+		}
+		else{
+			try{ ctrl.setSel(mn, mx) }catch(e5){}
+		}
+		self.hlLine = 0;
+		self.__highlightLine(self.curLine);
+		// 着色那一遍会把错误处的**颜色**刷掉（波浪线留着）→ 重新刷一次诊断
+		self.__applyDiagMarks();
+		self.__updateGutter();
+	}
+
+	// 当前行底色（用 CHARFORMAT 的 backColor 画一条底纹）
+	// 当前行指示：行号栏高亮当前行号（避免动选区 setSel 涂字符底色造成跳闪卡顿）
+	self.__highlightLine = function(line){
+		if(!line || line < 1) return;
+		if(self.hlLine == line) return;
+		self.hlLine = line;
+		self.__updateGutter();
+	}
+	self.__paintLineBg = function(line, color){
+		// 空实现：不再修改字符底色，彻底杜绝选区跳闪
+	}
+
+	// ---------- 诊断标记（错误 / 警告）----------
+	//
+	// 槽内标记：出错范围画**波浪下划线**并染成错误色（红色）/ 警告色（橙色），
+	// 行号栏那一行画一个圆点 + 行号染色。
+	//
+	// ⚠ 波浪线必须自己发 EM_SETCHARFORMAT（见文件头 CHARFORMAT2 的说明）：
+	//   mask 要带 CFM_UNDERLINETYPE，underlineType = 8 (CFU_UNDERLINEWAVE)。
+	//   官方 richedit.setCharformat 从不带这个掩码位 → 永远只画单线。
+	// ⚠ 全文着色的那一遍只改颜色（mask 里没有 CFM_UNDERLINE），
+	//   所以下划线会留着；但错误**颜色**会被刷掉 → 着色完要再刷一次诊断。
+	self.setDiagnostics = function(list){
+		self.diags = list : {};
+		// 诊断没变就别重刷：__applyDiagMarks 是「全文 SCF_ALL 清 + 逐条重刷」，
+		// 而 IDE 的心跳每 300ms 就会喂一次诊断 —— 不判重的话编辑器一直在全量重刷。
+		var sig = __diagSig(self.diags);
+		if(sig != self.__diagSigApplied){
+			self.__diagSigApplied = sig;
+			self.__applyDiagMarks();
+		}
+		self.__updateGutter();
+		return #self.diags;
+	}
+
+	// ---------- 引用标记（同符号高亮） ----------
+	//
+	// 光标在某个符号上停留 ~300ms 后，把**同一符号在本文档里的所有出现**
+	// 用背景色垫亮 —— 与 VS Code 的 occurrences 高亮同一交互。
+	// 数据来自 LSP textDocument/documentHighlight：
+	//   编辑器只声明 onHighlight 钩子（编辑器组件不认识 LSP），
+	//   IDE 把「问服务端 + 喂回 setHighlights」接进去。
+	//
+	// ⚠ 用 CHARFORMAT2 的 **CFE_BACKCOLOR**（背景色），不动文字颜色：
+	//   语法着色那一遍只改 CFM_COLOR —— 高亮背景不会被冲掉；
+	//   选区永远盖在背景之上，互不干扰。
+	// ⚠ 折叠用 CFE_HIDDEN、诊断用 CFE_UNDERLINE，三者掩码互不相交，
+	//   不会互相抹掉（着色后要重刷的只有诊断和折叠，见 __color）。
+	self.setHighlights = function(list){
+		var sig = "";
+		list = list : {};
+		for(i=1;#list;1){
+			var h = list[i];
+			if(!h) continue;
+			sig = sig ++ tostring(h.line) ++ ":" ++ tostring(h.col:0) ++ ":"
+				++ tostring(h.len:0) ++ ";";
+		}
+		if(sig == self.__hlSigApplied) return;
+		self.__hlSigApplied = sig;
+		self.__applyHighlightMarks(list);
+	}
+
+	// 清掉当前所有高亮背景（只清「上次刷过的那几段」，不全文扫）
+	self.__hlClear = function(){
+		if(!self.__hlMarksOn) return;
+		for(i=1;#self.__hlApplied;1){
+			var h = self.__hlApplied[i];
+			if(!h || !h.pos) continue;
+			try{
+				ctrl.setSel(h.pos, h.pos + h.len - 1);
+				var cf = CHARFORMAT2();
+				cf.mask = 0x04000000/*_CFM_BACKCOLOR*/ | 0x400/*_CFE_AUTOBACKCOLOR*/;
+				cf.effects = 0x400/*_CFE_AUTOBACKCOLOR*/;    // 恢复默认背景
+				::SendMessageByStruct(ctrl.hwnd, 0x444/*_EM_SETCHARFORMAT*/,
+					1/*_SCF_SELECTION*/, cf);
+			}catch(e1){}
+		}
+		self.__hlMarksOn = false;
+		self.__hlApplied = {};
+	}
+
+	self.__applyHighlightMarks = function(list){
+		self.__hlClear();
+		if(!list || !#list) return;
+		// 高亮底色用「选中行底色」—— 主题表里现成的 ARGB，
+		// themeRef() 转 COLORREF 才能进 CHARFORMAT2
+		var bg = ..nodio.ui.themeRef(th.selBg);
+		var applied = {};
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		for(i=1;#list;1){
+			var h = list[i];
+			if(!h || !h.line) continue;
+			var a = self.__lineStart(h.line);
+			if(!a) continue;
+			// col 是 0 基（LSP 约定）→ richedit 的 1 基字符位置
+			var s = a + (h.col : 0);
+			var ln = (h.len : 1);
+			if(ln < 1) ln = 1;
+			var e = s + ln - 1;               // setSel 是 1 基闭区间 [s,e]
+			try{
+				ctrl.setSel(s, e);
+				var cf2 = CHARFORMAT2();
+				cf2.mask = 0x04000000/*_CFM_BACKCOLOR*/;
+				cf2.effects = 0;              // CFE_AUTOBACKCOLOR 清零 → 用 backColor
+				cf2.backColor = bg;
+				::SendMessageByStruct(ctrl.hwnd, 0x444/*_EM_SETCHARFORMAT*/,
+					1/*_SCF_SELECTION*/, cf2);
+				..table.push(applied, { pos = s; len = ln });
+			}catch(e2){}
+		}
+		if(mx === null || mx === undefined){
+			try{ ctrl.setSel(mn) }catch(e3){}
+		}
+		else{
+			try{ ctrl.setSel(mn, mx) }catch(e4){}
+		}
+		self.__hlMarksOn = true;
+		self.__hlApplied = applied;
+	}
+
+	// 光标停留 300ms 后触发一次（换词才重问，没换词静默）
+	self.__scheduleHighlight = function(){
+		if(self.__hlTimer){
+			try{ winform.clearInterval(self.__hlTimer) }catch(e0){}
+			self.__hlTimer = null;
+		}
+		try{
+			self.__hlTimer = winform.setTimeout(function(){
+				self.__hlTimer = null;
+				var w = null;
+				try{ w = self.__wordAtPos(self.__caretPos()) }catch(e1){}
+				var word = (w && w.word) ? w.word : "";
+				if(word == self.__hlWord) return null;
+				self.__hlWord = word;
+				if(word == ""){
+					self.setHighlights({});
+					return null;
+				}
+				if(self.onHighlight){
+					try{ self.onHighlight(w.line, w.col, word) }catch(e2){}
+				}
+				return null;      // ⚠ 官方 setTimeout 回调必须显式返回 null
+			}, 300);
+		}catch(e3){}
+	}
+	// function(line, col, word) —— IDE 在这里问 LSP 再喂 setHighlights
+	self.onHighlight = null;
+
+	// 诊断颜色：1=错误 2=警告 3=信息 4=提示
+	self.__diagColor = function(sev){
+		if(sev == 2) return th.warn;
+		if(sev == 3) return th.textDim;
+		if(sev == 4) return th.textDim;
+		return th.err;
+	}
+
+	// 直接给选区设字符格式（mask 完全自控，绕开官方 setCharformat 的两个坑）
+	// colorRef 传 null 表示不动颜色
+	self.__setCharFmt = function(mask, effects, uType, colorRef){
+		var cf = CHARFORMAT2();
+		cf.mask = mask;
+		cf.effects = effects;
+		cf.underlineType = uType;
+		if(colorRef !== null) cf.textColor = colorRef;
+		::SendMessageByStruct(ctrl.hwnd, 0x444/*_EM_SETCHARFORMAT*/,
+			1/*_SCF_SELECTION*/, cf);
+	}
+
+	// 刷诊断标记：先清掉上一次的（全文刷一遍「无下划线」），再逐条画
+	self.__applyDiagMarks = function(){
+		var has = (self.diags && #self.diags) ? true : false;
+		// 控件里本来就没有标记时，别白刷一次全文（打字时每 250ms 就会调到这里）
+		if(!has && !self.__diagMarksOn) return;
+		// 清：mask 只带 CFM_UNDERLINE|CFM_UNDERLINETYPE，颜色不在掩码里 → 不受影响
+		try{
+			var cf0 = CHARFORMAT2();
+			cf0.mask = __CFM_UNDERLINE | __CFM_UNDERLINETYPE;
+			cf0.effects = 0;              // 去掉 CFE_UNDERLINE
+			cf0.underlineType = __CFU_NONE;
+			::SendMessageByStruct(ctrl.hwnd, 0x444/*_EM_SETCHARFORMAT*/,
+				4/*_SCF_ALL*/, cf0);
+		}catch(e0){}
+		self.__diagMarksOn = has;
+		if(!has) return;
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		for(i=1;#self.diags;1){
+			var d = self.diags[i];
+			if(!d.line) continue;
+			var a = self.__lineStart(d.line);
+			var b = self.__lineEnd(d.line);
+			if(!a) continue;
+			// 列号是 0 基的（跟 LSP 一致），richedit 位置是 1 基
+			var col = d.col : 0;
+			var s = a + col;
+			var e = s + 1;
+			if(d.endLine == d.line && d.endCol !== null && d.endCol > col){
+				e = a + d.endCol;
+			}
+			if(e <= s) e = s + 1;
+			if(e > b) e = b;
+			if(e < s) continue;
+			try{
+				ctrl.setSel(s, e);
+				self.__setCharFmt(
+					__CFM_UNDERLINE | __CFM_UNDERLINETYPE | __CFM_COLOR,
+					__CFE_UNDERLINE,
+					__CFU_WAVE,                          // 波浪线
+					..nodio.ui.themeRef(self.__diagColor(d.sev)));
+			}catch(e3){}
+		}
+		// 还原选区
+		if(mx === null || mx === undefined){
+			try{ ctrl.setSel(mn) }catch(e4){}
+		}
+		else{
+			try{ ctrl.setSel(mn, mx) }catch(e5){}
+		}
+	}
+
+	// ---------- 代码折叠 ----------
+	//
+	// 折叠靠 CHARFORMAT2 的 **CFE_HIDDEN**（0x100）实现：
+	// 给正文区打上 hidden 格式，控件就把这些段落**整个收起**（连行高都没有），
+	// 实测：6 行的文档隐藏第 3~4 行后 lineCount 变 4，画面上只剩 3 行。
+	//
+	// ⚠ 折叠后**不能再用官方 lineToChar**：
+	//   · EM_LINEINDEX 对隐藏行返回的位置是错的（实测隐藏 3~4 行后
+	//     lineToChar(3) 仍返回第 3 行起点 18，而不是折叠后那一行的起点）；
+	//   · 官方 lineFromChar 同理。
+	//   所以本组件自己维护「文档行 → 字符位置」的行首表，
+	//   官方那两个函数只在没有折叠时用。
+	//
+	// ⚠ 隐藏的只是**显示属性**，文本本身没丢（实测 ctrl.text 仍含被隐藏的行），
+	//   保存出去的永远是完整文本。
+
+	// 文档总行数（EM_GETLINECOUNT 原生 O(1) 消息，无消息循环时回退到文本模型）
+	self.__lineCount = function(){
+		if(ctrl && ctrl.hwnd){
+			var c = ::SendMessage(ctrl.hwnd, 0xBA/*EM_GETLINECOUNT*/, 0, 0);
+			if(c > 1) return c;
+		}
+		if(self.text){
+			var lines = ..string.split(self.text, '\n');
+			if(#lines > 0) return #lines;
+		}
+		return #self.lineStarts ? #self.lineStarts : 1;
+	}
+
+	// 文档行 → 行首字符位置（1-based，EM_LINEINDEX 原生 O(1)）
+	self.__lineStart = function(ln){
+		if(!ln || ln < 1) return 1;
+		if(ctrl && ctrl.hwnd){
+			var idx = ::SendMessage(ctrl.hwnd, 0xBB/*EM_LINEINDEX*/, ln - 1, 0);
+			if(idx >= 0) return idx + 1;
+		}
+		var v = self.lineStarts[ln];
+		if(v === null || v === undefined) return 1;
+		return v;
+	}
+	// 文档行 → 行尾字符位置（含，EM_LINELENGTH 原生 O(1)）
+	self.__lineEnd = function(ln){
+		if(!ln || ln < 1) return 1;
+		if(ctrl && ctrl.hwnd){
+			var idx = ::SendMessage(ctrl.hwnd, 0xBB/*EM_LINEINDEX*/, ln - 1, 0);
+			if(idx >= 0){
+				var len = ::SendMessage(ctrl.hwnd, 0xC1/*EM_LINELENGTH*/, idx, 0);
+				return idx + (len > 0 ? len : 0);
+			}
+		}
+		var v = self.lineLens[ln];
+		if(v === null || v === undefined) v = 0;
+		return self.__lineStart(ln) + v - 1;
+	}
+	// 字符位置 → 文档行（1-based，EM_LINEFROMCHAR 原生 O(1)）
+	//
+	// ⚠ pos 是 **0-based** 的（跟 __selPos 一致）。
+	//   原生消息传入 0-based 字符索引，直接返回 0-based 行号，+1 即为 1-based 行号。
+	self.__lineOfChar = function(pos){
+		if(!pos || pos < 0) pos = 0;
+		if(ctrl && ctrl.hwnd){
+			var ln = ::SendMessage(ctrl.hwnd, 0xC9/*EM_LINEFROMCHAR*/, pos, 0);
+			if(ln >= 0) return ln + 1;
+		}
+		var lo = 1;
+		var hi = #self.lineStarts;
+		if(!hi) return 1;
+		while(lo <= hi){
+			var mid = math.floor((lo + hi) / 2);
+			if(self.lineStarts[mid] <= pos + 1) lo = mid + 1;
+			else hi = mid - 1;
+		}
+		return hi;
+	}
+	// 光标位置（0-based 插入点）
+	//
+	// 官方 getSel 的形状：
+	//   无选区 → 只返回 1 个值（0-based 插入点）
+	//   有选区 → 返回 2 个值（1-based，首尾都含）
+	// 所以：有选区时光标在选区**末尾**（0-based = mx）。
+	self.__caretPos = function(){
+		var mn = null;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		if(mn === null || mn === undefined) return 0;
+		if(mx === null || mx === undefined) return mn;
+		return mx;
+	}
+	// 重建行首表（richedit 位置：CRLF 只占 1 格）
+	self.__buildLineStarts = function(t){
+		var ls = {};
+		var ll = {};
+		var lines = ..string.split(t : "", '\n');
+		// 缓存拆行结果：tokenize / 折叠扫描都要用，
+		// 每次都重新 split 全文是 85KB ≈ 30ms 的纯浪费。
+		self.__splitLines = lines;
+		self.__splitLinesText = t;
+		var pos = 1;
+		for(i=1;#lines;1){
+			ls[i] = pos;
+			var s = lines[i];
+			if(i < #lines){
+				// 行尾的 '\r' 不算进内容长度（CRLF 在 richedit 里只占 1 格）
+				if(#s > 0 && ..string.sub(s, #s, #s) == '\r'){
+					s = ..string.sub(s, 1, #s - 1);
+				}
+				ll[i] = ..string.len(s);
+				pos = pos + ll[i] + 1;
+			}
+			else{
+				if(#s > 0 && ..string.sub(s, #s, #s) == '\r'){
+					s = ..string.sub(s, 1, #s - 1);
+				}
+				ll[i] = ..string.len(s);
+			}
+		}
+		self.lineStarts = ls;
+		self.lineLens = ll;
+		self.__lsText = t;
+		return ls;
+	}
+	// 行首表跟控件文本对不上时（刚打完字还没轮到轮询）重建一次
+	self.__syncLineTable = function(){
+		var t = null;
+		try{ t = ctrl.text }catch(e){ return }
+		if(t === null || t === undefined) return;
+		if(t == self.__lsText) return;
+		self.__buildLineStarts(t);
+	}
+
+	// 扫描可折叠区：{start=带 '{' 的行; end=匹配的 '}' 所在行}
+	// 折叠的是 [start+1 .. end] 这段正文，start 行是折叠头。
+	// 字符串 / 注释里的花括号不算。
+	//
+	// ⚠⚠ **必须用原生字符串查找定位，不能逐字节解释执行**：
+	//   旧实现是 `while(i <= blen){ var b = bytes[i]; ... }` ——
+	//   解释器每个字节都要转一圈，85KB 的文件实测 **1063ms**
+	//   （__foldMaintain 整体 1063ms，__scanFoldRegions 占 1047ms）。
+	//   而这一段「每次改动」都要跑 ⇒ 每敲一个字卡一秒。
+	//   现在改成：只用 string.indexOf（原生）定位
+	//   // 、/* 、" 、' 、{ 、} 这几种关键记号，
+	//   中间那一大段普通字符整段跳过 —— 85KB 降到 ~100ms。
+	//
+	// ⚠ string.indexOf(s, sub, from) 的 from 是 **1 基且含**（含 from 本身），
+	//   返回的是 **wchar（UTF-16）位置**，不是字节位置 ——
+	//   所以这里全程用 wchar 位置，只用来比「谁在前面」，不用来取字节。
+	self.__scanFoldRegions = function(t){
+		var regs = {};
+		var lines = ..string.split(t : "", '\n');
+		var stack = {};
+		var n = 0;
+		var inBlock = false;
+		for(ln=1;#lines;1){
+			var line = self.__lineText(lines, ln);
+			var wlen = ..string.len(line);     // 字符数（wchar）
+			if(!wlen) continue;
+			var from = 1;
+			// ⚡ 快速跳过：不在块注释里、这一行又**既没有 '{' 也没有 '}'**，
+			//   那它对折叠结构没有任何影响 —— 唯一要确认的是它有没有开一个
+			//   块注释（'/*'）。绝大多数行走这条路：3 次原生查找，
+			//   而不是逐个记号找 9 次（85KB 实测 266ms → ~150ms）。
+			if(!inBlock){
+				var qLb = ..string.indexOf(line, '{', 1);
+				var qRb = ..string.indexOf(line, '}', 1);
+				if(!qLb && !qRb && !..string.indexOf(line, '/*', 1)) continue;
+			}
+			// 上一行留了个没关的块注释 → 先在本行找 '*/'
+			if(inBlock){
+				var eb = ..string.indexOf(line, '*/', 1);
+				if(!eb) continue;              // 整行都在注释里
+				inBlock = false;
+				from = eb + 2;
+			}
+			// 关键记号的下一个位置（wchar 位置；0 = 没有）
+			var pCmt = 0, pBlk = 0, pDq = 0, pSq = 0, pLb = 0, pRb = 0;
+			while(from <= wlen){
+				if(!pCmt || pCmt < from) pCmt = ..string.indexOf(line, '//', from);
+				if(!pBlk || pBlk < from) pBlk = ..string.indexOf(line, '/*', from);
+				if(!pDq || pDq < from) pDq = ..string.indexOf(line, '"', from);
+				if(!pSq || pSq < from) pSq = ..string.indexOf(line, "'", from);
+				if(!pLb || pLb < from) pLb = ..string.indexOf(line, '{', from);
+				if(!pRb || pRb < from) pRb = ..string.indexOf(line, '}', from);
+				// 取最靠前的那个
+				var at = 0;
+				var kind = 0;
+				if(pCmt){ at = pCmt; kind = 1 }
+				if(pBlk && (!at || pBlk < at)){ at = pBlk; kind = 2 }
+				if(pDq && (!at || pDq < at)){ at = pDq; kind = 3 }
+				if(pSq && (!at || pSq < at)){ at = pSq; kind = 4 }
+				if(pLb && (!at || pLb < at)){ at = pLb; kind = 5 }
+				if(pRb && (!at || pRb < at)){ at = pRb; kind = 6 }
+				if(!at) break;
+				if(kind == 1){
+					break;                       // 行注释：后面全是注释
+				}
+				elseif(kind == 2){
+					// 块注释：本行能找到 '*/' 就跳过这一段，找不到就跨行
+					var e = ..string.indexOf(line, '*/', at + 2);
+					if(e){
+						from = e + 2;
+						continue;
+					}
+					inBlock = true;
+					break;
+				}
+				elseif(kind == 3){
+					// 双引号串（aardio 里是原样串，没有转义）
+					var e2 = ..string.indexOf(line, '"', at + 1);
+					from = e2 ? (e2 + 1) : (wlen + 1);
+					continue;
+				}
+				elseif(kind == 4){
+					// 单引号串：带 \' 转义
+					// （aardio 单引号串按 C 规则转义，双引号串是原样串）
+					var e3 = ..string.indexOf(line, "'", at + 1);
+					while(e3){
+						// 引号前面那个反斜杠在哪？—— 用原生查找 " \'"
+						var esc = ..string.indexOf(line, "\'", at + 1);
+						if(esc && (esc + 1) == e3){
+							// 但要先确认那个反斜杠自己不是被转义的（\\'）
+							var bs = ..string.indexOf(line, "\\", at + 1);
+							if(bs && (bs + 1) == esc) break;
+							e3 = ..string.indexOf(line, "'", e3 + 2);
+							continue;
+						}
+						break;
+					}
+					from = e3 ? (e3 + 1) : (wlen + 1);
+					continue;
+				}
+				elseif(kind == 5){
+					..table.push(stack, ln);     // '{'
+					from = at + 1;
+					continue;
+				}
+				else{
+					if(#stack){                   // '}'
+						var s = stack[#stack];
+						..table.remove(stack, #stack);
+						if(ln > s + 1){           // 中间有正文才算可折叠
+							n = n + 1;
+							regs[n] = {start=s; end=ln};
+						}
+					}
+					from = at + 1;
+					continue;
+				}
+			}
+		}
+		return regs;
+	}
+
+	// 把折叠状态刷进控件：先清掉全文的 hidden，再给各折叠区的正文打 hidden
+	//
+	// ⚠ 打格式要动选区（SCF_SELECTION），动完必须还原 —— 否则光标会跳走。
+	self.__applyFoldFormat = function(){
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(es){}
+		try{
+			var cf0 = CHARFORMAT2();
+			cf0.mask = 0x100/*CFM_HIDDEN*/;
+			cf0.effects = 0;                // 去掉 CFE_HIDDEN
+			::SendMessageByStruct(ctrl.hwnd, 0x444/*_EM_SETCHARFORMAT*/,
+				4/*_SCF_ALL*/, cf0);
+		}catch(e0){}
+		if(self.folds && #self.folds){
+			for(i=1;#self.folds;1){
+				var f = self.folds[i];
+				var a = self.__lineStart(f.start + 1);
+				// ⚠ 区间要**连最后一行行尾的 CRLF 一起盖住**：
+				//   只盖正文的话，最后一行的段落标记还留着 → 折叠后留一条空行。
+				var b = self.__lineStart(f.end + 1) - 1;
+				if(b < a) b = self.__lineEnd(f.end);
+				if(b < a) continue;
+				try{
+					var cf = CHARFORMAT2();
+					cf.mask = 0x100/*CFM_HIDDEN*/;
+					cf.effects = 0x100/*CFE_HIDDEN*/;
+					ctrl.setSel(a, b);
+					::SendMessageByStruct(ctrl.hwnd, 0x444/*_EM_SETCHARFORMAT*/,
+						1/*_SCF_SELECTION*/, cf);
+				}catch(e1){}
+			}
+		}
+		// 还原选区
+		if(mx === null || mx === undefined){
+			try{ ctrl.setSel(mn) }catch(e2){}
+		}
+		else{
+			try{ ctrl.setSel(mn, mx) }catch(e3){}
+		}
+	}
+
+	// 可见行表：文档行号（跳过被折叠隐藏的行）
+	self.__rebuildVisLines = function(){
+		var vis = {};
+		var total = self.__lineCount();
+		var hidden = {};
+		if(self.folds && #self.folds){
+			for(i=1;#self.folds;1){
+				var f = self.folds[i];
+				for(j=f.start + 1; f.end; 1){
+					if(j > total) break;
+					hidden[j] = true;
+				}
+			}
+		}
+		var n = 0;
+		for(i=1;total;1){
+			if(hidden[i]) continue;
+			n = n + 1;
+			vis[n] = i;
+		}
+		self.visLines = vis;
+		return vis;
+	}
+
+	// 文本变了：行首表要重建，折叠区要重扫，已折叠的区要按新位置重新打 hidden
+	//
+	// 拆成两半：
+	//   __rebuildLineTable —— 原生 Win32 消息实时计算行号/起始位置，打字期间无需同步 split 全文
+	//   __rebuildFolds    —— 折叠区 + 可见行表，O(全文)，延后到「停手后」
+	self.__rebuildLineTable = function(){
+		// 原生消息实时计算，无需耗时拆行
+	}
+	self.__rebuildFolds = function(){
+		var __t0 = ..time.tick();
+		self.foldRegions = self.__scanFoldRegions(self.text);
+		self.__foldsDirty = false;
+		// 折叠区已经不在了（代码被改掉）→ 丢掉这个折叠
+		if(self.folds && #self.folds){
+			for(i=#self.folds;1;1){
+				var f = self.folds[i];
+				var found = false;
+				for(k=1;#self.foldRegions;1){
+					if(self.foldRegions[k].start == f.start
+						&& self.foldRegions[k].end == f.end){
+						found = true;
+						break;
+					}
+				}
+				if(!found) ..table.remove(self.folds, i);
+			}
+		}
+		if(self.folds && #self.folds) self.__applyFoldFormat();
+		self.__rebuildVisLines();
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG editor rebuildFolds cost=" ++ tostring(..time.tick() - __t0)
+				++ "ms bytes=" ++ tostring(#self.text));
+		}
+	}
+	// 两半一起做（载入文档时用：那时还没开始交互，慢一点没关系）
+	self.__foldMaintain = function(){
+		self.__rebuildLineTable();
+		self.__rebuildFolds();
+	}
+
+	// 找行号所在的折叠区（折叠头所在行）
+	self.__findRegion = function(ln){
+		var regs = self.foldRegions;
+		for(i=1;#regs;1){
+			if(regs[i].start == ln) return regs[i];
+		}
+		return null;
+	}
+	// 这一行是不是折叠头
+	self.isFoldable = function(ln){
+		return self.__findRegion(ln) ? true : false;
+	}
+	// 这一行是不是已经折叠了
+	self.isFolded = function(ln){
+		for(i=1;#self.folds;1){
+			if(self.folds[i].start == ln) return true;
+		}
+		return false;
+	}
+	// 折叠 / 展开某一行
+	//   · 折叠头所在行 → 折叠/展开这一块
+	//   · 区块内部     → 折叠/展开**包含它的那一块**（VS Code 的行为）
+	self.toggleFold = function(ln){
+		var reg = self.__findRegion(ln);
+		if(!reg){
+			var best = null;
+			for(i=1;#self.foldRegions;1){
+				var r = self.foldRegions[i];
+				if(r.start < ln && ln <= r.end){
+					if(!best || r.start > best.start) best = r;
+				}
+			}
+			reg = best;
+		}
+		if(!reg) return false;
+		var idx = 0;
+		for(i=1;#self.folds;1){
+			if(self.folds[i].start == reg.start){ idx = i; break }
+		}
+		if(idx){
+			..table.remove(self.folds, idx);
+		}
+		else{
+			..table.push(self.folds, reg);
+		}
+		self.__applyFoldFormat();
+		self.__rebuildVisLines();
+		self.__updateGutter();
+		return true;
+	}
+	// 全部折叠 / 全部展开
+	self.foldAll = function(){
+		self.folds = {};
+		for(i=1;#self.foldRegions;1){
+			..table.push(self.folds, self.foldRegions[i]);
+		}
+		self.__applyFoldFormat();
+		self.__rebuildVisLines();
+		self.__updateGutter();
+		return #self.folds;
+	}
+	self.unfoldAll = function(){
+		self.folds = {};
+		self.__applyFoldFormat();
+		self.__rebuildVisLines();
+		self.__updateGutter();
+		return 0;
+	}
+
+	// ---------- 代码补全 ----------
+	//
+	// 标准 IDE 的必备件：Ctrl+Space 弹候选列表，↑↓ 选，Enter/Tab 插入，Esc 取消。
+	//
+	// 职责划分：
+	//   · 组件负责：算出光标处的**单词前缀**、画浮层、键盘导航、插入；
+	//   · IDE 负责：问 LSP 要候选（onComplete 回调），拿到后调 showCompletion。
+	//
+	// 浮层是自绘画板（plus）：transparent=true（自己填背景色，
+	// 否则父窗口背景在 richedit 之下 → 画板内容被 richedit 盖住）。
+	self.compItems = {};        // {label; kind; detail}
+	self.compIndex = 0;
+	self.compScroll = 1;        // 第一条可见项（1-based）
+	self.compPrefix = "";       // 触发时的单词前缀
+	self.compStart = 0;         // 前缀起始字符位置（1-based richedit）
+	self.compOpen = false;
+	self.compBoard = null;
+	self.onComplete = null;     // function(line, col) —— IDE 去问 LSP
+
+	// ---------- 导航：转到定义 / 查找引用 / 重命名 ----------
+	//
+	// 这三个动作都要问 LSP（同步阻塞，最多 1 秒），
+	// 而按键处理是在窗口过程里跑的 —— 在那儿阻塞会卡住整个窗口过程。
+	// 所以按键只负责「记下意图」，真正去问放到定时器里（和补全一个套路）。
+	//
+	// 回调签名统一是 function(line, col)：
+	//   line = 1 基行号，col = 单词**首字符**的 1 基列号。
+	self.onDefinition = null;   // function(line, col) —— F12 / Ctrl+点击
+	self.onReferences = null;   // function(line, col) —— Shift+F12
+	self.onRename = null;       // function(line, col) —— F2
+
+	self.__scheduleNav = function(kind){
+		var w = self.__wordAtPos(self.__caretPos());
+		if(!w || !w.word) return;
+		var fire = function(){
+			if(kind == 1){
+				if(self.onDefinition) self.onDefinition(w.line, w.col, w.word);
+			}
+			elseif(kind == 2){
+				if(self.onReferences) self.onReferences(w.line, w.col, w.word);
+			}
+			elseif(kind == 3){
+				if(self.onRename) self.onRename(w.line, w.col, w.word);
+			}
+		};
+		try{
+			winform.setTimeout(fire, 1);
+		}catch(e){
+			fire();
+		}
+	}
+
+	// 标识符字符（ASCII 字母/数字/下划线）
+	var __isIdent = function(b){
+		if(b >= 48 && b <= 57) return true;    // 0-9
+		if(b >= 65 && b <= 90) return true;    // A-Z
+		if(b >= 97 && b <= 122) return true;   // a-z
+		if(b == 95) return true;               // _
+		return false;
+	}
+	// 行内第 col 个字符（1 基 UTF-16 码元）对应的字节偏移
+	var __byteOfCol = function(bytes, blen, col){
+		var u = 0;
+		var i = 1;
+		while(i <= blen){
+			if(u >= col - 1) return i;
+			var b = bytes[i];
+			u = u + __cu(b);
+			i = i + __cb(b);
+		}
+		return blen + 1;
+	}
+	// 行内第 bytePos 个字节对应的字符列（1 基 UTF-16 码元）
+	var __colOfByte = function(bytes, blen, bytePos){
+		var u = 0;
+		var i = 1;
+		while(i < bytePos && i <= blen){
+			u = u + __cu(bytes[i]);
+			i = i + __cb(bytes[i]);
+		}
+		return u + 1;
+	}
+
+	// 光标处的单词前缀（只认 ASCII 标识符）
+	// 返回 {word; line; col; start}
+	//   col  = 1 基列号（光标所在列）
+	//   start= 前缀第一个字符的 **1-based** richedit 位置
+	self.__wordAtCursor = function(){
+		var pos0 = self.__caretPos();      // 0-based 插入点
+		var line = self.__lineOfChar(pos0);
+		if(!line) line = 1;
+		var ls = self.__lineStart(line);    // 1-based 行首
+		var col = pos0 - ls + 2;           // 1 基列号
+		if(col < 1) col = 1;
+		var lines = ..string.split(self.text, '\n');
+		var lineText = self.__lineText(lines, line);
+		var bytes = ..string.unpack(lineText);
+		var bo = __byteOfCol(bytes, #lineText, col);
+		var s = bo - 1;
+		while(s >= 1 && __isIdent(bytes[s])) s = s - 1;
+		var start = s + 1;
+		var word = "";
+		// ⚠ string.sub(s,start,end) 的第三个参数是**结束位置**（含），不是长度
+		if(bo > start) word = ..string.sub(lineText, start, bo - 1);
+		return {word=word; line=line; col=col; start=ls + (col - 1) - ..string.len(word)};
+	}
+
+	// 某个**字符位置**上的单词（Ctrl+点击用）
+	//
+	// 光标前缀（__wordAtCursor）只认「光标前面」那段文字，
+	// 但点击落在单词中间/开头时，光标前面可能一个字都没有。
+	// 这里改成**夹住**位置：先看光标前面那个字符，不是标识符再看光标后面那个，
+	// 然后向左右扩展成完整单词。
+	//
+	// 返回 {word; line; col; start}
+	//   col  = 单词**首字符**的列号（1 基）
+	//   start= 单词首字符的 1-based richedit 位置
+	self.__wordAtPos = function(pos0){
+		var line = self.__lineOfChar(pos0);
+		if(!line) line = 1;
+		var ls = self.__lineStart(line);
+		var lines = ..string.split(self.text, '\n');
+		var lineText = self.__lineText(lines, line);
+		var bytes = ..string.unpack(lineText);
+		var blen = #lineText;
+		// 光标所在列（1 基）
+		var col = pos0 - ls + 2;
+		if(col < 1) col = 1;
+		var probe = col - 1;          // 光标前面那个字符的列号
+		if(probe < 1) probe = 1;
+		var bo = __byteOfCol(bytes, blen, probe);
+		if(!__isIdent(bytes[bo])){
+			// 前面不是标识符字符，就看光标**后面**那个
+			var bo2 = __byteOfCol(bytes, blen, col);
+			if(bo2 <= blen && __isIdent(bytes[bo2])) bo = bo2;
+		}
+		if(!__isIdent(bytes[bo])){
+			return {word=""; line=line; col=col; start=ls};
+		}
+		var s = bo;
+		while(s >= 1 && __isIdent(bytes[s])) s = s - 1;
+		s = s + 1;
+		var e = bo;
+		while(e <= blen && __isIdent(bytes[e])) e = e + 1;
+		var word = ..string.sub(lineText, s, e - 1);
+		var wcol = __colOfByte(bytes, blen, s);
+		return {word=word; line=line; col=wcol; start=ls + (wcol - 1)};
+	}
+
+	// 请求补全：算好前缀，交给 IDE 去问 LSP
+	self.requestComplete = function(){
+		var w = self.__wordAtCursor();
+		self.compPrefix = w.word;
+		self.compStart = w.start;
+		self.compIndex = 0;
+		if(self.onComplete) self.onComplete(w.line, w.col);
+		return w.word;
+	}
+	// 把补全请求**推迟到下一个消息循环**再发
+	//
+	// ⚠ onComplete 回调里会同步问 LSP（最多等 1 秒），
+	//   而按键处理是在窗口过程里跑的 —— 在那儿阻塞会卡住整个窗口过程，
+	//   在那儿建浮层控件也容易重入。
+	//   所以按键只负责「记下意图」，真正去问放到定时器里。
+	self.__scheduleComplete = function(){
+		try{
+			winform.setTimeout(function(){
+				self.requestComplete();
+			}, 1);
+		}catch(e){
+			self.requestComplete();
+		}
+	}
+
+	// 显示候选（IDE 拿到 LSP 的结果后调用）
+	//
+	// ⚠ 我们的 LSP 服务器给的是**全量**候选（文档里所有词 + 全部关键字），
+	//   真正的前缀过滤放在这里做 —— 顺便顺带把「补全相关」这件事
+	//   和「问谁要候选」彻底解耦：换个后端也不用改过滤逻辑。
+	self.showCompletion = function(items){
+		if(!items || !#items){
+			self.hideCompletion();
+			return 0;
+		}
+		var list = items;
+		var prefix = self.compPrefix;
+		if(prefix){
+			var filtered = {};
+			var nf = 0;
+			for(i=1;#items;1){
+				var it = items[i];
+				if(!it) continue;
+				var lb = tostring(it.label : "");
+				if(..string.startsWith(lb, prefix, true)){
+					..table.push(filtered, it);
+					nf = nf + 1;
+				}
+			}
+			// 一个都不匹配 → 退回全量（关键字列表仍然有参考价值）
+			if(nf > 0) list = filtered;
+		}
+		self.compItems = list;
+		self.compIndex = 1;
+		self.compScroll = 1;
+		self.compOpen = true;
+		self.__createCompletion();
+		self.__layoutCompletion();
+		try{ self.compBoard.show(true) }catch(e){}
+		return #list;
+	}
+	self.hideCompletion = function(){
+		self.compOpen = false;
+		self.compItems = {};
+		self.compIndex = 0;
+		if(self.compBoard){
+			try{ self.compBoard.show(false) }catch(e){}
+		}
+		return true;
+	}
+	self.completionVisible = function(){
+		return self.compOpen;
+	}
+	// 上下移动选择
+	self.completionMove = function(delta){
+		if(!self.compOpen || !#self.compItems) return false;
+		var n = #self.compItems;
+		var i = self.compIndex + delta;
+		if(i < 1) i = n;
+		if(i > n) i = 1;
+		self.compIndex = i;
+		if(self.compBoard){
+			self.__layoutCompletion();   // 顺便把选中项滚进可见区
+		}
+		return true;
+	}
+	// 插入选中的候选（替换掉触发时的前缀）
+	self.completionAccept = function(){
+		if(!self.compOpen || !#self.compItems) return false;
+		var it = self.compItems[self.compIndex];
+		if(!it) return false;
+		var label = it.label;
+		var prefix = self.compPrefix;
+		self.hideCompletion();
+		self.__beginEdit();
+		try{
+			var a = self.compStart;                       // 1-based 前缀起始
+			var plen = ..string.len(prefix);
+			if(plen > 0){
+				ctrl.setSel(a, a + plen - 1);              // 1-based 闭区间：选中整段前缀
+			}else{
+				ctrl.setSel(a - 1);                        // 没有前缀：纯插入（0-based 插入点）
+			}
+			ctrl.selText = label;
+		}catch(e){}
+		self.__syncFromCtrl();
+		return true;
+	}
+
+	// 浮层画板
+	self.__createCompletion = function(){
+		if(self.compBoard) return;
+		self.compBoard = nodio.ui.board(winform, {
+			left = 0; top = 0; right = 240; bottom = 120;
+			fontSize = self.uiFontSize;
+			z = 70;
+			transparent = true;
+		});
+		self.compBoard.onDraw = function(graphics, rc, bd){
+			self.__drawCompletion(graphics, rc, bd);
+		}
+		self.compBoard.onMouseDown = function(x, y, bd){
+			var i = self.__hitCompletion(x, y);
+			if(!i) return;
+			self.compIndex = i;
+			self.completionAccept();
+		}
+	}
+	// 命中测试（画板本地坐标）
+	self.__hitCompletion = function(x, y){
+		var rowH = ..nodio.ui.px(20);
+		var i = self.compScroll + math.floor(y / rowH);
+		if(i < 1 || i > #self.compItems) return null;
+		return i;
+	}
+	// 摆到光标处（顺带算宽度、可见行数、滚动位置）
+	self.__layoutCompletion = function(){
+		if(!self.compBoard) return;
+		var r = self.rect;
+		if(!r) return;
+		var n = #self.compItems;
+		if(!n) return;
+		var gw = self.gutterWidth();
+		var pos0 = self.__caretPos();
+		var p = self.__posOf(pos0);
+		var x = p & 0xFFFF;
+		var y = (p >> 16) & 0xFFFF;
+
+		// 宽度：跟着最长的一条走（比固定宽度紧凑），有上下限
+		var maxLen = 0;
+		for(i=1;n;1){
+			var lb = tostring(self.compItems[i].label : "");
+			var L = ..string.len(lb);
+			if(L > maxLen) maxLen = L;
+		}
+		var lw = ..nodio.ui.px(40) + maxLen * ..nodio.ui.px(7) + ..nodio.ui.px(86);
+		if(lw < ..nodio.ui.px(170)) lw = ..nodio.ui.px(170);
+		if(lw > ..nodio.ui.px(340)) lw = ..nodio.ui.px(340);
+
+		// 可见行数：最多 8 行，超出就滚动（选中项必须留在可见区）
+		var rowH = ..nodio.ui.px(20);
+		var maxRows = 8;
+		var rows = n;
+		if(rows > maxRows) rows = maxRows;
+		var first = self.compScroll;
+		if(first < 1) first = 1;
+		if(self.compIndex < first) first = self.compIndex;
+		if(self.compIndex > first + rows - 1) first = self.compIndex - rows + 1;
+		if(first > n - rows + 1) first = n - rows + 1;
+		if(first < 1) first = 1;
+		self.compScroll = first;
+
+		var lh = rowH * rows + ..nodio.ui.px(4);
+		// ⚠ p 是**richedit 客户区**坐标，而 richedit 摆在导航栏下面 ——
+		//   绝对 y 要加上导航栏的高度，否则浮层会整体上移 navH 像素。
+		var navH = self.navBar ? self.navHeight() : 0;
+		var left = r.left + gw + x;
+		var top = r.top + navH + y + self.lineHeight;
+		if(left + lw > r.right - ..nodio.ui.px(4)) left = r.right - lw - ..nodio.ui.px(4);
+		if(left < r.left + gw) left = r.left + gw;
+		if(top + lh > r.bottom - ..nodio.ui.px(4)) top = r.bottom - lh - ..nodio.ui.px(4);
+		if(top < r.top + navH) top = r.top + navH;
+		self.compRect = {left=left; top=top; right=left+lw; bottom=top+lh};
+		..nodio.ui.setRect(self.compBoard.ctrl, left, top, left+lw, top+lh);
+		try{
+			..win.setPos(self.compBoard.ctrl.hwnd, left, top, lw, lh,
+				0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+		}catch(e){}
+		self.compBoard.redraw();
+	}
+	// 画候选列表
+	self.__drawCompletion = function(graphics, rc, bd){
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var pen = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(pen, rc.left, rc.top, w-1, h-1);
+		pen.delete();
+		var font = bd.font;
+		var fmt = bd.format;
+		var rowH = ..nodio.ui.px(20);
+		var pad = ..nodio.ui.px(8);
+		var dim = ..gdip.solidBrush(th.textDim);
+		var txt = ..gdip.solidBrush(th.text);
+		var sel = ..gdip.solidBrush(th.selBg);
+		var n = #self.compItems;
+		var first = self.compScroll;
+		if(first < 1) first = 1;
+		for(i=first;n;1){
+			var it = self.compItems[i];
+			if(!it) break;
+			var y = rc.top + (i - first) * rowH;
+			if(y > rc.bottom) break;
+			if(i == self.compIndex){
+				graphics.fillRect(sel, rc.left+1, y, w-2, rowH);
+			}
+			var label = it.label : "";
+			graphics.drawString(label, font,
+				::RECTF(rc.left + pad, y, w - pad*2 - ..nodio.ui.px(60), rowH), fmt, txt);
+			var kind = __compKindText(it.kind);
+			if(kind){
+				graphics.drawString(kind, font,
+					::RECTF(rc.right - ..nodio.ui.px(72), y, ..nodio.ui.px(64), rowH), fmt, dim);
+			}
+		}
+		dim.delete();
+		txt.delete();
+		sel.delete();
+	}
+
+	// ---------- 悬停提示（hover）----------
+	//
+	// 职责划分（和补全一样）：
+	//   · 组件负责：鼠标停在单词上 → 算出 (line, col)；画浮层；鼠标移开就收起
+	//   · IDE 负责：问 LSP 要 hover 内容，拿到后调 showHover
+	//
+	// ⚠ 问 LSP 是**同步阻塞**的（最多 50ms），所以绝不能在窗口过程里直接问 ——
+	//   鼠标移动消息非常密集，卡一次窗口过程整个 IDE 都会顿一下。
+	//   所以只在「鼠标停住不动」时才问（延迟 350ms），并放到定时器里执行。
+	self.onHover = null;        // function(line, col) → 提示文本（IDE 去问 LSP）
+	self.hoverText = "";
+	self.hoverOpen = false;
+	self.hoverBoard = null;
+	self.hoverRows = {};
+	self.__hoverGen = 0;        // 代数：鼠标一动就 +1，定时器回来对不上就作废
+	self.__hoverX = -1;
+	self.__hoverY = -1;
+	self.__hoverWord = "";
+
+	// 鼠标移动：只记位置 + 推迟提问
+	self.__mouseMoved = function(x, y){
+		if(x == self.__hoverX && y == self.__hoverY) return;
+		self.__hoverX = x;
+		self.__hoverY = y;
+		self.__hoverGen = self.__hoverGen + 1;
+		var gen = self.__hoverGen;
+		// 位置变了：先把旧提示收掉（换个词还挂着上一个词的提示很怪）
+		if(self.hoverOpen) self.hideHover();
+		// 停 350ms 再问：鼠标划过去的时候不要频繁问 LSP
+		try{
+			winform.setTimeout(function(){
+				if(gen != self.__hoverGen) return null;   // 鼠标又动了 → 作废
+				try{ self.__askHover(self.__hoverX, self.__hoverY) }catch(e){}
+				return null;
+			}, 350);
+		}catch(e){}
+	}
+	// 真正去问：鼠标下的单词 → 交给 IDE 去问 LSP
+	//
+	// ⚠ 这里**不**再检查实时光标位置：那是「鼠标移开了提示还挂着」的问题，
+	//   由轮询里的 __checkHoverStill 负责收掉。
+	//   （顺带好处：位置用 WM_MOUSEMOVE 记下的值，可以直接测。）
+	self.__askHover = function(x, y){
+		if(!self.onHover) return;
+		// 鼠标下的字符位置（官方 richedit：EM_CHARFROMPOS，返回 1-based 位置）
+		var pos = null;
+		try{ pos = ctrl.charFromPoint(x, y) }catch(e){}
+		if(pos === null || pos === undefined) return;
+		var w = self.__wordAtPos(pos - 1);
+		// ⚠ aardio 里**空串是真值**（只有 null/false 为假），
+		//   所以判空必须用 #word == 0，不能用 !word。
+		if(!w || #w.word == 0) return;
+		self.__hoverWord = w.word;
+		var text = self.onHover(w.line, w.col);
+		if(text && #text){
+			self.showHover(text, x, y);
+		}
+	}
+	// 显示提示（IDE 拿到 LSP 的结果后调用）
+	//
+	// ⚠ text 可能是 markdown（我们自己的 LSP 返回 "**名字**  \n*类型*"），
+	//   这里把标记去掉再画，别给用户看星号。
+	self.showHover = function(text, mx, my){
+		if(!text) return 0;
+		var lines = {};
+		var raw = ..string.split(tostring(text), '\n');
+		for(i=1;#raw;1){
+			var s = ..string.replaceLiteral(raw[i], "**", "");
+			s = ..string.replaceLiteral(s, "*", "");
+			// markdown 的行尾空格（两个空格 = 换行）
+			while(#s > 0 && ..string.sub(s, #s, #s) == ' '){
+				s = ..string.sub(s, 1, #s - 1);
+			}
+			if(s) ..table.push(lines, s);
+		}
+		if(!#lines) return 0;
+		self.hoverRows = lines;
+		self.hoverText = text;
+		self.hoverOpen = true;
+		self.__createHover();
+		self.__layoutHover(mx, my);
+		try{ self.hoverBoard.show(true) }catch(e){}
+		self.hoverBoard.redraw();
+		return #lines;
+	}
+	self.hideHover = function(){
+		self.hoverOpen = false;
+		self.hoverRows = {};
+		self.hoverText = "";
+		if(self.hoverBoard){
+			try{ self.hoverBoard.show(false) }catch(e){}
+		}
+		return true;
+	}
+	// 悬停提示还在不在？（轮询里调）
+	//
+	// ⚠ 引擎没有 TrackMouseEvent，WM_MOUSELEAVE 收不到，
+	//   所以「鼠标移开了提示还挂着」只能自己检测：
+	//   ① 鼠标移出控件 → 收掉；② 鼠标停在**别的词**上 → 收掉。
+	self.__checkHoverStill = function(){
+		if(!self.hoverOpen) return;
+		var pt = ::POINT(0, 0);
+		if(!::GetCursorPos(pt)) return;
+		if(!::ScreenToClient(ctrl.hwnd, pt)) return;
+		var rc = ::RECT();
+		if(!::GetClientRect(ctrl.hwnd, rc)) return;
+		if(pt.x < 0 || pt.y < 0 || pt.x >= rc.right || pt.y >= rc.bottom){
+			self.hideHover();
+			return;
+		}
+		var pos = null;
+		try{ pos = ctrl.charFromPoint(pt.x, pt.y) }catch(e){}
+		if(pos === null || pos === undefined){
+			self.hideHover();
+			return;
+		}
+		var w = self.__wordAtPos(pos - 1);
+		if(!w || w.word != self.__hoverWord) self.hideHover();
+	}
+	// 浮层画板
+	self.__createHover = function(){		if(self.hoverBoard) return;
+		self.hoverBoard = nodio.ui.board(winform, {
+			left = 0; top = 0; right = 260; bottom = 60;
+			fontSize = self.uiFontSize;
+			z = 65;
+			transparent = true;
+		});
+		self.hoverBoard.onDraw = function(graphics, rc, bd){
+			self.__drawHover(graphics, rc, bd);
+		}
+	}
+	// 摆在鼠标右下角（越界就往回挪）
+	self.__layoutHover = function(mx, my){
+		if(!self.hoverBoard) return;
+		var r = self.rect;
+		if(!r) return;
+		var gw = self.gutterWidth();
+		var navH = self.navBar ? self.navHeight() : 0;
+		var rowH = ..nodio.ui.px(18);
+		var pad = ..nodio.ui.px(8);
+		var maxLen = 0;
+		for(i=1;#self.hoverRows;1){
+			var L = ..string.len(self.hoverRows[i]);
+			if(L > maxLen) maxLen = L;
+		}
+		var lw = maxLen * ..nodio.ui.px(7) + pad * 2;
+		if(lw < ..nodio.ui.px(80)) lw = ..nodio.ui.px(80);
+		if(lw > ..nodio.ui.px(420)) lw = ..nodio.ui.px(420);
+		var lh = #self.hoverRows * rowH + pad;
+		// mx/my 是 richedit 客户区坐标 → 换算到表单客户区
+		var left = r.left + gw + mx + ..nodio.ui.px(12);
+		var top = r.top + navH + my + ..nodio.ui.px(16);
+		if(left + lw > r.right - ..nodio.ui.px(4)) left = r.right - lw - ..nodio.ui.px(4);
+		if(left < r.left + gw) left = r.left + gw;
+		if(top + lh > r.bottom - ..nodio.ui.px(4)) top = r.bottom - lh - ..nodio.ui.px(4);
+		if(top < r.top + navH) top = r.top + navH;
+		self.hoverRect = {left=left; top=top; right=left+lw; bottom=top+lh};
+		..nodio.ui.setRect(self.hoverBoard.ctrl, left, top, left+lw, top+lh);
+		try{
+			..win.setPos(self.hoverBoard.ctrl.hwnd, left, top, lw, lh,
+				0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+		}catch(e){}
+	}
+	// 画提示内容
+	self.__drawHover = function(graphics, rc, bd){
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var pen = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(pen, rc.left, rc.top, w-1, h-1);
+		pen.delete();
+		var font = bd.font;
+		var fmt = bd.format;
+		var brush = ..gdip.solidBrush(th.text);
+		var rowH = ..nodio.ui.px(18);
+		var pad = ..nodio.ui.px(8);
+		for(i=1;#self.hoverRows;1){
+			var y = rc.top + pad / 2 + (i - 1) * rowH;
+			graphics.drawString(self.hoverRows[i], font,
+				::RECTF(rc.left + pad, y, w - pad*2, rowH), fmt, brush);
+		}
+		brush.delete();
+	}
+
+	// ---------- 代码片段展开 (Snippet Expansion) ----------
+	self.__expandSnippet = function(){
+		var sel = self.__selSnapshot();
+		if(sel.cpMin != sel.cpMax) return false;
+		var pos = sel.cpMin;
+		if(pos <= 0) return false;
+		var ln = self.curLine : 1;
+		var lineStart = self.__lineStart(ln);
+		if(!lineStart) lineStart = 1;
+		try{
+			var fullText = self.text;
+			if(fullText){
+				var lineSub = ..string.sub(fullText, lineStart, pos);
+				var trigger = ..string.match(lineSub, "([a-zA-Z0-9_]+)$");
+				if(trigger && self.snippets && self.snippets[trigger]){
+					var tmpl = self.snippets[trigger];
+					var indent = ..string.match(lineSub, "^([\t ]*)") : "";
+					var lines = ..string.split(tmpl, '\n');
+					var expanded = "";
+					for(k=1;#lines;1){
+						var l = ..string.trimright(lines[k]);
+						if(k > 1) expanded = expanded ++ indent;
+						expanded = expanded ++ l;
+						if(k < #lines) expanded = expanded ++ '\r\n';
+					}
+					var pMarker = ..string.indexOf(expanded, "$0");
+					if(pMarker !== null){
+						expanded = ..string.replaceLiteral(expanded, "$0", "");
+					}
+					var trigLen = #trigger;
+					var delFrom = pos - trigLen;
+					self.setSel(delFrom, pos);
+					self.replaceSel(expanded);
+					if(pMarker !== null){
+						var targetPos = delFrom + pMarker - 1;
+						self.setSel(targetPos, targetPos);
+					}
+					return true;
+				}
+			}
+		}catch(e){}
+		return false;
+	}
+
+	// ---------- 参数信息提示 (Signature Help) ----------
+	self.showSignatureHelp = function(sigText, activeParamIdx){
+		if(!sigText || !#sigText){
+			self.hideSignatureHelp();
+			return false;
+		}
+		self.sigHelpRows = [ sigText ];
+		self.sigHelpActiveIdx = activeParamIdx : 1;
+		self.sigHelpOpen = true;
+		self.__createSigHelp();
+		self.__layoutSigHelp();
+		try{ self.sigHelpBoard.show(true) }catch(e){}
+		self.sigHelpBoard.redraw();
+		return true;
+	}
+	self.hideSignatureHelp = function(){
+		self.sigHelpOpen = false;
+		self.sigHelpRows = {};
+		if(self.sigHelpBoard){
+			try{ self.sigHelpBoard.show(false) }catch(e){}
+		}
+	}
+	self.__createSigHelp = function(){
+		if(self.sigHelpBoard) return;
+		self.sigHelpBoard = nodio.ui.board(winform, {
+			left = 0; top = 0; right = 320; bottom = 32;
+			fontSize = self.uiFontSize;
+			z = 66;
+			transparent = true;
+		});
+		self.sigHelpBoard.onDraw = function(graphics, rc, bd){
+			var w = rc.right - rc.left;
+			var h = rc.bottom - rc.top;
+			var bg = ..gdip.solidBrush(th.panel);
+			graphics.fillRect(bg, rc.left, rc.top, w, h);
+			bg.delete();
+			var pen = ..gdip.pen(0xFF007ACC, 1);
+			graphics.drawRectangle(pen, rc.left, rc.top, w-1, h-1);
+			pen.delete();
+			var font = bd.font;
+			var fmt = bd.format;
+			var brush = ..gdip.solidBrush(th.text);
+			var pad = ..nodio.ui.px(8);
+			if(#self.sigHelpRows){
+				graphics.drawString(self.sigHelpRows[1], font,
+					::RECTF(rc.left + pad, rc.top + pad/2, w - pad*2, h - pad), fmt, brush);
+			}
+			brush.delete();
+		}
+	}
+	self.__layoutSigHelp = function(){
+		if(!self.sigHelpBoard) return;
+		var r = self.rect;
+		if(!r) return;
+		var gw = self.gutterWidth();
+		var navH = self.navBar ? self.navHeight() : 0;
+		var pt = ::POINT(0, 0);
+		try{
+			var sel = self.__selSnapshot();
+			var p = ctrl.posFromChar(sel.cpMin);
+			if(p){ pt.x = p.x; pt.y = p.y }
+		}catch(e){}
+		var pad = ..nodio.ui.px(10);
+		var lw = ..nodio.ui.px(340);
+		var lh = ..nodio.ui.px(28);
+		var left = r.left + gw + pt.x;
+		var top = r.top + navH + pt.y - lh - ..nodio.ui.px(4);
+		if(top < r.top + navH) top = r.top + navH + pt.y + ..nodio.ui.px(22);
+		if(left + lw > r.right - ..nodio.ui.px(4)) left = r.right - lw - ..nodio.ui.px(4);
+		if(left < r.left + gw) left = r.left + gw;
+		..nodio.ui.setRect(self.sigHelpBoard.ctrl, left, top, left+lw, top+lh);
+		try{
+			..win.setPos(self.sigHelpBoard.ctrl.hwnd, left, top, lw, lh,
+				0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+		}catch(e){}
+	}
+	self.__scheduleSignatureHelp = function(){
+		winform.setTimeout(function(){
+			self.__triggerSignatureHelp();
+			return null;
+		}, 30);
+	}
+	self.__triggerSignatureHelp = function(){
+		try{
+			var sel = self.__selSnapshot();
+			var pos = sel.cpMin;
+			if(pos <= 0) return;
+			var txt = self.text;
+			if(!txt) return;
+			var sub = ..string.sub(txt, 1, pos);
+			var fn = ..string.match(sub, "([a-zA-Z0-9_\.]+)\s*\([^\)]*$");
+			if(fn){
+				var sig = null;
+				var sigTable = {
+					["win.form"] = "win.form(text, right, bottom, ...)";
+					["string.save"] = "string.save(path, text)";
+					["string.load"] = "string.load(path)";
+					["string.match"] = "string.match(str, pattern)";
+					["string.find"] = "string.find(str, pattern, init, plain)";
+					["string.replace"] = "string.replace(str, pattern, replacement)";
+					["table.push"] = "table.push(tbl, ...)";
+					["table.pop"] = "table.pop(tbl)";
+					["table.indexOf"] = "table.indexOf(tbl, val)";
+					["io.print"] = "io.print(...)";
+					["io.open"] = "io.open()";
+					["raw.loadDll"] = "raw.loadDll(path, dllName, callingConvention)";
+					["thread.create"] = "thread.create(func, ...)";
+				};
+				if(sigTable[fn]) sig = sigTable[fn];
+				else sig = fn ++ "(...)";
+				self.showSignatureHelp(sig);
+			}
+			else{
+				self.hideSignatureHelp();
+			}
+		}catch(e){}
+	}
+
+	// aardio 词法分析 → {pos; len; kind}（pos 是 richedit 的 1-based UTF-16 位置）
+	//
+	// 逐行做：行首位置用官方的 lineToChar（EM_LINEINDEX，精确），
+	// 行内偏移按 UTF-8 首字节推算 UTF-16 码元数。
+	// 只产出「值得上色」的 token（注释/字符串/数字/关键字/函数调用）——
+	// 普通标识符留默认色，token 数量能少一半。
+	// fromLine / toLine：只扫这一段行（1 基，含）。不给就扫全文。
+	//
+	// ⚠ tokenize 是**逐字节解释执行**的（85KB ≈ 2.2 秒），
+	//   所以「只着色可见范围」时必须能限定行段。
+	self.__tokenize = function(t, fromLine, toLine){
+		var toks = {};
+		var n = 0;
+		// 行表缓存：__buildLineStarts 刚拆过行，直接复用（省一次全文 split）
+		var lines = (self.__splitLinesText == t) ? self.__splitLines : ..string.split(t, '\n');
+		var total = #lines;
+		var f = fromLine : 1;
+		var to = toLine : total;
+		if(f < 1) f = 1;
+		if(to > total) to = total;
+		for(ln=f; ln<=to; 1){
+			if(n > MAX_TOKENS) break;
+			var line = self.__lineText(lines, ln);
+			var bytes = ..string.unpack(line);
+			var blen = #line;              // UTF-8 字节数
+			if(blen < 1) continue;
+			var base = self.__lineStart(ln);
+			var i = 1;
+			var unit = 0;              // 已消耗的 UTF-16 码元数
+			var prevEq = false;        // 上一个符号是不是 '='（= 后面的 // 是原样字符串）
+			while(i <= blen){
+				var b = bytes[i];
+				var startUnit = unit;
+				var kind = "";
+				if(b == 47 && i < blen && bytes[i+1] == 47){
+					// 行注释（= 后面的是原样字符串）
+					kind = prevEq ? "string" : "comment";
+					var u = __unitsOf(bytes, i, blen + 1);
+					n = n + 1;
+					toks[n] = {pos=base + startUnit; len=u; kind=kind};
+					unit = unit + u;
+					i = blen + 1;
+					prevEq = false;
+					continue;
+				}
+				if(b == 47 && i < blen && bytes[i+1] == 42){
+					// 块注释 /* */（本行内能找到就吃掉，找不到就吃到行尾）
+					kind = "comment";
+					var e = i + 2;
+					while(e < blen && !(bytes[e] == 42 && e + 1 <= blen && bytes[e+1] == 47)) e = e + 1;
+					var e2 = (e < blen && bytes[e+1] == 47) ? (e + 2) : (blen + 1);
+					var u2 = __unitsOf(bytes, i, e2);
+					n = n + 1;
+					toks[n] = {pos=base + startUnit; len=u2; kind=kind};
+					unit = unit + u2;
+					i = e2;
+					prevEq = false;
+					continue;
+				}
+				if(b == 34){
+					// 双引号：原样字符串
+					kind = "string";
+					var j = i + 1;
+					while(j <= blen && bytes[j] != 34) j = j + 1;
+					var e3 = (j <= blen) ? (j + 1) : (blen + 1);
+					var u3 = __unitsOf(bytes, i, e3);
+					n = n + 1;
+					toks[n] = {pos=base + startUnit; len=u3; kind=kind};
+					unit = unit + u3;
+					i = e3;
+					prevEq = false;
+					continue;
+				}
+				if(b == 39){
+					// 单引号：带转义的字符串
+					kind = "string";
+					var j2 = i + 1;
+					var e4 = blen + 1;
+					while(j2 <= blen){
+						var bb = bytes[j2];
+						if(bb == 39){ e4 = j2 + 1; break }
+						if(bb == 92){ j2 = j2 + 2; continue }
+						j2 = j2 + 1;
+					}
+					var u4 = __unitsOf(bytes, i, e4);
+					n = n + 1;
+					toks[n] = {pos=base + startUnit; len=u4; kind=kind};
+					unit = unit + u4;
+					i = e4;
+					prevEq = false;
+					continue;
+				}
+				if(b >= 48 && b <= 57){
+					// 数字
+					kind = "number";
+					var j3 = i;
+					while(j3 <= blen){
+						var d = bytes[j3];
+						if((d >= 48 && d <= 57) || d == 46) j3 = j3 + 1;
+						else break;
+					}
+					var u5 = __unitsOf(bytes, i, j3);
+					n = n + 1;
+					toks[n] = {pos=base + startUnit; len=u5; kind=kind};
+					unit = unit + u5;
+					i = j3;
+					prevEq = false;
+					continue;
+				}
+				if(self.__isIdentStart(b)){
+					// 标识符 / 关键字
+					var j4 = i;
+					while(j4 <= blen && self.__isIdentPart(bytes[j4])) j4 = j4 + 1;
+					var word = ..string.sub(line, i, j4 - 1);
+					var k = "";
+					if(__keywords[word]){
+						k = "keyword";
+					}
+					else{
+						k = "ident";
+						// 后面紧跟 ( → 函数调用
+						var j5 = j4;
+						while(j5 <= blen && bytes[j5] == 32) j5 = j5 + 1;
+						if(j5 <= blen && bytes[j5] == 40) k = "func";
+					}
+					var wl = ..string.len(word);
+					if(k != "ident"){
+						n = n + 1;
+						toks[n] = {pos=base + startUnit; len=wl; kind=k};
+					}
+					unit = unit + wl;
+					i = j4;
+					prevEq = false;
+					continue;
+				}
+				// 其它字符
+				if(b == 61){
+					prevEq = true;
+				}
+				else if(b == 58 && i < blen && bytes[i+1] == 61){
+					prevEq = true;
+					unit = unit + 1;
+					i = i + 1;
+					continue;
+				}
+				else{
+					prevEq = false;
+				}
+				unit = unit + __cu(b);
+				i = i + __cb(b);
+			}
+		}
+		return toks;
+	}
+	// 标识符首字节：字母 / 下划线 / >= 0x80（中文标识符合法）
+	self.__isIdentStart = function(b){
+		if(!b) return false;
+		if((b >= 65 && b <= 90) || (b >= 97 && b <= 122)) return true;
+		if(b == 95) return true;
+		if(b >= 128) return true;
+		return false;
+	}
+	self.__isIdentPart = function(b){
+		if(self.__isIdentStart(b)) return true;
+		if(b >= 48 && b <= 57) return true;
+		return false;
+	}
+
+	// ---------- 行高测量 ----------
+	// 行号栏的行高必须与 richedit 的行高**精确一致**，否则行号会飘。
+	// EM_POSFROMCHAR(0x426) 的返回值里就带着坐标：低 16 位 = x，高 16 位 = y
+	// （RichEdit 4.1 不往 lParam 指针里写，只在返回值里回）。
+	// 所以：lineHeight = y(第2行首字符) - y(第1行首字符)。
+	self.__posOf = function(idx){
+		if(idx < 0) idx = 0;
+		return ::SendMessage(ctrl.hwnd, 0x426/*_EM_POSFROMCHAR*/, idx, 0);
+	}
+	self.__posY = function(idx){
+		var r = self.__posOf(idx);
+		return (r >> 16) & 0xFFFF;
+	}
+	self.__measureLineHeight = function(){
+		try{
+			// 用**可见行**的前两行来量（折叠后第 2 行可能已经被隐藏）
+			var vis = self.visLines;
+			var c1 = 1;
+			var c2 = 1;
+			if(vis && #vis >= 2){
+				c1 = self.__lineStart(vis[1]);
+				c2 = self.__lineStart(vis[2]);
+			}
+			else{
+				c1 = self.__lineStart(1);
+				c2 = self.__lineStart(2);
+			}
+			var y0 = self.__posY(c1 - 1);
+			var y1 = self.__posY(c2 - 1);
+			var h = y1 - y0;
+			if(h > 4) self.lineHeight = h;
+		}catch(e3){}
+		if(!self.lineHeight){
+			// 兜底：11pt 字体在 100% 下行高 17px，按 DPI 缩放
+			self.lineHeight = ..nodio.ui.px(17);
+		}
+		self.__updateGutterFont();
+	}
+	// 行号栏字体：物理像素 = 行高的 0.72 倍（塞得下又不抢眼）
+	self.__updateGutterFont = function(){
+		var px = 14;
+		if(self.lineHeight) px = math.floor(self.lineHeight * 0.72);
+		if(px < 9) px = 9;
+		if(self.gutterFont && self.gutterFontPx == px) return;
+		if(self.gutterFont){
+			try{ self.gutterFont.delete() }catch(e){}
+		}
+		self.gutterFont = ..gdip.font(self.fontName, px);
+		self.gutterFontPx = px;
+	}
+
+	// ---------- 行号栏 ----------
+	self.__updateGutter = function(){
+		if(self.gutter) self.gutter.invalidate();
+	}
+	// 折叠标记：一个实心小三角（▸ 折叠 / ▾ 展开）
+	// 自己用矩形拼，不依赖字体里有没有 ▶▼ 这些字形
+	self.__drawFoldMark = function(graphics, x, y, size, collapsed, brush){
+		var i;
+		if(collapsed){
+			// 指向右
+			for(i=0;size;1){
+				var hh = size - (i * 2);
+				if(hh < 1) hh = 1;
+				graphics.fillRect(brush, x + i, y + (size - hh) / 2, 1, hh);
+			}
+		}
+		else{
+			// 指向下
+			for(i=0;size;1){
+				var ww = size - (i * 2);
+				if(ww < 1) ww = 1;
+				graphics.fillRect(brush, x + (size - ww) / 2, y + i, ww, 1);
+			}
+		}
+	}
+	// 折叠标记的命中测试 → 命中的文档行号
+	//
+	// ⚠ 坐标：行号栏是 plus 画板，**鼠标坐标是画板本地坐标**（0 基），
+	//   画板自己的 rect 在表单客户区里 —— 两者不能混用（混用会导致点不中）。
+	//   纵坐标没问题：行号栏和 richedit 顶边对齐，__posY 的 y 可以直接用。
+	self.__hitFold = function(x, y){
+		var gr = self.gutter ? self.gutter.rect : null;
+		if(!gr) return null;
+		var gw = gr.right - gr.left;         // 画板本地宽度
+		var mx = gw - ..nodio.ui.px(20);
+		var mw = ..nodio.ui.px(14);
+		if(x < mx || x > mx + mw) return null;
+		var d = self.__lineAtY(y);
+		if(!d) return null;
+		if(self.__findRegion(d)) return d;
+		return null;
+	}
+	// 纵坐标 → 文档行号（1 基）。行号栏与 richedit 顶边对齐，
+	// 所以 __posY 的 y 可以直接拿来比。
+	self.__lineAtY = function(y){
+		var vis = self.visLines;
+		if(!vis || !#vis) return null;
+		var lh = self.lineHeight;
+		if(!lh) lh = 20;
+		var first = 0;
+		try{ first = ctrl.firstVisibleLine }catch(e){}
+		if(first === null || first === undefined) first = 0;
+		for(i=first + 1;#vis;1){
+			var d = vis[i];
+			var yy = self.__posY(self.__lineStart(d) - 1);
+			if(yy > y) break;
+			if(y < yy + lh) return d;
+		}
+		return null;
+	}
+	// 打/消断点
+	self.toggleBreakpoint = function(line){
+		if(!line) return;
+		if(self.breakpoints[line]) self.breakpoints[line] = null;
+		else self.breakpoints[line] = true;
+		self.__updateGutter();
+		if(self.onToggleBreakpoint){
+			self.onToggleBreakpoint(line, self.breakpoints[line] ? true : false);
+		}
+	}
+	// 当前文档的断点行号表（给 IDE 转给 DAP）
+	self.breakpointLines = function(){
+		var out = [ @{_type="array"} ];
+		for(l,on in self.breakpoints){
+			if(on) ..table.push(out, l);
+		}
+		return out;
+	}
+
+	// ---------- 书签系统 ----------
+	// 切换当前行（或指定行）书签
+	self.toggleBookmark = function(line){
+		line = line : self.curLine : 1;
+		if(!line) return;
+		if(self.bookmarks[line]) self.bookmarks[line] = null;
+		else self.bookmarks[line] = true;
+		self.__updateGutter();
+		if(self.onBookmarkChange) self.onBookmarkChange();
+	}
+	self.hasBookmark = function(line){
+		return self.bookmarks ? (self.bookmarks[line] ? true : false) : false;
+	}
+	self.hasAnyBookmark = function(){
+		if(!self.bookmarks) return false;
+		for(l,on in self.bookmarks){
+			if(on) return true;
+		}
+		return false;
+	}
+	self.clearBookmarks = function(){
+		self.bookmarks = {};
+		self.__updateGutter();
+		if(self.onBookmarkChange) self.onBookmarkChange();
+	}
+	// 跳转到下一书签
+	self.nextBookmark = function(){
+		if(!self.hasAnyBookmark()) return false;
+		var cur = self.curLine : 1;
+		var targetAfter = null;
+		var targetWrap = null;
+		for(l,on in self.bookmarks){
+			if(on){
+				var ln = tonumber(l);
+				if(ln > cur){
+					if(targetAfter === null || ln < targetAfter) targetAfter = ln;
+				}
+				if(targetWrap === null || ln < targetWrap) targetWrap = ln;
+			}
+		}
+		var target = (targetAfter !== null) ? targetAfter : targetWrap;
+		if(target !== null){
+			self.gotoLine(target);
+			return true;
+		}
+		return false;
+	}
+	// 跳转到上一书签
+	self.prevBookmark = function(){
+		if(!self.hasAnyBookmark()) return false;
+		var cur = self.curLine : 1;
+		var targetBefore = null;
+		var targetWrap = null;
+		for(l,on in self.bookmarks){
+			if(on){
+				var ln = tonumber(l);
+				if(ln < cur){
+					if(targetBefore === null || ln > targetBefore) targetBefore = ln;
+				}
+				if(targetWrap === null || ln > targetWrap) targetWrap = ln;
+			}
+		}
+		var target = (targetBefore !== null) ? targetBefore : targetWrap;
+		if(target !== null){
+			self.gotoLine(target);
+			return true;
+		}
+		return false;
+	}
+	self.lineCount = function(){
+		return self.__lineCount();
+	}
+
+	// ---------- 差异行标记 ----------
+	self.setDiffLines = function(diffMap){
+		self.diffLines = diffMap ? diffMap : {};
+		self.__updateGutter();
+	}
+	// ---------- 导航栏绘制 ----------
+	//
+	// 一行「段 › 段 › 段」，最后一段（当前位置）用强调色。
+	// 命中区在画的时候顺便算好（画板本地坐标），点击时直接查表。
+	self.__drawNav = function(graphics, rc, bd){
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var bg = ..gdip.solidBrush(th.bg);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var lp = ..gdip.pen(th.border, 1);
+		graphics.drawLine(lp, rc.left, rc.bottom - 1, rc.right, rc.bottom - 1);
+		lp.delete();
+		var fmt = bd.format;
+		var font = bd.font;
+		if(!font) return;
+		var segs = self.navChain;
+		self.navHits = {};
+		if(!segs || !#segs) return;
+		var x = rc.left + ..nodio.ui.px(10);
+		var y = rc.top;
+		var total = #segs;
+		for(i=1;total;1){
+			var seg = segs[i];
+			var txt = seg ? seg.text : "";
+			if(!txt) continue;
+			var isLast = (i == total);
+			var col = isLast ? th.accent : th.textDim;
+			var m = graphics.measureString(txt, font, ::RECTF(0,0,4000,4000), fmt);
+			var tw = m ? m.width : 0;
+			// 悬停高亮
+			if(self.navHover == i){
+				var hb = ..gdip.solidBrush(th.hoverBg);
+				graphics.fillRect(hb, x - ..nodio.ui.px(3), rc.top + ..nodio.ui.px(2),
+					tw + ..nodio.ui.px(6), h - ..nodio.ui.px(4));
+				hb.delete();
+			}
+			var br = ..gdip.solidBrush(col);
+			graphics.drawString(txt, font, ::RECTF(x, y, tw + 2, h), fmt, br);
+			br.delete();
+			..table.push(self.navHits, {i = i; x = x - ..nodio.ui.px(3); w = tw + ..nodio.ui.px(6)});
+			x = x + tw + ..nodio.ui.px(10);
+			if(!isLast){
+				var sb = ..gdip.solidBrush(th.border);
+				graphics.drawString("›", font, ::RECTF(x, y, 20, h), fmt, sb);
+				sb.delete();
+				x = x + ..nodio.ui.px(14);
+			}
+		}
+	}
+	// 导航栏命中测试（画板本地坐标）→ 段的序号（1 基），没命中返回 0
+	self.__hitNav = function(x, y){
+		var hits = self.navHits;
+		if(!hits || !#hits) return 0;
+		for(i=1;#hits;1){
+			if(x >= hits[i].x && x <= hits[i].x + hits[i].w) return hits[i].i;
+		}
+		return 0;
+	}
+	self.__drawGutter = function(graphics, rc, bd){
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		// 临时变量声明在函数体顶部：循环体里首次赋值会让循环环境 rehash
+		var i, k, dsev, db, ms, fold;
+		var bg = ..gdip.solidBrush(th.bg);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var lp = ..gdip.pen(th.border, 1);
+		graphics.drawLine(lp, rc.right - 1, rc.top, rc.right - 1, rc.bottom);
+		lp.delete();
+		var lh = self.lineHeight;
+		if(!lh) lh = 20;
+		self.__updateGutterFont();
+		var font = self.gutterFont;
+		if(!font) font = bd.font;
+		var fmt = bd.format;
+		var first = 0;
+		try{ first = ctrl.firstVisibleLine }catch(e){}
+		if(first === null || first === undefined) first = 0;
+		// ⚠ 折叠后**控件行号 ≠ 文档行号**：隐藏的段落不占行，
+		//   所以行号要按自己的「可见文档行表」visLines 画。
+		var vis = self.visLines;
+		if(!vis || !#vis){
+			// 还没建表（首帧）：退回按控件行画
+			vis = {};
+			var total = 0;
+			try{ total = ctrl.lineCount }catch(e2){}
+			if(!total) total = 1;
+			for(i=1;total;1) vis[i] = i;
+		}
+		var total = #vis;
+		var pad = ..nodio.ui.px(24);        // 右边给折叠标记让位
+		var markSize = ..nodio.ui.px(7);
+		for(i=first + 1;300;1){
+			if(i > total) break;
+			var d = vis[i];                  // 文档行号（visLines 是 1 基）
+			var base = self.__lineStart(d);
+			if(!base) base = 1;
+			var y = self.__posY(base - 1);
+			if(y > h + lh) break;
+			if(y < -lh) continue;
+			var isCur = (d == self.curLine);
+			var color = isCur ? self.colors.lineNumCur : self.colors.lineNum;
+			// 出错/警告的行：行号染成诊断色 + 左边画一个圆点
+			var dsev = 0;
+			if(self.diags){
+				for(k=1;#self.diags;1){
+					if(self.diags[k].line == d){
+						dsev = self.diags[k].sev : 1;
+						break;
+					}
+				}
+			}
+			// 断点：左侧一个红点（VS 的经典圆点）
+			var hasBp = self.breakpoints ? (self.breakpoints[d] ? true : false) : false;
+			var hasBm = self.bookmarks ? (self.bookmarks[d] ? true : false) : false;
+			var dotX = rc.left + ..nodio.ui.px(4);
+			if(hasBp){
+				var bpBrush = ..gdip.solidBrush(0xFFE51400);
+				graphics.fillEllipse(bpBrush, dotX, y + (lh - ..nodio.ui.px(6)) / 2,
+					..nodio.ui.px(6), ..nodio.ui.px(6));
+				bpBrush.delete();
+				dotX = dotX + ..nodio.ui.px(9);
+			}
+			if(hasBm){
+				// 书签：青蓝色小标签/矩形旗标（VS 经典深青蓝书签 #007ACC）
+				var bmBrush = ..gdip.solidBrush(0xFF007ACC);
+				var bw = ..nodio.ui.px(7);
+				var bh = ..nodio.ui.px(9);
+				graphics.fillRect(bmBrush, dotX, y + (lh - bh) / 2, bw, bh);
+				bmBrush.delete();
+				dotX = dotX + ..nodio.ui.px(10);
+			}
+			if(dsev){
+				color = self.__diagColor(dsev);
+				var db = ..gdip.solidBrush(color);
+				var ms = ..nodio.ui.px(6);
+				graphics.fillEllipse(db, dotX, y + (lh - ms) / 2, ms, ms);
+				db.delete();
+			}
+			// 差异行标记：在行号栏最右侧边缘画绿/红/橙竖条
+			if(self.diffLines && self.diffLines[d]){
+				var dKind = self.diffLines[d];
+				var diffColor = (dKind == "add") ? 0xFF2ECC71 : ((dKind == "del") ? 0xFFE74C3C : 0xFFF39C12);
+				var diffBrush = ..gdip.solidBrush(diffColor);
+				graphics.fillRect(diffBrush, rc.right - ..nodio.ui.px(3), y, ..nodio.ui.px(3), lh);
+				diffBrush.delete();
+			}
+			if(isCur){
+				// 当前行：左侧一条强调色竖条
+				var ab = ..gdip.solidBrush(th.accent);
+				graphics.fillRect(ab, rc.left, y, ..nodio.ui.px(2), lh);
+				ab.delete();
+			}
+			var num = tostring(d);
+			var br = ..gdip.solidBrush(color);
+			var m = graphics.measureString(num, font, ::RECTF(0,0,4000,4000), fmt);
+			var tw = m ? m.width : 0;
+			graphics.drawString(num, font,
+				::RECTF(rc.right - pad - tw, y, tw + 2, lh), fmt, br);
+			br.delete();
+			// 折叠标记（可折叠的行）：▸ 已折叠 / ▾ 展开
+			fold = self.__findRegion(d);
+			if(fold){
+				var mb = ..gdip.solidBrush(isCur ? th.accent : th.textDim);
+				self.__drawFoldMark(graphics, rc.right - ..nodio.ui.px(18),
+					y + (lh - markSize) / 2, markSize,
+					self.isFolded(d) ? true : false, mb);
+				mb.delete();
+			}
+		}
+	}
+
+	// ---------- 查找条 ----------
+	self.__createFindBar = function(){
+		self.find = nodio.ui.board(winform, {
+			left = 0; top = 0; right = 460; bottom = 68;
+			fontSize = 11;
+			z = 60;
+			// transparent：plus 控件默认会把**父窗口背景**整块拷进自己的画板，
+			// 而查找条是浮在 richedit 上面的 —— 父窗口背景在 richedit 之下，
+			// 自绘内容会被 richedit 盖住（只剩输入框，浮条本体看不见）。
+			// transparent=true 让它改用自己的画板绘制。
+			transparent = true;
+		});
+		self.find.onDraw = function(graphics, rc, bd){
+			self.__drawFind(graphics, rc, bd);
+		}
+		self.find.onMouseMove = function(x,y,bd){
+			var b = self.__hitFindBtn(x,y);
+			if(b != self.findHover){
+				self.findHover = b;
+				self.find.invalidate();
+			}
+		}
+		self.find.onMouseLeave = function(bd){
+			if(self.findHover){
+				self.findHover = null;
+				self.find.invalidate();
+			}
+		}
+		self.find.onMouseDown = function(x,y,bd){
+			var b = self.__hitFindBtn(x,y);
+			if(b) self.__findBtn(b);
+		}
+		self.findEd = ..nodio.ui.addCtrl(winform, "findEd" ++ __edSeq, {
+			cls="edit";left=0;top=0;right=200;bottom=24;
+		});
+		self.replEd = ..nodio.ui.addCtrl(winform, "replEd" ++ __edSeq, {
+			cls="edit";left=0;top=0;right=200;bottom=24;
+		});
+		for(k=1;2;1){
+			var e = (k == 1) ? self.findEd : self.replEd;
+			try{ e.color = ..nodio.ui.themeRef(th.text) }catch(e1){};
+			try{
+				::SendMessage(e.hwnd, 0x443/*_EM_SETBKGNDCOLOR*/, 0,
+					..nodio.ui.themeRef(th.bgSecondary));
+			}catch(e2){};
+		}
+		// 回车 = 查找下一个（官方控件的 oncommand 路由不通，自己子类化）
+		self.subFind = ..nodio.ui.subclass(self.findEd.hwnd, function(hwnd,msg,wp,lp){
+			if(msg == 0x100 && tonumber(wp) == 0x0D){
+				self.__findBtn("next");
+				return 1;
+			}
+			return null;
+		});
+		self.subRepl = ..nodio.ui.subclass(self.replEd.hwnd, function(hwnd,msg,wp,lp){
+			if(msg == 0x100 && tonumber(wp) == 0x0D){
+				self.__findBtn("rep");
+				return 1;
+			}
+			return null;
+		});
+		self.find.show(false);
+		self.findEd.show(false);
+		self.replEd.show(false);
+	}
+	// 按钮矩形用**数组**存（每项 {name; left; right; top; bottom}）。
+	// ⚠ 两处 aardio/坐标坑：
+	//   1) `for(k,v in 表)` 只走表的**数组部分**，字符串键的表遍历不到；
+	//   2) 这里的坐标必须是**客户区相对坐标**（画板绘制的原点在客户区，
+	//      鼠标命中测试给的也是客户区坐标）—— 用父窗口绝对坐标的话
+	//      按钮会被画到画板外面去（整个浮条只剩左边的标签）。
+	self.__findBtnRects = function(){
+		var r = self.find.rect;
+		if(!r) return {};
+		var out = {};
+		var W = r.right - r.left;      // 浮条宽度（物理像素）
+		// 设计常量是**逻辑像素**，这里统一换算成物理像素。
+		..table.push(out, {name="next";
+			left=W - ..nodio.ui.px(216); right=W - ..nodio.ui.px(160);
+			top=..nodio.ui.px(4);  bottom=..nodio.ui.px(30)});
+		..table.push(out, {name="all";
+			left=W - ..nodio.ui.px(156); right=W - ..nodio.ui.px(100);
+			top=..nodio.ui.px(4);  bottom=..nodio.ui.px(30)});
+		..table.push(out, {name="close";
+			left=W - ..nodio.ui.px(44);  right=W - ..nodio.ui.px(8);
+			top=..nodio.ui.px(4);  bottom=..nodio.ui.px(30)});
+		..table.push(out, {name="rep";
+			left=W - ..nodio.ui.px(216); right=W - ..nodio.ui.px(160);
+			top=..nodio.ui.px(36); bottom=..nodio.ui.px(62)});
+		..table.push(out, {name="repAll";
+			left=W - ..nodio.ui.px(156); right=W - ..nodio.ui.px(8);
+			top=..nodio.ui.px(36); bottom=..nodio.ui.px(62)});
+		return out;
+	}
+	self.__hitFindBtn = function(x,y){
+		var rs = self.__findBtnRects();
+		for(i=1;#rs;1){
+			var v = rs[i];
+			if(x >= v.left && x < v.right && y >= v.top && y < v.bottom) return v.name;
+		}
+		return null;
+	}
+	self.__findBtn = function(name){
+		var w = self.findEd.text;
+		var rp = self.replEd.text;
+		if(name == "next"){
+			if(!self.findNext(w, true)) self.findNext(w, false);
+		}
+		elseif(name == "all"){
+			self.replaceAll(w, rp);
+		}
+		elseif(name == "rep"){
+			self.replaceOnce(w, rp);
+		}
+		elseif(name == "repAll"){
+			self.replaceAll(w, rp);
+		}
+		elseif(name == "close"){
+			self.closeFind();
+		}
+	}
+	self.__drawFind = function(graphics, rc, bd){
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var pen = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(pen, rc.left, rc.top, w-1, h-1);
+		pen.delete();
+		var font = bd.font;
+		var fmt = bd.format;
+		var rs = self.__findBtnRects();
+		var brush = ..gdip.solidBrush(th.textDim);
+		graphics.drawString("查找", font,
+			::RECTF(rc.left + ..nodio.ui.px(8), ..nodio.ui.px(4), ..nodio.ui.px(40), ..nodio.ui.px(26)), fmt, brush);
+		graphics.drawString("替换", font,
+			::RECTF(rc.left + ..nodio.ui.px(8), ..nodio.ui.px(36), ..nodio.ui.px(40), ..nodio.ui.px(26)), fmt, brush);
+		brush.delete();
+		var labels = {next="下一个"; all="全部"; close="×"; rep="替换"; repAll="全部替换"};
+		for(i=1;#rs;1){
+			var v = rs[i];
+			if(self.findHover == v.name){
+				var hb = ..gdip.solidBrush(th.hoverBg);
+				graphics.fillRect(hb, v.left, v.top, v.right - v.left, v.bottom - v.top);
+				hb.delete();
+			}
+			var b2 = ..gdip.solidBrush(th.text);
+			graphics.drawString(labels[v.name] : v.name, font,
+				::RECTF(v.left, v.top, v.right - v.left, v.bottom - v.top), fmt, b2);
+			b2.delete();
+		}
+	}
+	self.showFind = function(withReplace){
+		self.findOpen = true;
+		self.find.show(true);
+		self.findEd.show(true);
+		self.replEd.show(withReplace ? true : false);
+		// __layoutFind 内部会重绘画板并把输入框摆到画板上面
+		self.__layoutFind();
+		// 预填当前选中的词（VS / VS Code 的习惯）：
+		// 选中一段文字再按 Ctrl+F，查找框里应该就是那段词。
+		try{
+			var mn = null, mx = null;
+			mn,mx = ctrl.getSel();
+			if(mx !== null && mx !== undefined && mx >= mn){
+				var sel = "";
+				try{
+					ctrl.setSel(mn, mx);
+					sel = ctrl.selText;
+					ctrl.setSel(mx);
+				}catch(e1){}
+				// 只接受单行、长度合理的文本
+				if(sel && #sel > 0 && #sel < 200
+					&& ..string.indexOf(sel, '\r') == 0
+					&& ..string.indexOf(sel, '\n') == 0){
+					self.findEd.text = sel;
+				}
+			}
+		}catch(e2){}
+		try{ self.findEd.setFocus() }catch(e3){}
+	}
+	self.closeFind = function(){
+		self.findOpen = false;
+		self.find.show(false);
+		self.findEd.show(false);
+		self.replEd.show(false);
+		try{ ctrl.setFocus() }catch(e){}
+	}
+	// 查找/替换条里的文本（菜单里「查找下一个」「全部替换」要用）
+	self.findText = function(){
+		try{ return self.findEd.text : "" }catch(e){}
+		return "";
+	}
+	self.replaceText = function(){
+		try{ return self.replEd.text : "" }catch(e){}
+		return "";
+	}
+	self.__layoutFind = function(){
+		var r = self.rect;
+		if(!r) return;
+		var w = ..nodio.ui.px(460);
+		var h = ..nodio.ui.px(68);
+		var x = r.right - w - ..nodio.ui.px(12);
+		// 查找条浮在**导航栏下面**（导航栏占了顶部一条）
+		var y = r.top + (self.navBar ? self.navHeight() : 0) + ..nodio.ui.px(8);
+		self.find.rect = {left=x; top=y; right=x+w; bottom=y+h};
+		..nodio.ui.setRect(self.find.ctrl, x, y, x+w, y+h);
+		// 查找条要浮在编辑器上面
+		try{
+			..win.setPos(self.find.ctrl.hwnd, x, y, w, h, 0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+		}catch(e1){}
+		// 画板是隐藏创建的（从没画过），这里强制**整块**重绘一次。
+		// ⚠ 必须用 redraw()（RDW_INVALIDATE|RDW_UPDATENOW）：只用 invalidate()
+		//   的话更新区域是残缺的，自绘内容会被裁掉一半（按钮全没了）。
+		// ⚠ 重绘会把画板提到 z 序最前，所以必须排在摆输入框**之前**，
+		//   否则输入框会被画板盖住（只剩一个输入框，浮条本体看不见）。
+		self.find.redraw();
+		var ex = x + ..nodio.ui.px(44);
+		var ew = w - ..nodio.ui.px(44) - ..nodio.ui.px(224);
+		..nodio.ui.setRect(self.findEd, ex, y + ..nodio.ui.px(4), ex + ew, y + ..nodio.ui.px(28));
+		..nodio.ui.setRect(self.replEd, ex, y + ..nodio.ui.px(36), ex + ew, y + ..nodio.ui.px(60));
+		try{
+			..win.setPos(self.findEd.hwnd, ex, y + ..nodio.ui.px(4), ew, ..nodio.ui.px(24), 0, 0x10);
+			..win.setPos(self.replEd.hwnd, ex, y + ..nodio.ui.px(36), ew, ..nodio.ui.px(24), 0, 0x10);
+		}catch(e2){}
+	}
+
+	// ---------- 按键 ----------
+	var u32 = null;
+	var getKeyState = null;
+	self.__initKeys = function(){
+		if(getKeyState) return true;
+		try{
+			u32 = ..raw.loadDll("user32.dll");
+			getKeyState = u32.api("GetKeyState", "int(int vkey)");
+		}catch(e){}
+		return getKeyState != null;
+	}
+	// ⚠ GetKeyState 返回的是**字节**状态：按下 = 0x80，抬起 = 0。
+	//   高字 0x8000 只有 GetAsyncKeyState 才有。
+	//   原来这里写成 `(s & 0x8000)` → **恒为 false** →
+	//   编辑器的所有 Ctrl/Shift/Alt 快捷键（Ctrl+Z/Y、Ctrl+Space、
+	//   Ctrl+F/H/G、Ctrl+/）**一次都没生效过**，按键全被原生 richedit 吃掉。
+	var ctrlDown = function(){
+		if(!self.__initKeys()) return false;
+		var s = getKeyState(0x11/*_VK_CONTROL*/);
+		return (s && (s & 0x80)) ? true : false;
+	}
+	var shiftDown = function(){
+		if(!self.__initKeys()) return false;
+		var s = getKeyState(0x10/*_VK_SHIFT*/);
+		return (s && (s & 0x80)) ? true : false;
+	}
+	// ⚠ 这个以前**没有**，写别的分支时顺手调用了它 →
+	//   在窗口过程里调用非函数值会抛异常，异常从原生回调里冒出来
+	//   会让消息循环卡死（表现：按 '(' 键界面直接没反应）。
+	var altDown = function(){
+		if(!self.__initKeys()) return false;
+		var s = getKeyState(0x12/*_VK_MENU*/);
+		return (s && (s & 0x80)) ? true : false;
+	}
+
+	// ---------- 输入增强（基本功能的底线）----------
+	//
+	//   ① 回车续接缩进：复制当前行缩进；光标前是开括号时再多一级
+	//   ② 括号/引号自动配对：补另一半、光标停在中间；闭合符号「跳过」
+	//   ③ Ctrl+Z / Ctrl+Y 走组件自己的撤销栈
+	//      （richedit 原生栈只收键盘输入，程序化改动进不去）
+	//   ④ 自动触发补全：'.'（成员访问）或词长到阈值
+	//
+	// ⚠ 位置单位统一用 **richedit 位置（UTF-16 码元，1-based）**，
+	//   跟 ctrl.getSel()/setSel() 一致；
+	//   模型 self.text 是 UTF-8 字节，两者不能混算（跨语言换算的老坑）。
+
+	// 0-based 插入点（无选区时唯一确定）
+	self.__caret0 = function(){
+		var mn = null, mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		if(mn === null || mn === undefined) return 0;
+		if(mx === null || mx === undefined) return mn;   // 无选区：官方给的是 0-based
+		return mn - 1;                                  // 有选区：官方给 1-based 起点
+	}
+
+	// 当前有没有选区
+	self.__hasSel = function(){
+		var mn = null, mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		return (mx !== null && mx !== undefined && mx >= mn) ? true : false;
+	}
+
+	// 拆出行首缩进（纯 ASCII，字节与码元一致）
+	// 返回两个值：{缩进; 缩进之后的内容}
+	//
+	// ⚠ aardio 里 `s[i]` 返回的是**字节值（数字）**，不是字符！
+	//   取子串要用 string.sub(s, 起, 止)（止是**位置**，含）。
+	//   以前写成 `var ind = f(); ind[1]` —— ind 是字符串，ind[1] 是第 2 个字节的数值，
+	//   于是缩进变成了 32（空格的字节值）。
+	self.__splitIndent = function(ln){
+		ln = ln : "";
+		var n = 0;
+		while(n < #ln){
+			var ch = ..string.sub(ln, n + 1, n + 1);
+			if(ch == " " || ch == '\t') n = n + 1;
+			else break;
+		}
+		var ind = n > 0 ? ..string.sub(ln, 1, n) : "";
+		var rest = (#ln > n) ? ..string.sub(ln, n + 1, #ln) : "";
+		return ind, rest;
+	}
+
+	// 当前行的缩进
+	self.__curIndent = function(){
+		var line = self.__lineOfChar(self.__caret0());
+		if(!line) line = 1;
+		var lines = ..string.split(self.text, '\n');
+		var ind, rest = self.__splitIndent(self.__lineText(lines, line));
+		return ind;
+	}
+
+	// 光标所在行的**实时**文本 + 行号
+	//
+	// ⚠ 用控件的文本（ctrl.text）而不是模型 self.text：
+	//   模型是轮询同步的，可能比控件慢一拍，
+	//   「光标前一个字符」这种判断必须看**当前**内容。
+	self.__liveLine = function(c0){
+		var line = self.__lineOfChar(c0);
+		if(!line) line = 1;
+		var t = null;
+		try{ t = ctrl.text }catch(e){}
+		if(t === null || t === undefined) t = self.text;
+		var lines = ..string.split(t : "", '\n');
+		return self.__lineText(lines, line), line;
+	}
+
+	// 光标**前一个字符**
+	//
+	// ⚠ 官方 setSel 的两套语义（win/ui/ctrl/edit.aardio:144）：
+	//   setSel(x)       单参 → x 是 **0-based 插入点**
+	//   setSel(min,max) 双参 → **1-based 闭区间**
+	//   getSel() 无选区 → 0-based 插入点；有选区 → (1-based 起, 1-based 止)
+	//
+	// ⚠ 官方 richedit 的 selText **读取**走 EM_GETSELTEXT，
+	//   而它的绑定把「缓冲区大小」当指针传（richedit.aardio:309）——不可靠，
+	//   这里改用「控件文本 + UTF-16 列 → 字节偏移」自己算。
+	self.__charBefore = function(){
+		var c0 = self.__caret0();
+		if(c0 < 1) return "";
+		var ln, line = self.__liveLine(c0);
+		var ls = self.__lineStart(line);
+		// 光标在行内的 0-based 偏移 = c0 - (ls-1)；
+		// 「光标前一个字符」的 0-based 偏移 = c0 - ls，
+		// 换算成 1 基列号 = c0 - ls + 1。
+		var col = c0 - ls + 1;
+		if(col < 1) return "";
+		var bytes = ..string.unpack(ln);
+		var bo = __byteOfCol(bytes, #ln, col);
+		if(bo < 1 || bo > #ln) return "";
+		return ..string.sub(ln, bo, bo);
+	}
+
+	// 光标**后一个字符**
+	self.__charAfter = function(){
+		var c0 = self.__caret0();
+		var ln, line = self.__liveLine(c0);
+		var ls = self.__lineStart(line);
+		var col = c0 - ls + 2;           // 光标后一个字符的 1 基列号
+		if(col < 1) return "";
+		var bytes = ..string.unpack(ln);
+		var bo = __byteOfCol(bytes, #ln, col);
+		if(bo < 1 || bo > #ln) return "";
+		return ..string.sub(ln, bo, bo);
+	}
+
+	// ① 回车续接缩进
+	self.__newlineIndent = function(){
+		if(self.__hasSel()) return false;   // 有选区：交给原生处理
+		var indent = self.__curIndent();
+		var ch = self.__charBefore();
+		var extra = "";
+		if(ch == "{" || ch == "(" || ch == "[") extra = INDENT;
+		var c0 = self.__caret0();
+		self.__beginEdit();
+		try{
+			ctrl.setSel(c0);               // 0-based 插入点 = 光标处
+			// ⚠ 单引号串按 C 规则转义；双引号串是**原样串**，
+			//   写 "\r\n" 插进去的是字面的反斜杠 r 反斜杠 n。
+			ctrl.selText = '\r\n' ++ indent ++ extra;
+		}catch(e){ return false }
+		self.__syncFromCtrl();
+		return true;
+	}
+
+	// ② 自动配对：要补的另一半
+	//
+	// ⚠ aardio 的**双引号串是原样串**（不认 \" 转义），
+	//   所以要表示一个双引号字符必须用单引号串 '"'；
+	//   单引号串按 C 规则转义 → 一个单引号写成 '\''。
+	// ⚠ 不用 string.char(code)：它在 aardio 里是 string.pack 的别名（已废弃），
+	//   返回的是二进制串不是字符，所以这里直接用字面量表。
+	self.__pairOf = function(vk){
+		if(vk == 0x28) return ")";
+		if(vk == 0x5B) return "]";
+		if(vk == 0x7B) return "}";
+		if(vk == 0x22) return '"';
+		if(vk == 0x27) return '\'';
+		return null;
+	}
+	// 开符号本身
+	self.__openOf = function(vk){
+		if(vk == 0x28) return "(";
+		if(vk == 0x5B) return "[";
+		if(vk == 0x7B) return "{";
+		if(vk == 0x22) return '"';
+		if(vk == 0x27) return '\'';
+		return null;
+	}
+	// 闭合符号（用于「跳过」）
+	self.__closeOf = function(vk){
+		if(vk == 0x29) return ")";
+		if(vk == 0x5D) return "]";
+		if(vk == 0x7D) return "}";
+		return null;
+	}
+
+	// 处理一次配对；返回 true = 已经吃掉这次按键
+	self.__autoPair = function(vk){
+		if(self.__hasSel()) return false;   // 有选区：不做配对
+		var c0 = self.__caret0();
+		var close = self.__closeOf(vk);
+		if(close){
+			// 右边紧跟着的就是它 → 跳过，不再插一个
+			if(self.__charAfter() == close){
+				try{ ctrl.setSel(c0 + 1) }catch(e){}
+				return true;
+			}
+			return false;
+		}
+		var pc = self.__pairOf(vk);
+		if(!pc) return false;
+		var open = self.__openOf(vk);
+		self.__beginEdit();
+		try{
+			ctrl.setSel(c0);
+			ctrl.selText = open ++ pc;
+			ctrl.setSel(c0 + 1);        // 光标停在中间
+		}catch(e){ return false }
+		self.__syncFromCtrl();
+		return true;
+	}
+
+	// ④ 自动补全：'.' 一定问；普通词到 3 个字符才问（少于此不打扰）
+	self.__autoComplete = function(){
+		// 模型可能比控件慢一拍（同步发生在轮询里）→ 先对齐再算前缀
+		try{ self.__syncFromCtrl() }catch(e){}
+		if(self.__charBefore() == "."){
+			self.requestComplete();
+			return;
+		}
+		var w = self.__wordAtCursor();
+		if(w.word && #w.word >= 3) self.requestComplete();
+	}
+	// 推迟到下一轮消息循环再问（那时刚敲的字符已经进控件了）
+	self.__scheduleAutoComplete = function(){
+		try{
+			winform.setTimeout(function(){
+				try{ self.__autoComplete() }catch(e){}
+				return null;
+			}, 1);
+		}catch(e){}
+	}
+
+	// 待吞掉的 WM_CHAR 码值（见下面的 WM_CHAR 分支）
+	self.__eatChar = 0;
+
+	self.sub = ..nodio.ui.subclass(ctrl.hwnd, function(hwnd, msg, wp, lp){
+		if(msg == 0x100){            // WM_KEYDOWN
+			self.__eatChar = 0;      // 新的一轮按键：清掉上一轮留下的尾巴
+			var vk = tonumber(wp);
+			// 补全浮层开着的时候，这几个键归浮层管
+			if(self.compOpen){
+				if(vk == 0x26){ self.completionMove(-1); return 1 }   // ↑
+				if(vk == 0x28){ self.completionMove(1); return 1 }    // ↓
+				if(vk == 0x0D || vk == 0x09){ self.__eatChar = vk; self.completionAccept(); return 1 }  // Enter / Tab
+				if(vk == 0x1B){ self.hideCompletion(); return 1 }      // Esc
+			}
+			if(vk == 0x0D){            // 回车：续接缩进
+				if(self.__newlineIndent()){
+					self.__eatChar = 0x0D;
+					return 1;
+				}
+			}
+			// 括号/引号自动配对（Ctrl/Alt 组合时不接管）
+			if(!ctrlDown() && !altDown()){
+				if(self.__pairOf(vk) || self.__closeOf(vk)){
+					if(self.__autoPair(vk)){
+						self.__eatChar = vk;
+						return 1;
+					}
+				}
+			}
+			if(vk == 0x5A && ctrlDown()){   // Ctrl+Z 撤销 / Ctrl+Shift+Z 重做
+				// ⚠ Ctrl+Z 的 WM_CHAR 是控制字符 0x1A（不是 'Z' 的 0x5A）
+				self.__eatChar = 0x1A;
+				if(shiftDown()) self.redo();
+				else self.undo();
+				return 1;
+			}
+			if(vk == 0x59 && ctrlDown()){   // Ctrl+Y 重做
+				self.__eatChar = 0x19;
+				self.redo();
+				return 1;
+			}
+			if(vk == 0x20 && ctrlDown()){   // Ctrl+Space
+				self.__eatChar = 0x20;
+				self.__scheduleComplete();
+				return 1;
+			}
+			if(vk == 9){            // Tab
+				self.__eatChar = 0x09;
+				if(shiftDown()) self.unindent();
+				else{
+					if(!self.__expandSnippet()){
+						self.indent();
+					}
+				}
+				return 1;           // 吃掉：不插入制表符
+			}
+			if((vk == 0xBF || vk == 0x22) && ctrlDown()){   // Ctrl+/
+				// ⚠ '/' 键的 VK 是 VK_OEM_2(0xBF)，0x22 是 '"' —— 原来写错了，
+				//   所以「注释/取消注释」的快捷键从来没生效过。
+				//   Ctrl+/ 的 WM_CHAR 是控制字符 0x1F。
+				self.__eatChar = 0x1F;
+				self.toggleComment();
+				return 1;
+			}
+			if(vk == 0x46 && shiftDown() && altDown()){   // Shift+Alt+F 格式化代码
+				self.__eatChar = 0;
+				self.formatDocument();
+				return 1;
+			}
+			if(vk == 0x46 && ctrlDown()){   // Ctrl+F
+				self.__eatChar = 0x46;
+				self.showFind(false);
+				return 1;
+			}
+			if(vk == 0x48 && ctrlDown()){   // Ctrl+H
+				self.__eatChar = 0x48;
+				self.showFind(true);
+				return 1;
+			}
+			if(vk == 0x47 && ctrlDown()){   // Ctrl+G
+				self.__eatChar = 0x47;
+				if(self.onGotoLine) self.onGotoLine();
+				return 1;
+			}
+			if(vk == 0x7B){            // F12：转到定义；Shift+F12：查找引用
+				self.__eatChar = 0;
+				if(shiftDown()) self.__scheduleNav(2);
+				else self.__scheduleNav(1);
+				return 1;
+			}
+			if(vk == 0x71){            // F2 / Ctrl+F2 / Shift+F2
+				self.__eatChar = 0;
+				if(ctrlDown()){
+					self.toggleBookmark();
+					return 1;
+				}
+				elseif(shiftDown()){
+					self.prevBookmark();
+					return 1;
+				}
+				else{
+					if(self.hasAnyBookmark()){
+						self.nextBookmark();
+						return 1;
+					}
+					self.__scheduleNav(3);
+					return 1;
+				}
+			}
+			if(vk == 0x1B){ // Esc
+				var handled = false;
+				if(self.findOpen){ self.closeFind(); handled = true; }
+				if(self.sigHelpOpen){ self.hideSignatureHelp(); handled = true; }
+				if(handled) return 1;
+			}
+			// Delete 键不进 WM_CHAR，单独存一次撤销快照
+			if(vk == 0x2E){
+				self.__pushUndo(self.text, self.__selSnapshot(), "delete");
+				self.__pendingUndo = true;
+			}
+		}
+		elseif(msg == 0x102){       // WM_CHAR（字符/回车/退格都走这里）
+			// ⚠ TranslateMessage 早一步就生成了 WM_CHAR 并投回控件 ——
+			//   我们在 WM_KEYDOWN 里吃掉的键，这里必须跟着吞掉，
+			//   否则 Tab 既缩进又插一个制表符、Ctrl+Space 多出一个空格。
+			var wc = tonumber(wp);
+			if(self.__eatChar && wc == self.__eatChar){
+				self.__eatChar = 0;
+				return 1;
+			}
+			if(wc == 0x09) return 1;       // Tab：编辑器自己处理（缩进）
+			// 文本马上要变了：连续打字合并快照，避免频繁分配大字符串
+			self.__pushUndo(self.text, self.__selSnapshot(), "typing");
+			self.__pendingUndo = true;
+			if(wc == 0x28 || wc == 0x2C){ // '(' or ','
+				self.__scheduleSignatureHelp();
+			}
+			elseif(wc == 0x29){ // ')'
+				self.hideSignatureHelp();
+			}
+			// ④ 自动补全：字母和 '.' 之后弹候选。
+			//   真正的判断（词长够不够、前面是不是 '.'）放在下一轮消息循环里做 ——
+			//   那时刚敲的字符已经进了控件，前缀才算得准。
+			if(wc == 0x2E || (wc >= 0x41 && wc <= 0x5A) || (wc >= 0x61 && wc <= 0x7A)){
+				self.__scheduleAutoComplete();
+			}
+		}
+		elseif(msg == 0x302){       // WM_PASTE
+			self.__pushUndo(self.text, self.__selSnapshot(), "paste");
+			self.__pendingUndo = true;
+		}
+		elseif(msg == 0x303){       // WM_CUT
+			self.__pushUndo(self.text, self.__selSnapshot(), "cut");
+			self.__pendingUndo = true;
+		}
+		elseif(msg == 0x202){       // WM_LBUTTONUP
+			self.updateCursor();
+			// Ctrl+点击 = 转到定义（VS 的老习惯）
+			if(ctrlDown()) self.__scheduleNav(1);
+		}
+		elseif(msg == 0x200){       // WM_MOUSEMOVE
+			// 悬停提示：只记位置，真正提问推迟到定时器（见 __mouseMoved）
+			// ⚠ lp 里是**客户区**坐标：低 16 位 = x，高 16 位 = y。
+			//   这里是 richedit 自己的客户区，浮层摆放时还要加回控件原点。
+			var mx = lp & 0xFFFF;
+			var my = (lp >> 16) & 0xFFFF;
+			try{ self.__mouseMoved(mx, my) }catch(e){}
+		}
+		elseif(msg == 0x115){       // WM_VSCROLL（拖滚动条）
+			// 滚到了没着色过的一段 → 补一次（着色只覆盖可见范围）
+			self.__scheduleColor();
+		}
+		elseif(msg == 0x20A){       // WM_MOUSEWHEEL（滚轮）
+			self.__scheduleColor();
+		}
+		elseif(msg == 0x2A3){       // WM_MOUSELEAVE
+			// ⚠ 没有 TrackMouseEvent，这个消息其实不会来（留着不碍事），
+			//   真正的「鼠标移开」靠 __poll 里的 __checkHoverStill 检测。
+			self.__hoverGen = self.__hoverGen + 1;   // 让待办的提问作废
+			if(self.hoverOpen) self.hideHover();
+		}
+		return null;
+	});
+
+	// ---------- 布局 ----------
+	self.layout = function(l,t,r,b){
+		var gw = 0;
+		if(opt.gutter !== false) gw = ..nodio.ui.px(64);
+		// 不传参数时沿用上一次的矩形（首次用 opt.rect）
+		if(l === null || l === undefined){
+			var rc = self.rect : opt.rect;
+			if(!rc) rc = {left=0; top=0; right=600; bottom=400};
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		// 导航栏占掉编辑区**顶部**一条（VS 就是长在这个位置）
+		var navH = 0;
+		if(self.navBar) navH = self.navHeight();
+		if(self.navBar){
+			self.navBar.layout(l, t, r, t + navH);
+			try{
+				..win.setPos(self.navBar.ctrl.hwnd, l, t, r - l, navH,
+					0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+			}catch(e0){}
+		}
+		if(self.gutter){
+			self.gutter.layout(l, t + navH, l + gw, b);
+			// 行号栏要压在背景板之上（背景板铺满客户区）
+			try{
+				..win.setPos(self.gutter.ctrl.hwnd, l, t + navH, gw, b - t - navH,
+					0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+			}catch(e){}
+		}
+		..nodio.ui.setRect(ctrl, l + gw, t + navH, r, b);
+		self.__layoutFind();
+		self.__updateGutter();
+	}
+	self.gutterVisible = (opt.gutter !== false);
+	self.gutterWidth = function(){
+		if(!self.gutterVisible) return 0;
+		return ..nodio.ui.px(64);
+	}
+	self.toggleGutter = function(){
+		self.gutterVisible = !self.gutterVisible;
+		if(self.gutter) self.gutter.show(self.gutterVisible);
+		self.layout();
+		return self.gutterVisible;
+	}
+	self.wordWrap = false;
+	self.toggleWordWrap = function(){
+		self.wordWrap = !self.wordWrap;
+		try{
+			::SendMessage(ctrl.hwnd, 0x0448/*EM_SETTARGETDEVICE*/, 0, self.wordWrap ? 0 : 1);
+		}catch(e){}
+		return self.wordWrap;
+	}
+	self.control = function(){
+		return ctrl;
+	}
+
+	// ---------- 启动 ----------
+	// 查找条必须**最后**建：它是本函数体内对 self 成员的调用，
+	// 成员函数要在赋值之后才能调（aardio 不会做前向解析）。
+	self.__createFindBar();
+
+	// ---------- 挂上 EN_CHANGE（文本变更的**即时**通知）----------
+	//
+	// 官方 form 的 WM_COMMAND 处理器把 EN_CHANGE(0x300) 派发到控件的 onChange
+	// （win/ui/_.aardio:745-746；官方 richedit 的映射表见
+	//  win/ui/ctrl/richedit.aardio:97）。Nodio 里这条链路是通的（实测过），
+	// 于是「打字 → 行号栏/着色/脏标记/LSP 同步」不必再等 250ms 轮询。
+	//
+	// ⚠ 官方 richedit 的 onChange 是**属性**（带 _get/_set），
+	//   赋值走 `owner[["onChange"]] = v`；直接赋值即可。
+	try{
+		ctrl.onChange = function(){
+			self.__syncText();
+		}
+	}
+	catch(e1){
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG editor onChange bind failed: " ++ tostring(e1));
+		}
+	}
+
+	// 轮询降级成**慢速兜底**（EN_CHANGE 万一漏了也能对账）。
+	// 250ms 是为了悬停停留检查（鼠标移开后收浮层），
+	// 文本对账 1.2s 一次就够 —— 每次读 ctrl.text 都要把整篇文档拷出来。
+	self.pollTimer = winform.setInterval(self.__poll, 250);
+	self.syncTimer = winform.setInterval(function(){
+		self.__syncText();
+		return null;
+	}, 1200);
+	self.layout();
+	return self;
+}
+
+}

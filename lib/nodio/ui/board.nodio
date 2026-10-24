@@ -36,6 +36,110 @@ import raw;
 
 var __bdSeq = 0;
 
+// ---------- 画板登记表 ----------
+//
+// 官方 plus 的 WM_PAINT（win/ui/ctrl/plus.aardio:833）：
+//     var rcPaint = ps.rcPaint;
+//     graphics.setClipRect(rcPaint, _GdipCombineModeReplace);
+//     this._draw(...)
+// **裁剪区 = 本次失效区域**。窗口从没画过时更新区可能是空的，
+// 于是「画了一遍」等于什么都没画 —— 画板在、可见、矩形也对，屏幕上却是空的。
+//
+// 这就是「IDE 打开后组件半天不显示」的根因：自绘板都在等一个
+// **永远不会来的失效通知**。这里登记所有画板，启动后统一强制整块重画。
+var __boards = {};
+
+// ---------- 延迟绘制（防屏闪） ----------
+//
+// ⚠⚠⚠ **为什么 27 块画板没法「合成一帧」** —— 这是本仓库最贵的一条经验，
+// 走过的弯路必须写下来：
+//
+//   官方 plus 的 WM_PAINT（win/ui/ctrl/plus.aardio:836）是这样画的：
+//     BitBlt 自身像素 → setClipRect(rcPaint) → _draw → BitBlt 回去
+//   **裁剪区 = 本次失效区（ps.rcPaint）**。
+//
+//   所以「InvalidateRect 全部置脏 + 一次
+//    RedrawWindow(父, RDW_ALLCHILDREN|RDW_UPDATENOW) 一次成帧」这条路**走不通**：
+//   父窗口先画自己的背景，把子控件的更新区**吃掉**，
+//   子控件随后拿到的是**空裁剪区** —— 裁剪区一空就等于什么都没画
+//   ⇒ 标题栏 / 工具条 / 停靠面板**整片消失**（实测截图确认）。
+//
+//   探针 tests/probe_redraw.aardio 里「一次成帧」是成立的
+//   （当场 1,1,1 次 WM_PAINT），但那 3 块 plus 是直接 form.add 出来的、
+//   没有「官方窗体背景板」参与遮挡；真实 IDE 是 27 块 + 官方窗体背景，
+//   结论正好相反。**探针的结论不能直接套到 IDE 上。**
+//
+//   ⇒ 结论：**N 个独立子窗口没法原子成帧**。
+//     真正的一帧只能把整个 chrome 画成**一块画板**（标题栏+工具条+停靠面板
+//     全画进同一个 HWND）—— 架构级改造，不在本次范围。
+//
+//   在那之前能做的是**别画中间态**：
+//   启动期窗口尺寸要跳 3 次（1281×821 → 1943×1287 → 3840×2160，
+//   官方窗体 DPI 初始化 / 去掉标题栏 / 最大化各来一次），
+//   每次跳变触发一次全量重排 + 27 块画板各强制上屏一次
+//   ⇒ 上百次上屏 = 用户看到的「满屏闪」。
+//   用 setDeferredPaint(true) 把这段期间的绘制**全部压掉**，
+//   只在最后画一次 ⇒ 窗口一出现就是最终样子。
+var __deferred = false;
+// 开关：true = 只置脏不上屏（中间态不显示），false = 立刻上屏
+setDeferredPaint = function(on){
+	__deferred = on ? true : false;
+	return __deferred;
+}
+isDeferredPaint = function(){
+	return __deferred;
+}
+
+// ---------- 拖拽改尺寸/挪位置的状态 ----------
+//
+// WM_ENTERSIZEMOVE(0x231)/WM_EXITSIZEMOVE(0x232) 之间，用户正在拖动
+// 窗口的边或标题栏。这个状态由 ide/nodio/app/shell.nodio 的窗体消息钩子
+// 维护，layout() 收尾据此决定要不要「逐块强制上屏」：
+//   拖拽中  → 只置脏，成帧交给系统的合成器（WS_EX_COMPOSITED 一帧上屏）；
+//   拖拽结束 → 立刻补一次完整重画。
+var __sizeMove = false;
+setSizeMove = function(on){
+	__sizeMove = on ? true : false;
+	return __sizeMove;
+}
+inSizeMove = function(){
+	return __sizeMove;
+}
+
+// 强制画板重画。
+//
+// ⚠ 计时：一次 redrawAll = N 个画板各做一次「整块失效 + 同步重画」，
+//   是启动期最贵的一次操作（窗口尺寸每跳一次就重来一遍）。
+//
+// onlyDirty = true 时**只重画「上次重画之后矩形变过」的板子**：
+//   布局 flush 里大多数板子只是挪了位置（尺寸没变）——
+//   主窗体有 WS_CLIPCHILDREN 之后，父窗体重绘不再擦掉子窗体的像素，
+//   挪位置的板子内容跟着窗口走，根本不需要重画；
+//   全量失效 27 块 = 每次 flush 白白多花一百多毫秒（实测）。
+//   板子自己的 __dirty 标记由 board.layout() 在尺寸变化时置位。
+redrawAll = function(onlyDirty){
+	var t0 = ..time.tick();
+	var n = 0;
+	var __slow = "";
+	for(k,v in __boards){
+		if(onlyDirty && !(v.isDirty ? v.isDirty() : false)) continue;
+		var __t = ..time.tick();
+		try{ v.redraw(); n = n + 1 }catch(e){}
+		try{ v.markClean() }catch(e4){}
+		var __c = ..time.tick() - __t;
+		if(__c >= 3){
+			__slow = __slow ++ " " ++ tostring(k) ++ ":" ++ tostring(__c) ++ "ms";
+		}
+	}
+	if( ..string.getenv("NODIO_IDE_DIAG") ){
+		io.print("DIAG redrawAll onlyDirty=" ++ tostring(onlyDirty ? true : false)
+			++ " boards=" ++ tostring(n)
+			++ " cost=" ++ tostring(..time.tick() - t0) ++ "ms"
+			++ " deferred=" ++ tostring(__deferred)
+			++ ( __slow ? (" slow:" ++ __slow) : "" ));
+	}
+}
+
 // ---------- 鼠标移出跟踪（TrackMouseEvent）----------
 //
 // 没有它，鼠标移出画板后画板收不到任何消息，悬停态会一直挂着
@@ -146,6 +250,7 @@ board = function(winform, opt){
 		onMouseMove = null;
 		onMouseUp = null;
 		onMouseClick = null;
+		onDoubleClick = null;  // function(x, y, self) —— 双击
 		onContextMenu = null;   // function(x, y, self) —— x,y 是**屏幕坐标**
 		onRightMouseDown = null;   // function(x, y, self) —— 客户区坐标
 		onRightMouseUp = null;     // function(x, y, self) —— 客户区坐标
@@ -156,6 +261,7 @@ board = function(winform, opt){
 		// 捕获必须一直保持到用户在菜单上按下为止，所以关掉自动释放。
 		// 默认仍然是「抬起即释放」（与 capture 的原始语义一致）。
 		autoReleaseCapture = (opt.autoReleaseCapture === null) ? true : opt.autoReleaseCapture;
+		__dirty = false;       // 上次重画之后矩形（尺寸）变过 → 需要整块重画
 	};
 
 	__bdSeq = __bdSeq + 1;
@@ -171,6 +277,9 @@ board = function(winform, opt){
 		cls="plus";left=r.left;top=r.top;right=r.right;bottom=r.bottom;
 		notify=1;transparent=opt.transparent;bgroup=false;z=opt.z : 15
 	});
+	// 记录当前矩形（扁平写法时 opt.rect 是 null，
+	// 不落地的话 layout() 无参调用会直接返回，矩形永远停在创建时的位置）
+	self.rect = r;
 
 	// 完全自绘：取消 plus 的默认背景与文字绘制
 	self.ctrl.onDrawBackground = function(graphics, rc, bg, color){
@@ -196,6 +305,9 @@ board = function(winform, opt){
 	self.sub = ..nodio.ui.subclass(self.ctrl.hwnd, function(hwnd, msg, wp, lp){
 		var x = lp & 0xFFFF;
 		var y = (lp >> 16) & 0xFFFF;
+		if(opt.diagTag && ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG board-msg " ++ opt.diagTag ++ " msg=" ++ msg ++ " lp=" ++ lp);
+		}
 		if(msg == 0x201){            // WM_LBUTTONDOWN
 			self.bDown = true;
 			self.dblClick = false;
@@ -225,7 +337,14 @@ board = function(winform, opt){
 		elseif(msg == 0x203){       // WM_LBUTTONDBLCLK
 			self.bDown = false;
 			self.dblClick = true;
-			if(self.onMouseClick) self.onMouseClick(x, y, self, lp);
+			// 双击必须**单独派发**：以前这里只转调 onMouseClick，
+			// 全仓库没有任何一处调用 onDoubleClick ——
+			// 于是 list / tree 挂上去的双击回调是死字段：
+			// 工程树双击打开文件、问题列表双击跳转、引用面板双击跳转、
+			// 搜索结果双击打开文件，**四个功能全是死的**。
+			// （第一次 click 已由前面的 WM_LBUTTONUP 派发过，这里不再重复。）
+			if(self.onDoubleClick) self.onDoubleClick(x, y, self, lp);
+			elseif(self.onMouseClick) self.onMouseClick(x, y, self, lp);
 		}
 		elseif(msg == 0x7B){        // WM_CONTEXTMENU
 			// 右键 / 菜单键 / Shift+F10。lParam 里是**屏幕坐标**
@@ -256,8 +375,28 @@ board = function(winform, opt){
 	});
 
 	// 重绘
+	//
+	// **必须整块失效**。
+	//
+	// 官方 plus 的 WM_PAINT 是这样画的（win/ui/ctrl/plus.aardio:836）：
+	//   1) 把窗口当前画面 BitBlt 到内存 DC
+	//   2) graphics.setClipRect(rcPaint, Replace)   ← 裁剪区 = **本次失效区域**
+	//   3) 画一遍
+	//   4) BitBlt 回窗口
+	// 于是「只失效了一小块」时，裁剪区就只有那一小块：
+	// 画板重画时**其余部分不会被重画**，屏幕上残留的旧像素就留在那里。
+	// 表现是：标题栏的 logo 和前两个菜单（文件/工程）忽然整块消失，
+	// 而菜单栏右边还是好的 —— 一模一样像「控件没画出来」。
+	//
+	// 所以 invalidate() 一律按**整窗**失效（rcPaint = 整个客户区），
+	// 保证自绘内容每次都完整重画。
 	self.invalidate = function(){
-		self.ctrl.invalidate();
+		try{
+			::InvalidateRect(self.ctrl.hwnd, 0, 1/*erase*/);
+		}
+		catch(e){
+			try{ self.ctrl.invalidate() }catch(e2){}
+		}
 	}
 
 	// 强制**整块**重绘。
@@ -265,11 +404,25 @@ board = function(winform, opt){
 	// invalidate() 只是置脏位，更新区域（rcPaint）可能是残缺的 ——
 	// 自绘内容会被 GDI+ 的裁剪区裁掉一部分。
 	// 官方 ctrl 没有可用的 redraw 成员（调用会抛「非函数值」），
-	// 这里用引擎 sysapi 的 InvalidateRect(整块) + UpdateWindow 强制重画。
+	// 这里用引擎 sysapi 的 InvalidateRect(整块) 失效整窗。
+	//
+	// ⚠⚠ 这里**不能**跟 UpdateWindow：
+	//   UpdateWindow 会**立刻**把这一块 WM_PAINT 掉并上屏。
+	//   布局过程中有 27 块画板，每块尺寸变了都要重画 ——
+	//   一块一块「重画 + 立即上屏」，用户看到的就是
+	//   「一半新一半旧」的中间态反复出现 = **满屏闪**。
+	//   现在只置脏，由 nodio.ui.redrawAll() 在布局收尾时
+	//   用一次 RedrawWindow(ALLCHILDREN|UPDATENOW) 统一成帧。
+	//
+	// 为什么整窗失效就够：官方 plus 的 WM_PAINT 用「本次失效区域」
+	// 当裁剪区，整窗失效 ⇒ 裁剪区 = 整个客户区 ⇒ 内容完整重画 ✓
 	self.redraw = function(){
 		try{
 			::InvalidateRect(self.ctrl.hwnd, 0, 1/*erase*/);
-			::UpdateWindow(self.ctrl.hwnd);
+			// UpdateWindow 会**立刻**把这一块 WM_PAINT 掉并上屏。
+			// 逐块上屏 = 每块一次上屏 = 用户看到「一半新一半旧」的中间态
+			// = 满屏闪。延迟绘制期间只置脏，最后统一画一次。
+			if(!__deferred) ::UpdateWindow(self.ctrl.hwnd);
 		}
 		catch(e){
 			try{ self.ctrl.invalidate() }catch(e2){}
@@ -277,8 +430,20 @@ board = function(winform, opt){
 	}
 
 	// 显示/隐藏
+	//
+	// ⚠ 显示之后**必须强制重画一次**：
+	//   官方 plus 的 WM_PAINT 用「本次失效区域」当绘制裁剪区
+	//   （见上面 invalidate 的说明）。一个画板如果创建时是隐藏的、
+	//   后来才 show(true)，Windows 给它的首次更新区域经常是空的 ——
+	//   裁剪区一空就等于什么都没画：
+	//   窗口在、IsWindowVisible 为真、矩形也对，屏幕上却什么都没有。
+	//   （设计器画布、提示条、查找条、补全浮层、下拉菜单全踩过这个坑。）
+	//   所以 show(true) 之后统一按整块失效 + 立刻重画。
 	self.show = function(flag){
 		self.ctrl.show(flag);
+		if(flag){
+			self.redraw();
+		}
 	}
 
 	// 显式捕获/释放鼠标。
@@ -296,10 +461,31 @@ board = function(winform, opt){
 			if(!rc) return;
 			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
 		}
+		var old = self.rect;
 		self.rect = {left=l; top=t; right=r; bottom=b};
 		// 官方 win.ui 控件的 setPos 是 (x,y,宽,高)，引擎原生控件是 (l,t,r,b)，
 		// 两套方言混用会让布局整体错乱 —— 统一走 win.setPos。
 		..nodio.ui.setRect(self.ctrl, l, t, r, b);
+		// 尺寸变了 → 强制整块重画。
+		// 官方 plus 只画「本次失效区域」：尺寸变化时新暴露出来的那一条会画，
+		// 其余部分保持旧像素 —— 表现是画板「一半新一半旧」甚至整块空白。
+		if(!old
+			|| (old.right - old.left) != (r - l)
+			|| (old.bottom - old.top) != (b - t)){
+			// 标记「需要整块重画」：redrawAll(true)（增量重画）据此挑板子。
+			// 只挪位置、尺寸没变的板子不标记 —— 主窗体有 WS_CLIPCHILDREN
+			// 之后，父窗体重绘不再擦掉子窗体的像素，内容跟着窗口走。
+			self.__dirty = true;
+			self.redraw();
+		}
+	}
+
+	// 「上次重画之后矩形变过」—— nodio.ui.redrawAll(true) 的挑选依据
+	self.isDirty = function(){
+		return self.__dirty ? true : false;
+	}
+	self.markClean = function(){
+		self.__dirty = false;
 	}
 
 	// 释放：解除子类化（否则子类化记录会钉住画板）
@@ -308,10 +494,20 @@ board = function(winform, opt){
 			try{ self.sub.free() }catch(e){}
 			self.sub = null;
 		}
+		__boards[bname] = null;
 		self.ctrl = null;
 	}
 
+	// 登记进全局表（启动后统一强制重画用）
+	__boards[bname] = self;
+
 	self.layout();
+	// ⚠ 创建完立刻**强制整块重画一次**：
+	//   画板是先创建、后由窗体显示出来的，中间隔着大量控件创建，
+	//   官方 plus 的 WM_PAINT 只画「本次失效区域」，
+	//   更新区为空 ⇒ 这一画等于没画 ⇒ 面板一片空白。
+	//   这里把整块区域标脏，窗口显示后第一次 WM_PAINT 就会画全。
+	self.redraw();
 	return self;
 }
 

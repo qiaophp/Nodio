@@ -90,6 +90,12 @@ tabstrip = function(winform, opt){
 		self.closeHit = 0;
 		self.board.invalidate();
 	}
+	self.board.onRightMouseUp = function(x, y, bd){
+		var i = self.__hitIndex(x);
+		if(i && self.onRightClick){
+			self.onRightClick(i, x, y);
+		}
+	}
 
 	// 绘制
 	// 扁平风格（对齐 aar.chengxu.online/thread-903.htm 的现代 IDE）：

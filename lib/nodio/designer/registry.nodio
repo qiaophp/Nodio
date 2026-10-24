@@ -1,0 +1,185 @@
+// nodio.designer.registry — 设计器组件注册表。
+//
+// 自定义组件加入设计器的入口：
+//
+//   // myWidget.aardio（放在 <工程目录>\components\ 下）
+//   import nodio.designer.registry;
+//   nodio.designer.registry.register({
+//       name = "我的按钮";
+//       cls = "button";          // 真实控件类
+//       drawAs = "button";       // 设计器里的替身类（对应官方 ide.customCtrl）
+//       category = "我的组件";
+//       props = { {"text";"标题";"string";"外观"} };
+//   })
+//
+// IDE 启动/打开工程时调用 registry.discover(<工程目录>\components)，
+// 组件即刻出现在工具箱里。
+//
+// 官方对应机制见 docs/official-ide-reference.md §3。
+namespace nodio.designer{
+
+var store = {};   // name → spec
+var order = {};   // 注册顺序
+
+// 属性键 → 分类（VS WinForms 属性窗口的「分类」）
+//
+// 属性定义数组的第 4 个元素可以自己指定分类（自定义组件用），
+// 没指定就按 key 查这张表，表里没有的归「基本」。
+//
+// 分类名要和 nodio.designer.propertyGrid 的规范顺序一致：
+//   外观 / 样式 / 数据 / 位置 / 基本
+//   （VS WinForms：Appearance / Behavior / Data / Layout / Misc）
+var __catMap = {
+	// 位置
+	left="位置"; top="位置"; right="位置"; bottom="位置";
+	width="位置"; height="位置"; x="位置"; y="位置"; w="位置"; h="位置";
+	// 外观
+	text="外观"; align="外观"; color="外观"; bgcolor="外观";
+	backcolor="外观"; font="外观"; image="外观"; border="外观"; picture="外观";
+	// 样式
+	checked="样式"; password="样式"; readonly="样式"; enabled="样式";
+	visible="样式"; hasLines="样式"; borderstyle="样式"; style="样式";
+	// 数据
+	items="数据"; columns="数据"; tabs="数据"; value="数据";
+};
+
+registry = {
+
+	// 官方 ide.customCtrl 的替身映射（照官方 lib/ide/customCtrl.aardio 原文，
+	// 见 docs/official-ide-reference.md §3）：
+	// **设计器画不出来的控件类，用一个可画的「替身」类代画，
+	//   DSG 里仍然写真实类名**（否则官方工程的 DSG 到了 Nodio 就画不出来）。
+	// 画布的 __findSpec 在注册表精确匹配失败后查这张表。
+	customCtrl = {
+		["radio"]="radiobutton";
+		["vlistview"]="listview";
+		["close"]="plus";
+		["ipaddress"]="edit";
+		["textbox"]="edit";
+		["custom.button"]="button";
+		["custom.edit"]="edit";
+		["custom.checkbox"]="checkbox";
+		["custom.radio"]="radiobutton";
+		["custom.trackbar"]="trackbar";
+	};
+
+	// 注册一个组件（同名覆盖）
+	register = function(spec){
+		if(!spec || !spec.name) return null;
+		spec.cls = spec.cls : "static";
+		spec.category = spec.category : "自定义";
+		spec.props = spec.props : {};
+		spec.drawAs = spec.drawAs : spec.cls;
+		if(!store[spec.name]) ..table.push(order, spec.name);
+		store[spec.name] = spec;
+		return spec;
+	}
+
+	// 注销
+	unregister = function(name){
+		if(!store[name]) return;
+		store[name] = null;
+		for(i=#order;1;-1){
+			if(order[i] == name) ..table.remove(order,i);
+		}
+	}
+
+	// 取一个组件（支持组件名和英文类名 cls 双向查找）
+	get = function(name){
+		if(!name) return null;
+		if(store[name]) return store[name];
+		for(k,v in store){
+			if(v && v.cls == name) return v;
+		}
+		return null;
+	};
+	find = function(name){
+		return registry.get(name);
+	};
+
+	// 列出组件（category 为空则列全部）
+	list = function(category){
+		var out = {};
+		for(i=1;#order;1){
+			var s = store[order[i]];
+			if(!s) continue;
+			if(category && s.category != category) continue;
+			..table.push(out, s);
+		}
+		return out;
+	}
+
+	// 分类名
+	categories = function(){
+		var out = {};
+		for(i=1;#order;1){
+			var s = store[order[i]];
+			if(!s) continue;
+			var found = false;
+			for(k=1;#out;1){
+				if(out[k] == s.category){ found = true; break }
+			}
+			if(!found) ..table.push(out, s.category);
+		}
+		return out;
+	}
+
+	// 属性键 → 分类（属性格分组带用）
+	categoryOf = function(key){
+		if(!key) return "基本";
+		var c = __catMap[key];
+		return c : "基本";
+	}
+
+	// 扫描目录，把每个 .aardio / .nodio 模块 import 进来（模块里自行 register）
+	discover = function(dir){
+		if(!dir) return 0;
+		var n = 0;
+		var masks = {"*.aardio"; "*.nodio"};
+		for(m=1;#masks;1){
+			var files = ..io.listFiles(dir, masks[m]) : {};
+			for(i=1;#files;1){
+				if(files[i].isDir) continue;
+				try{
+					global.import(files[i].path);
+					n = n + 1;
+				}
+				catch(e){
+					// 单个组件加载失败不影响其它组件
+				}
+			}
+		}
+		return n;
+	}
+
+	// 内置控件集
+	// 每个控件都带 左/上/宽/高 四个几何属性：属性格改它们时
+	// 画布会真的移动/缩放控件（见 nodio.designer.canvas.applyProps）。
+	//
+	// 属性定义是**四元组** {key; 标签; 类型; 分类}：
+	// 第 4 个元素是属性格分组带的分类名，省略时按
+	// registry.categoryOf(key) 查表。
+	defaults = function(){
+		var defs = {
+			{name="静态文本";cls="static";props={{"text";"标题";"string";"外观"};{"align";"对齐";"string";"外观"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="按钮";cls="button";props={{"text";"标题";"string";"外观"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="复选框";cls="checkbox";props={{"text";"标题";"string";"外观"};{"checked";"选中";"bool";"样式"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="单选框";cls="radio";props={{"text";"标题";"string";"外观"};{"checked";"选中";"bool";"样式"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="编辑框";cls="edit";props={{"text";"内容";"string";"外观"};{"password";"密码";"bool";"样式"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="多行编辑";cls="richedit";props={{"text";"内容";"string";"外观"};{"readonly";"只读";"bool";"样式"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="列表框";cls="listbox";props={{"items";"条目";"string";"数据"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="下拉框";cls="combobox";props={{"items";"条目";"string";"数据"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="列表";cls="listview";props={{"columns";"列";"string";"数据"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="树";cls="treeview";props={{"hasLines";"显示连线";"bool";"样式"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="分组框";cls="groupbox";props={{"text";"标题";"string";"外观"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="选项卡";cls="tab";props={{"tabs";"页签";"string";"数据"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+			{name="进度条";cls="progress";props={{"value";"进度";"number";"数据"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
+		};
+		for(i=1;#defs;1){
+			registry.register(defs[i]);
+		}
+		return #defs;
+	}
+}
+
+}

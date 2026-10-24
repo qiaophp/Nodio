@@ -30,6 +30,44 @@ setRect = function(ctrl, left, top, right, bottom){
 	..win.setPos(hwnd, left, top, right - left, bottom - top);
 }
 
+// ---------- z 序：压到最底 / 提到最前 ----------
+//
+// ⚠⚠ **必须用 topointer() 包住 after 参数** —— 这是本仓库最隐蔽的一个坑：
+//
+//   引擎内置 win.setPos 只认**指针型** after（engine/builtins.cpp）：
+//       HWND after = nullptr;
+//       if (a.size() > 5 && a[5].t == Value::Pointer)
+//           after = (HWND)a[5].ptr;
+//   传**数值** 1（_HWND_BOTTOM）时 a[5].t == Value::Num，
+//   条件不成立 → after 保持 nullptr = **HWND_TOP**。
+//   于是「把背景板压到最底」实际变成了「把背景板提到最顶」：
+//   背景板铺满整个客户区，把工具条 / 页签条 / 工程树 / 状态栏的鼠标
+//   **全部吃掉**（画面还在，点不动；选项卡切不了；按钮按下去没反应）。
+//
+//   topointer(1) 得到 Pointer(1) → after = (HWND)1 = HWND_BOTTOM ✅
+//
+// 标志位用 0x13 = SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE：
+//   不能带 SWP_NOZORDER(0x4)（带了就不改 z 序），
+//   位置/大小一律传 null（传 0 会把控件缩成 0×0）。
+sendToBack = function(ctrl){
+	if(!ctrl) return false;
+	var hwnd = ctrl.hwnd;
+	if(!hwnd) return false;
+	..win.setPos(hwnd, null, null, null, null,
+		topointer(1/*_HWND_BOTTOM*/), 0x13/*_SWP_NOSIZE|_SWP_NOMOVE|_SWP_NOACTIVATE*/);
+	return true;
+}
+
+// 提到 z 序最前（浮条 / 行号栏 / 画布用）
+bringToFront = function(ctrl){
+	if(!ctrl) return false;
+	var hwnd = ctrl.hwnd;
+	if(!hwnd) return false;
+	..win.setPos(hwnd, null, null, null, null,
+		topointer(0/*_HWND_TOP*/), 0x13/*_SWP_NOSIZE|_SWP_NOMOVE|_SWP_NOACTIVATE*/);
+	return true;
+}
+
 // 只挪位置，不改大小
 moveTo = function(ctrl, left, top){
 	if(!ctrl) return;

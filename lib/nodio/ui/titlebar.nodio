@@ -71,6 +71,7 @@ titlebar = function(winform, opt){
 		popItems = {};
 		popHandled = false;         // 下拉菜单这一轮按下是否已经处理过
 		wcache = {};                // 菜单项文字宽度缓存
+		onFormMsg = null;           // function(hwnd,msg,wp,lp) — 窗体消息钩子（返回非 null 拦截）
 	};
 
 	__tbSeq = __tbSeq + 1;
@@ -78,11 +79,68 @@ titlebar = function(winform, opt){
 		left = 0; top = 0; right = 800; bottom = self.height;
 		fontSize = opt.fontSize : 12;
 		z = Z_BAR;
+		diagTag = "titlebar";
 		// 按下时捕获鼠标：拖动窗口时鼠标要能移出标题栏
 		capture = true;
 		autoReleaseCapture = false;
 	});
 	self.ctrl = self.board.ctrl;
+
+	// 下拉菜单画板（一次建好，平时隐藏）
+	self.__ensurePopup = function(){
+		if(self.popup) return;
+		self.popup = nodio.ui.board(winform, {
+			left = 0; top = 0; right = 1; bottom = 1;
+			fontSize = 12;
+			capture = true;
+			autoReleaseCapture = false;
+			// transparent：下拉菜单是**浮层**，浮在工具条/左栏之上。
+			// 必须加：plus 控件默认按 z 序绘制，这个画板建得早（z 序靠下），
+			// 会被后面创建的控件整片盖掉 —— 板子在、可见、就是看不见。
+			// WS_EX_TRANSPARENT 让它最后绘制（可见）；
+			// 代价是**命中测试会跳过它**，但菜单打开时已经 SetCapture，
+			// 鼠标事件直接进捕获窗口，绕开了命中测试（可见又可点）。
+			transparent = true;
+			z = Z_POP;
+		});
+		self.popup.onDraw = function(graphics, rc, bd){
+			self.__drawPopup(graphics, rc, bd);
+		}
+		self.popup.onMouseMove = function(x,y,bd){
+			var h = self.__hitPop(x, y);
+			if(h != self.popHover){
+				self.popHover = h;
+				self.popup.invalidate();
+			}
+		}
+		// 按下：命中就执行，没命中就当取消
+		self.popup.onMouseDown = function(x,y,bd){
+			self.popHandled = true;
+			var hit = self.__hitPop(x, y);
+			self.popup.setCapture(false);
+			self.__closeMenu();
+			if(hit){
+				var it = self.popItems[hit];
+				var fn = it[2];
+				if(fn) fn(hit);
+			}
+		}
+		// 抬起：如果这一轮按下没在菜单画板上（按下发生在标题栏），
+		// 就用抬起位置决定选不选菜单项（按下-拖动-松开的用法）
+		self.popup.onMouseUp = function(x,y,bd){
+			if(self.popHandled){ self.popHandled = false; return }
+			var hit = self.__hitPop(x, y);
+			self.popup.setCapture(false);
+			if(hit){
+				self.__closeMenu();
+				var it = self.popItems[hit];
+				var fn = it[2];
+				if(fn) fn(hit);
+			}
+		}
+		self.popup.show(false);
+	}
+
 	self.board.onDraw = function(graphics, rc, bd){
 		self.__draw(graphics, rc, bd);
 	}
@@ -104,6 +162,9 @@ titlebar = function(winform, opt){
 	}
 	self.board.onMouseClick = function(x,y,bd,lp){
 		// 双击标题栏空白处 = 最大化/还原
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG tb.click dbl=" ++ tostring(bd.dblClick) ++ " x=" ++ x ++ " y=" ++ y);
+		}
 		if(!bd.dblClick) return;
 		if(self.__hitBtn(x,y)) return;
 		if(self.__hitMenu(x,y)) return;
@@ -115,12 +176,31 @@ titlebar = function(winform, opt){
 		if(self.hoverMenu && !self.openMenu){ self.hoverMenu = 0; self.board.invalidate() }
 	}
 
+	// ---------- 下拉菜单画板（**必须在这里就建好**）----------
+	//
+	// ⚠ 以前是「点开菜单时才创建」，看着省事，实际有两个致命后果：
+	//   1) 官方 form.add 建出来的控件是**可见**的，而此时窗体已经显示，
+	//      新控件一建出来就立刻收到 WM_PAINT —— 它当时的矩形是 (0,0,200,100)，
+	//      正好压在标题栏左侧，把 logo 和「文件/工程」两个菜单糊掉了；
+	//      之后再把它移到菜单位置，那块被糊掉的标题栏**再也没人重画**，
+	//      于是标题栏左边永远是空的（看上去像「菜单没画出来」）。
+	//   2) 移动控件本身不触发重画，菜单板出现在正确位置却是**一片空白**。
+	// 所以：画板提前建好、提前隐藏、尺寸取 1x1（不挡任何东西），
+	// 打开菜单时再挪位置 + show + redraw。
+	self.__ensurePopup();
+
 	// ---------- 画 ----------
 	self.__draw = function(graphics, rc, bd){
 		var font = bd.font;
 		var fmt = bd.format;
 		var w = rc.right - rc.left;
 		var h = rc.bottom - rc.top;
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			var cb = graphics.getVisibleClipBounds();
+			io.print("DIAG tb.draw rc=" ++ rc.left ++ "," ++ rc.top ++ "," ++ rc.right ++ "," ++ rc.bottom
+				++ " w=" ++ w ++ " h=" ++ h ++ " menus=" ++ #self.menus
+				++ " clip=" ++ cb.left ++ "," ++ cb.top ++ "," ++ cb.right ++ "," ++ cb.bottom);
+		}
 		// 底
 		var bg = ..gdip.solidBrush(th.bg);
 		graphics.fillRect(bg, rc.left, rc.top, w, h);
@@ -146,6 +226,9 @@ titlebar = function(winform, opt){
 			var pad = ..nodio.ui.px(MENU_PAD);
 			var rect = {left=x; right=x + tw + pad*2; top=rc.top; bottom=rc.bottom};
 			self.menuRects[i] = rect;
+			if( ..string.getenv("NODIO_IDE_DIAG") ){
+				io.print("DIAG tb.menu " ++ i ++ " cap=" ++ cap ++ " rect=" ++ rect.left ++ "," ++ rect.top ++ "," ++ rect.right ++ "," ++ rect.bottom);
+			}
 			if(self.openMenu == i || self.hoverMenu == i){
 				var hb = ..gdip.solidBrush(th.hoverBg);
 				graphics.fillRect(hb, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
@@ -163,6 +246,7 @@ titlebar = function(winform, opt){
 		var bw = ..nodio.ui.px(BTN_W);
 		var bx = rc.right - bw*3;
 		self.btnRects = {};
+		self.__btnW = rc.right - rc.left;   // 命中测试据此判断「矩形是不是过期的」
 		var kinds = {"min"; "max"; "close"};
 		for(i=1;3;1){
 			var br = {left=bx + (i-1)*bw; right=bx + i*bw; top=rc.top; bottom=rc.bottom};
@@ -251,6 +335,12 @@ titlebar = function(winform, opt){
 	// 窗口是否最大化（WS_MAXIMIZE = 0x01000000）
 	self.__isMaximized = function(){
 		try{
+			// 官方 win.isZoomed 更准（最大化时窗口矩形会超出屏幕，
+			// 光看 WS_MAXIMIZE 位在某些路径下不可靠）
+			var z = ..win.isZoomed(winform.hwnd);
+			if(z !== null && z !== undefined) return z ? true : false;
+		}catch(e0){}
+		try{
 			var st = ..win.getStyle(winform.hwnd, 0x01000000);
 			return st ? true : false;
 		}catch(e){
@@ -260,9 +350,32 @@ titlebar = function(winform, opt){
 
 	// ---------- 交互 ----------
 	// 命中的窗口按钮（0=没有）
-	self.__hitBtn = function(x, y){
+	//
+	// 按钮矩形是**绘制时**算出来的（self.btnRects）。但绘制可能落后于
+	// 窗口尺寸变化（最大化/还原后画板还没重画）—— 这时矩形是旧的，
+	// 点「最大化」会落到「最小化」上（窗口直接最小化掉，看着像黑屏）。
+	// 所以命中前先按**当前**画板宽度重算一次。
+	self.__btnRects = function(){
+		var rct = self.board.rect;
+		if(!rct) return self.btnRects;
+		var w = rct.right - rct.left;
+		var h = rct.bottom - rct.top;
+		if(!w) return self.btnRects;
+		if(self.__btnW == w) return self.btnRects;
+		self.__btnW = w;
+		var bw = ..nodio.ui.px(BTN_W);
+		var bx = rct.left + w - bw*3;
+		var rects = {};
 		for(i=1;3;1){
-			var r = self.btnRects[i];
+			rects[i] = {left=bx + (i-1)*bw; right=bx + i*bw; top=0; bottom=h};
+		}
+		self.btnRects = rects;
+		return rects;
+	}
+	self.__hitBtn = function(x, y){
+		var rects = self.__btnRects();
+		for(i=1;3;1){
+			var r = rects[i];
 			if(!r) continue;
 			if(x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
 		}
@@ -355,10 +468,19 @@ titlebar = function(winform, opt){
 
 	self.__click = function(x, y, bd, lp){
 		var b = self.__hitBtn(x, y);
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG tb.hit x=" ++ x ++ " y=" ++ y ++ " btn=" ++ b
+				++ " br=" ++ tostring(self.btnRects[1]) ++ "|" ++ tostring(self.btnRects[2])
+				++ "|" ++ tostring(self.btnRects[3]));
+		}
 		if(b){
-			if(b == 1) self.__sysCmd(0xF020);      // SC_MINIMIZE
-			elseif(b == 2) self.__sysCmd(0xF030); // SC_MAXIMIZE
-			else self.__sysCmd(0xF060);            // SC_CLOSE
+			if(b == 1) self.__sysCmd(0xF020);      // 最小化
+			elseif(b == 2){
+				// 最大化/还原**切换**（官方 hitMax 的行为）
+				if(self.__isMaximized()) self.__sysCmd(0xF120);
+				else self.__sysCmd(0xF030);
+			}
+			else self.__sysCmd(0xF060);            // 关闭
 			return;
 		}
 		var m = self.__hitMenu(x, y);
@@ -374,11 +496,45 @@ titlebar = function(winform, opt){
 		self.__beginDrag();
 	}
 
-	// 发 WM_SYSCOMMAND（最小化/最大化/关闭）
+	// 窗口按钮动作。
+	//
+	// ⚠⚠ **不能走 WM_SYSCOMMAND**：官方 win.form 的窗口过程把
+	//   wParam >= 0xF000 的系统命令**直接吞掉**（win/ui/_.aardio:726）：
+	//       if( wParam >= 0xF000 ) {
+	//           if(wParam==0xF020 && this.onMinimize) return this.onMinimize(lParam);
+	//           return;              ← 不调 DefWindowProc
+	//       }
+	//   SC_CLOSE(0xF060) / SC_MAXIMIZE(0xF030) / SC_RESTORE(0xF120) / SC_MINIMIZE
+	//   全部到不了 DefWindowProc —— 表现就是「右上角三个按钮点了没反应」。
+	//   （实测：直接给窗体发 WM_SYSCOMMAND/SC_CLOSE，窗口也不关。）
+	//
+	// 改用 Win32 原生语义：
+	//   最小化 / 最大化 / 还原 → ShowWindow
+	//   关闭                   → WM_CLOSE（走官方 form 自己的关闭流程，
+	//                             有未保存文档时会提示）
 	self.__sysCmd = function(cmd){
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG tb.cmd cmd=" ++ tostring(cmd));
+		}
 		try{
-			::SendMessage(winform.hwnd, 0x112/*_WM_SYSCOMMAND*/, cmd, 0);
+			if(cmd == 0xF020){        // SC_MINIMIZE
+				::User32.ShowWindow(winform.hwnd, 6/*_SW_MINIMIZE*/);
+				return true;
+			}
+			if(cmd == 0xF030){        // SC_MAXIMIZE
+				::User32.ShowWindow(winform.hwnd, 3/*_SW_MAXIMIZE*/);
+				return true;
+			}
+			if(cmd == 0xF120){        // SC_RESTORE
+				::User32.ShowWindow(winform.hwnd, 9/*_SW_RESTORE*/);
+				return true;
+			}
+			if(cmd == 0xF060){        // SC_CLOSE
+				::PostMessage(winform.hwnd, 0x10/*_WM_CLOSE*/, 0, 0);
+				return true;
+			}
 		}catch(e){}
+		return false;
 	}
 
 	// ---------- 下拉菜单 ----------
@@ -415,83 +571,52 @@ titlebar = function(winform, opt){
 		// 别超出窗口右边
 		if(px2 + pw > self.board.rect.right) px2 = self.board.rect.right - pw;
 		self.__ensurePopup();
-		..nodio.ui.setRect(self.popup.ctrl, px2, py, px2 + pw, py + totalH);
-		// 下拉菜单也要在最前（官方 add 是按创建顺序排层次的）
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG tb.open idx=" ++ idx ++ " rect=" ++ r.left ++ "," ++ r.top ++ "," ++ r.right ++ "," ++ r.bottom
+				++ " px2=" ++ px2 ++ " py=" ++ py ++ " pw=" ++ pw ++ " totalH=" ++ totalH);
+		}
+		// 摆位 + 提到最前 + 显示：全部走原生 API。
+		// 官方 ctrl.show 对「窗体 show 之后才创建」的控件不可靠 ——
+		// 会出现「窗口存在、IsWindowVisible 为真、但不绘制」的鬼板
+		// （菜单点得开、板子也在，就是看不见）。
 		try{
-			..win.setPos(self.popup.ctrl.hwnd, px2, py, pw, totalH,
-				0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
+			::User32.SetWindowPos(self.popup.ctrl.hwnd, 0/*_HWND_TOP*/, px2, py, pw, totalH,
+				0x10/*_SWP_NOACTIVATE*/);
+			::User32.ShowWindow(self.popup.ctrl.hwnd, 5/*_SW_SHOW*/);
 		}catch(e2){}
-		self.popup.show(true);
 		self.popRects = {};
 		var yy = py;
 		for(i=1;#items;1){
 			var it3 = items[i];
 			var txt3 = tostring(it3[1] : "");
+			// ⚠ 这里必须用**画板本地坐标**（原点在菜单画板左上角）：
+			//   · 画板绘制时的原点就是自己的客户区原点；
+			//   · 鼠标事件（onMouseDown/onMouseUp）给的也是画板客户区坐标。
+			// 以前存的是**窗体坐标**（px2/py 绝对位置），
+			// 于是 __hitPop 永远命中不了 —— 点菜单项只会把菜单关掉，什么都不发生。
 			if(txt3 == "-"){
-				self.popRects[i] = {left=px2; right=px2+pw; top=yy; bottom=yy+sepH; sep=true};
+				self.popRects[i] = {left=0; right=pw; top=yy-py; bottom=yy-py+sepH; sep=true};
 				yy = yy + sepH;
 			}
 			else{
-				self.popRects[i] = {left=px2; right=px2+pw; top=yy; bottom=yy+itemH};
+				self.popRects[i] = {left=0; right=pw; top=yy-py; bottom=yy-py+itemH};
 				yy = yy + itemH;
 			}
 		}
 		self.popHover = 0;
 		self.popHandled = false;
-		self.popup.invalidate();
-		self.board.invalidate();
-		// 提到最前（画板是主窗体的子窗口，后建的在上）
-		try{ ::SetWindowPos(self.popup.ctrl.hwnd, 0, 0,0,0,0, 0x1|0x2|0x10) }catch(e){}
-		// 捕获鼠标：这样点菜单外面也能收到消息（点外面 = 取消菜单）
+		// 整块失效 + 立刻重画
+		self.popup.redraw();
+		self.board.redraw();
+		// 捕获鼠标：这样点菜单外面也能收到消息（点外面 = 取消菜单）。
+		// ⚠ SetCapture 只有**前台窗口**才能成功拿到鼠标 —— 菜单是浮层，
+		// 靠 WS_EX_TRANSPARENT 保证最后绘制（可见），而 WS_EX_TRANSPARENT
+		// 的窗口命中测试会被跳过（点不到）。两条合起来：
+		//   可见 = WS_EX_TRANSPARENT（永远最后绘制）
+		//   可点 = SetCapture（命中测试被绕过，鼠标直接进捕获窗口）
+		// 所以先把主窗体提成前台，再捕获。
+		try{ ::User32.SetForegroundWindow(winform.hwnd) }catch(e3){}
 		self.popup.setCapture(true);
-	}
-
-	// 下拉菜单画板（一次建好，平时隐藏）
-	self.__ensurePopup = function(){
-		if(self.popup) return;
-		self.popup = nodio.ui.board(winform, {
-			left = 0; top = 0; right = 200; bottom = 100;
-			fontSize = 12;
-			capture = true;
-			autoReleaseCapture = false;
-			z = Z_POP;
-		});
-		self.popup.onDraw = function(graphics, rc, bd){
-			self.__drawPopup(graphics, rc, bd);
-		}
-		self.popup.onMouseMove = function(x,y,bd){
-			var h = self.__hitPop(x, y);
-			if(h != self.popHover){
-				self.popHover = h;
-				self.popup.invalidate();
-			}
-		}
-		// 按下：命中就执行，没命中就当取消
-		self.popup.onMouseDown = function(x,y,bd){
-			self.popHandled = true;
-			var hit = self.__hitPop(x, y);
-			self.popup.setCapture(false);
-			self.__closeMenu();
-			if(hit){
-				var it = self.popItems[hit];
-				var fn = it[2];
-				if(fn) fn(hit);
-			}
-		}
-		// 抬起：如果这一轮按下没在菜单画板上（按下发生在标题栏），
-		// 就用抬起位置决定选不选菜单项（按下-拖动-松开的用法）
-		self.popup.onMouseUp = function(x,y,bd){
-			if(self.popHandled){ self.popHandled = false; return }
-			var hit = self.__hitPop(x, y);
-			self.popup.setCapture(false);
-			if(hit){
-				self.__closeMenu();
-				var it = self.popItems[hit];
-				var fn = it[2];
-				if(fn) fn(hit);
-			}
-		}
-		self.popup.show(false);
 	}
 
 	// 命中的下拉菜单项（0=没有）
@@ -509,6 +634,12 @@ titlebar = function(winform, opt){
 		var fmt = bd.format;
 		var w = rc.right - rc.left;
 		var h = rc.bottom - rc.top;
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			var pcb = graphics.getVisibleClipBounds();
+			io.print("DIAG pop.draw rc=" ++ rc.left ++ "," ++ rc.top ++ "," ++ rc.right ++ "," ++ rc.bottom
+				++ " items=" ++ #self.popRects
+				++ " clip=" ++ pcb.left ++ "," ++ pcb.top ++ "," ++ pcb.right ++ "," ++ pcb.bottom);
+		}
 		var bg = ..gdip.solidBrush(th.panel);
 		graphics.fillRect(bg, rc.left, rc.top, w, h);
 		bg.delete();
@@ -611,18 +742,74 @@ titlebar = function(winform, opt){
 	//   接管会把内容顶出屏幕。
 	// WM_NCHITTEST：标题栏 → HTCAPTION（系统负责拖动/双击/贴边）；
 	//   左右下边缘 → HTLEFT/HTRIGHT/...（保留拖边改大小）。
+	var __wp = null;      // 缓存的新窗口矩形 {x;y;w;h}（屏幕坐标）
 	self.sub = ..nodio.ui.subclass(winform.hwnd, function(hwnd, msg, wp, lp){
+		// 通用窗体消息钩子：宿主（IDE shell）在这里挂窗体级消息处理
+		// （WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE 等）。
+		// 返回非 null = 已处理（拦截，不再往下走）。
+		if(self.onFormMsg){
+			var hr = self.onFormMsg(hwnd, msg, wp, lp);
+			if(hr !== null) return hr;
+		}
+		if(msg == 0xF){            // WM_PAINT
+			// 父窗口重绘会把下拉菜单板擦掉：菜单板是子窗口，
+			// 父窗口 WM_PAINT 走完一遍之后，子窗口原来那点像素不再被保留，
+			// 菜单就变成「开着但看不见」。菜单开着的时候顺手让菜单板重画一次。
+			if(self.openMenu && self.popup){
+				try{ ::InvalidateRect(self.popup.ctrl.hwnd, 0, 0) }catch(e0){}
+			}
+			return null;
+		}
+		if(msg == 0x46){           // WM_WINDOWPOSCHANGING
+			// 缓存**即将生效**的窗口矩形（WM_NCCALCSIZE 要用）。
+			// cx/cy 为 0 = 这次没改尺寸（SWP_NOSIZE），
+			//   这时 x/y 也可能是 0（SWP_NOMOVE）→ 整个忽略，沿用上次的缓存。
+			try{
+				var pr = ..raw.convert(topointer(lp) + 16, ::RECT());
+				var nx = pr.left, ny = pr.top;
+				var nw = pr.right, nh = pr.bottom;
+				if(nw > 0 && nh > 0){
+					// 尺寸没变 → 位置多半也没给（SWP_NOMOVE）→ 沿用缓存位置
+					if(__wp && nw == __wp.w && nh == __wp.h){
+						nx = __wp.x; ny = __wp.y;
+					}
+					__wp = {x=nx; y=ny; w=nw; h=nh};
+				}
+			}catch(e5){}
+			return null;
+		}
 		if(msg == 0x83){            // WM_NCCALCSIZE
-			if(self.__isMaximized()) return null;
+			// ⚠⚠ 客户区必须用「**即将生效**的新窗口矩形」，不能用当前的窗口矩形。
+			//   WM_NCCALCSIZE 是在窗口矩形还没更新的时候发出来的，
+			//   这里调 ::GetWindowRect 拿到的是**旧**矩形。
+			//   还原（SW_RESTORE）时旧矩形还是最大化那次的（屏幕 -10,-10,3850,2170），
+			//   把它写进 lParam → 客户区被钉在屏幕左上角，
+			//   而窗口本身已经挪回 (947,405,2890,1692) → **内容整块跑到窗口外 → 黑屏**。
+			//   （实测：还原后窗口矩形 1943x1287，GetClientRect 却报 3860x2180。）
+			//
+			//   新矩形从 WM_WINDOWPOSCHANGING(0x46) 缓存 —— 它在 WM_NCCALCSIZE **之前**到达，
+			//   lParam 指向 WINDOWPOS，x,y,cx,cy 是偏移 16 起的连续 4 个 int，
+			//   用 ::RECT() 一次读 16 字节正好对上。
 			var r = null;
 			try{ r = ..raw.convert(topointer(lp), ::RECT()) }catch(e){}
 			if(!r) return null;
-			var wr = ..win.getRect(hwnd, true);
-			if(!wr) return null;
-			r.left = wr.left;
-			r.top = wr.top;
-			r.right = wr.right;
-			r.bottom = wr.bottom;
+			var nw = __wp;
+			if(!nw) return null;     // 没有新矩形 → 用系统提议的（不接管）
+			// 最大化时**不接管**：此时系统提议的矩形就是工作区，
+			//   接管会把内容顶出屏幕（自绘标题栏最经典的坑）。
+			// ⚠ 判断必须基于**新**尺寸，不能用当前样式（IsZoomed）：
+			//   最大化/还原过程中 WS_MAXIMIZE 什么时候清掉并不确定，
+			//   用旧状态判断会漏判 → 接管 → 客户区被算成旧尺寸 → 黑屏。
+			var sw = 0, sh = 0;
+			try{
+				sw = ::GetSystemMetrics(0/*_SM_CXSCREEN*/);
+				sh = ::GetSystemMetrics(1/*_SM_CYSCREEN*/);
+			}catch(e4){}
+			if(sw && sh && nw.w >= sw && nw.h >= sh) return null;
+			r.left = nw.x;
+			r.top = nw.y;
+			r.right = nw.x + nw.w;
+			r.bottom = nw.y + nw.h;
 			try{ ..raw.copy(topointer(lp), r) }catch(e2){}
 			return 1;
 		}

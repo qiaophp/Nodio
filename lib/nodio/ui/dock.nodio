@@ -109,7 +109,8 @@ dock = function(winform, opt){
 			tParam.top = tParam.top : cr.top;
 			tParam.right = tParam.right : cr.right;
 			tParam.bottom = tParam.bottom : cr.bottom;
-			tParam.anchors = tParam.anchors : {left=1; top=1; right=1; bottom=1};
+			tParam.autoResize = false;
+			tParam.anchors = null;
 			self.pages[idx].ctrl = ..nodio.ui.addCtrl(self.winform, cname, tParam);
 			self.pages[idx].obj = null;
 		}

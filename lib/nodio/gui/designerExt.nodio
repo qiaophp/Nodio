@@ -1,0 +1,162 @@
+// nodio.gui.designerExt — 把 nodio.gui 控件注册成**设计器组件**。
+//
+// 「组件」不是展厅：nodio.gui 的每个控件都要出现在设计器的工具箱里，
+// 点一下就落到设计画布上，能拖动、改属性、存进 DSG —— 跟原生控件
+// （button / edit / listview …）完全同一条工作流。
+//
+// 落地机制（见 nodio.designer.canvas 的 spec.ctor 约定）：
+//   · registry.register({ name=..; cls="gui.button"; ctor=function(winform,rect){..} })
+//   · ctor 收到**物理像素**矩形，返回门面表
+//       { ctrl = {hwnd=..;show=..;invalidate=..};   ← 画布摆/选/子类化都走它
+//         setProp = function(key,value){..}          ← 属性格回写给 widget 本体
+//         dispose = function(){..} }                 ← 移除时把画板从登记表摘掉
+//   · 每个落下来的组件 = 一块 nodio.ui.board（nodio.gui.host 的宿主板），
+//     widget 铺满板面；DSG 里以 cls="gui.xxx" 序列化，fromDSG 按 cls 找回
+//     注册项重建 —— 与源码往返闭环。
+//
+// 属性四元组 {key; 标签; 类型; 分类}：几何四项（left/top/width/height）
+// 由画布统一处理（applyProps 的几何分支），这里只声明 text/value 等
+// 业务属性。
+namespace nodio.gui{
+import nodio.designer.registry;
+import nodio.ui.board;
+import nodio.ui.dpi;
+import nodio.gui.theme;
+import nodio.gui.style;
+import nodio.gui.ctx;
+import nodio.gui.widget;
+import nodio.gui.button;
+import nodio.gui.check;
+import nodio.gui.label;
+import nodio.gui.input;
+import nodio.gui.panel;
+
+// 建一块「单控件宿主板」：widget 铺满板面，门面表接回设计器。
+var __face = function(winform, t, mkWidget){
+	var host = ..nodio.gui.host(winform, {
+		rect = {left=t.left; top=t.top; right=t.right; bottom=t.bottom};
+	});
+	var wgt = mkWidget();
+	wgt.setRect(0, 0, t.right - t.left, t.bottom - t.top);
+	host.add(wgt);
+	return {
+		ctrl = host.ctrl;
+		widget = wgt;
+		host = host;
+		show = function(flag){
+			try{ host.ctrl.show(flag) }catch(e){}
+		};
+		invalidate = function(){
+			host.invalidate();
+		};
+		setProp = function(key, value){
+			if(key == "text"){
+				wgt.text = value;
+				host.invalidate();
+				return true;
+			}
+			if(key == "placeholder" && (wgt.placeholder !== undefined)){
+				wgt.placeholder = value;
+				host.invalidate();
+				return true;
+			}
+			if(key == "value" && (wgt.value !== undefined)){
+				wgt.value = tonumber(value) : wgt.value;
+				host.invalidate();
+				return true;
+			}
+			if(key == "checked" && (wgt.checked !== undefined)){
+				wgt.checked = value ? true : false;
+				host.invalidate();
+				return true;
+			}
+			return false;
+		};
+		dispose = function(){
+			try{ host.board.dispose() }catch(e){}
+		};
+	};
+}
+
+// 几何四项（所有组件共用）
+var __geom = {
+	{"left";"左边";"number";"位置"};
+	{"top";"上边";"number";"位置"};
+	{"width";"宽度";"number";"位置"};
+	{"height";"高度";"number";"位置"};
+};
+var __withGeom = function(props){
+	var out = {};
+	for(i=1;#props;1){ ..table.push(out, props[i]) }
+	for(i=1;#__geom;1){ ..table.push(out, __geom[i]) }
+	return out;
+}
+
+registerDesignerComponents = function(){
+	// 按钮
+	..nodio.designer.registry.register({
+		name = "按钮 (nodio.gui)";
+		cls = "gui.button";
+		category = "nodio.gui";
+		ctor = function(winform, t){
+			return __face(winform, t, function(){
+				return ..nodio.gui.button({ text = t.text : "按钮" });
+			});
+		};
+		props = __withGeom({ {"text";"标题";"string";"外观"} });
+	});
+	// 标签
+	..nodio.designer.registry.register({
+		name = "标签 (nodio.gui)";
+		cls = "gui.label";
+		category = "nodio.gui";
+		ctor = function(winform, t){
+			return __face(winform, t, function(){
+				return ..nodio.gui.label({ text = t.text : "标签"; role = "textPrimary" });
+			});
+		};
+		props = __withGeom({ {"text";"标题";"string";"外观"} });
+	});
+	// 输入框
+	..nodio.designer.registry.register({
+		name = "输入框 (nodio.gui)";
+		cls = "gui.input";
+		category = "nodio.gui";
+		ctor = function(winform, t){
+			return __face(winform, t, function(){
+				return ..nodio.gui.input({ text = t.text : ""; placeholder = "输入…" });
+			});
+		};
+		props = __withGeom({ {"text";"内容";"string";"外观"}; {"placeholder";"占位";"string";"外观"} });
+	});
+	// 复选框
+	..nodio.designer.registry.register({
+		name = "复选框 (nodio.gui)";
+		cls = "gui.checkbox";
+		category = "nodio.gui";
+		ctor = function(winform, t){
+			return __face(winform, t, function(){
+				return ..nodio.gui.checkbox({ text = t.text : "复选框" });
+			});
+		};
+		props = __withGeom({ {"text";"标题";"string";"外观"}; {"checked";"选中";"bool";"样式"} });
+	});
+	// 进度条
+	..nodio.designer.registry.register({
+		name = "进度条 (nodio.gui)";
+		cls = "gui.progress";
+		category = "nodio.gui";
+		ctor = function(winform, t){
+			return __face(winform, t, function(){
+				return ..nodio.gui.progress({ value = 40 });
+			});
+		};
+		props = __withGeom({ {"value";"进度";"number";"数据"} });
+	});
+	return 5;
+}
+
+// import 本模块即完成注册（shell.nodio import 之后工具箱就能看到）
+registerDesignerComponents();
+
+}
