@@ -13,6 +13,7 @@ add_library(nodio_engine STATIC
     json.cpp
     runtime.cpp
     import.cpp
+    allocstat.cpp
     aardio_chunk.cpp
     aardio_chunk.h
     aardio_vm.cpp

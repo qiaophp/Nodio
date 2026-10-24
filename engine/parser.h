@@ -1344,7 +1344,7 @@ namespace NodioVM
 
         PNode New(Node::K k)   // member: stamps the current token line
         {
-            PNode n = std::make_shared<Node>();
+            PNode n = NewPNode();
             n->k = k;
             n->line = Peek().line;
             return n;

@@ -12,6 +12,10 @@ namespace NodioVM
     vector<Tok> Lex(const wstring& src, wstring* strError)
     {
         vector<Tok> out;
+        // token 数约在源字符数的 1/2 量级（注释不产 token，成员链
+        // a.b.c() 每 2-3 字符 1 token）；按 1/3 预留消灭 vector 倍增
+        // 的整段搬移（普查：>32K 桶 775 次 133MB 全是这 churn）
+        out.reserve(src.size() / 3 + 32);
         size_t i = 0, n = src.size();
         int line = 1;
         bool hadSpace = false;

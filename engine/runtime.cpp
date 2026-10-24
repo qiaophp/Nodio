@@ -8,6 +8,10 @@ thread_local int g_metaDispatchDepth = 0;   // metaProperty dispatch flag
 thread_local std::unordered_set<Table*> g_metaDispatchActive;
 thread_local Value s_currentOwner;
 bool g_nsTrace = false;   // NODIO_NS_TRACE=1 — namespace resolution diagnostics
+// NODIO_BOOT_TRACE 门控的总开关：所有 BootTrace 累积器（语句/求值计时）
+// 都必须先判它再付 QPC——Ident 是最高频求值，无条件计时曾让每条语句
+// 白付 ~60ns（动态初始化在 main 前完成，执行期零环境查询）。
+bool g_bootTrace = GetEnvironmentVariableW(L"NODIO_BOOT_TRACE", nullptr, 0) != 0;
 Interp* Interp::g_self = nullptr;    // M2: self for meta callbacks
 Value Interp::GetCurrentOwner() { return s_currentOwner; }
 void Interp::SetCurrentOwner(const Value& v) { s_currentOwner = v; }
@@ -105,8 +109,16 @@ Value Interp::Eval(const PNode& n, Env* env)
             case Node::Ident:
             {
                 if (n->str == L"..") return Value();  // root marker
-                if (Value* v = env->Find(NameIdOf(n->str, n->nid), n->str))
-                    return *v;
+                Value* v;
+                if (g_bootTrace)   // 计时器全程门控：Ident 是最高频求值，
+                {                  // 无条件 QPC 会让每条语句白付 ~60ns
+                    LARGE_INTEGER bt0; QueryPerformanceCounter(&bt0);
+                    v = env->Find(NameIdOf(n->str, n->nid), n->str);
+                    g_usFind += UsSince(bt0); g_nFind++;
+                }
+                else
+                    v = env->Find(NameIdOf(n->str, n->nid), n->str);
+                if (v) return *v;
                 static auto isBuiltinPrimitive = [](const wstring& name) {
                     return name == L"type" || name == L"call" || name == L"loadcode" ||
                            name == L"loadcodex" || name == L"eval" || name == L"error" ||
@@ -157,6 +169,13 @@ Value Interp::Eval(const PNode& n, Env* env)
                             return im->second;
                     }
                     return Value();
+                }
+                if (g_bootTrace)
+                {
+                    LARGE_INTEGER bt0; QueryPerformanceCounter(&bt0);
+                    Value rM = GetMember(obj, n->str);
+                    g_usMember += UsSince(bt0); g_nMember++;
+                    return rM;
                 }
                 return GetMember(obj, n->str);
             }
@@ -316,6 +335,10 @@ Value Interp::Eval(const PNode& n, Env* env)
             }
             case Node::FuncLit:
             {
+                LARGE_INTEGER bt0 = {};
+                if (g_bootTrace) QueryPerformanceCounter(&bt0);
+                struct BtDone { LARGE_INTEGER t0; ~BtDone() {
+                    if (t0.QuadPart) { g_usFuncLit += UsSince(t0); g_nFuncLit++; } } } bt{ bt0 };
                 Value f;
                 f.t = Value::Func;
                 f.fn = n->a;
@@ -365,6 +388,10 @@ Value Interp::Eval(const PNode& n, Env* env)
             }
             case Node::TableCtor:
             {
+                LARGE_INTEGER bt0 = {};
+                if (g_bootTrace) QueryPerformanceCounter(&bt0);
+                struct BtDone { LARGE_INTEGER t0; ~BtDone() {
+                    if (t0.QuadPart) { g_usTabCtor += UsSince(t0); g_nTabCtor++; } } } bt{ bt0 };
                 auto tb = std::make_shared<Table>();
                 for (size_t i = 0; i + 1 < n->list.size(); i += 2)
                 {
@@ -857,6 +884,10 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             }
             if (f.t == Value::Class)
             {
+                LARGE_INTEGER bt0 = {};
+                if (g_bootTrace) QueryPerformanceCounter(&bt0);
+                struct BtDone { LARGE_INTEGER t0; ~BtDone() {
+                    if (t0.QuadPart) { g_usClassCtor += UsSince(t0); g_nClassCtor++; } } } bt{ bt0 };
                 Value r = InstantiateClass(f, args, owner, true);
                 s_currentOwner = oldOwner;
                 return r;
@@ -1809,6 +1840,10 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             if (f.t == Value::Class)
             {
+                LARGE_INTEGER bt0 = {};
+                if (g_bootTrace) QueryPerformanceCounter(&bt0);
+                struct BtDone { LARGE_INTEGER t0; ~BtDone() {
+                    if (t0.QuadPart) { g_usClassCtor += UsSince(t0); g_nClassCtor++; } } } bt{ bt0 };
                 vector<Value> args = evalCallArgs(n->list);
                 return InstantiateClass(f, args, vThis, bMethod);
             }
@@ -2452,6 +2487,10 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
             // _set hook may run — keep it reachable for the collector
             GcRootScope rs;
             rs.add(v);
+            LARGE_INTEGER bt0 = {};
+            if (g_bootTrace) QueryPerformanceCounter(&bt0);
+            struct BtDone { LARGE_INTEGER t0; ~BtDone() {
+                if (t0.QuadPart) { g_usAssign += UsSince(t0); g_nAssign++; } } } bt{ bt0 };
             Value val = v;
             val.mrets = nullptr;
             if (op == L":=" || op == L"::=")
@@ -2993,6 +3032,64 @@ void Interp::MaybeCollectGC(Env* env)
         return g_curModuleFile.empty();
     }
 
+    // ---- NODIO_BOOT_TRACE: exec-phase hot-path accumulators ----
+    double g_usClassCtor = 0, g_usFuncLit = 0, g_usNsAssign = 0;
+    long g_nClassCtor = 0, g_nFuncLit = 0, g_nNsAssign = 0;
+    double g_usClassDef = 0, g_usNsStmt = 0;
+    long g_nClassDef = 0, g_nNsStmt = 0;
+    double g_usTabCtor = 0, g_usAssign = 0;
+    long g_nTabCtor = 0, g_nAssign = 0;
+    double g_usBind = 0, g_usImport = 0;
+    long g_nBind = 0, g_nImport = 0;
+    double g_usFind = 0;
+    long g_nFind = 0;
+    double g_usMember = 0;
+    long g_nMember = 0;
+    long g_nSlotConv = 0, g_nKeepResize = 0;
+    double g_usStmt[32] = { 0 };
+    long g_nStmt[32] = { 0 };
+    static const wchar_t* StmtKindName(int k)
+    {
+        static const wchar_t* names[] = {
+            L"Num", L"Str", L"Bool", L"Null", L"Ident", L"Member", L"Index",
+            L"Call", L"Bin", L"Un", L"FuncLit", L"TableCtor", L"ExprStmt",
+            L"Assign", L"If", L"While", L"ForNum", L"ForIn", L"Try",
+            L"Return", L"Break", L"Continue", L"VarDecl", L"Import",
+            L"Namespace", L"Class", L"Block", L"With", L"DoWhile" };
+        return (k >= 0 && k < 29) ? names[k] : L"?";
+    }
+    double UsSince(LARGE_INTEGER t0)
+    {
+        LARGE_INTEGER t1, fr;
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&fr);
+        return (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)fr.QuadPart;
+    }
+    void BootDump()
+    {
+        if (GetEnvironmentVariableW(L"NODIO_BOOT_TRACE", nullptr, 0) == 0)
+            return;
+        fwprintf(stderr, L"[BOOT] totals: classCtor=%ld/%.1fms funcLit=%ld/%.1fms nsAssign=%ld/%.1fms classDef=%ld/%.1fms nsStmt=%ld/%.1fms tabCtor=%ld/%.1fms assign=%ld/%.1fms bind=%ld/%.1fms import=%ld/%.1fms find=%ld/%.1fms member=%ld/%.1fms\n",
+                 g_nClassCtor, g_usClassCtor / 1000.0,
+                 g_nFuncLit, g_usFuncLit / 1000.0,
+                 g_nNsAssign, g_usNsAssign / 1000.0,
+                 g_nClassDef, g_usClassDef / 1000.0,
+                 g_nNsStmt, g_usNsStmt / 1000.0,
+                 g_nTabCtor, g_usTabCtor / 1000.0,
+                 g_nAssign, g_usAssign / 1000.0,
+                 g_nBind, g_usBind / 1000.0,
+                 g_nImport, g_usImport / 1000.0,
+                 g_nFind, g_usFind / 1000.0,
+                 g_nMember, g_usMember / 1000.0);
+        fwprintf(stderr, L"[BOOT] slots: conv=%ld keepResize=%ld\n",
+                 g_nSlotConv, g_nKeepResize);
+        for (int k = 0; k < 29; k++)
+            if (g_nStmt[k])
+                fwprintf(stderr, L"[BOOT] stmt %-10s n=%-8ld %.1fms\n",
+                         StmtKindName(k), g_nStmt[k], g_usStmt[k] / 1000.0);
+        fflush(stderr);
+    }
+
 Value Interp::ExecBlock(const PNode& blk, Env* env)
         {
             Value last;
@@ -3050,7 +3147,15 @@ Value Interp::ExecBlock(const PNode& blk, Env* env)
                 // half-evaluated expression is live on the C++ stack here
                 g_gcEpochStack.push_back(++g_gcEpoch);
                 MaybeCollectGC(env);
-                last = Exec(st, env);
+                if (g_bootTrace)
+                {
+                    LARGE_INTEGER bt0; QueryPerformanceCounter(&bt0);
+                    last = Exec(st, env);
+                    int k = (int)st->k; if (k >= 0 && k < 29) {
+                        g_usStmt[k] += UsSince(bt0); g_nStmt[k]++; }
+                }
+                else
+                    last = Exec(st, env);
                 g_gcEpochStack.pop_back();
                 g_gcRoots[lastRoot] = last;
                 if (nBreak || nContinue || nReturn || !err->empty())
@@ -3299,7 +3404,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                         Value item = (k2 < flatVals.size()) ? flatVals[k2] : Value();
                         if (n->names[k2].empty())
                             continue;   // hole slot: consumed a return value
-                        PNode idT = std::make_shared<Node>();
+                        PNode idT = NewPNode();
                         idT->k = Node::Ident;
                         idT->str = n->names[k2];
                         DoAssign(idT, item, env, L"=");
@@ -3437,10 +3542,17 @@ Value Interp::Exec(const PNode& n, Env* env)
                     env->VarAt(id) = val;
                     if (env->bNsBody)
                     {
+                        LARGE_INTEGER bt0 = {};
+                        if (g_bootTrace) QueryPerformanceCounter(&bt0);
                         if (env->nsTable)
                             env->nsTable->map[name] = val;
                         else if (env->modTable)
                             env->modTable->map[name] = val;
+                        if (bt0.QuadPart)
+                        {
+                            g_usNsAssign += UsSince(bt0);
+                            g_nNsAssign++;
+                        }
                     }
                 };
                 // var a = e1, b = e2 — positional init list; all initializers
@@ -3517,6 +3629,10 @@ Value Interp::Exec(const PNode& n, Env* env)
                 return DoImport(n, env);
             case Node::Namespace:
             {
+                LARGE_INTEGER bt0 = {};
+                if (g_bootTrace) QueryPerformanceCounter(&bt0);
+                struct BtDone { LARGE_INTEGER t0; ~BtDone() {
+                    if (t0.QuadPart) { g_usNsStmt += UsSince(t0); g_nNsStmt++; } } } bt{ bt0 };
                 Value ns = NsPath(n->names, env, n->bRoot);
                 if (g_nsTrace)
                 {
@@ -3545,7 +3661,16 @@ Value Interp::Exec(const PNode& n, Env* env)
                 return r;
             }
             case Node::Class:
-                return EvalClass(n, env);
+            {
+                LARGE_INTEGER bt0 = {};
+                if (g_bootTrace) QueryPerformanceCounter(&bt0);
+                Value rC = EvalClass(n, env);
+                if (bt0.QuadPart)
+                {
+                    g_usClassDef += UsSince(bt0); g_nClassDef++;
+                }
+                return rC;
+            }
             case Node::With:
             {
                 // with(expr) body: bare names inside the body READ AND

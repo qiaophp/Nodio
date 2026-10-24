@@ -606,7 +606,7 @@ namespace NodioVM
             if (err) *err = e;
             return nullptr;
         }
-        PNode fn = std::make_shared<Node>();
+        PNode fn = NewPNode();
         fn->k = Node::FuncLit;
         fn->a = blk;
         fn->names.push_back(L"...");
@@ -10586,7 +10586,7 @@ void Interp::InitBuiltins()
                 Value fnGlobalImport = NF([this](vector<Value>& a) -> Value {
                     if (a.empty() || a[0].t != Value::Str)
                         return Value();
-                    PNode n = std::make_shared<Node>();
+                    PNode n = NewPNode();
                     n->k = Node::Import;
                     wstring full = BStr(a[0]);
                     if (full.find(L'\\') != wstring::npos ||
@@ -11312,7 +11312,7 @@ void Interp::InitBuiltins()
                 return Value(); });
             // Preload builtin (VM preloads builtin on startup)
             {
-                PNode nImp = std::make_shared<Node>();
+                PNode nImp = NewPNode();
                 nImp->k = Node::Import;
                 nImp->names = { L"builtin" };
                 DoImport(nImp, &globals);

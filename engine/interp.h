@@ -8,6 +8,38 @@
 namespace NodioVM
 {
     extern bool g_nsTrace;   // runtime.cpp — NODIO_NS_TRACE=1 diagnostics
+    extern bool g_bootTrace; // runtime.cpp — NODIO_BOOT_TRACE=1 总门控（计时器）
+
+    // NODIO_BOOT_TRACE=1 exec-phase accumulators (runtime.cpp), dumped by
+    // BootDump() at normal script exit
+    extern double g_usClassCtor, g_usFuncLit, g_usNsAssign;
+    extern long g_nClassCtor, g_nFuncLit, g_nNsAssign;
+    extern double g_usClassDef, g_usNsStmt;
+    extern long g_nClassDef, g_nNsStmt;
+    extern double g_usTabCtor, g_usAssign;
+    extern long g_nTabCtor, g_nAssign;
+    extern double g_usBind, g_usImport;
+    extern long g_nBind, g_nImport;
+    extern double g_usFind;
+    extern long g_nFind;
+    extern double g_usMember;
+    extern long g_nMember;
+    extern long g_nSlotConv, g_nKeepResize;   // VarAt 槽越界诊断
+    double UsSince(LARGE_INTEGER t0);
+    void BootDump();
+
+    // allocstat.cpp — 全局分配普查（NODIO_ALLOC_TRACE=1 门控）。
+    // AllocPhaseScope 把作用域内的堆分配归到指定阶段（1=parse 2=exec 3=finish）。
+    extern std::atomic<bool> g_allocOn;
+    extern std::atomic<int> g_allocPhase;
+    void AllocStatEnable();
+    void AllocStatDump();
+    struct AllocPhaseScope
+    {
+        int old;
+        AllocPhaseScope(int p);
+        ~AllocPhaseScope();
+    };
 
     // 官方取模语义（docs/language-reference/operator/arithmetic.md §mod）：
     //   a % b == a - ⌊a/b⌋ * b，计算 ⌊a/b⌋ 时**向负无穷大取整**，
@@ -30,7 +62,11 @@ namespace NodioVM
         Env globals;
         // Round 13: the root env is resident for the interp's whole
         // lifetime — store its vars in the intern-id slot table.
-        Interp() { globals.bSlots = true; }
+        Interp()
+        {
+            globals.bSlots = true;
+            globals.bSlotsKeep = true;   // 驻留帧：槽空间不受 kSlotMax 限制
+        }
         int nBreak = 0, nContinue = 0, nReturn = 0;
         Value ret;
         // M2: static self for meta callbacks fired from static helpers

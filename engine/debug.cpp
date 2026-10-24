@@ -48,7 +48,7 @@ namespace NodioVM
 // ---- ExprToNode ----
 PNode Interp::ExprToNode(const Value& v)
         {
-            PNode n = std::make_shared<Node>();
+            PNode n = NewPNode();
             if (v.t == Value::Num) { n->k = Node::Num; n->num = v.n; }
             else if (v.t == Value::Str) { n->k = Node::Str; n->str = v.s; }
             else if (v.t == Value::Bool) { n->k = Node::Bool; n->num = v.b; }

@@ -73,8 +73,50 @@ namespace NodioVM
         nullptr
     };
 
+    struct Env;
+    struct Value;
+
+    // gc.cpp — pooled slot buffers (used by Env::VarAt's overflow fallback;
+    // declarations early because Env's accessors reference them)
+    void GcReleaseSlotBuf(std::vector<Value>&& v);
+    void GcReleaseBoundBuf(std::vector<uint8_t>&& v);
+
+    // VarAt 槽越界诊断计数（runtime.cpp 定义，BootDump 打印）——必须放在
+    // 文件作用域：块作用域 extern 会被 MSVC 绑到全局命名空间（LNK2019）
+    extern long g_nSlotConv;
+    extern long g_nKeepResize;
+
     struct Node;
     using PNode = shared_ptr<Node>;
+
+
+    // ---- PNode 节点池（gc.cpp 实现链表）----
+    // import 普查（allocstat.cpp）：一次 import win.ui 家族 make_shared<Node>
+    // 约 13 万次（256B 桶 27.8MB）。allocate_shared 定制分配器把节点块
+    // （控制块+Node 一体的整块）按尺寸归还 thread_local 空闲链表，命中时
+    // 零堆调用。块级回收——块只在引用归零后入链，被复用时旧 AST 必已死，
+    // 无 arena 的生命周期问题；进程内的 AST 终生存活特性让池命中率先行爬升。
+    void* NodePoolTake(size_t nBytes);
+    void NodePoolGive(void* p, size_t nBytes);
+
+    template <class T>
+    struct NodePoolAlloc
+    {
+        using value_type = T;
+        NodePoolAlloc() = default;
+        template <class U> NodePoolAlloc(const NodePoolAlloc<U>&) {}
+        template <class U> struct rebind { using other = NodePoolAlloc<U>; };
+        T* allocate(size_t n) { return (T*)NodePoolTake(n * sizeof(T)); }
+        void deallocate(T* p, size_t n) { NodePoolGive(p, n * sizeof(T)); }
+        bool operator==(const NodePoolAlloc&) const { return true; }
+        bool operator!=(const NodePoolAlloc&) const { return false; }
+    };
+
+    // 所有 AST 节点的统一创建入口（parser / compiler / builtins / import）
+    inline PNode NewPNode()
+    {
+        return std::allocate_shared<Node>(NodePoolAlloc<Node>{});
+    }
 
     struct Env;
     struct Value;
@@ -1043,6 +1085,9 @@ namespace NodioVM
         // clearVars): they dispatch on bSlots, so a single code path serves
         // both storages and a write can never land in the wrong one.
         bool bSlots = false;
+        // 池化槽帧的槽空间上限（见 VarAt 越界退化）；驻留帧不受限。
+        // sizeof(Value)=328B，512 槽 ≈ 168KB/缓冲，24MB 池预算可容 140 个
+        static constexpr size_t kSlotMax = 512;
         std::vector<Value> slots;
         std::vector<uint8_t> slotBound;
         shared_ptr<Table> nsTable;   // namespace scope: bare names land here
@@ -1075,6 +1120,12 @@ namespace NodioVM
         // skips these frames so method-defined callbacks (win.form's
         // wndproc) still resolve namespace members like `_defaultProc`.
         bool bNsInst = false;
+        // 槽帧保护开关：驻留帧（globals/mainEnv，entry.cpp 与 Interp()
+        // 显式 bSlots=true）槽空间随 intern id 增长是一次性成本，保持槽化；
+        // 池化槽帧（EnvUsePooledSlots）遇到越界 id 时整帧退化回 vars map
+        // （kSlotMax 见 VarAt），避免晚定义函数的调用帧为几个局部变量
+        // 撑起 max-id × sizeof(Value) 的槽向量。
+        bool bSlotsKeep = false;
         // true while executing classBody member initializers
         bool bClassBody = false;
         // true in the ctor body frame: `this.x = v` there is member
@@ -1116,8 +1167,37 @@ namespace NodioVM
                 size_t s = (size_t)id - 1;
                 if (s >= slots.size())
                 {
-                    slots.resize(s + 1);
-                    slotBound.resize(s + 1, 0);
+                    // 池化槽帧越界保护：槽下标 = 进程级 intern id - 1，id
+                    // 随导入的模块线性增长。晚定义函数的调用帧只写几个
+                    // 局部，却要把槽向量撑到 max-id × sizeof(Value)
+                    //（win.ui 家族 ~5 万 id ≈ 4.4MB/帧），池预算只够缓存
+                    // 个位数大缓冲，之后每帧重新 malloc+resize+清零——
+                    // 普查 175 次 × ~400KB 全源于此。非驻留帧遇到越界
+                    // id 时把已有槽位搬回 vars map、整帧退化为 map 模式
+                    //（一次性 O(本帧变量数)），槽向量保持小而可池化。
+                    if (!bSlotsKeep && s >= kSlotMax)
+                    {
+                        g_nSlotConv++;   // 诊断计数（BootDump 打印）
+                        // 整帧退化为 map：已写入的槽位必须搬走（否则
+                        // FindInSelf 落到 parent 链，局部变量凭空丢失），
+                        // 一次性 O(本帧变量数)；槽缓冲归还池。
+                        for (size_t i = 0; i < slots.size(); i++)
+                            if (slotBound[i])
+                                vars[(uint32_t)(i + 1)] = std::move(slots[i]);
+                        GcReleaseBoundBuf(std::move(slotBound));
+                        GcReleaseSlotBuf(std::move(slots));
+                        bSlots = false;
+                        return vars[id];
+                    }
+                    // 几何增长：intern id 进程级递增，每导入一个新模块
+                    // max-id 就抬升；若逐次 +1 扩张，每次都要 realloc 拷贝
+                    // 整段旧槽 + 清零尾部（普查：import 一次 175 次 ×
+                    // ~400KB）。几何步长让容量内的后续 +1 写退化为 O(1)。
+                    if (bSlotsKeep) g_nKeepResize++;
+                    size_t ns = slots.size() ? slots.size() * 2 : 64;
+                    if (ns < s + 1) ns = s + 1;
+                    slots.resize(ns);
+                    slotBound.resize(ns, 0);
                 }
                 slotBound[s] = 1;
                 return slots[s];

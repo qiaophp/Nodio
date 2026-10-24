@@ -8,6 +8,20 @@
 namespace NodioVM
 {
     extern bool g_nsTrace;
+    // NODIO_BOOT_TRACE=1: per-module load phase timing (read/parse/exec)
+    static bool BootTraceOn()
+    {
+        static bool b = GetEnvironmentVariableW(L"NODIO_BOOT_TRACE", nullptr, 0) != 0;
+        return b;
+    }
+    struct BootTimer
+    {
+        LARGE_INTEGER t0; double* dst;
+        BootTimer(double* d) : dst(d) { QueryPerformanceCounter(&t0); }
+        ~BootTimer() { LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+            LARGE_INTEGER fr; QueryPerformanceFrequency(&fr);
+            *dst += (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)fr.QuadPart; }
+    };
     static std::wstring GetExecutableDir()
     {
         wchar_t szPath[MAX_PATH] = L"";
@@ -133,6 +147,9 @@ bool Interp::ResolveModulePath(const vector<wstring>& names, wstring* outFile) c
 // ---- BindModule ----
 Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
         {
+            LARGE_INTEGER bt0; QueryPerformanceCounter(&bt0);
+            struct BtDone { LARGE_INTEGER t0; ~BtDone() {
+                g_usBind += UsSince(t0); g_nBind++; } } bt{ bt0 };
             static bool bDbg = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
             if (bDbg)
             {
@@ -336,7 +353,7 @@ Value Interp::RunAardioChunkModule(const std::string& raw,
         for (size_t i = 0; i < a.size(); i++)
             if (a[i].t == Value::TableT && a[i].tab) { target = a[i].tab; break; }
         // 交给 Nodio 的导入机制（走标准库解析 / 命名空间绑定）
-        PNode imp = std::make_shared<Node>();
+        PNode imp = NewPNode();
         imp->k = Node::Import;
         imp->names = segs;
         Value mod = self->DoImport(imp, self->globals.self.get());
@@ -379,7 +396,7 @@ Value Interp::RunAardioChunkModule(const std::string& raw,
             pos = dot + 1;
         }
         if (segs.empty()) return false;
-        PNode imp = std::make_shared<Node>();
+        PNode imp = NewPNode();
         imp->k = Node::Import;
         imp->names = segs;
         Value mod = self->DoImport(imp, self->globals.self.get());
@@ -491,6 +508,9 @@ Value Interp::RunAardioChunkModule(const std::string& raw,
 // ---- DoImport ----
 Value Interp::DoImport(const PNode& n, Env* env)
         {
+            LARGE_INTEGER bt0; QueryPerformanceCounter(&bt0);
+            struct BtDone { LARGE_INTEGER t0; ~BtDone() {
+                g_usImport += UsSince(t0); g_nImport++; } } bt{ bt0 };
             (void)env;
             // global lib root — enabled via NODIO_LIBDIR or configuration;
             // resolution order: overlay lib dir (D:\Nodio\lib) first, then strLibDir
@@ -823,7 +843,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 else
                 {
                     vector<Tok> toks = Lex(src, &modErr);
-                    Parser ps{ toks, 0, &modErr };
+                    Parser ps{ std::move(toks), 0, &modErr };
                     ps.strEmbedBase = baseDir;
                     ps.strEmbedRoot = EmbedRoot();
                     prog = ps.ParseBlock();
@@ -1009,8 +1029,11 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 return Value();
             }
             std::string raw;
+            double nUsRead = 0, nUsParse = 0, nUsExec = 0;
+            AllocPhaseScope apReadParse(1);
             {
-                char buf[4096];
+                BootTimer tr(&nUsRead);
+                char buf[65536];
                 size_t rd;
                 while ((rd = fread(buf, 1, sizeof(buf), pf)) > 0)
                     raw.append(buf, rd);
@@ -1062,8 +1085,9 @@ Value Interp::DoImport(const PNode& n, Env* env)
             }
             else
             {
+                BootTimer tp(&nUsParse);
                 vector<Tok> toks = Lex(src, &modErr);
-                Parser ps{ toks, 0, &modErr };
+                Parser ps{ std::move(toks), 0, &modErr };
                 {
                     size_t sl = file.find_last_of(L"\\/");
                     ps.strEmbedBase = (sl == wstring::npos) ? wstring()
@@ -1073,6 +1097,9 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 prog = ps.ParseBlock();
                 AnnotateNameIds(prog);
             }
+            if (BootTraceOn())
+                fwprintf(stderr, L"[BOOT] parse %s read=%.0fus lex+parse=%.0fus bytes=%zu\n",
+                         file.c_str(), nUsRead, nUsParse, raw.size());
             if (!modErr.empty() || !prog)
             {
                 (*err) = L"库 " + file + L" 编译失败: " + modErr;
@@ -1174,10 +1201,19 @@ Value Interp::DoImport(const PNode& n, Env* env)
             nReturn = nBreak = nContinue = 0;
             ret = Value();
             GcFrameScope fsMod(*this, modEnv);
-            ExecBlock(prog, modEnv.get());
+            {
+                AllocPhaseScope apExec(2);
+                BootTimer te(&nUsExec);
+                ExecBlock(prog, modEnv.get());
+            }
+            if (BootTraceOn())
+                fwprintf(stderr, L"[BOOT] exec  %s exec=%.0fus\n", file.c_str(), nUsExec);
             bool bTopReturn = (nReturn != 0);
-            for (auto& kv : modEnv->vars)
-                placeholder->scopeVars[NameOf(kv.first)] = kv.second;
+            {
+                AllocPhaseScope apFin(3);
+                for (auto& kv : modEnv->vars)
+                    placeholder->scopeVars[NameOf(kv.first)] = kv.second;
+            }
             g_curModuleFile = oldModFile;
             Value mod = ret;
             nReturn = oldR; nBreak = oldB; nContinue = oldC;

@@ -294,7 +294,7 @@ namespace NodioVM
             return nullptr;
         }
 
-        auto n = std::make_shared<Node>();
+        auto n = NewPNode();
         n->k = (Node::K)k;
 
         uint8_t flags = 0;

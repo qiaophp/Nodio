@@ -149,6 +149,61 @@ namespace NodioVM
         if (!t_envBufs) t_envBufs = new EnvBufPool();
         return *t_envBufs;
     }
+
+    // ---- PNode 节点池自由链表（common.h NodePoolAlloc 的后端）----
+    // 链上只放单一尺寸的块：尺寸切换时把旧链整条还堆（尺寸切换实际不发生，
+    // allocate_shared<Node> 的块尺寸进程内恒定）。块数上限防病态驻留。
+    struct NodePoolBlock
+    {
+        NodePoolBlock* next;
+        size_t nBytes;
+    };
+    static thread_local NodePoolBlock* t_nodeFree = nullptr;
+    static thread_local size_t t_nodeFreeN = 0;
+    static thread_local size_t t_nodeFreeSize = 0;
+    static constexpr size_t kNodePoolMaxBlocks = 100000;   // ≈23MB 上限，与槽池预算同量级
+
+    void* NodePoolTake(size_t nBytes)
+    {
+        if (t_nodeFree && t_nodeFreeSize == nBytes)
+        {
+            NodePoolBlock* b = t_nodeFree;
+            t_nodeFree = b->next;
+            t_nodeFreeN--;
+            return b;
+        }
+        return malloc(nBytes);
+    }
+
+    void NodePoolGive(void* p, size_t nBytes)
+    {
+        if (!p) return;
+        if (t_nodeFreeSize != nBytes)
+        {
+            NodePoolBlock* b = t_nodeFree;
+            while (b)
+            {
+                NodePoolBlock* nx = b->next;
+                free(b);
+                b = nx;
+            }
+            t_nodeFree = nullptr;
+            t_nodeFreeN = 0;
+            t_nodeFreeSize = nBytes;
+        }
+        if (t_nodeFreeN < kNodePoolMaxBlocks)
+        {
+            NodePoolBlock* b = (NodePoolBlock*)p;
+            b->next = t_nodeFree;
+            t_nodeFree = b;
+            t_nodeFreeN++;
+        }
+        else
+        {
+            free(p);
+        }
+    }
+
     std::vector<Value> GcAcquireSlotBuf()
     {
         EnvBufPool& p = EnvBufs();

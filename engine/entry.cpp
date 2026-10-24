@@ -281,6 +281,7 @@ namespace NodioVM
         mainEnv->parent = it.globals.self;
         // Round 13: the main-script frame is resident too — slot it.
         mainEnv->bSlots = true;
+        mainEnv->bSlotsKeep = true;   // 驻留帧：槽空间不受 kSlotMax 限制
         // S-2: the main script owns its own file — a runtime error in it
         // reports "<script>:<line>" instead of a bare line number.
         if (pScriptFile && !pScriptFile->empty())
@@ -308,6 +309,7 @@ namespace NodioVM
         {
             localErr = L"运行错误: 未知 C++ 异常";
         }
+        NodioVM::BootDump();
         if (!localErr.empty())
         {
             // S-2: the top-level report point.  It appends the location

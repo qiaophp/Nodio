@@ -33,6 +33,7 @@
 #include <commctrl.h>
 #pragma comment(lib, "comctl32.lib")
 #include "engine/common.h"
+#include "engine/interp.h"
 #include "engine/NodioVM.h"
 #include "engine/aardio_chunk.h"
 #include "engine/aardio_vm.h"
@@ -151,6 +152,12 @@ int wmain(int argc, wchar_t** argv)
 {
     INITCOMMONCONTROLSEX icc = { sizeof(INITCOMMONCONTROLSEX), ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES | ICC_COOL_CLASSES };
     InitCommonControlsEx(&icc);
+
+    // 分配普查开关（allocstat.cpp）：NODIO_ALLOC_TRACE 或 NODIO_BOOT_TRACE
+    // 任一置位即打开全局 new/delete 计数，进程退出时 BootDump 打印。
+    if (GetEnvironmentVariableW(L"NODIO_ALLOC_TRACE", nullptr, 0) != 0 ||
+        GetEnvironmentVariableW(L"NODIO_BOOT_TRACE", nullptr, 0) != 0)
+        NodioVM::AllocStatEnable();
 
     // NODIO_CHECK=<listfile>: parse-only sweep for coverage measurement.
     // The list file holds one script path per line; each is lexed and
