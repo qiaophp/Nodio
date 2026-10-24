@@ -1,0 +1,82 @@
+// tests/reg_hover.aardio — 编辑器**悬停提示（hover）**回归用例。
+//
+// 覆盖：
+//   1. 鼠标停在单词上 → 组件算出 (line, col) 并回调 IDE 的 onHover
+//   2. 回调返回文本 → 浮层打开、内容正确
+//   3. markdown 标记（**名字**）被剥掉
+//   4. 移到空白处 → 不回调
+//   5. hideHover 能收掉浮层
+//
+// ⚠ 走的是组件自己的 __askHover(x, y)（= 真实鼠标路径 WM_MOUSEMOVE →
+//   350ms 定时器 → __askHover 的同一条链），只是不依赖真实鼠标。
+import win.ui;
+import nodio.ui.editor;
+
+var f = win.form(text="hover regression";right=1000;bottom=600);
+f.add({
+	ed={cls="richedit";left=80;top=40;right=900;bottom=540;multiline=true;vscroll=true}
+});
+f.show();
+..win.delay(300);
+
+var ed = nodio.ui.editor(f, {ctrl=f.ed; fontSize=11});
+ed.layout(80, 40, 900, 540);
+..win.delay(300);
+
+var fails = 0;
+var log = '';
+var step = function(s){
+	log = log ++ s ++ '\r\n';
+	..string.save('D:/Nodio/build-x64/Release/reg_hover.log', log);
+	io.print(s);
+};
+var expect = function(tag, got, want){
+	var ok = (got == want);
+	if(!ok) fails = fails + 1;
+	step((ok ? "PASS " : "FAIL ") ++ tag ++ " got=[" ++ tostring(got) ++ "] want=[" ++ tostring(want) ++ "]");
+};
+
+// 记录被问到的位置
+var asked = {};
+ed.onHover = function(line, col){
+	asked.line = line;
+	asked.col = col;
+	// ⚠ aardio 双引号是**原样串**：换行要用单引号 '\n'，
+	//   写成 "\n" 插进去的是字面的反斜杠 n（会当成一整行）。
+	return "**" ++ "myFunc" ++ "**" ++ '  \n*' ++ "function" ++ "*";
+};
+
+ed.setText('var myFunc = 1\r\n\r\nmyFunc();\r\n\r\n  ;\r\n');
+..win.delay(400);
+
+// 第 1 行 "var myFunc = 1" 里 myFunc 的起始字符位置（1-based）：
+//   v(1)a(2)r(3) (4)m(5) → myFunc 从第 5 个字符开始
+var pos = ed.__lineStart(1) + 4;        // 第 5 个字符（1-based）
+var p = ed.__posOf(pos - 1);            // EM_POSFROMCHAR(0-based)
+var x = (p & 0xFFFF) + 3;               // 落在单词中间
+var y = (p >> 16) & 0xFFFF;
+step("probe-pos line=" ++ tostring(asked.line) ++ " x=" ++ tostring(x) ++ " y=" ++ tostring(y));
+
+ed.__askHover(x, y);
+expect("T1-回调行号", asked.line, 1);
+expect("T1-回调列号", asked.col, 5);
+expect("T2-浮层已打开", ed.hoverOpen, true);
+expect("T2-浮层行数", #ed.hoverRows, 2);
+expect("T3-去掉markdown-第1行", ed.hoverRows[1], "myFunc");
+expect("T3-去掉markdown-第2行", ed.hoverRows[2], "function");
+
+// 移到没有标识符的位置（第 5 行 "  ;" 的分号）→ 不该问
+asked.line = null;
+var pos3 = ed.__lineStart(5) + 2;       // "  ;" 的第 3 个字符（分号）
+var p3 = ed.__posOf(pos3 - 1);
+var hx = (p3 & 0xFFFF) + 1;
+var hy = (p3 >> 16) & 0xFFFF;
+ed.__askHover(hx, hy);
+expect("T4-空白处不回调", asked.line, null);
+
+ed.hideHover();
+expect("T5-浮层已收起", ed.hoverOpen, false);
+
+step(fails == 0 ? "REG-HOVER-OK" : ("REG-HOVER-FAIL fails=" ++ tostring(fails)));
+..win.delay(200);
+f.close();

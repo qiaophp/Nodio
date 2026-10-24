@@ -1,7 +1,7 @@
-# Nodio standalone single EXE publisher regression lock
+﻿# Nodio standalone single EXE publisher regression lock
 $ErrorActionPreference = 'Stop'
 
-$nodioExe = "C:\Users\QQ\AppData\Local\Temp\nr26\build-x64\Release\nodio.exe"
+$nodioExe = "D:\Nodio\build-x64\Release\nodio.exe"
 if (-not (Test-Path $nodioExe)) {
     Write-Error "nodio.exe not found at $nodioExe"
 }
@@ -18,7 +18,7 @@ console.log("SUBSTR:" ++ sub);
 console.log("STANDALONE_RUN_OK");
 '@
 
-$fixtureDir = Join-Path (Get-Location) "tests\fixtures_dist"
+$fixtureDir = Join-Path $PSScriptRoot "fixtures_dist"
 if (-not (Test-Path $fixtureDir)) {
     New-Item -ItemType Directory -Path $fixtureDir | Out-Null
 }

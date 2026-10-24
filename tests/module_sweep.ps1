@@ -1,4 +1,4 @@
-# Behavioral import coverage for every public official-library module.
+﻿# Behavioral import coverage for every public official-library module.
 # PowerShell port of tests/sweep_all.py with:
 #   - a longer per-module timeout
 #   - captured first-error text, so the log can be grouped into defect clusters

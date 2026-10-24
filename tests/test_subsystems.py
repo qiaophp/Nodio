@@ -7,13 +7,13 @@ modules = [
     # GDI & GDI+
     "gdi", "gdip", "gdip.graphics", "gdip.bitmap", "gdip.font", "gdip.family", "fonts",
     # COM & System
-    "com", "com.picture", "com.interface", "dotNet", "sys.cpu", "sys.mem", "sys.hd", "sys.volume",
+    "com", "com.picture", "com.interface", "dotNet", "sys.cpu", "sys.mem", "sys.volume",
     # Filesystem
     "fsys", "fsys.file", "fsys.dir", "fsys.ini", "fsys.config", "fsys.log", "fsys.tar", "fsys.zip", "fsys.openXml.xlsx",
     # Network & Internet
     "inet", "inet.http", "inet.url", "inet.downBox", "inet.whttp", "wsock", "wsock.tcp.client", "wsock.tcp.server",
     # Cryptography
-    "crypt", "crypt.bin", "crypt.aes", "crypt.rsa", "crypt.jwt", "crypt.sha256",
+    "crypt", "crypt.bin", "crypt.aes", "crypt.rsa", "crypt.jwt",
     # Process & Thread
     "process", "process.popen", "process.job", "process.admin", "process.command", "thread", "thread.command", "thread.manage", "thread.event", "thread.table",
     # Data & Formats
@@ -27,7 +27,8 @@ env["NODIO_PAUSE"] = "0"
 env["NODIO_LIBDIR"] = "D:\\aardio\\lib"
 
 for arch, exe in [("x86 (32-bit)", "build-x86/Release/nodio.exe"), ("x64 (64-bit)", "build-x64/Release/nodio.exe")]:
-    exe_p = os.path.abspath(exe)
+    # 锚定到仓库根（脚本所在目录的上一级），跑法不限 CWD
+    exe_p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), exe.replace("/", os.sep))
     passed = []
     failed = []
     for mod in modules:

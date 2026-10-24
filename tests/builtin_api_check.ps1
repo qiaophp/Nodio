@@ -1,4 +1,4 @@
-# 官方内建 API 契约回归（第二十三轮补齐的那批）
+﻿# 官方内建 API 契约回归（第二十三轮补齐的那批）
 #
 # 覆盖官方 lib/builtin/*.aardio 的 intellisense 声明里、而 Nodio 此前缺失的
 # 引擎原生函数，以及本轮修正的运算符/多返回值语义：
@@ -20,7 +20,7 @@
 #   D:\aardio\docs\language-reference\operator\arithmetic.md:46  （% 的 floor 语义）
 #
 # 用法: powershell -File builtin_api_check.ps1 [-Exe <nodio.exe>]
-param($Exe = 'C:\Users\QQ\AppData\Local\Temp\nr26\build-x64\Release\nodio.exe',
+param($Exe = 'D:\Nodio\build-x64\Release\nodio.exe',
       [string]$LibDir = 'D:\aardio\lib',
       [string]$OverlayDir = 'D:\Nodio\lib')
 $ErrorActionPreference = 'Stop'

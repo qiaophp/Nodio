@@ -1,4 +1,4 @@
-# string.markdown x64 补版回归 —— 锁住「按官方同名路径补 Nodio 自己实现」这一批
+﻿# string.markdown x64 补版回归 —— 锁住「按官方同名路径补 Nodio 自己实现」这一批
 #
 # 官方 lib/string/markdown/_.aardio 把 32 位 sundown.dll 用 $"..." 内嵌进源码
 # 再内存加载，x64 进程装不下该 PE（实测「无法加载 DLL: (内嵌的内存映像)」）。
@@ -32,7 +32,8 @@ if (-not (Test-Path $Exe)) { "EXE NOT FOUND: $Exe"; exit 2 }
 
 $repoRoot   = Split-Path $PSScriptRoot -Parent
 $overlayDir = Join-Path $repoRoot 'lib\string\markdown'
-$overlayMod = Join-Path $overlayDir '_.aardio'
+# overlay 模块已迁移为 .nodio 扩展名（.aardio 保留兜底，旧检出兼容）
+$overlayMod = if (Test-Path (Join-Path $overlayDir '_.nodio')) { Join-Path $overlayDir '_.nodio' } else { Join-Path $overlayDir '_.aardio' }
 $overlaySrc = Join-Path $overlayDir '.res\markdown64.c'
 $overlayDll = Join-Path $overlayDir '.res\markdown64.dll'
 
@@ -536,7 +537,7 @@ $libPath = ''
 foreach ($ln in ($r4.out -split "`r?`n")) {
     if ($ln -match '^LIBPATH\s+(.*?)\s*$') { $libPath = $Matches[1] }
 }
-$expectOverlay = Join-Path $overlayDir '_.aardio'
+$expectOverlay = $overlayMod
 if ($isX64) {
     Check 'x64 命中 Nodio overlay' $expectOverlay $libPath
 }

@@ -1,0 +1,92 @@
+// probe_propgrid.aardio — 属性格分组带的自检探针。
+//
+// 验证：
+//   ① registry.categoryOf 的分类映射
+//   ② 显示行表（分组带 + 属性行）的结构
+//   ③ 折叠/展开后行数变化
+//   ④ 就地编辑的编辑框落在**显示行**上（不是属性序号）
+//
+// 用法：NODIO_RUN=...probe_propgrid.aardio nodio.exe
+import win.ui;
+import nodio.designer.registry;
+import nodio.designer.propertyGrid;
+
+io.print("== 分类映射 ==");
+io.print("CAT text=" ++ nodio.designer.registry.categoryOf("text"));
+io.print("CAT left=" ++ nodio.designer.registry.categoryOf("left"));
+io.print("CAT checked=" ++ nodio.designer.registry.categoryOf("checked"));
+io.print("CAT items=" ++ nodio.designer.registry.categoryOf("items"));
+io.print("CAT zzz=" ++ nodio.designer.registry.categoryOf("zzz"));
+
+var frm = win.ui.form();
+frm.text = "probe";
+frm.width = 300;
+frm.height = 260;
+
+var pg = nodio.designer.propertyGrid(frm, {left=0;top=0;right=260;bottom=240});
+
+pg.setItems({
+	{key="text";   name="标题"; value="按钮"; type="string"; cat="外观"};
+	{key="left";   name="左边"; value="40";   type="number"; cat="位置"};
+	{key="top";    name="上边"; value="40";   type="number"; cat="位置"};
+	{key="width";  name="宽度"; value="120";  type="number"; cat="位置"};
+	{key="height"; name="高度"; value="30";   type="number"; cat="位置"};
+});
+
+io.print("== 显示行表 ==");
+io.print("ROWS=" ++ #pg.rows);
+for(i=1;#pg.rows;1){
+	var r = pg.rows[i];
+	io.print("ROW " ++ i ++ " type=" ++ r.type ++ " cat=" ++ r.cat
+		++ " index=" ++ (r.index === null ? "-" : r.index));
+}
+
+io.print("== 折叠「位置」 ==");
+pg.collapseCategory("位置");
+io.print("COLLAPSED=" ++ tostring(pg.isCollapsed("位置")));
+io.print("ROWS=" ++ #pg.rows);
+for(i=1;#pg.rows;1){
+	var r = pg.rows[i];
+	io.print("ROW " ++ i ++ " type=" ++ r.type ++ " cat=" ++ r.cat
+		++ " index=" ++ (r.index === null ? "-" : r.index));
+}
+
+io.print("== 展开「位置」 ==");
+pg.collapseCategory("位置", false);
+io.print("ROWS=" ++ #pg.rows);
+
+io.print("== 点属性行的值列应该落编辑框 ==");
+// 找属性序号 3（上边）对应的**显示行**（跟分类顺序无关）
+var dispRow = 0;
+for(i=1;#pg.rows;1){
+	if(pg.rows[i].type == "item" && pg.rows[i].index == 3){ dispRow = i; break }
+}
+io.print("DISPROW=" ++ tostring(dispRow));
+if(!dispRow){ io.print("PROPGRID-FAIL: 找不到属性序号 3 的显示行"); return }
+pg.__click(200, pg.rowH * dispRow);
+io.print("EDITINDEX=" ++ tostring(pg.editIndex));
+if(pg.editIndex != 3){
+	io.print("PROPGRID-FAIL: 编辑框落在属性序号 " ++ tostring(pg.editIndex) ++ "，应为 3");
+	return;
+}
+// 编辑框的 y 必须落在**显示行**上（用属性序号算 y 会落到别的行 —— 分组带夹在中间）
+var br = pg.__boardRect();
+var er = ..win.getRect(pg.editCtrl.hwnd);
+io.print("BOARD-TOP=" ++ tostring(br.top));
+io.print("EDIT-TOP=" ++ tostring(er.top));
+var wantTop = br.top + pg.rowH * dispRow;
+io.print("WANT-TOP=" ++ tostring(wantTop));
+if(math.abs(er.top - wantTop) > 2){
+	io.print("PROPGRID-FAIL: 编辑框 y=" ++ tostring(er.top)
+		++ "，显示行 " ++ tostring(dispRow) ++ " 应在 y=" ++ tostring(wantTop));
+	return;
+}
+
+io.print("== 点第 1 行（分组带）应该折叠 ==");
+pg.__click(20, pg.rowH * 1);
+io.print("COLLAPSED-FIRST=" ++ tostring(pg.isCollapsed(pg.rows[1].cat)));
+if(!pg.isCollapsed(pg.rows[1].cat)){
+	io.print("PROPGRID-FAIL: 点分组带没有折叠");
+	return;
+}
+io.print("PROPGRID-OK");

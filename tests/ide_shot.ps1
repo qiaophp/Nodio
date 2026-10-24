@@ -38,6 +38,9 @@ public class Win32Shot {
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+    [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder sb, int max);
     public delegate bool EnumProc(IntPtr h, IntPtr l);
 
     // 进程里最大的可见顶层窗口 —— MainWindowHandle 偶尔会抓到
@@ -47,6 +50,9 @@ public class Win32Shot {
         EnumWindows((h, l) => {
             uint pid; GetWindowThreadProcessId(h, out pid);
             if (pid != want || !IsWindowVisible(h)) return true;
+            System.Text.StringBuilder cls = new System.Text.StringBuilder(256);
+            GetClassName(h, cls, 256);
+            if (cls.ToString() == "ConsoleWindowClass") return true;
             RECT r; if (!GetWindowRect(h, out r)) return true;
             long a = (long)(r.Right - r.Left) * (r.Bottom - r.Top);
             if (a > bestArea) { bestArea = a; best = h; }
@@ -60,7 +66,7 @@ public class Win32Shot {
 $stdoutFile = [IO.Path]::GetTempFileName()
 $stderrFile = [IO.Path]::GetTempFileName()
 $env:NODIO_IDE_DIAG = '1'
-$p = Start-Process -FilePath $exe -PassThru -NoNewWindow -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+$p = Start-Process -FilePath $exe -WorkingDirectory 'D:\Nodio' -PassThru -WindowStyle Normal -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
 $hwnd = [IntPtr]::Zero
 $deadline = (Get-Date).AddSeconds(20)
 while ((Get-Date) -lt $deadline) {
@@ -69,14 +75,46 @@ while ((Get-Date) -lt $deadline) {
     if ($p.HasExited) { Write-Output "FAIL: process exited early (code $($p.ExitCode))"; exit 1 }
     # 取进程里最大的可见顶层窗口（MainWindowHandle 偶尔会抓到 tooltip 小窗口）
     $hwnd = [Win32Shot]::BiggestWindow([uint32]$p.Id)
-    if ($hwnd -ne [IntPtr]::Zero) { break }
+    if ($hwnd -ne [IntPtr]::Zero) {
+        # ⚠ 窗体**刚建好时还没布局**：矩形可能只有 158x26 且停在屏幕外
+        #   （aardio 的窗体在 show() 之前就是这个样子）。
+        #   那时候抓图只会拍到一块空白 —— 必须等窗口真的摆好了再抓。
+        $r0 = New-Object Win32Shot+RECT
+        [void][Win32Shot]::GetWindowRect($hwnd, [ref]$r0)
+        if (($r0.Right - $r0.Left) -ge 400 -and ($r0.Bottom - $r0.Top) -ge 300) { break }
+    }
 }
 if ($hwnd -eq [IntPtr]::Zero) { try { $p.Kill() } catch {}; Write-Output 'FAIL: no main window'; exit 1 }
 
-[void][Win32Shot]::ShowWindow($hwnd, 9)   # SW_RESTORE
+$clsBuf = New-Object System.Text.StringBuilder 256
+[void][Win32Shot]::GetClassName($hwnd, $clsBuf, 256)
+$rInit = New-Object Win32Shot+RECT
+[void][Win32Shot]::GetWindowRect($hwnd, [ref]$rInit)
+Write-Output "DEBUG-WINDOW: HWND=$($hwnd.ToInt64().ToString('X')) CLS=$clsBuf RECT=$($rInit.Left),$($rInit.Top),$($rInit.Right),$($rInit.Bottom) ($($rInit.Right-$rInit.Left)x$($rInit.Bottom-$rInit.Top)) iconic=$([Win32Shot]::IsIconic($hwnd)) zoomed=$([Win32Shot]::IsZoomed($hwnd))"
+
+if ([Win32Shot]::IsIconic($hwnd)) {
+    [void][Win32Shot]::ShowWindow($hwnd, 9)   # SW_RESTORE
+    [void][Win32Shot]::ShowWindow($hwnd, 3)   # SW_MAXIMIZE
+}
 [void][Win32Shot]::BringWindowToTop($hwnd)
 [void][Win32Shot]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0040) # HWND_TOPMOST|NOMOVE|NOSIZE|SHOWWINDOW
 [void][Win32Shot]::SetForegroundWindow($hwnd)
+
+# ⚠ SW_RESTORE 之后窗体还要走一遍 WM_SIZE → shell.layout（自绘层的重排是
+#   **延迟**的，DIAG redrawAll deferred=true）—— 抓图抓在重排中间就会拍到
+#   「画布还是旧矩形、编辑器白板露出来」的混帧。等窗口矩形**稳定**再抓：
+#   连续 500ms 矩形不变才算数（上限 5s，防退化成永久等待）。
+$stable = 0
+$prev = 0
+$deadline = (Get-Date).AddSeconds(5)
+while ((Get-Date) -lt $deadline -and $stable -lt 500) {
+    Start-Sleep -Milliseconds 100
+    $rs = New-Object Win32Shot+RECT
+    if (-not [Win32Shot]::GetWindowRect($hwnd, [ref]$rs)) { break }
+    $cur = $rs.Right * 1000000 + $rs.Bottom
+    if ($cur -eq $prev) { $stable += 100 } else { $stable = 0; $prev = $cur }
+}
+
 Start-Sleep -Milliseconds $DelayMs
 
 $rc = New-Object Win32Shot+RECT

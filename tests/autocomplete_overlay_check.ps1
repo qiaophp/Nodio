@@ -1,4 +1,4 @@
-# com.autoComplete x64 补版回归
+﻿# com.autoComplete x64 补版回归
 #
 # 官方 lib/com/autoComplete/_.aardio 加载 32 位 autoComplete.dll（VC6 编译的 MFC IDispatch 封装），
 # x64 进程装不下该 PE（实测「无法加载 DLL: C:\Users\QQ\AppData\Local\aardio/std/com/autoComplete.dll」）。

@@ -1,4 +1,4 @@
-# av.video.kernel x64 补版回归 —— 官方随库发布 C 源码的那一类
+﻿# av.video.kernel x64 补版回归 —— 官方随库发布 C 源码的那一类
 #
 # 官方 lib/av/video/kernel.aardio 把 32 位 kernel.dll 用 $"..." 内嵌进源码再内存加载，
 # x64 进程装不下该 PE（实测「无法加载 DLL: (内嵌的内存映像)」）。
@@ -29,7 +29,8 @@ if (-not (Test-Path $Exe)) { "EXE NOT FOUND: $Exe"; exit 2 }
 
 $repoRoot   = Split-Path $PSScriptRoot -Parent
 $overlayDir = Join-Path $repoRoot 'lib\av\video'
-$overlayMod = Join-Path $overlayDir 'kernel.aardio'
+# overlay 模块已迁移为 .nodio 扩展名（.aardio 保留兜底，旧检出兼容）
+$overlayMod = if (Test-Path (Join-Path $overlayDir 'kernel.nodio')) { Join-Path $overlayDir 'kernel.nodio' } else { Join-Path $overlayDir 'kernel.aardio' }
 $overlayDll = Join-Path $overlayDir '.res\kernel64.dll'
 
 function Get-PEMachine([string]$path) {

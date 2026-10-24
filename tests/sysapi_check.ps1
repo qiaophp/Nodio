@@ -1,4 +1,4 @@
-# 系统 API 表回归：引擎的 `::Name` 解析表（engine/sysapi.cpp）
+﻿# 系统 API 表回归：引擎的 `::Name` 解析表（engine/sysapi.cpp）
 #
 # 官方契约来源：
 #   D:\aardio\lib\win\region\_.aardio:5-9

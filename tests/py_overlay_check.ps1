@@ -1,4 +1,4 @@
-# py2 / py3 overlay 回归 —— 锁住「按官方同名路径补 Nodio 自己的 Python 扩展库版本」
+﻿# py2 / py3 overlay 回归 —— 锁住「按官方同名路径补 Nodio 自己的 Python 扩展库版本」
 #
 # 官方 py2 / py3 的命名空间结构：
 #   lib/py2/_.aardio        父模块：载入 python27.dll，导出 ::Python2

@@ -1,4 +1,4 @@
-# IDE-layer right-click regression (round 5).
+﻿# IDE-layer right-click regression (round 5).
 #
 # Exercises the whole right-click chain on top of the official aardio
 # contracts — no bespoke API:

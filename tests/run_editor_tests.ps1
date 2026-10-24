@@ -1,10 +1,11 @@
-# run_editor_tests.ps1 — 编辑器组件（nodio.ui.editor）的行为回归入口。
+﻿# run_editor_tests.ps1 — 编辑器组件（nodio.ui.editor）的行为回归入口。
 #
 #   pwsh -NoProfile -File D:\Nodio\tests\run_editor_tests.ps1
 #
-# 跑两个探针，都必须打出 PROBE-OK：
+# 跑三个探针，都必须打出 PROBE-OK：
 #   editor_probe.aardio     —— 文本模型 / 缩进 / 注释 / 查找 / 撤销 / 脏标记 / 诊断波浪线
 #   editor_fold_probe.aardio —— 代码折叠（识别 / 收起 / 文本不丢 / 折叠中定位 / 打字后保持）
+#   editor_comp_probe.aardio —— 代码补全（前缀计算 / 浮层 / 上下移动 / 滚动 / 插入 / 关闭）
 #
 # 探针必须用 Start-Process + 重定向输出跑：直接跑会挂在消息循环里等输入。
 param(
@@ -19,7 +20,8 @@ if (-not (Test-Path $Exe)) { Write-Output "FAIL: exe not found: $Exe"; exit 1 }
 
 $probes = @(
     'D:\Nodio\tests\editor_probe.aardio',
-    'D:\Nodio\tests\editor_fold_probe.aardio'
+    'D:\Nodio\tests\editor_fold_probe.aardio',
+    'D:\Nodio\tests\editor_comp_probe.aardio'
 )
 
 $env:NODIO_LIBDIR        = $LibDir

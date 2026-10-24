@@ -1,4 +1,4 @@
-# Phase 1.3 regression: import every real official library and assert the
+﻿# Phase 1.3 regression: import every real official library and assert the
 # expected log line. The official library tree is never redistributed —
 # point -LibDir at a local aardio installation (default D:\aardio\lib).
 #

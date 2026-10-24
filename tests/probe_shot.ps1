@@ -1,4 +1,4 @@
-# probe_shot.ps1 — 给「探针窗体」截图（置顶 + 移到屏幕左上，避免被别的程序挡住）
+﻿# probe_shot.ps1 — 给「探针窗体」截图（置顶 + 移到屏幕左上，避免被别的程序挡住）
 #
 #   pwsh -NoProfile -File tests/probe_shot.ps1 -Script <aardio> -Out <png> [-DelayMs 2500]
 param(

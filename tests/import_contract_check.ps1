@@ -1,4 +1,4 @@
-# import 契约回归：官方 aardio 的「库查找顺序 + 库自建命名空间」契约
+﻿# import 契约回归：官方 aardio 的「库查找顺序 + 库自建命名空间」契约
 #
 # 官方契约来源（docs/library-guide/import.md）：
 #   · 查找顺序只有 4 条路径（公共库）：

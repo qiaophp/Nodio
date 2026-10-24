@@ -1,4 +1,4 @@
-# x64 FFI 浮点 ABI 回归 —— 锁住「cdecl 调用绕过 XMM0..3」这个根因缺陷
+﻿# x64 FFI 浮点 ABI 回归 —— 锁住「cdecl 调用绕过 XMM0..3」这个根因缺陷
 #
 # 缺陷（第二十八轮实测定位）：
 #   engine/builtins.cpp 的调用分派写成

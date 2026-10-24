@@ -1,4 +1,4 @@
-# ── tests/fasm_overlay_check.ps1 ─────────────────────────────────────────────
+﻿# ── tests/fasm_overlay_check.ps1 ─────────────────────────────────────────────
 # 验证 raw.fasm x64 overlay 补版（同名路径覆盖）：
 #   1. 产物存在性、PE 架构与导出符号检查（3 个符号全部对齐）
 #   2. x64 Nodio 执行 import raw.fasm
@@ -8,11 +8,13 @@
 #   6. x86 构建回归验证（双架构同绿）
 # ─────────────────────────────────────────────────────────────────────────────
 $ErrorActionPreference = 'Stop'
+# 本脚本全程用仓库根相对路径（含 python pefile 段），锚定到根，跑法不限 CWD
+Set-Location (Split-Path $PSScriptRoot -Parent)
 
-$NodioX64 = "C:\Users\QQ\AppData\Local\Temp\nr26\build-x64\Release\nodio.exe"
-$NodioX86 = "C:\Users\QQ\AppData\Local\Temp\nr26\build-x86\Release\nodio.exe"
+$NodioX64 = "D:\Nodio\build-x64\Release\nodio.exe"
+$NodioX86 = "D:\Nodio\build-x86\Release\nodio.exe"
 $FasmDll = "lib/raw/fasm/.res/fasm64.dll"
-$FasmAardio = "lib/raw/fasm/_.aardio"
+$FasmAardio = if (Test-Path "lib/raw/fasm/_.nodio") { "lib/raw/fasm/_.nodio" } else { "lib/raw/fasm/_.aardio" }
 $FasmC = "lib/raw/fasm/.res/fasm64.c"
 
 Write-Host "=== 1. 静态文件与 PE 检查 ==="

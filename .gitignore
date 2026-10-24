@@ -30,3 +30,6 @@ tests/editor_*.aardio
 tests/ide_diag_sample.nodio
 tests/m7/proj/probe2.aardio
 pelican-bike.html
+
+# 发布回归自产的可执行产物（回归锁每次重新发布）
+tests/fixtures_dist/*.exe

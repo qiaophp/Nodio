@@ -1,4 +1,4 @@
-# One-shot VM regression: runs every scripts\vmtests\tNN.aardio through the
+﻿# One-shot VM regression: runs every scripts\vmtests\tNN.aardio through the
 # NODIO_RUN harness and compares merged stdout+stderr with tNN.expect.
 # Usage: powershell -File run_vm_tests.ps1 [path\to\nodio.exe] [-Only tNN[,tMM...]]
 param($Exe = 'D:\Nodio\build-x64\Release\nodio.exe',

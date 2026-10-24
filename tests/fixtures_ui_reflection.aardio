@@ -1,0 +1,76 @@
+﻿import win.ui;
+import console;
+
+// 阶段一：测试 win.ui 标准库下的控件 oncommand 反射
+var winform = win.form(text="MsgReflectionTest";right=400;bottom=300);
+winform.add(
+    btn1 = {cls="button";text="TestButton";left=20;top=20;right=120;bottom=60;autoResize=false};
+    btn2 = {cls="button";text="TestButton2";left=140;top=20;right=240;bottom=60;autoResize=false};
+);
+
+var results = {};
+
+// 1. 测试子控件 oncommand 反射
+winform.btn1.oncommand = function(id, event){
+    results.btnOnCommand = true;
+    results.btnId = id;
+    results.btnEvent = event;
+};
+
+// 2. 模拟发送 WM_COMMAND 给 btn1
+var WM_COMMAND = 0x111;
+var BN_CLICKED = 0;
+var wp = winform.btn1.id | (BN_CLICKED << 16);
+::User32 := raw.loadDll("user32.dll");
+::User32.SendMessageW(winform.hwnd, WM_COMMAND, wp, winform.btn1.hwnd);
+
+assert(results.btnOnCommand == true, "btn1.oncommand was not called!");
+assert(results.btnId == winform.btn1.id, "btn1 id mismatch!");
+
+// 3. 测试窗体级 wndproc 拦截自定义消息
+winform.wndproc = function(hwnd, message, wParam, lParam){
+    if (message == 0x0400/*WM_USER*/ + 123) {
+        results.wndprocHandled = true;
+        return 999;
+    }
+};
+
+var WM_USER = 0x400;
+var ret = ::User32.SendMessageW(winform.hwnd, WM_USER + 123, 11, 22);
+assert(results.wndprocHandled == true, "winform.wndproc was not called!");
+assert(ret == 999, "winform.wndproc return value mismatch, expected 999, got " ++ tostring(ret));
+
+// 4. 阶段二：测试原生引擎级 win.form 的控件反射与 wndproc
+// 原生 win.form（不通过 win.ui 库，直接由 builtins 构造）
+var rawForm = win.form("RawNativeForm", 300, 200);
+rawForm.addCtrl({
+    { name = "subBtn"; cls = "button"; text = "Sub"; left = 10; top = 10; width = 80; height = 30; }
+});
+
+var rawResults = {};
+rawForm.subBtn.oncommand = function(id, event){
+    rawResults.subOnCommand = true;
+    rawResults.id = id;
+};
+rawForm.oncommand = function(id, event){
+    rawResults.formOnCommand = true;
+};
+rawForm.wndproc = function(hwnd, message, wParam, lParam){
+    if (message == WM_USER + 888) {
+        rawResults.rawWndproc = true;
+        return 777;
+    }
+};
+
+// 触发 subBtn 点击
+var rawWp = rawForm.subBtn.id | (BN_CLICKED << 16);
+::User32.SendMessageW(rawForm.hwnd, WM_COMMAND, rawWp, rawForm.subBtn.hwnd);
+
+assert(rawResults.subOnCommand == true, "rawForm.subBtn.oncommand failed");
+assert(rawResults.formOnCommand == true, "rawForm.oncommand failed");
+
+var rawRet = ::User32.SendMessageW(rawForm.hwnd, WM_USER + 888, 0, 0);
+assert(rawResults.rawWndproc == true, "rawForm.wndproc failed");
+assert(rawRet == 777, "rawForm.wndproc return mismatch");
+
+console.log("UI_MSG_REFLECTION_PASS");

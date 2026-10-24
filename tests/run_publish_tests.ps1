@@ -1,4 +1,4 @@
-# Phase 2 regression: publish the fixture project and assert the standalone
+﻿# Phase 2 regression: publish the fixture project and assert the standalone
 # exe runs with the expected output. Exercises the whole pipeline —
 # .aproj embed rules, import closure, byte-exact payload append, subsystem
 # patch — plus the host's payload self-detection at startup.

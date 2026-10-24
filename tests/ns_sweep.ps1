@@ -1,4 +1,4 @@
-# Namespace import coverage: import every top-level official-lib
+﻿# Namespace import coverage: import every top-level official-lib
 # namespace headlessly and record pass/fail. PowerShell port of
 # tests/ns_sweep.sh so the sweep runs on a Windows host without bash.
 #

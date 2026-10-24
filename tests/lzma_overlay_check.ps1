@@ -1,4 +1,4 @@
-# sevenZip.lzma x64 补版回归 —— 官方无源码、Nodio 侧自写等价实现的那一类
+﻿# sevenZip.lzma x64 补版回归 —— 官方无源码、Nodio 侧自写等价实现的那一类
 #
 # 官方 lib/sevenZip/lzma/_.aardio 把 32 位 LzmaUtil.dll 用 $"..." 内嵌进源码再内存加载，
 # x64 进程装不下该 PE（实测「无法加载 DLL: (内嵌的内存映像)」）。
@@ -30,7 +30,8 @@ if (-not (Test-Path $Exe)) { "EXE NOT FOUND: $Exe"; exit 2 }
 
 $repoRoot   = Split-Path $PSScriptRoot -Parent
 $overlayDir = Join-Path $repoRoot 'lib\sevenZip\lzma'
-$overlayMod = Join-Path $overlayDir '_.aardio'
+# overlay 模块已迁移为 .nodio 扩展名（.aardio 保留兜底，旧检出兼容）
+$overlayMod = if (Test-Path (Join-Path $overlayDir '_.nodio')) { Join-Path $overlayDir '_.nodio' } else { Join-Path $overlayDir '_.aardio' }
 $overlayC   = Join-Path $overlayDir '.res\lzma64.c'
 $overlayDll = Join-Path $overlayDir '.res\lzma64.dll'
 

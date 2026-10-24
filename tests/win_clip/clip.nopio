@@ -15,17 +15,27 @@
 //
 // 剪贴板是**全局**系统资源：被同机其它进程占用时 OpenClipboard 返回 0
 // （ERROR_ACCESS_DENIED），官方语义是「静默失败」——相关调用返回 null。
-// 这种机器上只断言与剪贴板无关的 API 面，剪贴板相关的值原样打印出来，
-// 由回归脚本按 CLIP-OK 决定是否断言。
+// 占用可能发生在运行中途（剪贴板管理器/远端会话随时来抢），开头探测一次
+// 判定全程是错的（会有假红）——所以**每一步操作前都重新探测**，把结果
+// 作为 `CLIP0/CLIP1` 门拼在该步输出末尾，由回归脚本按门选择期望值：
+//   CLIP1 → 断言成功语义；CLIP0 → 断言官方「静默失败」语义。
+// 依赖「我们写入的内容」的断言（read/test/formats/eachFormat）只在
+// 对应 write 真正成功时才判定（写入失败时板上是什么内容不可控）。
 function safe(f)
 {
 	try{ return f() }
 	catch(e){ return null }
 }
 
-var CLIP = ::User32.OpenClipboard(0);
-if(CLIP) ::User32.CloseClipboard();
-io.print("CLIP-OK " ++ (CLIP ? 1 : 0));
+// 每步前重探：自己 Open 一次试试（开了就关掉），拿到的就是「此刻能不能用」
+function probeClip()
+{
+	var h = ::User32.OpenClipboard(0);
+	if(h) ::User32.CloseClipboard();
+	return h ? 1 : 0;
+}
+
+io.print("CLIP-OK " ++ probeClip());
 
 // ---------------- B: 引擎内置实现 ----------------
 var names = {"readUtf16","read","write","writeBitmap","readBitmap","clear","test","formats","getFormatName","eachFormat","readUnicode"};
@@ -42,15 +52,26 @@ io.print("B-API-MISS " ++ miss);
 io.print("B-FMTNAMES " ++ tostring(type(win.clip.formatNames)) ++ " " ++ tostring(win.clip.formatNames[13]) ++ " " ++ tostring(win.clip.formatNames[1]));
 io.print("B-GFN " ++ tostring(win.clip.getFormatName(13,true)) ++ " " ++ tostring(win.clip.getFormatName(999,true)) ++ " " ++ tostring(win.clip.getFormatName(999,false)));
 
+var bClipW = probeClip();
 var bWrite = safe(function(){ return win.clip.write("nodio-clip-roundtrip") });
-io.print("B-WRITE " ++ tostring(bWrite ? 1 : 0));
+io.print("B-WRITE " ++ tostring(bWrite ? 1 : 0) ++ " CLIP" ++ bClipW);
+
+var bClipR = probeClip();
 var bRead = safe(function(){ return win.clip.read() });
-io.print("B-READ " ++ tostring(bRead));
+io.print("B-READ " ++ tostring(bRead) ++ " CLIP" ++ bClipR);
+
+var bClipR2 = probeClip();
 var bRead16 = safe(function(){ return win.clip.readUtf16() });
-io.print("B-READ16 " ++ tostring(bRead16));
-io.print("B-TEST13 " ++ tostring(safe(function(){ return win.clip.test(13) })));
+io.print("B-READ16 " ++ tostring(bRead16) ++ " CLIP" ++ bClipR2);
+
+var bClipT = probeClip();
+io.print("B-TEST13 " ++ tostring(safe(function(){ return win.clip.test(13) })) ++ " CLIP" ++ bClipT);
+
+var bClipF = probeClip();
 var bFmt = safe(function(){ return win.clip.formats() });
-io.print("B-FMT-HAS13 " ++ tostring(bFmt ? (..table.find(bFmt,13) ? 1 : 0) : null));
+io.print("B-FMT-HAS13 " ++ tostring(bFmt ? (..table.find(bFmt,13) ? 1 : 0) : null) ++ " CLIP" ++ bClipF);
+
+var bClipE = probeClip();
 var bEach = safe(function(){ return win.clip.eachFormat() });
 var bEachHas = null;
 if(bEach)
@@ -64,9 +85,15 @@ if(bEach)
 		if(id == 13) bEachHas = 1;
 	}
 }
-io.print("B-EACH-HAS13 " ++ tostring(bEachHas));
-io.print("B-CLEAR " ++ tostring(safe(function(){ return win.clip.clear() })));
-io.print("B-READ2 " ++ tostring(safe(function(){ return win.clip.read() })));
+io.print("B-EACH-HAS13 " ++ tostring(bEachHas) ++ " CLIP" ++ bClipE);
+
+var bClipC = probeClip();
+var bClear = safe(function(){ return win.clip.clear() });
+io.print("B-CLEAR " ++ tostring(bClear) ++ " CLIP" ++ bClipC);
+
+var bClipR3 = probeClip();
+var bRead2 = safe(function(){ return win.clip.read() });
+io.print("B-READ2 " ++ tostring(bRead2) ++ " CLIP" ++ bClipR3);
 
 // ---------------- O: 官方包实现 ----------------
 // 官方文档要求显式导入；导入后官方包整体覆盖内置实现。
@@ -85,15 +112,26 @@ io.print("O-API-MISS " ++ miss2);
 io.print("O-FMTNAMES " ++ tostring(type(win.clip.formatNames)) ++ " " ++ tostring(win.clip.formatNames[13]) ++ " " ++ tostring(win.clip.formatNames[1]));
 io.print("O-GFN " ++ tostring(safe(function(){ return win.clip.getFormatName(13,true) })) ++ " " ++ tostring(safe(function(){ return win.clip.getFormatName(999,true) })) ++ " " ++ tostring(safe(function(){ return win.clip.getFormatName(999,false) })));
 
+var oClipW = probeClip();
 var oWrite = safe(function(){ return win.clip.write("nodio-clip-roundtrip") });
-io.print("O-WRITE " ++ tostring(oWrite ? 1 : 0));
+io.print("O-WRITE " ++ tostring(oWrite ? 1 : 0) ++ " CLIP" ++ oClipW);
+
+var oClipR = probeClip();
 var oRead = safe(function(){ return win.clip.read() });
-io.print("O-READ " ++ tostring(oRead));
+io.print("O-READ " ++ tostring(oRead) ++ " CLIP" ++ oClipR);
+
+var oClipR2 = probeClip();
 var oRead16 = safe(function(){ return win.clip.readUtf16() });
-io.print("O-READ16 " ++ tostring(oRead16));
-io.print("O-TEST13 " ++ tostring(safe(function(){ return win.clip.test(13) })));
+io.print("O-READ16 " ++ tostring(oRead16) ++ " CLIP" ++ oClipR2);
+
+var oClipT = probeClip();
+io.print("O-TEST13 " ++ tostring(safe(function(){ return win.clip.test(13) })) ++ " CLIP" ++ oClipT);
+
+var oClipF = probeClip();
 var oFmt = safe(function(){ return win.clip.formats() });
-io.print("O-FMT-HAS13 " ++ tostring(oFmt ? (..table.find(oFmt,13) ? 1 : 0) : null));
+io.print("O-FMT-HAS13 " ++ tostring(oFmt ? (..table.find(oFmt,13) ? 1 : 0) : null) ++ " CLIP" ++ oClipF);
+
+var oClipE = probeClip();
 var oEach = safe(function(){ return win.clip.eachFormat() });
 var oEachHas = null;
 if(oEach)
@@ -107,6 +145,12 @@ if(oEach)
 		if(id2 == 13) oEachHas = 1;
 	}
 }
-io.print("O-EACH-HAS13 " ++ tostring(oEachHas));
-io.print("O-CLEAR " ++ tostring(safe(function(){ return win.clip.clear() })));
-io.print("O-READ2 " ++ tostring(safe(function(){ return win.clip.read() })));
+io.print("O-EACH-HAS13 " ++ tostring(oEachHas) ++ " CLIP" ++ oClipE);
+
+var oClipC = probeClip();
+var oClear = safe(function(){ return win.clip.clear() });
+io.print("O-CLEAR " ++ tostring(oClear) ++ " CLIP" ++ oClipC);
+
+var oClipR3 = probeClip();
+var oRead2 = safe(function(){ return win.clip.read() });
+io.print("O-READ2 " ++ tostring(oRead2) ++ " CLIP" ++ oClipR3);

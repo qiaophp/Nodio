@@ -1,4 +1,4 @@
-# 官方 "=aardio" 预编译块：容器层解析与诊断回归
+﻿# 官方 "=aardio" 预编译块：容器层解析与诊断回归
 #
 # 背景（docs/aardio-bytecode.md）：
 #   · 官方 aardio.exe 内部称该格式为 "precompiled chunk"（官方报错文案

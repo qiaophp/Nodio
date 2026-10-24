@@ -1,7 +1,7 @@
-# Nodio String UTF-8 / Codepoint character slicing regression lock
+﻿# Nodio String UTF-8 / Codepoint character slicing regression lock
 $ErrorActionPreference = 'Stop'
 
-$exe = "C:\Users\QQ\AppData\Local\Temp\nr26\build-x64\Release\nodio.exe"
+$exe = "D:\Nodio\build-x64\Release\nodio.exe"
 if (-not (Test-Path $exe)) {
     Write-Error "nodio.exe not found at $exe"
 }
@@ -27,8 +27,8 @@ assert(string.right(s2, 4, true) == "😂abc", "emoji right failed: " ++ tostrin
 console.log("STRING_CHARS_CHECK_PASS");
 '@
 
-$sampleFile = "tests/fixtures_string_chars.aardio"
-[System.IO.File]::WriteAllText((Join-Path (Get-Location) $sampleFile), $sampleCode, [System.Text.Encoding]::UTF8)
+$sampleFile = Join-Path $PSScriptRoot "fixtures_string_chars.aardio"
+[System.IO.File]::WriteAllText($sampleFile, $sampleCode, [System.Text.Encoding]::UTF8)
 
 try {
     $out = & $exe $sampleFile

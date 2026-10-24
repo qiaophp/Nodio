@@ -1,4 +1,4 @@
-# ── tests/webview_overlay_check.ps1 ──────────────────────────────────────────
+﻿# ── tests/webview_overlay_check.ps1 ──────────────────────────────────────────
 # 验证 web.view x64 overlay 补版（同名路径覆盖）：
 #   1. 产物存在性、PE 架构与导出符号检查（26 个符号全部对齐）
 #   2. x64 Nodio 执行 import web.view
@@ -6,11 +6,14 @@
 #   4. x86 构建回归验证（双架构同绿）
 # ─────────────────────────────────────────────────────────────────────────────
 $ErrorActionPreference = 'Stop'
+# 本脚本全程用仓库根相对路径（含 python pefile 段），锚定到根，跑法不限 CWD
+Set-Location (Split-Path $PSScriptRoot -Parent)
 
-$NodioX64 = "C:\Users\QQ\AppData\Local\Temp\nr26\build-x64\Release\nodio.exe"
-$NodioX86 = "C:\Users\QQ\AppData\Local\Temp\nr26\build-x86\Release\nodio.exe"
+$NodioX64 = "D:\Nodio\build-x64\Release\nodio.exe"
+$NodioX86 = "D:\Nodio\build-x86\Release\nodio.exe"
 $WbDll = "lib/web/view/.res/webview64.dll"
-$WbAardio = "lib/web/view/_.aardio"
+# overlay 模块已迁移为 .nodio 扩展名（.aardio 保留兜底，旧检出兼容）
+$WbAardio = if (Test-Path "lib/web/view/_.nodio") { "lib/web/view/_.nodio" } else { "lib/web/view/_.aardio" }
 $WbCpp = "lib/web/view/.res/webview64.cpp"
 
 Write-Host "=== 1. 静态文件与 PE 检查 ==="

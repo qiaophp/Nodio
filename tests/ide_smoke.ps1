@@ -71,8 +71,22 @@ if (-not $p.WaitForExit($TimeoutSec * 1000)) {
 
 # the engine writes UTF-8; Windows PowerShell 5.1 would read it as the ANSI
 # code page and turn every Chinese string into mojibake
-$out = if (Test-Path $log) { [IO.File]::ReadAllText($log, [Text.Encoding]::UTF8) } else { '' }
-$errOut = if (Test-Path $err) { [IO.File]::ReadAllText($err, [Text.Encoding]::UTF8) } else { '' }
+#
+# ⚠ 刚退出就读重定向文件偶尔会撞上「另一个进程正在使用此文件」——
+#   Start-Process 的管道句柄释放有竞态。读失败重试几次即可。
+function Read-TextRetry([string]$path) {
+    for ($i = 0; $i -lt 20; $i++) {
+        try {
+            if (Test-Path $path) { return [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8) }
+            return ''
+        } catch {
+            Start-Sleep -Milliseconds 150
+        }
+    }
+    return ''
+}
+$out = Read-TextRetry $log
+$errOut = Read-TextRetry $err
 Remove-Item $log, $err -Force -ErrorAction SilentlyContinue
 if ($null -eq $out) { $out = '' }
 if ($null -eq $errOut) { $errOut = '' }
@@ -113,6 +127,13 @@ if ($env:NODIO_IDE_PROJECT) {
     if ($out -notmatch 'PROJOPS-REL:app\\c\.nodio') { Write-Output 'FAIL: relPath is wrong'; exit 1 }
 }
 
+# 钩子链路：shell.hooks.onOpenFile → main.nodio 的 openFile → 真的打开页签
+# （模块级钩子曾被模块帧的局部副本遮蔽，整片是死的 —— 见 capability-gap §1.20.3）
+if ($out -notmatch 'SMOKE-HOOK-OPEN:.*nodio_ide_hook\.aardio') {
+    Write-Output 'FAIL: shell hook onOpenFile did not open the file'
+    exit 1
+}
+
 # layout: the three docks (left/right/bottom) must be materialised
 if ($out -notmatch 'DOCK-LEFT-STRIP:1')    { Write-Output 'FAIL: left dock strip missing'; exit 1 }
 if ($out -notmatch 'DOCK-RIGHT-CONTENT:1') { Write-Output 'FAIL: right dock content missing'; exit 1 }
@@ -124,8 +145,10 @@ if ($out -notmatch 'DESIGNER-ITEM:\w')   { Write-Output 'FAIL: designer canvas i
 if ($out -notmatch 'DESIGNER-DSG:.*DSG') { Write-Output 'FAIL: designer did not emit DSG'; exit 1 }
 if ($out -notmatch 'TOOLBOX-COUNT:\d+')  { Write-Output 'FAIL: component registry empty'; exit 1 }
 
-# DSG must carry the component geometry as its own keys
-if ($out -notmatch 'button1=\{cls="button";left=\d+;top=\d+;right=\d+;bottom=\d+\}') {
+# DSG must carry the component geometry as its own keys.
+# text= is optional: a component's 标题 property defaults to the component
+# name (VS behaviour), so the DSG usually carries it too.
+if ($out -notmatch 'button1=\{cls="button";(text="[^"]*";)?left=\d+;top=\d+;right=\d+;bottom=\d+\}') {
     Write-Output 'FAIL: DSG does not carry component geometry'
     exit 1
 }
@@ -164,6 +187,25 @@ if ($out -notmatch 'TABSTRIP-COUNT:1')        { Write-Output 'FAIL: document tab
 if ($out -notmatch 'TABSTRIP-AFTER-ADD:2')    { Write-Output 'FAIL: document tab strip did not add a tab'; exit 1 }
 if ($out -notmatch 'TABSTRIP-AFTER-REMOVE:1') { Write-Output 'FAIL: document tab strip did not remove a tab'; exit 1 }
 
+# 事件代码生成：双击组件 → 源码里出现官方形状的事件桩；再来一次只跳转不重复
+if ($out -notmatch 'EVENT-STUB:1')     { Write-Output 'FAIL: double-click did not generate the event stub'; exit 1 }
+if ($out -notmatch 'EVENT-STUB-DUP:1') { Write-Output 'FAIL: second double-click duplicated the event stub'; exit 1 }
+if ($out -notmatch 'EVENT-CODE-VIEW:1'){ Write-Output 'FAIL: double-click did not switch to the code view'; exit 1 }
+
+# 设计 ↔ 源码同步（switchActiveForm）：开设计器载入源码的设计块，
+# 关设计器把当前设计写回源码（编辑器缓冲）
+if ($out -notmatch 'SYNC-ITEMS:1')      { Write-Output 'FAIL: opening the designer did not load the DSG from source'; exit 1 }
+if ($out -notmatch 'SYNC-WRITEBACK:1')  { Write-Output 'FAIL: closing the designer did not write the design back to source'; exit 1 }
+if ($out -notmatch 'SYNC-BLOCKS:1')     { Write-Output 'FAIL: design sync duplicated the DSG block'; exit 1 }
+
+# 官方 ide.customCtrl 替身映射：textbox 用 edit 代画，DSG 仍写真实类名
+if ($out -notmatch 'CUSTOMCTRL-MAP:edit')          { Write-Output 'FAIL: official ide.customCtrl mapping missing'; exit 1 }
+if ($out -notmatch 'CUSTOMCTRL-DRAW:textbox/edit') { Write-Output 'FAIL: surrogate must draw as edit while the DSG keeps the real class'; exit 1 }
+# 窗体设置：选中窗体本身 → 属性格改 标题/宽度/高度 → DSG 头跟着变
+if ($out -notmatch 'FORM-SET:111')      { Write-Output 'FAIL: form settings did not reach the DSG header'; exit 1 }
+# 网格吸附：拖动/缩放坐标钉到网格（30→32、33→32）
+if ($out -notmatch 'SNAP:32/32')        { Write-Output 'FAIL: grid snapping is broken'; exit 1 }
+
 # 文档闭环：脏标记是推导的（当前文本 vs 上次保存的文本）
 if ($out -notmatch 'DOC-DIRTY-INIT:false') { Write-Output 'FAIL: a freshly opened document must be clean'; exit 1 }
 if ($out -notmatch 'DOC-DIRTY-SET:true')  { Write-Output 'FAIL: dirty marker was not set'; exit 1 }
@@ -180,6 +222,26 @@ if ($out -notmatch 'DOC-UNDO-LEN:30')       { Write-Output 'FAIL: editor undo di
 # every dock / editor must be visible once the window is shown
 foreach ($v in @('VIS-LEFT','VIS-RIGHT','VIS-BOTTOM','VIS-DOC','VIS-ED','VIS-TOOLBOX')) {
     if ($out -notmatch ($v + ':true')) { Write-Output "FAIL: $v is not visible"; exit 1 }
+}
+
+# 属性格分组带（VS WinForms 属性窗口的「分类」）：
+# 分类映射 / 显示行表 / 折叠 / 就地编辑框落位 —— 见 capability-gap §1.22
+$probe = Join-Path $PSScriptRoot 'dsg_propgrid_probe.aardio'
+if (Test-Path $probe) {
+    $plog = Join-Path $env:TEMP ("nodio_propgrid_{0}.log" -f $PID)
+    $perr = "$plog.err"
+    $env:NODIO_RUN = $probe
+    $pp = Start-Process -FilePath $Exe -PassThru -NoNewWindow `
+            -RedirectStandardOutput $plog -RedirectStandardError $perr
+    if (-not $pp.WaitForExit(60 * 1000)) { try { $pp.Kill() } catch {} }
+    $pout = if (Test-Path $plog) { [IO.File]::ReadAllText($plog, [Text.Encoding]::UTF8) } else { '' }
+    Remove-Item $plog, $perr -Force -ErrorAction SilentlyContinue
+    $env:NODIO_RUN = $Ide
+    if ($pout -notmatch 'PROPGRID-OK') {
+        Write-Output 'FAIL: property grid category bands probe failed'
+        Write-Output $pout
+        exit 1
+    }
 }
 
 Write-Output 'SMOKE OK'

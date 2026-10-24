@@ -1,4 +1,4 @@
-# 官方 "=aardio" 预编译块的**记录 VM** 回归（S-1b 第二阶段）
+﻿# 官方 "=aardio" 预编译块的**记录 VM** 回归（S-1b 第二阶段）
 #
 # 背景（docs/aardio-bytecode.md §7.5.2）：
 #   官方运行期没有 AST —— `=aardio` 预编译块就是「32 位 RISC 记录流 +

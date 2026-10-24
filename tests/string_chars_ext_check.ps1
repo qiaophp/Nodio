@@ -1,11 +1,11 @@
-# Nodio String extended regression lock: UTF-8 byte positions (index/indexOf/
+﻿# Nodio String extended regression lock: UTF-8 byte positions (index/indexOf/
 # lastIndexOf with from-clamps), codepoint-safe reverse, per-codepoint split.
 # Independent from string_chars_check.ps1 on purpose: that lock regenerates its
 # fixture on every run, so extended assertions must live in their own fixture
 # to avoid being overwritten.
 $ErrorActionPreference = 'Stop'
 
-$exe = "C:\Users\QQ\AppData\Local\Temp\nr26\build-x64\Release\nodio.exe"
+$exe = "D:\Nodio\build-x64\Release\nodio.exe"
 if (-not (Test-Path $exe)) {
     Write-Error "nodio.exe not found at $exe"
 }
@@ -166,8 +166,8 @@ assert(cd == "x1", "concat num failed: " ++ tostring(cd));
 console.log("STRING_CHARS_EXT_CHECK_PASS");
 '@
 
-$sampleFile = "tests/fixtures_string_chars2.aardio"
-[System.IO.File]::WriteAllText((Join-Path (Get-Location) $sampleFile), $sampleCode, [System.Text.Encoding]::UTF8)
+$sampleFile = Join-Path $PSScriptRoot "fixtures_string_chars2.aardio"
+[System.IO.File]::WriteAllText($sampleFile, $sampleCode, [System.Text.Encoding]::UTF8)
 
 try {
     $out = & $exe $sampleFile

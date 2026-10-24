@@ -1,4 +1,4 @@
-# 第二十三轮收口核对：官方内建成员清单 vs Nodio 运行期实际成员
+﻿# 第二十三轮收口核对：官方内建成员清单 vs Nodio 运行期实际成员
 # 用法: pwsh -NoProfile -File tests/builtin_api_coverage.ps1
 param($Exe = 'D:\Nodio\build-x64\Release\nodio.exe',
       [string]$Official = 'D:\Nodio\tests\official_builtin_members.json')

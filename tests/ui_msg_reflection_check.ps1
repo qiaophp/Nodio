@@ -1,7 +1,7 @@
 # Nodio win.ui & native win.form message reflection & wndproc regression lock
 $ErrorActionPreference = 'Stop'
 
-$exe = "C:\Users\QQ\AppData\Local\Temp\nr26\build-x64\Release\nodio.exe"
+$exe = "D:\Nodio\build-x64\Release\nodio.exe"
 if (-not (Test-Path $exe)) {
     Write-Error "nodio.exe not found at $exe"
 }

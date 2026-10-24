@@ -1,0 +1,4 @@
+var alpha = 1
+var beta = alpha + 2
+io.print("alpha=" ++ alpha ++ " beta=" ++ beta)
+// 代码补全演示样本：第 1 行 alph| 后面会弹出候选浮层

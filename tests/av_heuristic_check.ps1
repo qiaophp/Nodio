@@ -1,4 +1,4 @@
-# Regression lock for the antivirus heuristic false positive.
+﻿# Regression lock for the antivirus heuristic false positive.
 #
 # Symptom (observed 2026-10-21): the 32-bit build of nodio.exe was reported
 # and quarantined by 火绒 as "HEUR:Backdoor/Farfli.e", while the 64-bit

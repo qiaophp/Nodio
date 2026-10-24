@@ -1,4 +1,4 @@
-# 结构体布局回归 —— 锁住「官方 stuct 拼写容错」这个引擎级修复
+﻿# 结构体布局回归 —— 锁住「官方 stuct 拼写容错」这个引擎级修复
 #
 # 官方 lib/string/markdown/_.aardio 的 html_renderopt 类里写的是：
 #

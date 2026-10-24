@@ -1,0 +1,205 @@
+// tests/reg_editor_input.aardio — 编辑器**基本输入行为**回归用例。
+//
+// 覆盖（这些是「代码编辑器能用」的底线，之前一条都没有）：
+//   1. 回车续接缩进：复制当前行缩进
+//   2. 回车续接缩进：光标前是开括号时再多一级
+//   3. 括号自动配对：补另一半、光标停在中间
+//   4. 引号自动配对
+//   5. 闭合符号「跳过」（右边就是它时不再插一个）
+//   6. 撤销 / 重做（函数路径 + Ctrl+Z 快捷键路径）
+//   7. 注释**保留缩进** + 再按一次能取消（Ctrl+/ 快捷键路径）
+//
+// ⚠ 输出用**字节级 hex**，不用可读文本 —— 控制台编码会把 "//" 这类
+//   内容显示成 '?'，肉眼判断会误判。
+//
+// ⚠ 走真实按键路径：直接给 richedit 发 WM_KEYDOWN。
+//   Ctrl 状态用 SetKeyboardState 置**本线程**键盘状态，
+//   GetKeyState 读的就是它（实测有效；TranslateMessage 不认，
+//   所以 Ctrl+字母的 WM_CHAR 造不出来 —— 那半条路不测）。
+import win.ui;
+import raw;
+import nodio.ui.editor;
+
+var f = win.form(text="editor input regression";right=1000;bottom=600);
+f.add({
+	ed={cls="richedit";left=80;top=40;right=900;bottom=540;multiline=true;vscroll=true}
+});
+f.show();
+..win.delay(300);
+
+var ed = nodio.ui.editor(f, {
+	ctrl = f.ed;
+	fontSize = 11;
+});
+ed.layout(80, 40, 900, 540);
+..win.delay(300);
+
+var u32 = ..raw.loadDll("user32.dll");
+var setKb = u32.api("SetKeyboardState", "bool(addr state)");
+var getKb = u32.api("GetKeyState", "int(int vkey)");
+var kbBuf = ..raw.buffer(256);
+
+var setCtrl = function(on){
+	var kb = ..string.rep('\0', 256);
+	if(on){
+		// 键盘状态数组的下标就是**虚拟键码**：
+		//   VK_SHIFT = 0x10、VK_CONTROL = 0x11、VK_MENU = 0x12
+		// ⚠ 下标 0x11 = 数组第 **18** 个字节（1 基），
+		//   写成 0x10 会按住 Shift —— 表现是 Shift+/ 打出 '?'，
+		//   一开始就踩过这个坑（探针把 Ctrl 位按到了 Shift 上）。
+		kb = ..string.sub(kb, 1, 0x11) ++ '\x80' ++ ..string.sub(kb, 0x13, 256);
+	}
+	..raw.write(kbBuf, kb);
+	setKb(kbBuf);
+};
+// 发一个按键（只发 WM_KEYDOWN；编辑器自己插字符，不需要 WM_CHAR）
+var key = function(vk, ctrl){
+	setCtrl(ctrl);
+	::PostMessage(f.ed.hwnd, 0x100/*WM_KEYDOWN*/, vk, 0);
+	..win.delay(250);
+	setCtrl(false);
+};
+// 行列表（去掉行尾 \r）
+var lines = function(){
+	var out = ..string.split(ed.getText(), '\n');
+	for(i=1;#out;1){
+		var s = out[i];
+		if(#s > 0 && ..string.sub(s, #s, #s) == '\r'){
+			out[i] = ..string.sub(s, 1, #s - 1);
+		}
+	}
+	return out;
+};
+
+var log = '';
+var step = function(s){
+	log = log ++ s ++ '\r\n';
+	// 每步落盘：万一卡死，也能看出停在哪一步（stdout 有缓冲，看不到）
+	// ⚠ 路径用正斜杠：aardio 单引号串按 C 规则转义，'D:\...' 里的
+	//   \e / \b 会被吃掉（实测变 ESC / 退格）。
+	..string.save('D:/Nodio/build-x64/Release/reg_editor_input.log', log);
+	io.print(s);
+};
+// 字节级 hex：一眼看清每个字符到底是什么
+var hexdig = '0123456789ABCDEF';
+var HEX2 = {};
+for(i=0;255;1){
+	var hi = math.floor(i / 16);
+	var lo = i % 16;
+	HEX2[i + 1] = ..string.sub(hexdig, hi + 1, hi + 1) ++ ..string.sub(hexdig, lo + 1, lo + 1);
+}
+var hex = function(s){
+	if(s === null || s === undefined) return "<null>";
+	s = tostring(s);
+	var out = '';
+	var b = ..string.unpack(s);
+	for(i=1;#b;1){
+		out = out ++ HEX2[b[i] + 1] ++ ' ';
+	}
+	return out;
+};
+// 期望值断言：不等直接标 FAIL
+var fails = 0;
+var expect = function(tag, got, want){
+	var ok = (got == want);
+	if(!ok) fails = fails + 1;
+	step((ok ? "PASS " : "FAIL ") ++ tag ++ " got=[" ++ hex(got) ++ "] want=[" ++ hex(want) ++ "]");
+};
+var expectInt = function(tag, got, want){
+	var ok = (tonumber(got) == tonumber(want));
+	if(!ok) fails = fails + 1;
+	step((ok ? "PASS " : "FAIL ") ++ tag ++ " got=" ++ tostring(got) ++ " want=" ++ tostring(want));
+};
+
+// ---------- 0. 前置：Ctrl 状态注入是否真的生效 ----------
+setCtrl(true);
+step("GetKeyState(Ctrl)=" ++ tostring(getKb(0x11)) ++ " (按下应为 128)");
+step("GetKeyState(Shift)=" ++ tostring(getKb(0x10)) ++ " (应为 0)");
+setCtrl(false);
+step("GetKeyState(Ctrl)=" ++ tostring(getKb(0x11)) ++ " (抬起应为 0)");
+
+// ---------- 1. 回车续接缩进 ----------
+step("SETUP-OK");
+ed.setText('    var x = 1\r\n    var y = 2\r\n');
+..win.delay(300);
+f.ed.setSel(13);              // "    var x = 1" 共 13 个字符 → 行尾插入点
+..win.delay(150);
+expect("T1-当前行缩进", ed.__curIndent(), '    ');
+expect("T1-光标前字符", ed.__charBefore(), '1');
+key(0x0D/*VK_RETURN*/, false);
+expect("T1-回车后新行内容", lines()[2], '    ');
+
+// ---------- 2. 开括号后多缩进一级 ----------
+ed.setText('if(x){\r\n}\r\n');
+..win.delay(300);
+f.ed.setSel(6);               // "if(x){" 共 6 个字符 → 行尾插入点
+..win.delay(150);
+expect("T2-光标前字符", ed.__charBefore(), '{');
+key(0x0D, false);
+expect("T2-大括号内多一级", lines()[2], '    ');
+
+// ---------- 3. 括号配对 ----------
+ed.setText("");
+..win.delay(300);
+f.ed.setSel(0);
+..win.delay(150);
+key(0x28/*VK_(*/, false);
+expect("T3-括号配对-文本", ed.getText(), '()');
+expectInt("T3-括号配对-光标停在中间", ed.__caret0(), 1);
+
+// ---------- 4. 引号配对 ----------
+ed.setText("");
+..win.delay(300);
+f.ed.setSel(0);
+..win.delay(150);
+key(0x22/*VK_"*/, false);
+expect("T4-引号配对-文本", ed.getText(), '""');
+expectInt("T4-引号配对-光标停在中间", ed.__caret0(), 1);
+
+// ---------- 5. 闭合符号跳过 ----------
+//
+// ⚠ 光标必须落在 '(' 和 ')' **之间**（0-based 插入点 = 1），
+//   落在 ')' 右边才谈得上「跳过」。
+//   这里直接调 __autoPair（按键处理里调的就是它），因为注入的 WM_KEYDOWN
+//   不带 WM_CHAR，而「跳过」只看文档里右邻字符。
+ed.setText('()');
+..win.delay(300);
+f.ed.setSel(1);
+..win.delay(150);
+expect("T5-光标前字符", ed.__charBefore(), '(');
+expect("T5-光标后字符", ed.__charAfter(), ')');
+ed.__autoPair(0x29/*VK_)*/);
+expect("T5-跳过-文本没多一个", ed.getText(), '()');
+expectInt("T5-跳过-光标右移一位", ed.__caret0(), 2);
+
+// ---------- 6. 撤销 / 重做 ----------
+ed.setText('');
+..win.delay(300);
+f.ed.setSel(0);
+..win.delay(150);
+key(0x28/*(*/, false);
+expect("T6-配对后-文本", ed.getText(), '()');
+ed.undo();
+expect("T6-撤销后-文本", ed.getText(), '');
+ed.redo();
+expect("T6-重做后-文本", ed.getText(), '()');
+
+// ---------- 6b. Ctrl+Z 快捷键路径 ----------
+key(0x5A/*VK_Z*/, true);      // Ctrl+Z
+expect("T6b-Ctrl+Z-文本", ed.getText(), '');
+key(0x59/*VK_Y*/, true);      // Ctrl+Y
+expect("T6b-Ctrl+Y-文本", ed.getText(), '()');
+
+// ---------- 7. 注释保留缩进（Ctrl+/ 快捷键路径） ----------
+ed.setText('    var x = 1\r\n');
+..win.delay(300);
+f.ed.setSel(2);
+..win.delay(150);
+key(0xBF/*VK_OEM_2 = '/'*/, true);   // Ctrl+/
+expect("T7-注释保留缩进", lines()[1], '    // var x = 1');
+key(0xBF, true);                      // 再按一次 → 取消注释
+expect("T7-取消注释", lines()[1], '    var x = 1');
+
+step(fails == 0 ? "REG-EDITOR-INPUT-OK" : ("REG-EDITOR-INPUT-FAIL fails=" ++ tostring(fails)));
+..win.delay(300);
+f.close();
