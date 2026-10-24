@@ -15,8 +15,49 @@ import app.lspClient;
 import app.dapClient;
 import nodio.designer.registry;
 import nodio.ui.dpi;
+import nodio.ui.board;   // nodio.ui.redrawAll（窗口显示后统一强制重画）
+import raw;
+
+// ---------- 启动期：延迟绘制（防满屏闪）----------
+//
+// 窗体在 app.shell 的模块体里就 show 了（那 27 块画板会各上一次屏），
+// 之后官方窗体还要做 DPI 初始化、去掉原生标题栏、再最大化 ——
+// 客户区连跳 3 次（1281×821 → 1943×1287 → 3840×2160），
+// 每次跳变都触发一次全量重排 + 27 块画板各**强制上屏**一次：
+// 上百次上屏 = 用户看到的「满屏闪」。
+//
+// 这里把这段时间的绘制**全部压掉**（只置脏不上屏），
+// 启动代码跑完再统一画**最终一帧** ⇒ 窗口一出现就是最终样子。
+//
+// ⚠ 为什么不能改成「一次 RedrawWindow 批量成帧」：
+//   官方 plus 的 WM_PAINT 用「本次失效区」当裁剪区，
+//   父窗口先画背景会把子控件的更新区吃掉 ⇒ 子控件裁剪区为空 = 什么都没画
+//   （实测：标题栏/工具条/停靠面板整片消失）。详见 lib/nodio/ui/board.aardio。
+..nodio.ui.setDeferredPaint( !..string.getenv("NODIO_IDE_NODEFER") );
+
+// ---------- 启动计时（诊断用）----------
+//
+// 回答「IDE 打开要 1 秒，花在哪」：
+//   · bootT0 是**所有模块 import 完**的时刻（import = 编译 aardio 源码，最贵的一段）
+//   · 每一拍（fillLibrary / 工程 / 打开文件 / LSP）单独计时
+// 绝对值用 GetTickCount，和外部 bench 脚本同钟可比。
+var bootT0 = ..time.tick();
+var bootMark = function(tag){
+	if( ..string.getenv("NODIO_IDE_DIAG") ){
+		io.print("DIAG boot " ++ tag ++ " at=" ++ tostring(..time.tick())
+			++ " since-import=" ++ tostring(..time.tick() - bootT0) ++ "ms");
+	}
+};
+
 
 var NODIO_EXE = ..string.getenv("NODIO_EXE") : "nodio.exe";
+
+// 测试 / 演示模式：启动流程要**同步**跑完（冒烟测试与截图回归
+// 依赖「起来就是那样」）。正常启动走的是分阶段异步加载（见 bootTick）。
+var isTestMode = ( ..string.getenv("NODIO_IDE_SMOKE") )
+	|| ( ..string.getenv("NODIO_IDE_NAV_SMOKE") )
+	|| ( ..string.getenv("NODIO_IDE_DEMO") );
+
 // LSP / DAP 可执行文件是 nodio.exe **同目录**下的 nodio-lsp.exe / nodio-dap.exe。
 // ⚠ 不能用 NODIO_EXE ++ "-lsp" 拼：NODIO_EXE 本身就带 .exe，拼出来是
 //   "nodio.exe-lsp"（不存在）→ popen 失败 → LSP / 调试器**从来没起来过**。
@@ -42,31 +83,167 @@ var curFile = null;   // file loaded in the editor
 var designer = app.designer.create(shell);
 
 // ---------- LSP ----------
-// The LSP server tracks ONE document; attach it to the active tab's file
-// and push the buffer on every change (debounced by an idle timer).
+//
+// LSP 服务端持有**整个工程**的符号索引：
+//   · 转到定义（F12）      —— 跨文件找定义
+//   · 查找引用（Shift+F12）—— 跨文件找引用
+//   · 跨文件重命名（F2）
+//   · 项目符号搜索
+// 所以启动后要把**工程根目录 + 源文件清单**发给它；
+// 换标签页时也要把当前文档切过去（openDoc），不能只跟一个文档 ——
+// 之前只有一个 uri，切文件后补全/诊断都落到错的文档上。
 var lspTimer = null;
+var lspProjectSent = false;
+
+// 把工程文件清单交给 LSP（建立项目级符号索引）
+//
+// ⚠ files 必须是**数组**表：JSON.stringify 只把带 _type="array" 的表
+//   当数组输出，普通表会被写成对象。
+var lspSendProject = function(){
+	if(!app.lspClient.isRunning()) return;
+	if(!proj || !proj.root || !projFiles) return;
+	var files = [ @{_type="array"} ];
+	for(i=1;#projFiles;1){
+		var f = projFiles[i];
+		var ext = ..string.lower(..io.splitpath(f.full).ext);
+		if(ext == ".nodio" || ext == ".aardio"){
+			..table.push(files, f.path);
+		}
+	}
+	app.lspClient.setProject(proj.root, files);
+	lspProjectSent = true;
+};
+
 var lspEnsure = function(){
 	if(!app.lspClient.isRunning()){
 		if(!curFile) return;
 		var r = app.lspClient.start(LSP_EXE, curFile, shell.tabGetText(curFile));
 		if(r != "ok"){ shell.setStatus("LSP 启动失败"); return }
+		lspProjectSent = false;
 	}
+	if(!lspProjectSent) lspSendProject();
 };
+// ⚠ 心跳每 300ms 都会调一次同步，**文档没改就不要送**：
+//   didChange 会把整篇文本发给 LSP 服务端，67KB 的文件每 300ms 送一次
+//   = 持续不断的 IPC + 服务端重新分析 —— 「一动鼠标就卡一下」的大头。
+var lspLastText = null;
 var lspSync = function(){
 	if(!curFile || !app.lspClient.isRunning()) return;
-	app.lspClient.didChange(shell.tabGetText(curFile));
+	var txt = shell.tabGetText(curFile);
+	if(txt === null || txt === undefined) return;
+	if(txt === lspLastText) return;
+	lspLastText = txt;
+	app.lspClient.didChange(txt);
 };
 // 当前文档的诊断（喂给编辑器画槽内标记）
-var editorDiags = {};
+var editorDiags = {};// 代码补全：编辑器算好前缀 → 这里问 LSP 要候选 → 交回编辑器弹浮层
+//
+// ⚠ lspClient.completion 是**同步阻塞**的（最多等 1 秒）。
+//   本地 LSP 正常 ~20~40ms 就回；服务器没起来时最多卡 1 秒。
+shell.editor.onComplete = function(line, col){
+	var items = null;
+	if(app.lspClient.isRunning()){
+		items = app.lspClient.completion(line - 1, col - 1);
+	}
+	if(!items || !#items){
+		items = {
+			{label="function"; kind=14; detail="keyword"};
+			{label="var"; kind=14; detail="keyword"};
+			{label="import"; kind=14; detail="keyword"};
+			{label="return"; kind=14; detail="keyword"};
+			{label="if"; kind=14; detail="keyword"};
+			{label="else"; kind=14; detail="keyword"};
+			{label="elseif"; kind=14; detail="keyword"};
+			{label="while"; kind=14; detail="keyword"};
+			{label="for"; kind=14; detail="keyword"};
+			{label="class"; kind=14; detail="keyword"};
+			{label="try"; kind=14; detail="keyword"};
+			{label="catch"; kind=14; detail="keyword"};
+		};
+	}
+	if(!items || !#items){
+		shell.editor.hideCompletion();
+		return;
+	}
+	shell.editor.showCompletion(items);
+};
+// 悬停提示：编辑器算出鼠标下的词 → 这里问 LSP → 交回编辑器弹浮层
+//
+// ⚠ lspClient.hover 是**同步阻塞**的（最多等 50ms）。
+//   组件侧已经做了两件事保证不卡：
+//   ① 只在鼠标**停住 350ms** 之后才问；
+//   ② 提问放到定时器里，不在窗口过程里做。
+shell.editor.onHover = function(line, col){
+	if(!app.lspClient.isRunning()) return "";
+	var txt = app.lspClient.hover(line - 1, col - 1);
+	if(txt === null || txt === undefined) return "";
+	return tostring(txt);
+};
+// 代码导航：转到定义 / 查找引用 / 重命名
+//
+// 编辑器组件负责按键（F12 / Shift+F12 / F2 / Ctrl+点击），
+// 并且已经把这些动作**推迟到定时器**（问 LSP 是同步阻塞的，
+// 在窗口过程里做会卡住整个窗口过程）。
+shell.editor.onDefinition = function(line, col, word){
+	navGotoDefinition(line, col, word);
+};
+shell.editor.onReferences = function(line, col, word){
+	navFindReferences(line, col, word);
+};
+shell.editor.onRename = function(line, col, word){
+	navRenameSymbol(line, col, word);
+};
+// 引用标记：光标在符号上停留 ~300ms → 编辑器这里回调 → 问 LSP 拿
+// 本文档里同一符号的全部出现 → 喂回编辑器垫亮背景。
+// ⚠ documentHighlight 同样是同步阻塞（最多 100ms），但触发点在
+//   setTimeout 里（编辑器 __scheduleHighlight），不在窗口过程里。
+shell.editor.onHighlight = function(line, col, word){
+	if(!app.lspClient.isRunning()) return;
+	var hl = app.lspClient.documentHighlight(line - 1, col - 1);
+	if(hl === null || hl === undefined) hl = {};
+	if( ..string.getenv("NODIO_IDE_DIAG") ){
+		io.print("DIAG onHighlight word=" ++ tostring(word)
+			++ " marks=" ++ tostring(#hl));
+	}
+	shell.editor.setHighlights(hl);
+};
+// 菜单入口（键盘之外的路径）：以当前光标位置为准
+shell.hooks.onGotoDefinition = function(){
+	var w = shell.editor.__wordAtPos ? shell.editor.__wordAtPos(shell.editor.__caretPos()) : null;
+	if(!w || !w.word){ shell.setStatus("光标处没有符号"); return }
+	navGotoDefinition(w.line, w.col, w.word);
+};
+shell.hooks.onFindReferences = function(){
+	var w = shell.editor.__wordAtPos ? shell.editor.__wordAtPos(shell.editor.__caretPos()) : null;
+	if(!w || !w.word){ shell.setStatus("光标处没有符号"); return }
+	navFindReferences(w.line, w.col, w.word);
+};
+shell.hooks.onRenameSymbol = function(){
+	var w = shell.editor.__wordAtPos ? shell.editor.__wordAtPos(shell.editor.__caretPos()) : null;
+	if(!w || !w.word){ shell.setStatus("光标处没有符号"); return }
+	navRenameSymbol(w.line, w.col, w.word);
+};
+var lastDiagsSig = "";
 var lspPoll = function(){
 	if(!app.lspClient.isRunning()) return;
 	var ds = app.lspClient.getDiags();
 	var n = #ds;
+	var sig = tostring(curFile) ++ ":" ++ n;
 	if(n > 0){
 		var d0 = ds[1];
+		var dn = ds[n];
+		sig = sig ++ ":" ++ d0.line ++ ":" ++ d0.msg ++ ":" ++ dn.line ++ ":" ++ dn.msg;
 		shell.setStatus("诊断: " ++ n ++ " 项 — 行 " ++ (d0.line + 1) ++ ": " ++ d0.msg);
 	}
-	else shell.setStatus("就绪");
+	else if(shell.statusIdleAllowed()){
+		// 空闲态只在**没有**待展示的用户消息时才写，
+		// 否则用户操作后的反馈 300ms 就被抹掉（表现为「点了没反应」）。
+		shell.setStatus("就绪");
+	}
+	// 诊断无变化时直接跳过列表和波浪线重绘，避免心跳每 300ms 无脑重绘 UI
+	if(sig == lastDiagsSig) return;
+	lastDiagsSig = sig;
+
 	// 问题列表（自绘 nodio.ui.list）：行 / 级别 / 说明
 	// tag 里带上文件路径和行号 —— 双击能跳到出错那一行。
 	var rows = {};
@@ -102,10 +279,316 @@ var lspPoll = function(){
 	shell.editor.setDiagnostics(editorDiags);
 };
 
+// ---------- 代码导航：转到定义 / 查找引用 / 重命名 ----------
+//
+// ⚠ 这三个动作都要**同步**问 LSP（最多 1 秒），绝不能放在按键处理里 ——
+//   编辑器组件已经用定时器把它们从窗口过程里推迟出来了。
+
+// 相对工程根的短路径（引用面板 / 状态栏里显示用）
+var navShortPath = function(path){
+	if(!path) return "";
+	if(proj && proj.root){
+		var r = app.project.relPath(proj, path);
+		if(r) return r;
+	}
+	var pi = ..io.splitpath(path);
+	return pi.name ++ (pi.ext : "");
+};
+
+// 跳到某个文件的某行某列（列是 1 基）
+var jumpTo = function(path, line, col){
+	if(!path) return false;
+	if(shell.tabCurPath() != path){
+		if(!openFile(path)) return false;
+	}
+	if(line) shell.editor.gotoLineCol(line, col ? col : 1);
+	shell.editor.setFocus();
+	return true;
+};
+
+// ---------- 导航栏（面包屑）----------
+//
+// VS 的导航栏：编辑区正上方一条，跟着光标显示
+// 「工程 › 目录 › 文件 › 命名空间 › 函数」，点哪一段就跳到哪一段。
+// 一眼看出自己在**整个项目**的哪个位置 —— VS 体感的关键一环。
+//
+// 数据来源：LSP 的 documentSymbol（**层级树**）。
+// ⚠ 层级链是**本地**算的：符号树只在文档变化时重新问一次 LSP，
+//   光标移动只做纯内存遍历 —— 每动一下都同步问一次 LSP 会把编辑器卡死。
+var curSymTree = [ @{_type="array"} ];   // 当前文档的符号树
+var symTreeDirty = false;                // 符号树要重新拉
+
+// 模块路径段：工程名 / 目录 / 文件
+var navModuleSegs = function(path){
+	var out = [ @{_type="array"} ];
+	var i;
+	if(!path) return out;
+	if(proj && proj.root){
+		// 工程根自带一个尾部分隔符（"D:\a\b\"），直接 splitpath 拿不到名字 ——
+		// 先把尾部的分隔符去掉。
+		// ⚠⚠ aardio 的 s[i] 取出来是**字节值**（数字），不是 1 字符的串！
+		//   所以 t[#t] == '\\' 永远不成立（数字 vs 字符串）——
+		//   必须跟字节值比：'\' = 92，'/' = 47。
+		var rootTrim = proj.root;
+		while(#rootTrim > 1 &&
+			(rootTrim[#rootTrim] == 92 || rootTrim[#rootTrim] == 47)){
+			rootTrim = ..string.left(rootTrim, #rootTrim - 1);
+		}
+		var pn = ..io.splitpath(rootTrim).name;
+		if(pn && #pn) ..table.push(out, {text = pn; kind = "dir"});
+	}
+	var rel = navShortPath(path);
+	if(!rel) rel = path;
+	rel = ..string.replaceLiteral(rel, "/", '\\');
+	var ps = ..string.split(rel, '\\');
+	var last = #ps;
+	for(i=1;last;1){
+		var seg = ps[i];
+		if(!seg || #seg == 0) continue;
+		..table.push(out, {
+			text = seg;
+			kind = (i == last) ? "file" : "dir";
+			path = path;
+		});
+	}
+	return out;
+}
+
+// 从符号树里找「包含该行的最内层符号」，返回从外到内的链
+//
+// 判定用**包含**（line <= 光标行 <= endLine），不是「在它上面」：
+// 只看起始行的话，光标停在一个刚结束的函数**之后**的顶层语句上时，
+// 会被误算成「还在那个函数里」。
+//
+// 只有**作用域类**符号（命名空间 / 类 / 函数）才算外层；
+// 变量不是作用域（kind 13 = Variable）。
+var navSymChain = function(tree, line){
+	var chain = [ @{_type="array"} ];
+	var walk = function(nodes){
+		var i, n;
+		var pick = null;
+		if(!nodes) return null;
+		for(i=1;#nodes;1){
+			n = nodes[i];
+			if(n.kind == 13) continue;              // 变量不是作用域
+			if(n.line <= line && line <= n.endLine) pick = n;
+		}
+		if(!pick) return null;
+		..table.push(chain, pick);
+		return walk(pick.children);
+	}
+	walk(tree);
+	return chain;
+}
+
+// 拼出完整的面包屑：工程 › 目录 › 文件 › 符号链
+var navBuildChain = function(line){
+	var chain = [ @{_type="array"} ];
+	var i, n;
+	var ms = navModuleSegs(curFile);
+	for(i=1;#ms;1) ..table.push(chain, ms[i]);
+	var sc = navSymChain(curSymTree, line);
+	for(i=1;#sc;1){
+		n = sc[i];
+		var nm = n.name;
+		// 命名空间/类的名字是**全限定名**（app.editor），
+		// 面包屑里只显示最后一段（前面的层级已经由目录/文件名体现了）
+		var dot = ..string.indexOf(nm, '.');
+		if(dot) nm = ..string.slice(nm, dot + 1);
+		..table.push(chain, {
+			text = nm;
+			kind = "symbol";
+			line = n.line;
+			col = n.col;
+		});
+	}
+	return chain;
+}
+
+// 光标移动 → 刷新导航栏
+var navLastLine = 0;
+var navUpdate = function(line){
+	if(!line) line = 1;
+	navLastLine = line;
+	shell.editor.setNavChain(navBuildChain(line));
+}
+
+// 拉一次符号树（同步阻塞，最多 50ms —— 放在心跳里，不在按键路径上）
+var navRefreshSymTree = function(){
+	symTreeDirty = false;
+	if(!app.lspClient.isRunning() || !curFile) return;
+	curSymTree = app.lspClient.symbols();
+	navUpdate(shell.editor.curLine);
+}
+
+// 点导航栏的一段 → 跳过去
+shell.editor.onNavClick = function(seg){
+	if(!seg) return;
+	if(seg.kind == "symbol"){
+		shell.editor.gotoLineCol(seg.line, (seg.col : 0) + 1);
+		shell.editor.setFocus();
+		return;
+	}
+	if(seg.kind == "file"){
+		shell.setStatus("当前文件: " ++ navShortPath(seg.path));
+		return;
+	}
+};
+// 光标移动 → 导航栏跟着走
+// （行号没变就不重算：onCursor 每 250ms 就会回调一次）
+shell.hooks.onCursorMove = function(line, col){
+	if(line == navLastLine) return;
+	navUpdate(line);
+};
+
+// 转到定义（F12 / Ctrl+点击）
+var navGotoDefinition = function(line, col, word){
+	if(!app.lspClient.isRunning()){
+		shell.setStatus("LSP 未运行，无法转到定义");
+		return;
+	}
+	var list = app.lspClient.definition(line - 1, col - 1);
+	if(!list || !#list){
+		shell.setStatus("没有找到定义" ++ (word ? ("：" ++ word) : ""));
+		return;
+	}
+	var loc = list[1];
+	if(jumpTo(loc.path, loc.line, loc.col + 1)){
+		shell.setStatus("定义: " ++ navShortPath(loc.path)
+			++ " 第 " ++ tostring(loc.line) ++ " 行");
+	}
+};
+
+// 查找引用（Shift+F12）：结果填进底部「引用」页
+var navFindReferences = function(line, col, word){
+	if(!app.lspClient.isRunning()){
+		shell.setStatus("LSP 未运行，无法查找引用");
+		return;
+	}
+	var list = app.lspClient.references(line - 1, col - 1);
+	var rows = {};
+	var n = 0;
+	if(list){
+		for(i=1;#list;1){
+			var loc = list[i];
+			n = n + 1;
+			..table.push(rows, {
+				cells = {navShortPath(loc.path); tostring(loc.line); (word : "")};
+				tag = {path = loc.path; line = loc.line; col = loc.col};
+			});
+		}
+	}
+	shell.refList.setRows(rows);
+	shell.bottomDock.setSelIndex(5);
+	shell.setStatus("找到 " ++ tostring(n) ++ " 处引用" ++ (word ? ("：" ++ word) : ""));
+};
+
+// 编辑清单按「行号从大到小」排（改的时候从后往前，前面的偏移才不会失效）
+var navSortEdits = function(es){
+	var n = #es;
+	for(a=1; a<=n; 1){
+		var mx = a;
+		for(b=a+1; b<=n; 1){
+			if(es[b].line > es[mx].line
+				|| (es[b].line == es[mx].line && es[b].col > es[mx].col)){
+				mx = b;
+			}
+		}
+		if(mx != a){
+			var t = es[a]; es[a] = es[mx]; es[mx] = t;
+		}
+	}
+	return es;
+};
+
+// 应用跨文件重命名
+var navApplyRename = function(edits, newName){
+	var byFile = {};
+	for(i=1;#edits;1){
+		var e = edits[i];
+		if(!e || !e.path) continue;
+		if(!byFile[e.path]) byFile[e.path] = {};
+		..table.push(byFile[e.path], e);
+	}
+	var changed = 0;
+	for(path, es in byFile){
+		navSortEdits(es);
+		var isOpen = (shell.tabCurPath() == path);
+		var text = isOpen ? shell.tabGetText(path) : ..string.load(path);
+		if(!text) continue;
+		var ok = true;
+		for(j=1;#es;1){
+			var e = es[j];
+			// ⚠ LSP 的列是 0 基、UTF-16 码元；编辑器要 1 基
+			var nt = shell.editor.replaceTextAt(text, e.line, e.col + 1, e.len, newName);
+			if(nt === null){ ok = false; break }
+			text = nt;
+		}
+		if(!ok) continue;
+		if(isOpen){
+			shell.tabSetText(path, text);
+			shell.tabSetDirty(path, true);
+		}
+		else{
+			..string.save(path, text);
+		}
+		// 新内容推给 LSP，索引要跟上
+		app.lspClient.pushDoc(path, text);
+		changed = changed + 1;
+	}
+	shell.setStatus("已重命名：" ++ tostring(#edits) ++ " 处（" ++ tostring(changed) ++ " 个文件）");
+};
+
+// 跨文件重命名（F2）：先问新名字，再让 LSP 算改动点
+var navRenameSymbol = function(line, col, word){
+	if(!app.lspClient.isRunning()){
+		shell.setStatus("LSP 未运行，无法重命名");
+		return;
+	}
+	if(!word){
+		shell.setStatus("光标处没有可重命名的符号");
+		return;
+	}
+	shell.showPrompt("重命名为", word, function(t){
+		var nn = ..string.trim(t);
+		if(!nn || nn == word) return false;
+		var edits = app.lspClient.rename(line - 1, col - 1, nn);
+		if(!edits || !#edits){
+			shell.setStatus("没有找到可重命名的位置");
+			return false;
+		}
+		navApplyRename(edits, nn);
+		return true;
+	});
+};
+
+// 项目符号搜索（Ctrl+Shift+T）：结果也填进「引用」面板
+shell.hooks.onGotoSymbol = function(q){
+	if(!app.lspClient.isRunning()){
+		shell.setStatus("LSP 未运行，无法搜索符号");
+		return;
+	}
+	var list = app.lspClient.workspaceSymbols(q);
+	var rows = {};
+	var n = 0;
+	if(list){
+		for(i=1;#list;1){
+			var s = list[i];
+			n = n + 1;
+			..table.push(rows, {
+				cells = {navShortPath(s.path); tostring(s.line); s.name};
+				tag = {path = s.path; line = s.line; col = s.col};
+			});
+		}
+	}
+	shell.refList.setRows(rows);
+	shell.bottomDock.setSelIndex(5);
+	shell.setStatus("符号 “" ++ q ++ "”：找到 " ++ tostring(n) ++ " 个");
+};
 // ---------- property grid (file info) ----------
 var propShowFile = function(path){
 	var pi = ..io.splitpath(path);
-	designer.propertyGrid.setItems({
+	designer.propGrid.setItems({
 		{name="名称"; value=pi.name ++ pi.ext};
 		{name="目录"; value=pi.dir};
 		{name="大小"; value=..io.getSize(path) ++ " 字节"};
@@ -171,11 +654,11 @@ var fillOutline = function(){
 		name = "";
 		icon = "code";
 		// ① name = function(...)  /  var name = function(...)
-		pf = ..string.split(line, "= function");
+		pf = ..string.split(line, "<= function>");
 		if(#pf >= 2){
 			pre = ..string.trim(pf[1]);
 			if(..string.startsWith(pre, "var ")){
-				pv = ..string.split(pre, "var ");
+				pv = ..string.split(pre, "<var >");
 				pre = ..string.trim(pv[2]);
 			}
 			// 只要简单标识符：成员函数（a.b）、带参调用都不算
@@ -186,7 +669,7 @@ var fillOutline = function(){
 		}
 		// ② var name = ...（变量）
 		if(!name && ..string.startsWith(line, "var ")){
-			pv2 = ..string.split(line, "var ");
+			pv2 = ..string.split(line, "<var >");
 			rest = ..string.trim(pv2[2]);
 			pe = ..string.split(rest, "=");
 			nm = ..string.trim(pe[1]);
@@ -290,7 +773,9 @@ var projRefresh = function(){
 	if(!proj) return 0;
 	var tree = shell.projTree;
 	tree.clear();
-	var root = tree.addNode(proj.root, proj.root, null);
+	var projName = proj.name : ..io.splitpath(proj.root).name;
+	if(!projName || !#projName) projName = proj.root;
+	var root = tree.addNode(projName, proj.root, null);
 	tree.markDir(root);
 	var dirNodes = {};    // 绝对路径 → 目录节点
 	dirNodes[proj.root] = root;
@@ -374,6 +859,8 @@ var projRefresh = function(){
 		..table.push(projFiles, {path = rel; full = full});
 	}
 	searchScopeUpdate();
+	// 工程清单变了 → LSP 的项目级符号索引也要跟着重建
+	lspSendProject();
 	tree.expand(root);
 	return nodes;
 }
@@ -404,6 +891,9 @@ openProject = function(){
 	proj = m;
 	projRefresh();
 	shell.setProjectStatus(tostring(m.path));
+	// 记住上次打开的工程：下次启动 IDE 直接回到这个工程
+	// （否则正常启动是一片空白，见下面的 startupProject）
+	cfgWrite("lastProject", m.path);
 	shell.setStatus("工程: " ++ tostring(m.path));
 	// user components join the designer from <project>\components
 	var n = designer.discover(m.root ++ "components");
@@ -587,11 +1077,17 @@ var projSetStart = function(path){
 }
 
 // 新建文档（未命名）
-newFile = function(){
+newFile = function(initialText){
 	var n = 1;
 	while(shell.tabFind("未命名-" ++ n) !== null) n = n + 1;
 	var name = "未命名-" ++ n;
-	shell.tabAdd(name, "");
+	if(initialText === null || initialText === undefined){
+		initialText = "// 新建 aardio 源文件" ++ '\r\n'
+			++ "import console;" ++ '\r\n\r\n'
+			++ "console.log(""Hello, Nodio!"");" ++ '\r\n'
+			++ "console.pause();" ++ '\r\n';
+	}
+	shell.tabAdd(name, initialText);
 	curFile = name;
 	fillOutline();
 	shell.setStatus("新建文档: " ++ name);
@@ -610,12 +1106,51 @@ openTab = function(path){
 	curFile = path;
 	fillOutline();
 	lspEnsure();
-	lspSync();
+	// LSP 是多文档的：换文件要把**当前文档**切过去，
+	// 否则补全/诊断/定义查询全都作用在旧文件上。
+	if(app.lspClient.isRunning()){
+		app.lspClient.openDoc(path, shell.tabGetText(path));
+	}
+	// 符号树要重拉（导航栏面包屑的层级链）
+	curSymTree = [ @{_type="array"} ];
+	symTreeDirty = true;
+	navUpdate(shell.editor.curLine);
 	shell.setStatus("已打开: " ++ path);
 	return true;
 }
 
 // ---------- 保存 ----------
+// 原子安全落盘：写临时文件 -> 校验大小 -> MoveFileEx 替换目标，
+// 杜绝断电/崩溃/磁盘满导致原文件截断损坏。
+var atomicSaveFile = function(dstPath, text){
+	var fullDst = ..io.fullpath(dstPath);
+	var tmpPath = fullDst ++ ".nodio.tmp";
+	if(!..string.save(tmpPath, text)){
+		return false;
+	}
+	var fsize = ..io.getSize(tmpPath);
+	if(fsize === null || fsize != #text){
+		try{ ..io.remove(tmpPath) }catch(e){}
+		return false;
+	}
+	// 0x1 = MOVEFILE_REPLACE_EXISTING, 0x8 = MOVEFILE_WRITE_THROUGH
+	var ok = ::Kernel32.MoveFileEx(tmpPath, fullDst, 0x1 | 0x8);
+	if(!ok){
+		try{
+			..io.remove(fullDst);
+			..io.rename(tmpPath, fullDst);
+			ok = true;
+		}catch(e){
+			ok = false;
+		}
+	}
+	if(!ok){
+		..string.save(fullDst, text);
+		try{ ..io.remove(tmpPath) }catch(e){}
+	}
+	return true;
+};
+
 // 保存当前文档
 saveFile = function(){
 	var path = shell.tabCurPath();
@@ -634,7 +1169,10 @@ savePath = function(path){
 	}
 	// 按该文档自己的换行符还原（LF 文件不会被写成 CRLF）
 	var text = shell.tabTextForSave(path);
-	..string.save(path, text);
+	if(!atomicSaveFile(path, text)){
+		shell.setStatus("保存失败: " ++ path);
+		return false;
+	}
 	shell.tabMarkSaved(path);
 	shell.setStatus("已保存: " ++ path);
 	lspSync();
@@ -668,7 +1206,7 @@ saveFileAs = function(path){
 		return false;
 	}
 	curFile = np;
-	..string.save(np, shell.tabTextForSave(np));
+	atomicSaveFile(np, shell.tabTextForSave(np));
 	shell.tabMarkSaved(np);
 	shell.setStatus("已另存为: " ++ np);
 	lspSync();
@@ -713,13 +1251,35 @@ closeTab = function(path){
 
 runScript = function(){
 	var f = proj ? proj.start : curFile;
-	if(!f){ shell.setStatus("没有工程/启动文件"); return }
+	if(!f){
+		newFile();
+		f = curFile;
+	}
+	// 切换底栏到「输出」页签（索引 2）
+	if(shell.bottomDock){
+		shell.bottomDock.setSelIndex(2);
+	}
+	if(!..io.exist(f)){
+		// 临时草稿文档：存入临时运行文件直接跑，无需弹窗打扰
+		var tempRun = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_scratch_run.aardio");
+		var text = shell.tabTextForSave(curFile);
+		..string.save(tempRun, text);
+		runner.run(tempRun, ..io.splitpath(tempRun).dir);
+		return;
+	}
 	saveFile();
 	runner.run(f);
 }
 
 // ---------- debugging (F10) ----------
-var dbgSession = null;   // dapClient session
+//
+// dapClient 是**模块式 API**（跟 lspClient 一样），不是对象实例：
+//   app.dapClient.start() 返回 "ok" / 失败原因；
+//   之后一律 app.dapClient.launch() / .pollEvents() 调用。
+// 以前这里把 start() 的返回值当对象用，而 dapClient.start() 结尾写的是
+// `return self`（模块作用域里没有 self）→ 永远返回空 → F10 永远
+// 「调试适配器启动失败」。
+var dbgSession = null;   // 调试会话是否已建立
 var dbgTimer = null;
 
 debugRun = function(){
@@ -727,21 +1287,34 @@ debugRun = function(){
 	if(!f){ shell.setStatus("没有工程/启动文件"); return }
 	saveFile();
 	if(!dbgSession){
-		dbgSession = app.dapClient.start(DAP_EXE);
-		if(!dbgSession){ shell.setStatus("调试适配器启动失败"); return }
+		var st = app.dapClient.start(DAP_EXE);
+		if(st !== "ok"){ shell.setStatus("调试适配器启动失败: " ++ tostring(st)); return }
+		dbgSession = true;
 	}
 	shell.dbgClear();
 	shell.setStatus("调试中...");
-	var r = dbgSession.launch(f);
-	if(r !== true){ shell.setStatus("调试启动失败: " ++ tostring(r)); dbgSession.stop(); dbgSession = null; return }
+	var r = app.dapClient.launch(f);
+	if(r !== true){ shell.setStatus("调试启动失败: " ++ tostring(r)); app.dapClient.stop(); dbgSession = null; return }
+	// 调试会话起来之后，把**之前**就打好的断点补发给适配器
+	// （断点是在会话之前点的，当时没有地方可发）。
+	if(curFile && breakpoints[curFile]){
+		var bl = {};
+		var bn = 0;
+		var bp0 = breakpoints[curFile];
+		for(l,on in bp0){
+			if(on){ bn = bn + 1; bl[bn] = l - 1 }
+		}
+		if(bn) app.dapClient.setBreakpoints(curFile, bl);
+	}
 	if(dbgTimer) shell.winform.clearInterval(dbgTimer);
 	dbgTimer = shell.winform.setInterval(pollDebug, 120);
 }
 
 stopDebug = function(){
 	if(dbgTimer){ shell.winform.clearInterval(dbgTimer); dbgTimer = null }
-	if(dbgSession){ dbgSession.stop(); dbgSession = null }
-	shell.setStatus("调试已停止");
+	if(dbgSession){ app.dapClient.stop(); dbgSession = null }
+	if(runner.isRunning()) runner.stop();
+	shell.setStatus("已停止");
 }
 
 // one IDE-side breakpoint slot per line on the debugged file
@@ -749,56 +1322,131 @@ var breakpoints = {};
 var setBreakpoint = function(path, line, onOff){
 	breakpoints[path] = breakpoints[path] : {};
 	breakpoints[path][line] = onOff ? true : null;
-	if(dbgSession && dbgSession.ready()){
+	if(dbgSession && app.dapClient.ready()){
 		var lines = {};
 		var n = 0;
 		var bp = breakpoints[path] : {};
 		for(l,on in bp){
 			if(on){ n = n + 1; lines[n] = l - 1 }   // 0-based for DAP
 		}
-		dbgSession.setBreakpoints(path, lines);
+		app.dapClient.setBreakpoints(path, lines);
 	}
 }
 
 pollDebug = function(){
 	if(!dbgSession) return;
-	dbgSession.poll(function(ev, data){
+	// ⚠ 方法名：dapClient 暴露的是 pollEvents(ev)，不是 poll()
+	// （poll 是模块内部的收包函数，外部调用不到）。
+	app.dapClient.pollEvents(function(ev, data){
 		if(ev == "stopped"){
 			shell.dbgAppend("[停止] 行 " ++ (data.line + 1));
-			var vars = dbgSession.getVars();
+			var vars = app.dapClient.getVars();
 			for(i=1;#vars;1){
 				shell.dbgAppend("  " ++ vars[i].name ++ " = " ++ vars[i].value);
 			}
-			var v = dbgSession.stackTrace();
+			if(refreshWatchList) refreshWatchList();
+			var v = app.dapClient.stackTrace();
 			for(i=1;#v;1){
 				shell.dbgAppend("  @ 行 " ++ (v[i].line + 1));
 			}
-			shell.setStatus("已停止 — F10 继续/单步, Ctrl+F9 停止");
+			shell.setStatus("已停止 — F10 继续, F11 单步, Ctrl+F9 停止");
+			// 光标跳到停住的那一行（不跳的话用户根本不知道停在哪）
+			// ⚠ data.line 是 **0 基**行号，编辑器的 gotoLine 是 1 基。
+			if(data.line !== null && data.line !== undefined){
+				shell.editor.gotoLine(data.line + 1);
+			}
 		}
 		elseif(ev == "terminated"){
 			shell.dbgAppend("[调试结束]");
 			stopDebug();
 		}
 	});
+	// ⚠ 显式返回 null：官方 WM_TIMER 会把「返回值既不是 null 也不是 true」
+	//   的定时器**移除**（win/ui/_.aardio:342）——
+	//   这里最后一句是 pollEvents(...)，返回值会传出去，
+	//   一旦是 false，**调试轮询就停了**（断点不再命中、F10 失灵）。
+	return null;
 }
 
 debugStep = function(){
-	if(dbgSession) dbgSession.next();
+	if(dbgSession) app.dapClient.next();
 }
 
-shell.onOpenProject = openProject;
-shell.onOpenFile    = openFile;      // path == "" → 弹「打开文件」对话框
-shell.onNewFile     = newFile;
-shell.onSave        = saveFile;
-shell.onSaveAs      = function(){ return saveFileAs() };
-shell.onSaveAll     = saveAllFiles;
-shell.onCloseTab    = closeTab;
+// 行号栏点一下打/消断点 → 转给 DAP 适配器
+shell.editor.onToggleBreakpoint = function(line, on){
+	if(!curFile) return;
+	setBreakpoint(curFile, line, on);
+	shell.setStatus((on ? "已设断点 行 " : "已取消断点 行 ") ++ line);
+};
+
+shell.hooks.onOpenProject = openProject;
+shell.hooks.onOpenFile    = openFile;      // path == "" → 弹「打开文件」对话框
+shell.hooks.onNewFile     = newFile;
+shell.hooks.onSave        = saveFile;
+shell.hooks.onSaveAs      = function(){ return saveFileAs() };
+shell.hooks.onSaveAll     = saveAllFiles;
+shell.hooks.onCloseTab    = closeTab;
+shell.hooks.onCloseOtherTabs = function(keepPath){
+	keepPath = keepPath : shell.curTab;
+	if(!keepPath) return;
+	var toClose = {};
+	for(i=1;#shell.tabOrder;1){
+		if(shell.tabOrder[i] != keepPath) ..table.push(toClose, shell.tabOrder[i]);
+	}
+	for(i=1;#toClose;1){
+		closeTab(toClose[i]);
+	}
+};
+shell.hooks.onCloseAllTabs = function(){
+	var toClose = {};
+	for(i=1;#shell.tabOrder;1){ ..table.push(toClose, shell.tabOrder[i]); }
+	for(i=1;#toClose;1){
+		closeTab(toClose[i]);
+	}
+};
+shell.hooks.onQuickOpen = function(query){
+	var target = null;
+	var lowerQ = ..string.lower(query);
+	if(proj && projFiles && #projFiles){
+		for(i=1;#projFiles;1){
+			var pf = projFiles[i];
+			var pi = ..io.splitpath(pf.path);
+			var name = pi.name ++ pi.ext;
+			if(..string.lower(name) == lowerQ){
+				target = pf.full : (proj.root ++ pf.path);
+				break;
+			}
+		}
+		if(!target){
+			for(i=1;#projFiles;1){
+				var pf = projFiles[i];
+				if(..string.find(..string.lower(pf.path), lowerQ)){
+					target = pf.full : (proj.root ++ pf.path);
+					break;
+				}
+			}
+		}
+	}
+	if(!target){
+		if(..io.exist(query)) target = ..io.fullpath(query);
+		elseif(proj && proj.root && ..io.exist(proj.root ++ query)){
+			target = proj.root ++ query;
+		}
+	}
+	if(target && ..io.exist(target)){
+		openFile(target);
+		shell.setStatus("已快速打开: " ++ target);
+		return true;
+	}
+	shell.setStatus("未找到匹配的文件: " ++ query);
+	return false;
+};
 // 工程树文件操作（磁盘动作 + 工程清单同步）
-shell.onProjNewFile = projNewFile;
-shell.onProjNewDir  = projNewDir;
-shell.onProjRename  = projRename;
-shell.onProjDelete  = projDelete;
-shell.onProjSetStart = projSetStart;
+shell.hooks.onProjNewFile = projNewFile;
+shell.hooks.onProjNewDir  = projNewDir;
+shell.hooks.onProjRename  = projRename;
+shell.hooks.onProjDelete  = projDelete;
+shell.hooks.onProjSetStart = projSetStart;
 // 左栏「搜索」页：双击结果 → 打开文件并跳到那一行
 shell.searchPanel.onStatus = function(text){
 	shell.setStatus(text);
@@ -809,31 +1457,455 @@ shell.searchPanel.onOpenFile = function(path, line){
 }
 // 文档内容变了：大纲要重建（标个脏，心跳里统一做，别在按键回调里重扫全文）
 var outlineDirty = false;
-shell.onDocChange   = function(path, text){
+shell.hooks.onDocChange   = function(path, text){
 	outlineDirty = true;
+	// 导航栏的层级链也依赖符号树 → 同样标脏
+	symTreeDirty = true;
 };
-shell.onRun         = runScript;
-shell.onDebug       = function(){
-	if(dbgSession && dbgSession.ready()){ dbgSession.next(); pollDebug() }
-	else debugRun();
+shell.hooks.onRun         = runScript;
+// F10 = 调试：没有会话 → 开始调试；已经停住了 → **继续**（resume）
+//
+// ⚠ 以前这里停住之后走的是 next()（单步跳过），resume() 从来没被调用过 ——
+//   「F10 继续」在界面上写着，实际上是单步，跑不出效果。
+//   单步挪到 F11（见 onDebugStep），两边语义就分开了。
+shell.hooks.onDebug       = function(){
+	if(dbgSession && app.dapClient.ready()){
+		if(app.dapClient.isStopped()){
+			app.dapClient.resume();
+			shell.setStatus("继续运行...");
+		}
+		else{
+			app.dapClient.next();
+		}
+		pollDebug();
+		return;
+	}
+	debugRun();
 };
-shell.onStopDebug   = stopDebug;
-shell.onDesigner    = function(){ designer.toggle() };
-shell.onTabChange   = function(path){
+// F11 = 单步跳过
+shell.hooks.onDebugStep   = function(){
+	if(!dbgSession){ shell.setStatus("没有调试会话"); return }
+	if(!app.dapClient.isStopped()){ shell.setStatus("程序没有停在断点上"); return }
+	debugStep();
+	pollDebug();
+};
+shell.hooks.onStopDebug   = stopDebug;
+shell.hooks.onDesigner    = function(){ designer.toggle() };
+// ---------- 设计的保存 / 载入 ----------
+//
+// 官方 aardio 的窗体源码里带 /*DSG{{*/ … /*}}*/ 设计块，
+// 设计器读写的就是这一段 —— 所以「保存设计」= 把画布内容写回当前文档。
+//
+// ⚠ 以前 designer 只有 toDSG()/fromDSG() 两个纯函数，**没有任何入口**：
+//   画完就丢，工具条上的「设计器」按钮只能开合面板，存不下来。
+shell.hooks.onDesignerSave = function(){
+	var path = shell.tabCurPath();
+	if(!path){ shell.setStatus("没有打开的文档"); return }
+	var src = shell.tabGetText(path);
+	var ns = designer.applyToSource(src);
+	if(ns == src){ shell.setStatus("设计没有变化"); return }
+	shell.tabSetText(path, ns);
+	shell.setStatus("设计已写回源码: " ++ path);
+};
+shell.hooks.onDesignerLoad = function(){
+	var path = shell.tabCurPath();
+	if(!path){ shell.setStatus("没有打开的文档"); return }
+	designer.open();
+	if(!designer.readFromSource(shell.tabGetText(path))){
+		shell.setStatus("当前文档里没有 DSG 设计块");
+		return;
+	}
+	shell.setStatus("已从源码载入设计");
+};
+shell.hooks.onDesignerSaveAs = function(){
+	var path = shell.fileDlg.save('DSG 文件|*.dsg|所有文件|*.*|', "设计另存为", null, "设计.dsg");
+	if(!path) return;
+	designer.saveToFile(path);
+};
+shell.hooks.onDesignerOpen = function(){
+	var path = shell.fileDlg.open('DSG 文件|*.dsg|所有文件|*.*|', "打开设计");
+	if(!path) return;
+	designer.open();
+	designer.loadFromFile(path);
+};
+// ---------- 窗体设置 / 网格吸附 / 边距线（官方 USR.CFG 的 dlg_* 一族） ----------
+//
+// 窗体设置 = 选中「窗体本身」：点画布空白处或这里 —— 左栏属性格改
+// 标题/宽度/高度，写回的是 DSG 头 win.form(text=..;right=..;bottom=..)。
+// 网格吸附 = 拖动/缩放时把坐标钉到网格上（属性格里的精确值不吸附）。
+// 边距线 = 表单内容区参考线（设计坐标，默认 8 逻辑像素）。
+shell.hooks.onDesignerForm = function(){
+	if(!designer.visible) designer.open();
+	designer.canvas.selectForm();
+	shell.leftDock.setSelIndex(2);
+	shell.setStatus("窗体设置：在左栏「属性」里改 标题/宽度/高度");
+};
+shell.hooks.onDesignerGrid = function(){
+	designer.canvas.showGrid = designer.canvas.showGrid ? false : true;
+	designer.canvas.__refresh();
+	shell.setStatus("显示网格线: " ++ (designer.canvas.showGrid ? "开" : "关"));
+};
+shell.hooks.onDesignerSnap = function(){
+	designer.canvas.snap = designer.canvas.snap ? false : true;
+	shell.setStatus("对齐网格: " ++ (designer.canvas.snap ? "开" : "关"));
+};
+shell.hooks.onDesignerAlignSnap = function(){
+	designer.canvas.alignSnap = designer.canvas.alignSnap ? false : true;
+	shell.setStatus("控件吸附对齐: " ++ (designer.canvas.alignSnap ? "开" : "关"));
+};
+shell.hooks.onDesignerMargin = function(){
+	if(designer.canvas.margins){
+		designer.canvas.margins = null;
+		designer.canvas.__refresh();
+		shell.setStatus("边距线: 关");
+	}
+	else{
+		designer.canvas.margins = {left=8; top=8; right=8; bottom=8};
+		designer.canvas.__refresh();
+		shell.setStatus("边距线: 8 逻辑像素（设计菜单可关）");
+	}
+};
+shell.hooks.onDesignerZoom100 = function(){
+	designer.canvas.setZoom(100);
+	shell.setStatus("设计器缩放: 100%");
+};
+shell.hooks.onDesignerZoomIn = function(){
+	var cur = designer.canvas.zoom : 100;
+	designer.canvas.setZoom(cur + 25);
+	shell.setStatus("设计器缩放: " ++ tostring(designer.canvas.zoom) ++ "%");
+};
+shell.hooks.onDesignerZoomOut = function(){
+	var cur = designer.canvas.zoom : 100;
+	designer.canvas.setZoom(cur - 25);
+	shell.setStatus("设计器缩放: " ++ tostring(designer.canvas.zoom) ++ "%");
+};
+
+// ---------- 设计器批量对齐与画布撤销/重做 ----------
+shell.hooks.onDesignerAlignLeft = function(){
+	if(designer.canvas.alignLeft()) shell.setStatus("已左对齐选中控件");
+	else shell.setStatus("至少需要选中 2 个控件进行对齐");
+};
+shell.hooks.onDesignerAlignRight = function(){
+	if(designer.canvas.alignRight()) shell.setStatus("已右对齐选中控件");
+	else shell.setStatus("至少需要选中 2 个控件进行对齐");
+};
+shell.hooks.onDesignerAlignTop = function(){
+	if(designer.canvas.alignTop()) shell.setStatus("已顶对齐选中控件");
+	else shell.setStatus("至少需要选中 2 个控件进行对齐");
+};
+shell.hooks.onDesignerAlignBottom = function(){
+	if(designer.canvas.alignBottom()) shell.setStatus("已底对齐选中控件");
+	else shell.setStatus("至少需要选中 2 个控件进行对齐");
+};
+shell.hooks.onDesignerAlignCenterH = function(){
+	if(designer.canvas.alignCenterH()) shell.setStatus("已水平居中对齐选中控件");
+	else shell.setStatus("至少需要选中 2 个控件进行对齐");
+};
+shell.hooks.onDesignerAlignCenterV = function(){
+	if(designer.canvas.alignCenterV()) shell.setStatus("已垂直居中对齐选中控件");
+	else shell.setStatus("至少需要选中 2 个控件进行对齐");
+};
+shell.hooks.onDesignerSameWidth = function(){
+	if(designer.canvas.sameWidth()) shell.setStatus("已统一选中控件宽度");
+	else shell.setStatus("至少需要选中 2 个控件进行等宽调整");
+};
+shell.hooks.onDesignerSameHeight = function(){
+	if(designer.canvas.sameHeight()) shell.setStatus("已统一选中控件高度");
+	else shell.setStatus("至少需要选中 2 个控件进行等高调整");
+};
+shell.hooks.onDesignerUndo = function(){
+	if(designer.canvas.undo()) shell.setStatus("已撤销设计画布操作");
+	else shell.setStatus("无更多可撤销画布操作");
+};
+shell.hooks.onDesignerRedo = function(){
+	if(designer.canvas.redo()) shell.setStatus("已重做设计画布操作");
+	else shell.setStatus("无更多可重做画布操作");
+};
+
+// ---------- 差异对比导航 (Diff Navigation) ----------
+shell.hooks.onNextDiff = function(){
+	if(!shell.splitDiff || !shell.editor2){
+		shell.setStatus("双栏对比未开启");
+		return;
+	}
+	var t1 = shell.editor.getText();
+	var t2 = shell.editor2.getText();
+	var l1 = ..string.split(t1, '\n');
+	var l2 = ..string.split(t2, '\n');
+	var d1 = {};
+	var d2 = {};
+	var maxL = (#l1 > #l2) ? #l1 : #l2;
+	var firstDiff = null;
+	var cur = shell.editor.curLine : 1;
+	for(i=1;maxL;1){
+		var s1 = (i <= #l1) ? ..string.trimright(l1[i]) : null;
+		var s2 = (i <= #l2) ? ..string.trimright(l2[i]) : null;
+		if(s1 != s2){
+			if(s1 === null) d2[i] = "add";
+			elseif(s2 === null) d1[i] = "del";
+			else { d1[i] = "mod"; d2[i] = "mod"; }
+			if(firstDiff === null && i > cur) firstDiff = i;
+		}
+	}
+	shell.editor.setDiffLines(d1);
+	shell.editor2.setDiffLines(d2);
+	if(firstDiff !== null){
+		shell.editor.gotoLine(firstDiff);
+		shell.editor2.gotoLine(firstDiff);
+		shell.setStatus("已跳转至差异行: " ++ firstDiff);
+	}
+	else{
+		shell.setStatus("向下无更多差异");
+	}
+};
+
+shell.hooks.onPrevDiff = function(){
+	if(!shell.splitDiff || !shell.editor2){
+		shell.setStatus("双栏对比未开启");
+		return;
+	}
+	var t1 = shell.editor.getText();
+	var t2 = shell.editor2.getText();
+	var l1 = ..string.split(t1, '\n');
+	var l2 = ..string.split(t2, '\n');
+	var d1 = {};
+	var d2 = {};
+	var maxL = (#l1 > #l2) ? #l1 : #l2;
+	var prevDiff = null;
+	var cur = shell.editor.curLine : 1;
+	for(i=maxL;1;-1){
+		var s1 = (i <= #l1) ? ..string.trimright(l1[i]) : null;
+		var s2 = (i <= #l2) ? ..string.trimright(l2[i]) : null;
+		if(s1 != s2){
+			if(s1 === null) d2[i] = "add";
+			elseif(s2 === null) d1[i] = "del";
+			else { d1[i] = "mod"; d2[i] = "mod"; }
+			if(prevDiff === null && i < cur) prevDiff = i;
+		}
+	}
+	shell.editor.setDiffLines(d1);
+	shell.editor2.setDiffLines(d2);
+	if(prevDiff !== null){
+		shell.editor.gotoLine(prevDiff);
+		shell.editor2.gotoLine(prevDiff);
+		shell.setStatus("已跳转至上一差异行: " ++ prevDiff);
+	}
+	else{
+		shell.setStatus("向上无更多差异");
+	}
+};
+
+// ---------- 监视表达式 (Watch Expressions) ----------
+var watchList = {};
+var refreshWatchList = function(){
+	if(!#watchList) return;
+	var vars = {};
+	if(dbgSession && app.dapClient.ready() && app.dapClient.isStopped()){
+		vars = app.dapClient.getVars();
+	}
+	var varMap = {};
+	if(vars){
+		for(i=1;#vars;1){ varMap[vars[i].name] = vars[i].value; }
+	}
+	for(i=1;#watchList;1){
+		var expr = watchList[i];
+		var val = (varMap[expr] !== null) ? varMap[expr] : "<未定义或超出范围>";
+		shell.dbgAppend("[监视] " ++ expr ++ " = " ++ tostring(val));
+	}
+};
+
+shell.hooks.onAddWatch = function(){
+	shell.showPrompt("添加监视表达式", "", function(expr){
+		expr = ..string.trim(expr);
+		if(!expr) return false;
+		..table.push(watchList, expr);
+		shell.setStatus("已添加监视: " ++ expr);
+		refreshWatchList();
+		return true;
+	});
+};
+
+shell.hooks.onClearWatch = function(){
+	watchList = {};
+	shell.setStatus("已清空监视列表");
+	refreshWatchList();
+};
+
+// ---------- 外部工具与工程代码统计 ----------
+shell.hooks.onRevealInExplorer = function(){
+	var cur = shell.tabCurPath();
+	if(!cur && proj) cur = proj.root;
+	if(!cur){
+		shell.setStatus("当前没有打开的文件或工程");
+		return;
+	}
+	var full = ..io.fullpath(cur);
+	try{
+		::Shell32.ShellExecute(0, "open", "explorer.exe", '/select,"' ++ full ++ '"', null, 1);
+		shell.setStatus("已在资源管理器中定位: " ++ full);
+	}catch(e){
+		shell.setStatus("定位失败: " ++ tostring(e));
+	}
+};
+
+shell.hooks.onOpenTerminal = function(){
+	var dir = (proj && proj.root) ? proj.root : ..io.fullpath(".");
+	var cur = shell.tabCurPath();
+	if(cur){
+		var pi = ..io.splitpath(cur);
+		if(pi && pi.dir) dir = pi.dir;
+	}
+	try{
+		::Shell32.ShellExecute(0, "open", "cmd.exe", null, dir, 1);
+		shell.setStatus("已在目录打开终端: " ++ dir);
+	}catch(e){
+		shell.setStatus("打开终端失败: " ++ tostring(e));
+	}
+};
+
+shell.hooks.onProjectStats = function(){
+	if(!proj || !proj.root){
+		shell.setStatus("当前未打开工程");
+		return;
+	}
+	var totalFiles = 0;
+	var totalLines = 0;
+	var codeLines = 0;
+	var commentLines = 0;
+	var blankLines = 0;
+	var files = projFiles;
+	if(files && #files){
+		for(i=1;#files;1){
+			var fp = files[i].full : (proj.root ++ files[i].path);
+			if(..io.exist(fp)){
+				totalFiles = totalFiles + 1;
+				var txt = ..string.load(fp);
+				if(txt){
+					var lines = ..string.split(txt, '\n');
+					totalLines = totalLines + #lines;
+					for(k=1;#lines;1){
+						var trimmed = ..string.trim(lines[k]);
+						if(trimmed == "") blankLines = blankLines + 1;
+						elseif(..string.startsWith(trimmed, "//") || ..string.startsWith(trimmed, "/*")) commentLines = commentLines + 1;
+						else codeLines = codeLines + 1;
+					}
+				}
+			}
+		}
+	}
+	var msg = "工程路径: " ++ proj.root ++ '\r\n\r\n'
+		++ "源文件总数: " ++ totalFiles ++ " 个\r\n"
+		++ "代码总行数: " ++ totalLines ++ " 行\r\n"
+		++ "有效代码行: " ++ codeLines ++ " 行\r\n"
+		++ "注释行数:   " ++ commentLines ++ " 行\r\n"
+		++ "空行行数:   " ++ blankLines ++ " 行";
+	modalBusy = true;
+	..win.msgbox(msg, "Nodio IDE - 工程代码行统计");
+	modalBusy = false;
+};
+// ---------- 事件代码生成（双击组件 / 右键「查看事件代码」） ----------
+//
+// 官方 IDE 的行为：设计视图里双击控件 → 切到代码视图，
+// 在源码里生成（或跳到）它的事件处理函数。事件名按官方控件库的默认事件：
+//   button/checkbox/radio/groupbox → oncommand        (WM_COMMAND)
+//   combobox/listbox               → onSelChange      (WM_COMMAND 通知)
+//   edit/richedit                  → onChange         (EN_CHANGE)
+//   listview/treeview/tab          → onnotify         (WM_NOTIFY)
+// （对照 D:\aardio\lib\win\ui\ctrl\*.aardio 的 _commandFuncnames /
+//   事件成员文档；自定义组件可以在 registry spec 里自带 event 字段。）
+var defaultEventOf = function(cls){
+	var t = {
+		button="oncommand"; checkbox="oncommand"; radio="oncommand"; groupbox="oncommand";
+		combobox="onSelChange"; listbox="onSelChange";
+		edit="onChange"; richedit="onChange";
+		listview="onnotify"; treeview="onnotify"; tab="onnotify";
+	};
+	return cls ? t[cls] : null;
+};
+var eventSigOf = function(ev){
+	if(ev == "onChange") return "function()";
+	if(ev == "onnotify") return "function(id,code,ptr)";
+	return "function(id,event)";
+};
+// pos（1 基字符位置）之前有几个换行 → 所在行（1 基）
+var lineOfPos = function(src, pos){
+	var head = ..string.left(src, pos - 1);
+	var n = 1;
+	for(c in ..string.gmatch(head, '\n')) n = n + 1;
+	return n;
+};
+var genEventStub = function(item){
+	if(!item || !item.spec) return;
+	var ev = item.spec.event : defaultEventOf(item.spec.cls);
+	if(!ev){ shell.setStatus("「" ++ item.spec.name ++ "」没有默认事件"); return }
+	var path = shell.tabCurPath();
+	if(!path){ shell.setStatus("没有打开的文档"); return }
+	// 先切回代码视图：close 会把当前设计同步进文档的 DSG 块，
+	// 事件代码要插在**同步后**的源码上（官方窗体里 DSG 块在前、事件代码在后）。
+	designer.close();
+	var src = shell.tabGetText(path);
+	if(!src) return;
+	// 已有这个事件的处理函数 → 只跳过去，不重复生成（官方同款行为）
+	var pat = 'winform\.' ++ item.name ++ '\.' ++ ev ++ '\s*=';
+	if(..string.match(src, pat)){
+		shell.setStatus("已转到 " ++ item.name ++ " 的 " ++ ev ++ "（源码里已有）");
+		return;
+	}
+	var stub = 'winform.' ++ item.name ++ '.' ++ ev ++ ' = '
+		++ eventSigOf(ev) ++ '{\r\n\t\r\n}\r\n';
+	// 插入点：有 DSG 块就插在块结束标记后面，没有就追加到文件末尾
+	var b = ..string.indexOf(src, '/*}}*/');
+	var ns, at;
+	if(b !== null){
+		at = b + 6;   // '/*}}*/' 共 6 个字符，插在它后面
+		var tail = ..string.mid(src, at);
+		// 吃掉紧跟着的行尾，避免出现空行夹层
+		while(#tail && (..string.sub(tail, 1, 1) == '\r' || ..string.sub(tail, 1, 1) == '\n')){
+			tail = ..string.sub(tail, 2);
+		}
+		ns = ..string.left(src, at - 1) ++ '\r\n' ++ stub ++ tail;
+	}
+	else{
+		at = #src + 1;
+		var nl = (#src && ..string.sub(src, #src, #src) == '\n') ? '' : '\r\n';
+		ns = src ++ nl ++ stub;
+	}
+	shell.tabSetText(path, ns);
+	// 光标落到函数体那一行（stub 的第二行），直接开写
+	shell.editor.gotoLine(lineOfPos(ns, at) + 1);
+	shell.setStatus("已生成 " ++ item.name ++ "." ++ ev ++ " 事件代码");
+};
+designer.hooks.onEventCode = genEventStub;
+shell.hooks.onTabChange   = function(path){
 	curFile = path;
 	fillOutline();
+	// 换文档 → 符号树要重拉，导航栏面包屑跟着换
+	curSymTree = [ @{_type="array"} ];
+	symTreeDirty = true;
+	navUpdate(shell.editor.curLine);
 	// 换文档：槽内标记先清掉（下一个心跳会用新文档的诊断补上）
 	editorDiags = {};
 	shell.editor.setDiagnostics(editorDiags);
-	// LSP 只跟一个文档：换文档就重开
+	// LSP 跟着当前文档走（多文档：切 uri，不用重开服务）
 	if(app.lspClient.isRunning() && path && ..io.exist(path)){
-		app.lspClient.stop();
-		lspEnsure();
+		app.lspClient.openDoc(path, shell.tabGetText(path));
 	}
 };
+// 布局重排后：设计画布（覆盖层）立刻跟着编辑区走。
+// 以前这条只能靠心跳兜底（relayout 里调 designer.layout），
+// 布局与重排之间会差一拍；接上钩子后是即时的。
+shell.hooks.onAfterLayout = function(er){
+	designer.layout();
+};
 shell.install();
-fillLibrary();
-fillTools();
+bootMark("install-done");
+// 填右栏列表（标准库 / 范例 / 工具）要扫官方 lib 目录，不便宜 ——
+// 正常启动改到**分阶段**里做（bootTick 第 1 拍），
+// 这样窗口能先画出来。测试/演示模式仍然同步做完（截图要完整界面）。
+if(isTestMode){
+	fillLibrary();
+	fillTools();
+}
 // 问题列表：双击跳到出错那一行（文件没开着就顺手打开）
 shell.probList.onDoubleClick = function(row, index){
 	if(!row || !row.tag) return;
@@ -848,6 +1920,17 @@ shell.probList.onDoubleClick = function(row, index){
 // 大纲：点条目跳到对应行
 shell.outlineTree.onSelect = function(node){
 	if(node && node.line) app.editor.gotoLine(shell.editor, node.line);
+};
+// 引用面板：双击跳到那一处（跨文件）
+shell.refList.onDoubleClick = function(row, index){
+	if(!row || !row.tag) return;
+	var p = row.tag.path;
+	if(!p) return;
+	if(shell.tabCurPath() != p){
+		if(!openFile(p)) return;
+	}
+	if(row.tag.line) shell.editor.gotoLineCol(row.tag.line, (row.tag.col : 0) + 1);
+	shell.setStatus("跳到 " ++ navShortPath(p) ++ " 第 " ++ tostring(row.tag.line) ++ " 行");
 };
 if( ..string.getenv("NODIO_IDE_DIAG") ){
 	io.print("DIAG outline nodes=" ++ #shell.outlineTree.nodes
@@ -865,14 +1948,23 @@ if( ..string.getenv("NODIO_IDE_DIAG") ){
 var lastClientW = 0, lastClientH = 0;
 var lastScale = ..nodio.ui.dpiScale();
 var relayout = function(){
-	var sc = ..nodio.ui.dpiScale();
-	if(sc != lastScale){
-		var ns = ..nodio.ui.dpiSetScaleFrom(shell.winform);
-		lastScale = ns;
+	var t0 = ..time.tick();
+	var curScale = null;
+	try{ curScale = shell.winform.dpiScaleX }catch(e){}
+	if(type(curScale) != "number" || curScale <= 0){
+		try{
+			var sx = ..gdi.getDpiScale(, shell.winform.hwnd);
+			if(type(sx) == "number" && sx > 0) curScale = sx;
+		}catch(e2){}
+	}
+	if(type(curScale) == "number" && curScale > 0 && curScale != lastScale){
+		..nodio.ui.dpiSetScale(curScale);
+		lastScale = curScale;
 		shell.layout();
 		designer.layout();
 		if( ..string.getenv("NODIO_IDE_DIAG") ){
-			io.print("DIAG dpi-changed scale=" ++ tostring(ns));
+			io.print("DIAG dpi-changed scale=" ++ tostring(curScale)
+				++ " cost=" ++ tostring(..time.tick() - t0) ++ "ms");
 		}
 	}
 	var w,h = shell.clientWH();
@@ -881,23 +1973,215 @@ var relayout = function(){
 	shell.layout();
 	designer.layout();
 	if( ..string.getenv("NODIO_IDE_DIAG") ){
-		io.print("DIAG relayout client=" ++ w ++ "x" ++ h);
+		io.print("DIAG relayout client=" ++ w ++ "x" ++ h
+			++ " cost=" ++ tostring(..time.tick() - t0) ++ "ms");
 	}
 };
 
+// ---------- 启动分阶段：先渲染，后加载 ----------
+//
+// 以前启动是「全部做完才显示窗口」：扫工程树、打开起始文件（67KB 源码
+// + 全量语法着色）、扫官方标准库目录、起 LSP —— 全在 UI 线程上串行跑完，
+// 窗口迟迟不出现，用户看到的是「半分钟白屏 / 组件半天不出来」。
+//
+// 现在改成：
+//   第 0 拍  窗口已经显示（chrome 全部画好）→ 马上能用
+//   第 1 拍  填右栏列表（标准库 / 范例 / 工具）—— 要扫官方 lib 目录
+//   第 2 拍  加载工程 + 扫工程树
+//   第 3 拍  打开起始文件（全量语法着色，最重的一步）
+//   第 4 拍  起 LSP（握手有超时，单独一拍）
+// 每一拍之间窗口都在正常跑消息循环，随时可点。
+var bootStage = (isTestMode) ? 4 : 0;   // 测试/演示模式：启动已同步做完
+var bootNeedProject = false;
+var bootTick = function(){
+	if(bootStage >= 4) return;
+	bootStage = bootStage + 1;
+	var t0 = ..time.tick();
+	if(bootStage == 1){
+		fillLibrary();
+		fillTools();
+	}
+	elseif(bootStage == 2){
+		if(bootNeedProject){
+			if(!startupProject()){
+				shell.setStatus("就绪（未打开工程）—— 文件 → 打开工程");
+			}
+		}
+	}
+	elseif(bootStage == 3){
+		if(bootNeedProject){
+			if(!startupOpenStart()){
+				// 未指定工程或工程无启动文件时，自动建一个新文件让用户直接可输入可运行！
+				if(!curFile && #shell.tabOrder == 0){
+					newFile();
+				}
+			}
+		}
+	}
+	elseif(bootStage == 4){
+		lspEnsure();
+	}
+	if( ..string.getenv("NODIO_IDE_DIAG") ){
+		// 这一拍占了多少毫秒 —— 卡顿定位的关键
+		io.print("DIAG boot stage=" ++ bootStage ++ " cost=" ++ tostring(..time.tick() - t0) ++ "ms");
+	}
+}
+
 // idle timer: LSP sync + diagnostics poll + 布局自愈 (single 300ms heartbeat)
+//
+// ⚠⚠ **回调必须显式返回 null**：
+//   官方 win.form 的 WM_TIMER 处理（win/ui/_.aardio:342）是：
+//       var ret = invoke(proc,this);
+//       if( (ret !== null) && ( ret !== true ) ){
+//           var tick = tonumber(ret)
+//           if( !tick ) this.clearInterval(wParam)   ← **把定时器移除**
+//       }
+//   也就是说：回调返回值只要「不是 null 也不是 true」，而且转成数字是 0，
+//   官方就**把这个定时器删掉** —— 静默失效，连异常都不报。
+//   心跳最后一句如果落在 `if(...)` 判断上，返回值随内容变化
+//   （fillOutline() / navRefreshSymTree() 返回 false 时）→ 心跳被自己杀掉：
+//   于是布局不再自愈（窗口一改尺寸就是黑屏）、状态栏不再更新、LSP 不再轮询。
+//
+//   所以：**所有 setInterval 回调一律以 `return null;` 收尾**。
+var hbTick = 0;
+var hbErr = 0;
 shell.winform.setInterval(function(){
 	// 模态对话框开着的时候不要动 VM（对话框自己的消息循环会重入解释器）
-	if(modalBusy) return;
-	relayout();
-	lspSync();
-	lspPoll();
-	// 大纲跟着文档内容走（按键回调只标脏，重扫放在这里做）
-	if(outlineDirty){
-		outlineDirty = false;
-		fillOutline();
+	if(modalBusy) return null;
+	hbTick = hbTick + 1;
+	if( ..string.getenv("NODIO_IDE_DIAG") && (hbTick % 5 == 0) ){
+		io.print("DIAG hb=" ++ hbTick);
 	}
+	// ⚠ 心跳里任何一处抛异常，官方 setInterval 都会**停掉这个定时器** ——
+	//   于是 IDE 从此不再重绘、不再轮询 LSP、不再自愈布局：
+	//   窗口改个大小就变成黑屏（自绘板还停在旧尺寸），状态栏也不再更新。
+	//   所以整段包在 try 里，异常要**打出来**（原来只有编辑器那边的
+	//   子类化会吞异常，心跳这一层没人管）。
+	try{
+		bootTick();
+		relayout();
+		lspSync();
+		lspPoll();
+		// 大纲跟着文档内容走（按键回调只标脏，重扫放在这里做）
+		if(outlineDirty){
+			outlineDirty = false;
+			fillOutline();
+		}
+		// 符号树（导航栏面包屑的层级链）同理
+		if(symTreeDirty){
+			navRefreshSymTree();
+		}
+	}
+	catch(e){
+		hbErr = (hbErr : 0) + 1;
+		if( ..string.getenv("NODIO_IDE_DIAG") ){
+			io.print("DIAG HB-ERR #" ++ hbErr ++ " tick=" ++ hbTick ++ " :" ++ tostring(e));
+		}
+	}
+	return null;
 }, 300);
+
+// ---------- 配置持久化（%APPDATA%\Nodio\ide.cfg）----------
+// 极简 key=value，一行一个键。
+// 只存「上次打开的工程」这种跨会话要记住的东西。
+var CFG_PATH = ..string.getenv("APPDATA") ++ "\Nodio\ide.cfg";
+var cfgRead = function(key){
+	if(!key) return null;
+	var text = ..string.load(CFG_PATH);
+	if(!text) return null;
+	for(line in ..string.lines(text)){
+		var s = ..string.trim(line);
+		if(!s) continue;
+		var p = ..string.indexOf(s, "=");
+		if(!p) continue;
+		var k = ..string.trim(..string.left(s, p - 1));
+		var v = ..string.trim(..string.slice(s, p + 1));
+		if(k == key) return v;
+	}
+	return null;
+}
+var cfgWrite = function(key, val){
+	if(!key) return false;
+	var dir = ..io.splitpath(CFG_PATH).dir;
+	if(dir && !..io.exist(dir)) ..io.createDir(dir);
+	var text = "";
+	var old = ..string.load(CFG_PATH);
+	if(old){
+		for(line in ..string.lines(old)){
+			var s = ..string.trim(line);
+			if(!s) continue;
+			var p = ..string.indexOf(s, "=");
+			if(p){
+				var k = ..string.trim(..string.left(s, p - 1));
+				if(k == key) continue;
+			}
+			text = text ++ s ++ '\r\n';
+		}
+	}
+	text = text ++ key ++ "=" ++ (val : "") ++ '\r\n';
+	..string.save(CFG_PATH, text);
+	return true;
+}
+
+// ---------- 正常启动：加载工程 + 打开文档 ----------
+//
+// ⚠ 之前工程只在 smoke / nav / demo 三个**测试**分支里加载 ——
+//   正常启动 IDE 是一片空白：工程树空的、编辑器空的、状态栏没有工程，
+//   用户第一眼看到的是「什么都没发生」，等于功能残了。
+//
+// 现在的顺序（跟 VS 打开解决方案一致）：
+//   1) NODIO_IDE_PROJECT 指定的工程
+//   2) 上次打开的工程（%APPDATA%\Nodio\ide.cfg 的 lastProject）
+//   3) 当前工作目录下的 *.nproj / *.aproj（以及 ide/nodio 子目录下的工程）
+//   4) 都没有 → 提示「文件 → 打开工程」，编辑器留空可输入
+var findProjectNearby = function(){
+	var cwd = ..io.fullpath(".");
+	var masks = {"*.nproj"; "*.aproj"};
+	for(m=1;#masks;1){
+		var files = ..io.listFiles(cwd, masks[m]) : {};
+		for(i=1;#files;1){
+			if(files[i].isDir) continue;
+			return files[i].path;
+		}
+	}
+	var sub = ..io.fullpath("ide/nodio");
+	if(..io.exist(sub)){
+		for(m=1;#masks;1){
+			var files = ..io.listFiles(sub, masks[m]) : {};
+			for(i=1;#files;1){
+				if(files[i].isDir) continue;
+				return files[i].path;
+			}
+		}
+	}
+	return null;
+}
+var startupProject = function(){
+	var p = ..string.getenv("NODIO_IDE_PROJECT");
+	if(!p) p = cfgRead("lastProject");
+	if(!p) p = findProjectNearby();
+	if(!p) return false;
+	if(!..io.exist(p)) return false;
+	proj = app.project.load(p);
+	if(!proj) return false;
+	projRefresh();
+	shell.setProjectStatus(tostring(proj.path));
+	cfgWrite("lastProject", proj.path);
+	// 自定义组件直接进工具箱
+	designer.discover(proj.root ++ "components");
+	shell.setStatus("工程: " ++ tostring(proj.path));
+	return true;
+}
+
+// 打开工程的起始文件（**单独一拍**）：
+// 打开 67KB 源码要跑全量语法着色，是启动里最重的一步 ——
+// 和「加载工程」分开，窗口能更早变成可交互状态。
+var startupOpenStart = function(){
+	if(!proj || !proj.start) return false;
+	if(!..io.exist(proj.start)) return false;
+	openFile(proj.start);
+	return true;
+}
 
 // ---------- smoke mode (headless test hook) ----------
 if( ..string.getenv("NODIO_IDE_SMOKE") ){
@@ -1044,6 +2328,85 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 	io.print("TABSTRIP-AFTER-ADD:" ++ tostring(shell.docStrip.count()));
 	shell.docStrip.removeTab(shell.docStrip.count());
 	io.print("TABSTRIP-AFTER-REMOVE:" ++ tostring(shell.docStrip.count()));
+
+	// ---------- 事件代码生成（设计器双击组件的代码路径） ----------
+	//
+	// 官方 IDE 的行为：双击控件 → 切到代码视图，源码里出现（或跳到）
+	// 它的事件处理函数。冒烟直接驱动 hooks.onEventCode（= 双击回调走的同一条路）。
+	if(item){
+		designer.hooks.onEventCode(item);
+		var stubKey = 'winform.button1.oncommand = function(id,event)';
+		io.print("EVENT-STUB:" ++ tostring(..string.indexOf(shell.tabGetText(target), stubKey) !== null ? 1 : 0));
+		// 再来一次：已有处理函数只跳转，不重复生成
+		designer.hooks.onEventCode(item);
+		var stubCnt = 0;
+		for(x in ..string.gmatch(shell.tabGetText(target), 'winform\.button1\.oncommand')) stubCnt = stubCnt + 1;
+		io.print("EVENT-STUB-DUP:" ++ stubCnt);
+		// 双击 = 切回代码视图（设计器收起）
+		io.print("EVENT-CODE-VIEW:" ++ tostring(designer.visible ? 0 : 1));
+	}
+
+	// ---------- 设计 ↔ 源码同步（switchActiveForm 语义） ----------
+	//
+	// 开设计器 = 从源码载入设计块；关设计器 = 把当前设计写回源码。
+	// 用一个独立页签验证两个方向（加页签的断言都放在页签计数之后，见上）。
+	var syncPath = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_sync.nodio");
+	var syncSrc = '// sync 测试\r\n' ++ designer.toDSG() ++ '\r\nio.print("sync-ok");\r\n';
+	..string.save(syncPath, syncSrc);
+	shell.tabAdd(syncPath, syncSrc);
+	designer.open();   // 设计视图：应自动从源码载入 1 个组件
+	io.print("SYNC-ITEMS:" ++ tostring(designer.canvas ? #designer.canvas.items : -1));
+	var syncOk = 0;
+	if(designer.canvas && #designer.canvas.items){
+		var sit = designer.canvas.items[1];
+		designer.canvas.select(sit.name);
+		var swIdx = 0;
+		for(i=1;#sit.props;1){ if(sit.props[i].key == "width") swIdx = i }
+		if(swIdx){
+			// 走属性格回写这条真实链路把宽度改成 222
+			designer.propGrid.onChange(swIdx, "222");
+			designer.close();   // 切回代码视图 → 当前设计写回源码
+			var stxt = shell.tabGetText(syncPath);
+			syncOk = (..string.indexOf(stxt, 'right=' ++ (sit.x + 222)) !== null) ? 1 : 0;
+			// 设计块只有一份（同步是替换，不是追加）
+			var blocks = 0;
+			for(x in ..string.gmatch(stxt, '/\*DSG\{\{\*/')) blocks = blocks + 1;
+			io.print("SYNC-BLOCKS:" ++ blocks);
+		}
+		else{ designer.close() }
+	}
+	io.print("SYNC-WRITEBACK:" ++ tostring(syncOk));
+
+	// ---------- 官方 ide.customCtrl 替身映射 / 窗体设置 / 网格吸附 ----------
+	// 1) 映射表本身（官方 lib/ide/customCtrl.aardio 原文照抄）
+	io.print("CUSTOMCTRL-MAP:" ++ tostring(nodio.designer.registry.customCtrl.textbox));
+	// 2) DSG 里的官方自定义类（textbox）：Nodio 用 edit 代画，
+	//    **DSG 仍写真实类名** —— 官方工程画得出，写回官方也认
+	var tDsg = '/*DSG{{*/\r\nwinform = win.form(text="窗体";right=400;bottom=300)\r\nwinform.add(\r\n\ttextbox1={cls="textbox";text="输入";left=10;top=10;right=110;bottom=30}\r\n)\r\n/*}}*/\r\n';
+	designer.canvas.fromDSG(tDsg);
+	var tIt = (#designer.canvas.items ? designer.canvas.items[1] : null);
+	io.print("CUSTOMCTRL-DRAW:" ++ (tIt ? tostring(tIt.spec.cls) ++ "/" ++ tostring(tIt.spec.drawAs) : "none"));
+	// 3) 窗体设置：选中窗体本身 → 属性格改 标题/宽度/高度 → DSG 头跟着变
+	designer.canvas.selectForm();
+	designer.propGrid.onChange(1, "登录窗口");
+	designer.propGrid.onChange(2, "800");
+	designer.propGrid.onChange(3, "600");
+	var fds = designer.toDSG();
+	io.print("FORM-SET:"
+		++ ((..string.indexOf(fds, 'text="登录窗口"') !== null) ? 1 : 0)
+		++ ((..string.indexOf(fds, 'right=800') !== null) ? 1 : 0)
+		++ ((..string.indexOf(fds, 'bottom=600') !== null) ? 1 : 0));
+	// 4) 网格吸附：30 → 32（1.875 逐进），33 → 32（2.0625 逐退）
+	io.print("SNAP:" ++ tostring(designer.canvas.__snap(30)) ++ "/" ++ tostring(designer.canvas.__snap(33)));
+
+	// 钩子链路：shell.hooks.onOpenFile → main.nodio 的 openFile → 真的打开页签
+	// （以前这条链是**死的**：模块级的钩子被模块帧的局部副本遮蔽，
+	//   外部 app.shell.onX = f 灌不进来 —— 工具条/菜单/快捷键/工程树全废）
+	// ⚠ 放在页签计数断言**之后**：它会真的多开一个页签。
+	var hookTarget = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_hook.aardio");
+	..io.writeFile(hookTarget, `io.print("hook-open-ok")`);
+	shell.hooks.onOpenFile(hookTarget);
+	io.print("SMOKE-HOOK-OPEN:" ++ tostring(shell.tabCurPath()));
 	// optional: prove the project model loads (NODIO_IDE_PROJECT=<*.nproj>)
 	var smokeProj = ..string.getenv("NODIO_IDE_PROJECT");
 	if(smokeProj){
@@ -1060,7 +2423,10 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 			io.print("SEARCH-HITS:" ++ tostring(hits));
 			io.print("SEARCH-ROWS:" ++ tostring(#shell.searchPanel.list.rows));
 			// 工程清单维护：增删改 + 写回（用临时工程文件，不碰真工程）
-			var tmpProj = "D:\Nodio\tests\_tmp_proj.nproj";
+			// ⚠ 写进 TEMP 而不是仓库里：冒烟要验证的是「清单增删改 + 写回」
+			//   这条链路本身，工程文件落在哪个盘不该影响结果
+			//   （只读检出 / CI 临时目录 / 沙箱里仓库不可写时同样能跑）。
+			var tmpProj = ..string.getenv("TEMP") ++ "\_tmp_proj.nproj";
 			..string.save(tmpProj, 'f?xml version="1.0" encoding="utf-8"?>\n'
 				++ '<project start="main.nodio">\n\t<file path="main.nodio" />\n'
 				++ '\t<file path="app\\a.nodio" />\n</project>\n');
@@ -1086,6 +2452,7 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 
 	shell.winform.setInterval(function(){
 		try{ runner.run(target) }catch(e){ io.print("RUN-ERR:" ++ tostring(e)) };
+		return null;   // 官方 WM_TIMER 会按返回值决定是否移除定时器
 	},600);
 	shell.winform.setInterval(function(){
 		if(!runner.isRunning() && outCtl.contains("[运行结束]")){
@@ -1106,6 +2473,156 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 		io.print("VIS-ED:" ++ tostring(..win.isVisible(shell.winform.ed.hwnd)));
 		io.print("VIS-TOOLBOX:" ++ tostring(..win.isVisible(shell.rightDock.pages[1].ctrl.hwnd)));
 	},900);
+}
+
+// ---------- 导航 smoke（NODIO_IDE_NAV_SMOKE=1）----------
+// 无头自检「转到定义 / 查找引用 / 重命名 / 符号搜索」整条链路：
+// 打开 app/shell.nodio，问 LSP 它里面 app.editor.contextMenu 的定义在哪
+//（contextMenu 定义在 app/editor.nodio —— 必须跨文件找得到）。
+if( ..string.getenv("NODIO_IDE_NAV_SMOKE") ){
+	io.print("NAV-SMOKE-BRANCH");
+	var navProj = ..string.getenv("NODIO_IDE_PROJECT") : "D:\Nodio\ide\nodio\ide.nproj";
+	proj = app.project.load(navProj);
+	if(proj) projRefresh();
+	var navPath = proj ? (proj.root ++ "app\shell.nodio") : "";
+	if(!navPath || !..io.exist(navPath)){
+		io.print("NAV-SMOKE-NO-FILE");
+		shell.winform.close();
+	}
+	else{
+		openTab(navPath);
+		var navTick = 0;
+		var navDone = false;
+		shell.winform.setInterval(function(){
+			if(navDone) return;
+			navTick = navTick + 1;
+			// setProject 是通知：服务端要把整个工程扫一遍才建好索引，等它一会儿
+			if(navTick < 8) return;
+			navDone = true;
+			// 找 app.editor.contextMenu 的调用点
+			var txt = shell.tabGetText(navPath);
+			var lines = ..string.split(txt, '\n');
+			var row = 0, col = 0;
+			for(i=1;#lines;1){
+				var j = ..string.indexOf(lines[i], "app.editor.contextMenu");
+				if(j > 0){ row = i; col = j + 11; break }
+			}
+			io.print("NAV-SITE:" ++ tostring(row) ++ "," ++ tostring(col));
+			var navDiags = app.lspClient.getDiags();
+			io.print("NAV-DIAGS:" ++ tostring(#navDiags));
+			for(i=1;#navDiags;1){
+				io.print("NAV-DIAG:" ++ tostring(navDiags[i].line + 1) ++ ":" ++ tostring(navDiags[i].msg));
+			}
+			// 导航栏（面包屑）：工程 › 目录 › 文件 › 符号链
+			// 符号树是懒的（心跳里拉），这里先强制拉一次再算链
+			navRefreshSymTree();
+			io.print("NAV-SYMTREE:" ++ tostring(#curSymTree));
+			var navChain = navBuildChain(row);
+			var navTxt = "";
+			for(k=1;#navChain;1){
+				navTxt = navTxt ++ navChain[k].text ++ "|";
+			}
+			io.print("NAV-CHAIN:" ++ navTxt);
+
+			// 找一个**有body的函数**（kind 12 = Function）：
+			// 光标落在它里面时，链里必须出现它；点它要能跳回那一行。
+			var fnLine = 0, fnName = "";
+			var findFn = function(nodes){
+				var i, n;
+				for(i=1;#nodes;1){
+					n = nodes[i];
+					if(n.kind == 12 && n.endLine > n.line){
+						fnLine = n.line; fnName = n.name;
+						return true;
+					}
+					if(findFn(n.children)) return true;
+				}
+				return false;
+			};
+			findFn(curSymTree);
+			if(fnLine){
+				var fnChain = navBuildChain(fnLine + 1);
+				var fnTxt = "";
+				for(k=1;#fnChain;1) fnTxt = fnTxt ++ fnChain[k].text ++ "|";
+				io.print("NAV-FNCHAIN:" ++ fnTxt);
+				io.print("NAV-FNNAME:" ++ fnName);
+				io.print("NAV-FNLINE:" ++ tostring(fnLine));
+				shell.editor.onNavClick(fnChain[#fnChain]);
+				io.print("NAV-FNCUR:" ++ tostring(shell.editor.curLine));
+				// 钩子链路端到端：onNavClick → 光标移动 → 编辑器 onCursor →
+				// shell 的 hooks.onCursorMove → navUpdate → 组件 navChain
+				var cc = shell.editor.navChain;
+				var ct = "";
+				for(k=1;#cc;1) ct = ct ++ cc[k].text ++ "|";
+				io.print("NAV-COMPCHAIN:" ++ ct);
+			}
+			var defs = app.lspClient.definition(row - 1, col - 1);
+			io.print("NAV-DEF-COUNT:" ++ tostring(#defs));
+			if(#defs){
+				io.print("NAV-DEF-PATH:" ++ defs[1].path);
+				io.print("NAV-DEF-LINE:" ++ tostring(defs[1].line));
+				io.print("NAV-DEF-COL:" ++ tostring(defs[1].col));
+			}
+			var refs = app.lspClient.references(row - 1, col - 1);
+			io.print("NAV-REF-COUNT:" ++ tostring(#refs));
+			var ren = app.lspClient.rename(row - 1, col - 1, "ctxMenuRenamed");
+			io.print("NAV-RENAME-COUNT:" ++ tostring(#ren));
+			var syms = app.lspClient.workspaceSymbols("contextMenu");
+			io.print("NAV-SYM-COUNT:" ++ tostring(#syms));
+			// 引用面板：填进去看看行数对不对
+			navFindReferences(row, col, "contextMenu");
+			io.print("NAV-REF-ROWS:" ++ tostring(#shell.refList.rows));
+
+			// ---- 完整链路：编辑器回调 → 跨文件打开 → 光标落位 ----
+			shell.editor.onDefinition(row, col, "contextMenu");
+			io.print("NAV-JUMP-PATH:" ++ tostring(shell.tabCurPath()));
+			io.print("NAV-JUMP-LINE:" ++ tostring(shell.editor.curLine));
+
+			// ---- 跨文件重命名（临时工程，绝不碰真源码）----
+			var tmpDir = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_nav_proj");
+			..io.createDir(tmpDir);
+			var aPath = tmpDir ++ "\a.nodio";
+			var bPath = tmpDir ++ "\b.nodio";
+			..string.save(aPath, "var shared = 1;\nvar other = 2;\n");
+			..string.save(bPath, "..io.print(shared);\n");
+			openTab(bPath);
+			// 把 LSP 的项目索引指到临时工程
+			var tmpFiles = [ @{_type="array"} ];
+			..table.push(tmpFiles, "a.nodio");
+			..table.push(tmpFiles, "b.nodio");
+			app.lspClient.setProject(tmpDir, tmpFiles);
+			// 等服务端把临时工程扫完
+			var navTick2 = 0;
+			shell.winform.setInterval(function(){
+				navTick2 = navTick2 + 1;
+				if(navTick2 < 6) return;
+				var bt = shell.tabGetText(bPath);
+				var blines = ..string.split(bt, '\n');
+				var brow = 0, bcol = 0;
+				for(i=1;#blines;1){
+					var j = ..string.indexOf(blines[i], "shared");
+					if(j > 0){ brow = i; bcol = j; break }
+				}
+				io.print("NAV-REN2-SITE:" ++ tostring(brow) ++ "," ++ tostring(bcol));
+				var ren2 = app.lspClient.rename(brow - 1, bcol - 1, "renamed");
+				io.print("NAV-REN2-COUNT:" ++ tostring(#ren2));
+				if(#ren2) navApplyRename(ren2, "renamed");
+				var atext = ..string.load(aPath);
+				var btext = shell.tabGetText(bPath);
+				io.print("NAV-REN2-A:" ++ ((..string.indexOf(atext, "renamed") > 0) ? "OK" : "BAD"));
+				io.print("NAV-REN2-B:" ++ ((..string.indexOf(btext, "renamed") > 0) ? "OK" : "BAD"));
+				io.print("NAV-REN2-AOLD:" ++ ((..string.indexOf(atext, "shared") > 0) ? "STILL" : "GONE"));
+				io.print("NAV-SMOKE-DONE");
+				// 收工前把 LSP 停掉：它继承了 stdout 句柄，
+				// 不关的话 IDE 退出后日志文件还被占着，测试脚本读不出来。
+				app.lspClient.stop();
+				shell.winform.close();
+			},500);
+			return;
+			io.print("NAV-SMOKE-DONE");
+			shell.winform.close();
+		},500);
+	}
 }
 
 // ---------- 布局诊断（NODIO_IDE_DIAG=1 时每秒打印一次几何） ----------
@@ -1133,6 +2650,7 @@ if( ..string.getenv("NODIO_IDE_DIAG") ){
 		if(designer.canvas.items[1]){
 			diagRect("item1", designer.canvas.items[1].ctrl);
 		}
+		return null;   // 官方 WM_TIMER 会按返回值决定是否移除定时器
 	},1000);
 }
 
@@ -1154,7 +2672,35 @@ if( ..string.getenv("NODIO_IDE_DEMO") ){
 		openFile(demoFile);
 		fillOutline();
 	}
+	// 演示模式可以把光标放到指定行（截图回归用）：
+	//   NODIO_IDE_DEMO_LINE=<行号> —— 导航栏面包屑会跟着显示所在函数
+	var demoLine = tonumber(..string.getenv("NODIO_IDE_DEMO_LINE"));
+	if(demoLine && demoLine > 0){
+		shell.winform.setTimeout(function(){
+			shell.editor.gotoLine(demoLine);
+			// NODIO_IDE_DEMO_COL=<列> —— 把光标钉到行内第 N 个字符上
+			//（引用标记的视觉回归：光标停在符号上 ~300ms 后同符号垫亮）
+			var demoCol = tonumber(..string.getenv("NODIO_IDE_DEMO_COL"));
+			if(demoCol && demoCol > 0){
+				try{
+					var a = shell.editor.__lineStart(demoLine);
+					if(a) shell.editor.ctrl.setSel(a + demoCol - 1);
+					shell.editor.updateCursor();
+				}catch(e1){}
+			}
+		}, 2200);
+	}
 	designer.open();
+	// 演示模式可以弹出**悬停提示**浮层（视觉回归用）：
+	//   NODIO_IDE_DEMO_HOVER=1 —— 在编辑区放一个 hover 提示
+	if( ..string.getenv("NODIO_IDE_DEMO_HOVER") ){
+		shell.winform.setTimeout(function(){
+			shell.editor.gotoLine(12);
+			var p = shell.editor.__posOf(60);
+			shell.editor.showHover('myFunc  \n*function*',
+				(p & 0xFFFF) + 12, (p >> 16) & 0xFFFF);
+		}, 2400);
+	}
 	// 演示模式可以指定要看哪个页签（视觉回归用）：
 	//   NODIO_IDE_DEMO_TAB=outline|library|problems|syntax|tools|examples|search|gallery|source
 	var demoTab = ..string.getenv("NODIO_IDE_DEMO_TAB");
@@ -1163,10 +2709,35 @@ if( ..string.getenv("NODIO_IDE_DEMO") ){
 	elseif(demoTab == "syntax") shell.rightDock.setSelIndex(2);
 	elseif(demoTab == "tools") shell.rightDock.setSelIndex(5);
 	elseif(demoTab == "examples") shell.rightDock.setSelIndex(4);
-	elseif(demoTab == "problems") shell.bottomDock.setSelIndex(1);
+	elseif(demoTab == "problems"){
+		shell.bottomDock.setSelIndex(1);
+		designer.close();     // 设计器画布会盖住编辑器 —— 看诊断时关掉
+	}
 	elseif(demoTab == "search") shell.leftDock.setSelIndex(3);
-	elseif(demoTab == "gallery") shell.rightDock.setSelIndex(7);
+	elseif(demoTab == "gallery") shell.rightDock.setSelIndex(1);
+	// ↑ 右栏已无「组件」展厅页 —— gallery 映射到「控件」（设计器工具箱）
+	elseif(demoTab == "designer"){
+		// 设计器 + 左栏「属性」页：验证属性格的**分组带**
+		shell.leftDock.setSelIndex(2);
+	}
 	elseif(demoTab == "source") designer.close();   // 只看编辑器（查源码渲染）
+	elseif(demoTab == "references"){
+		// 演示「查找引用」：问 LSP 要 app.editor.contextMenu 的全部引用，
+		// 填进底部「引用」页签（截图回归用）。
+		designer.close();
+		shell.bottomDock.setSelIndex(5);
+		shell.winform.setTimeout(function(){
+			var dpath = curFile;
+			var dtxt = shell.tabGetText(dpath);
+			var dlines = ..string.split(dtxt, '\n');
+			var drow = 0, dcol = 0;
+			for(i=1;#dlines;1){
+				var j = ..string.indexOf(dlines[i], "app.editor.contextMenu");
+				if(j > 0){ drow = i; dcol = j + 11; break }
+			}
+			if(drow) navFindReferences(drow, dcol, "contextMenu");
+		},2500);
+	}
 	var dspec = nodio.designer.registry.get("按钮");
 	if(dspec){
 		var ditem = designer.canvas.add(dspec, {x=40; y=40; w=120; h=30});
@@ -1202,6 +2773,52 @@ if( ..string.getenv("NODIO_IDE_DEMO") ){
 			});
 		}, 1200);
 	}
+	// 演示：拉起代码补全浮层（走真 LSP：编辑器算前缀 → LSP 出候选 → 浮层）
+	if( ..string.getenv("NODIO_IDE_DEMO_COMPLETE") ){
+		shell.winform.setTimeout(function(){
+			// 停在第 1 行 "var alpha = 1" 的 alph| 后面
+			var ln = 1;
+			var ls = shell.editor.__lineStart(ln);
+			shell.editor.gotoPos(ls + 8);
+			shell.editor.requestComplete();
+		}, 1500);
+	}
+	// 演示：模拟真实键盘输入（在 IDE 自己身上打字，验证输入链路通不通）
+	//
+	// 这条链路以前是**必崩**的：官方 win 消息泵对任何按键消息都会调
+	// win.isDialogMessage(root,msg)，而消息表没有结构体定义 → FFI 传 NULL
+	// → IsDialogMessageW 读地址 0 → 进程直接没了。
+	if( ..string.getenv("NODIO_IDE_DEMO_TYPE") ){
+		shell.winform.setTimeout(function(){
+			shell.editor.setFocus();
+			..win.setForeground(shell.winform.hwnd);
+			var u32 = ..raw.loadDll("user32.dll");
+			var keybd = u32.api("keybd_event",
+				"void(int bVk,int bScan,int dwFlags,addr dwExtraInfo)");
+			..win.delay(400);
+			var before = shell.editor.text;
+			keybd(0x58, 0, 0, 0); keybd(0x58, 0, 2, 0);   // X
+			..win.delay(600);
+			var after = shell.editor.text;
+			io.print("TYPE-LEN-BEFORE:" ++ tostring(#before)
+				++ " AFTER:" ++ tostring(#after));
+			io.print("TYPE-TEXT:[" ++ ..string.replace(tostring(after), '\r\n', '|') ++ "]");
+		}, 2000);
+	}
+}
+
+// ---------- 正常模式（不是任何测试分支）：加载工程 ----------
+//
+// 之前这一段根本不存在 —— 工程只在 smoke / nav / demo 三个测试分支里加载，
+// 正常启动 IDE 是**一片空白**（工程树空、编辑器空、没工程），
+// 看上去就像「所有功能都没接上」。
+//
+// ⚠ 现在**不再**放在 show() 之前：加载工程要扫目录树、打开起始文件还要
+// 做全量语法着色，全在窗口显示前跑完的话，用户看到的是「半分钟白屏」。
+// 改成 show() 之后由心跳分阶段做（见 bootTick）—— 先渲染，再加载。
+if(!isTestMode){
+	// 标记「等窗口出来后再加载」
+	bootNeedProject = true;
 }
 
 // 显示主窗体。
@@ -1242,4 +2859,34 @@ try{
 catch(e4){
 	io.print("BORDERLESS-ERR:" ++ tostring(e4));
 }
+
+// 窗口摆位：官方 win.form 建窗时给的默认位置会把窗口甩到屏幕外
+// （实测 2560x1440 屏上，1280x820 的窗体会落在 x=946，右边 329 像素
+//  在屏幕外 —— 右栏「标准库/工具/AI/组件」那几页签根本点不到）。
+// IDE 的窗口应该老老实实落在主显示器工作区里并最大化。
+try{
+	var _hwnd = shell.winform.hwnd;
+	::User32.SetWindowPos(_hwnd, -2/*_HWND_NOTOPMOST*/, 0, 0, 0, 0,
+		0x43/*_SWP_NOMOVE|_SWP_NOSIZE|_SWP_SHOWWINDOW*/);
+	::User32.ShowWindow(_hwnd, 3/*_SW_MAXIMIZE*/);
+	..nodio.ui.dpiSetScaleFrom(shell.winform);
+	shell.flushLayout();
+}
+catch(e5){}
+
+// ⚠ 窗口显示后**强制所有自绘板整块重画一次**。
+//
+// 官方 plus 的 WM_PAINT 只画「本次失效区域」（win/ui/ctrl/plus.aardio:833
+// 把 rcPaint 当裁剪区）：更新区为空 ⇒ 这一画等于没画。
+// 画板是在窗体显示**之前**创建的，等窗体真正显示出来时它们的更新区
+// 往往已经被判空 —— 于是窗口在、面板在、矩形也对，屏幕上却是一片空白。
+// （实测：标题栏 / 工具条 / 行号栏画出来了，三个停靠面板、页签条、
+//   状态栏全没有 —— 正好是「从没被显式提到 HWND_TOP 的那些板子」。）
+// 启动期结束：关掉延迟绘制，把**最终一帧**画出来。
+// 这一帧是用户真正看到的第一帧完整界面。
+..nodio.ui.setDeferredPaint(false);
+try{
+	..nodio.ui.redrawAll();
+}catch(e6){}
+
 return win.loopMessage();

@@ -68,10 +68,19 @@ var poll = function(wantSeq){
 };
 
 // ---------- public API ----------
+//
+// ⚠ 本模块是**模块式 API**（跟 app.lspClient 一样）：调用方用
+//   app.dapClient.start(...) / app.dapClient.launch(...) 这样的写法，
+//   不是拿一个对象实例。
+//   以前 start() 结尾写的是 `return self` —— 模块作用域里根本没有 self
+//   （模块级代码的 this 才是模块表），于是 start 永远返回空，
+//   IDE 那边 `if(!dbgSession){ ... }` 恒成立 → 「调试适配器启动失败」，
+//   F10 从来就没能真正跑起来过。
+// 现在统一返回 "ok" / 错误原因字符串。
 start = function(exePath){
-	if(p) return null;
+	if(p) return "busy";
 	p = process.popen(exePath);
-	if(!p) return null;
+	if(!p) return "spawn-failed";
 	p.codepage = 65001;
 	nextSeq = 1; inbox = ""; readyFlag = false;
 	stoppedFlag = false; terminatedFlag = false;
@@ -81,7 +90,7 @@ start = function(exePath){
 		sleep(20);
 		if(poll(seq) !== null) break;
 	}
-	return self;
+	return "ok";
 };
 
 // spawn the debuggee; true on success
@@ -109,8 +118,11 @@ launch = function(scriptPath){
 // 0-based → we add 1 so the editor's 0-based marks map cleanly)
 setBreakpoints = function(path, lines0){
 	if(!p) return;
-	var bps = {};
-	for(i=1;#lines0;1){ bps[i] = { line = lines0[i] + 1 } }
+	// ⚠ breakpoints 必须是 **JSON 数组**，不是对象：
+	//   用 `{}` + 数字键去拼，JSON.stringify 出来是 {"1":{...}}，
+	//   服务端按数组解析 → 断点一个都建不起来。
+	var bps = [ @{_type="array"} ];
+	for(i=1;#lines0;1){ ..table.push(bps, { line = lines0[i] + 1 }) }
 	request("setBreakpoints", { source = { path = path }; breakpoints = bps });
 };
 

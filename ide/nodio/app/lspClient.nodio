@@ -10,6 +10,9 @@
 //     whole thing to the pipe (the server tolerates the stray blank line);
 //   * every request read must go through poll() — never a blocking read,
 //     the IDE cannot afford to freeze on a silent server.
+//
+// LSP 坐标约定（和服务器一致）：line / character 都是 **0 基**。
+// IDE 内部用 1 基行列，调用处自行换算。
 import process.popen;
 import JSON;
 
@@ -17,11 +20,13 @@ exeName = "nodio-lsp.exe";
 
 var p = null;          // popen process
 var nextId = 1;        // JSON-RPC request id
-var uri = "";          // current document uri (file:/// url)
-var text = "";         // current document text (mirrors the editor)
+var curUri = "";       // 当前文档 uri (file:/// url)
+var curText = "";      // 当前文档文本
 var version = 0;       // document version counter
-var diags = {};        // latest diagnostics: { {line,col,msg,sev}; ... }
-var pending = {};      // responses we can't serve synchronously
+var diags = {};        // uri -> { {line,col,endLine,endCol,msg,sev}; ... }
+var opened = {};       // uri -> true（已经 didOpen 过的文档）
+var projRoot = "";     // 工程根目录
+var projFiles = {};    // 工程文件清单（相对路径）
 
 // ---------- framing ----------
 var sendRaw = function(body){
@@ -49,25 +54,42 @@ var toFileUri = function(path){
 	// file:///C:/dir/file.nodio — forward slashes, percent-free is fine
 	// for the paths this IDE produces (ASCII project dirs)
 	var s = ..string.replace(path, '\\', '/');
-	if(..string.indexOf(s, "file:///") !== null) return s;
+	if(..string.indexOf(s, "file:///") === 1) return s;
 	return "file:///" ++ s;
 };
 
-// Read every complete frame currently available and process it. Frames are
-// accumulated in `inbox` across calls: peek() removes bytes from the pipe,
-// so a frame split over two pipe reads is only safe when the leftover is
-// kept. Returns the response body whose id == wantId, or null.
+// file:///D:/dir/file.nodio -> D:\dir\file.nodio
 //
-// Byte-offset facts (probed, keep them):
-//   * string.indexOf returns the 1-based index of the FIRST byte of the
-//     match: for "AB\r\n\r\nCDEF" indexOf('\r\n\r\n') == 3;
-//   * string.mid(s, k, n) is a CLOSED 1-based slice starting at byte k, so
-//     the body starts at hEnd + 4 (hEnd points at the first '\r');
-//   * string.slice(s, k) keeps bytes k..#s (also closed), so the consumed
-//     frame is removed with slice(inbox, hEnd + 4 + cl);
-//   * a TRUNCATED json body makes JSON.parse hang forever (it never
-//     returns an error), so the length check below is load-bearing: never
-//     hand json.parse a body shorter than Content-Length.
+// ⚠ string.left(s,n) 取的是**前 n 个字符** —— 想去掉前缀必须用 slice(s,9)
+//   （slice == sub，第三参省略时到串尾）。用 left(s,#s-8) 会把**尾巴**切掉。
+// ⚠ string.replace 返回**两个**值（替换结果 + 替换次数），
+//   这里只取第一个，别让它顺着 return 漏出去。
+var uriToPath = function(uri){
+	if(type(uri) !== type.string) return "";
+	var s = uri;
+	if(..string.indexOf(s, "file:///") === 1){
+		s = ..string.slice(s, 9);        // 去掉 8 个字符的 "file:///" 前缀
+	}
+	elseif(..string.indexOf(s, "file://") === 1){
+		s = ..string.slice(s, 8);
+	}
+	var r = ..string.replace(s, '/', '\\');
+	return r;
+};
+
+// 读每个已完整的帧并处理。帧在多次调用之间累积在 `inbox` 里：
+// peek() 会把字节从管道里取走，所以跨两次读取的半截帧必须留着。
+// 返回 id == wantId 的那条响应，没有则返回 null。
+//
+// 字节偏移的事实（实测，别再踩坑）：
+//   * string.indexOf 返回匹配处**第一个字节**的 1 基位置：
+//     "AB\r\n\r\nCDEF" 里 indexOf('\r\n\r\n') == 3；
+//   * string.mid(s, k, n) 是从第 k 个字节开始的 1 基闭区间，
+//     所以 body 从 hEnd + 4 开始；
+//   * string.slice(s, k) 保留 k..#s（也是闭区间），
+//     消费掉一帧用 slice(inbox, hEnd + 4 + cl)；
+//   * **残缺的 json 会让 JSON.parse 永远卡住**（它不报错），
+//     所以下面的长度判断是刚需：绝不能把短于 Content-Length 的 body 喂给 json.parse。
 var inbox = "";
 
 var poll = function(wantId){
@@ -81,13 +103,13 @@ var poll = function(wantId){
 		var head = ..string.left(inbox, hEnd - 1);
 		var cl = ..string.match(head, "Content-Length:\s*(\d+)");
 		if(cl === null){
-			// corrupt header: drop one byte and resync
+			// 坏头：丢掉一个字节重新同步
 			inbox = ..string.slice(inbox, 2);
 			continue;
 		}
 		var nLen = tonumber(cl);
-		var bodyStart = hEnd + 4;              // 1-based index of body[1]
-		if((#inbox - bodyStart + 1) < nLen) break;   // frame incomplete
+		var bodyStart = hEnd + 4;              // body[1] 的 1 基位置
+		if((#inbox - bodyStart + 1) < nLen) break;   // 帧没收全
 		var body = ..string.mid(inbox, bodyStart, nLen);
 		inbox = ..string.slice(inbox, bodyStart + nLen);
 		var msg = JSON.parse(body);
@@ -96,12 +118,14 @@ var poll = function(wantId){
 			found = msg;
 		}
 		elseif(msg.method === "textDocument/publishDiagnostics"){
+			// 诊断按 uri 分开存 —— 多文档切换时不能互相覆盖
+			var u = msg.params ? msg.params.uri : null;
 			var ds = msg.params ? msg.params.diagnostics : null;
-			diags = {};
+			var list = {};
 			if(ds){
 				for(k,v in ds){
 					var end = v.range ? v.range.end : null;
-					..table.push(diags, {
+					..table.push(list, {
 						line = tonumber(v.range.start.line);
 						col = tonumber(v.range.start.character);
 						// 结束位置：编辑器要用它画「槽内波浪线」的准确范围
@@ -112,9 +136,43 @@ var poll = function(wantId){
 					});
 				}
 			}
+			if(u) diags[u] = list;
 		}
 	}
 	return found;
+};
+
+// 同步等一条响应（最多 wait 次 × 20ms）
+var waitReply = function(id, wait){
+	if(wait === null) wait = 50;
+	for(i = 1; wait; 1){
+		sleep(20);
+		var r = poll(id);
+		if(r !== null) return r;
+	}
+	return null;
+};
+
+// 把 LSP 的 Location[] 转成 { path; line; col; len } 列表
+//   line 是 **1 基**，col 是 0 基字符偏移
+var locList = function(res){
+	var out = {};
+	if(!res) return out;
+	if(type(res) !== type.table) return out;
+	for(i = 1; #res; 1){
+		var v = res[i];
+		if(!v) continue;
+		var st = v.range ? v.range.start : null;
+		if(!st) continue;
+		var en = v.range ? v.range.end : null;
+		..table.push(out, {
+			path = uriToPath(v.uri);
+			line = tonumber(st.line) + 1;
+			col = tonumber(st.character);
+			len = en ? (tonumber(en.character) - tonumber(st.character)) : 0;
+		});
+	}
+	return out;
 };
 
 // ---------- public API ----------
@@ -126,117 +184,302 @@ start = function(exePath, filePath, docText){
 	// UTF-8 output as GBK->UTF-8 and corrupt every frame. The LSP wire is
 	// byte-oriented; keep it raw.
 	p.codepage = 65001;
-	uri = toFileUri(filePath);
-	text = docText;
-	version = 0;
 	nextId = 1;
 	diags = {};
+	opened = {};
 	var id = request("initialize", { capabilities = {} });
-	// wait briefly for the initialize reply so didOpen lands after it
-	for(i = 1; 20; 1){
-		sleep(20);
-		if(poll(id) !== null) break;
-	}
-	didChange(docText);
+	// 等 initialize 的回复，好让后面的 didOpen 排在它后面
+	waitReply(id, 20);
+	curUri = toFileUri(filePath);
+	curText = docText;
+	version = 0;
+	opened[curUri] = true;
+	notify("textDocument/didOpen", {
+		textDocument = { uri = curUri; languageId = "nodio"; version = version; text = docText };
+	});
 	return "ok";
 };
 
-didChange = function(docText){
+// 切换当前文档（打开另一个文件时调用）
+//
+// 之前这个客户端只认一个 uri：切标签页时服务器还在处理旧文件，
+// 补全/诊断都会落到错的文档上。所以这里按 uri 分别记 didOpen/didChange。
+openDoc = function(path, docText){
 	if(!p) return;
-	text = docText;
+	curUri = toFileUri(path);
+	curText = docText;
 	version = version + 1;
+	if(!opened[curUri]){
+		opened[curUri] = true;
+		notify("textDocument/didOpen", {
+			textDocument = { uri = curUri; languageId = "nodio"; version = version; text = docText };
+		});
+		return;
+	}
 	notify("textDocument/didChange", {
-		textDocument = { uri = uri; version = version };
+		textDocument = { uri = curUri; version = version };
 		contentChanges = { { text = docText } };
 	});
+};
+
+// 把某个文件的最新内容推给服务器（**不改**当前文档）
+//
+// 重命名会同时改多个文件 —— 改完要把新内容推回去，
+// 否则服务端的索引还停在旧名字上，下一次「查找引用」就找不到新名字。
+pushDoc = function(path, docText){
+	if(!p) return;
+	var u = toFileUri(path);
+	version = version + 1;
+	if(!opened[u]){
+		opened[u] = true;
+		notify("textDocument/didOpen", {
+			textDocument = { uri = u; languageId = "nodio"; version = version; text = docText };
+		});
+		return;
+	}
+	notify("textDocument/didChange", {
+		textDocument = { uri = u; version = version };
+		contentChanges = { { text = docText } };
+	});
+};
+
+// 当前文档内容变化
+didChange = function(docText){
+	if(!p) return;
+	curText = docText;
+	version = version + 1;
+	notify("textDocument/didChange", {
+		textDocument = { uri = curUri; version = version };
+		contentChanges = { { text = docText } };
+	});
+};
+
+// 告诉服务器工程根目录和全部源文件（建立项目级符号索引）
+//
+// ⚠ files 必须是**数组**表：JSON.stringify 只把带 _type="array" 的表
+//   当数组输出，普通表会被写成对象。
+setProject = function(root, files){
+	if(!p) return;
+	projRoot = root;
+	projFiles = files;
+	notify("nodio/setProject", { root = root; files = files });
 };
 
 // completion -> array of { label; kind; detail } or null
 completion = function(line, character){
 	if(!p) return null;
 	var id = request("textDocument/completion", {
-		textDocument = { uri = uri };
+		textDocument = { uri = curUri };
 		position = { line = line; character = character };
 	});
-	for(i = 1; 50; 1){
-		sleep(20);
-		var r = poll(id);
-		if(r !== null){
-			var res = r.result;
-			var items = null;
-			if(res){
-				// server may return [ CompletionList ] — unwrap
-				if(#res > 0 && type(res[1]) === type.table && res[1].items !== null){
-					res = res[1];
-				}
-				// CompletionList wrapper or plain array
-				items = res.items ? res.items : res;
-			}
-			var out = {};
-			if(items){
-				for(k,v in items){
-					..table.push(out, {
-						label = tostring(v.label);
-						kind = v.kind === null ? 0 : tonumber(v.kind);
-						detail = v.detail === null ? "" : tostring(v.detail);
-					});
-				}
-			}
-			return out;
+	var r = waitReply(id, 50);
+	if(r === null) return null;
+	var res = r.result;
+	var items = null;
+	if(res){
+		// server 可能返回 [ CompletionList ] —— 解包
+		if(#res > 0 && type(res[1]) === type.table && res[1].items !== null){
+			res = res[1];
+		}
+		// CompletionList 外壳或裸数组
+		items = res.items ? res.items : res;
+	}
+	var out = {};
+	if(items){
+		for(k,v in items){
+			..table.push(out, {
+				label = tostring(v.label);
+				kind = v.kind === null ? 0 : tonumber(v.kind);
+				detail = v.detail === null ? "" : tostring(v.detail);
+			});
 		}
 	}
-	return null;
+	return out;
 };
 
 // hover -> string or ""
 hover = function(line, character){
 	if(!p) return "";
 	var id = request("textDocument/hover", {
-		textDocument = { uri = uri };
+		textDocument = { uri = curUri };
 		position = { line = line; character = character };
 	});
-	for(i = 1; 50; 1){
-		sleep(20);
-		var r = poll(id);
-		if(r !== null){
-			if(r.result === null || r.result === undefined) return "";
-			var c = r.result.contents;
-			if(type(c) === type.table){
-				if(c.value !== null) return tostring(c.value);
-				return tostring(c);
-			}
-			return tostring(c);
-		}
+	var r = waitReply(id, 50);
+	if(r === null) return "";
+	if(r.result === null || r.result === undefined) return "";
+	var c = r.result.contents;
+	if(type(c) === type.table){
+		if(c.value !== null) return tostring(c.value);
+		return tostring(c);
 	}
-	return "";
+	return tostring(c);
 };
 
+// 文档符号（**层级树**）-> [{ name; kind; line; col; children }]
+//
+// 服务端回的是 LSP 的 DocumentSymbol：
+//   { name; kind; range; selectionRange; children:[...] }
+// ⚠ 位置在 `range`/`selectionRange` 里，**没有** `location` ——
+//   老代码读 v.location.range.start.line，行号恒为 0（整棵树都没有位置）。
+// ⚠ `children` 是数组，**必须原样保留层级**：导航栏的面包屑
+//   「模块 › 命名空间 › 函数」就是靠它算出来的。
+//
+// line = 1 基（跟 definition/references/workspaceSymbols 一致），
+// col  = 0 基。
+var __parseSyms = function(arr){
+	var out = [ @{_type="array"} ];
+	if(!arr) return out;
+	for(k,v in arr){
+		var node = {
+			name = tostring(v.name);
+			kind = v.kind === null ? 0 : tonumber(v.kind);
+			line = 0;
+			endLine = 0;
+			col = 0;
+			children = [ @{_type="array"} ];
+		};
+		if(v.selectionRange && v.selectionRange.start){
+			node.line = tonumber(v.selectionRange.start.line) + 1;
+			node.col = tonumber(v.selectionRange.start.character);
+		}
+		elseif(v.range && v.range.start){
+			node.line = tonumber(v.range.start.line) + 1;
+			node.col = tonumber(v.range.start.character);
+		}
+		// endLine：符号的**结束行**（服务端算好）。
+		// 没有它就没法判断「光标是不是在这个符号里面」——
+		// 只能退化成「光标在它下面」，于是光标停在一个刚结束的函数
+		// 之后的顶层语句上时，会被算成「还在那个函数里」。
+		if(v.endLine !== null && v.endLine !== undefined){
+			node.endLine = tonumber(v.endLine);
+		}
+		else{
+			node.endLine = node.line;
+		}
+		if(v.children) node.children = __parseSyms(v.children);
+		..table.push(out, node);
+	}
+	return out;
+};
 symbols = function(){
+	if(!p) return [ @{_type="array"} ];
+	var id = request("textDocument/documentSymbol", { textDocument = { uri = curUri } });
+	var r = waitReply(id, 50);
+	if(r === null) return [ @{_type="array"} ];
+	return __parseSyms(r.result);
+};
+
+// 转到定义 -> { path; line; col; len }
+definition = function(line, character){
 	if(!p) return {};
-	var id = request("textDocument/documentSymbol", { textDocument = { uri = uri } });
-	for(i = 1; 50; 1){
-		sleep(20);
-		var r = poll(id);
-		if(r !== null){
-			var out = {};
-			if(r.result){
-				for(k,v in r.result){
-					..table.push(out, {
-						name = tostring(v.name);
-						kind = v.kind === null ? 0 : tonumber(v.kind);
-						line = v.location ? tonumber(v.location.range.start.line) : 0;
-					});
-				}
-			}
-			return out;
+	var id = request("textDocument/definition", {
+		textDocument = { uri = curUri };
+		position = { line = line; character = character };
+	});
+	var r = waitReply(id, 100);
+	if(r === null) return {};
+	return locList(r.result);
+};
+
+// 查找引用 -> { path; line; col; len }
+references = function(line, character){
+	if(!p) return {};
+	var id = request("textDocument/references", {
+		textDocument = { uri = curUri };
+		position = { line = line; character = character };
+		context = { includeDeclaration = true };
+	});
+	var r = waitReply(id, 100);
+	if(r === null) return {};
+	return locList(r.result);
+};
+
+// 引用标记（同符号高亮）-> { line; col; len }（line **1 基**，col 0 基）
+//
+// 只覆盖当前文档 —— 编辑器里把同一符号的出现垫亮背景；
+// 全项目引用走 references()。
+documentHighlight = function(line, character){
+	if(!p) return {};
+	var id = request("textDocument/documentHighlight", {
+		textDocument = { uri = curUri };
+		position = { line = line; character = character };
+	});
+	var r = waitReply(id, 100);
+	if(r === null) return {};
+	var out = {};
+	if(type(r.result) === type.table){
+		for(i = 1; #r.result; 1){
+			var v = r.result[i];
+			if(!v || !v.range || !v.range.start) continue;
+			var st = v.range.start;
+			var en = v.range.end;
+			..table.push(out, {
+				line = tonumber(st.line) + 1;
+				col = tonumber(st.character);
+				len = en ? (tonumber(en.character) - tonumber(st.character)) : 0;
+			});
 		}
 	}
-	return {};
+	return out;
+};
+
+// 跨文件重命名 -> { path; line; col; len }（要改的位置清单）
+rename = function(line, character, newName){
+	if(!p) return {};
+	var id = request("textDocument/rename", {
+		textDocument = { uri = curUri };
+		position = { line = line; character = character };
+		newName = newName;
+	});
+	var r = waitReply(id, 100);
+	if(r === null) return {};
+	var changes = r.result ? r.result.changes : null;
+	var out = {};
+	if(!changes) return out;
+	for(u, eds in changes){
+		var path = uriToPath(u);
+		for(i = 1; #eds; 1){
+			var e = eds[i];
+			if(!e || !e.range) continue;
+			var st = e.range.start;
+			var en = e.range.end;
+			..table.push(out, {
+				path = path;
+				line = tonumber(st.line) + 1;
+				col = tonumber(st.character);
+				len = en ? (tonumber(en.character) - tonumber(st.character)) : 0;
+			});
+		}
+	}
+	return out;
+};
+
+// 项目符号搜索 -> { name; kind; path; line; col }
+workspaceSymbols = function(query){
+	if(!p) return {};
+	var id = request("workspace/symbol", { query = query });
+	var r = waitReply(id, 100);
+	if(r === null) return {};
+	var out = {};
+	if(r.result){
+		for(k,v in r.result){
+			var loc = v.location;
+			if(!loc || !loc.range) continue;
+			..table.push(out, {
+				name = tostring(v.name);
+				kind = v.kind === null ? 0 : tonumber(v.kind);
+				path = uriToPath(loc.uri);
+				line = tonumber(loc.range.start.line) + 1;
+				col = tonumber(loc.range.start.character);
+			});
+		}
+	}
+	return out;
 };
 
 getDiags = function(){
-	poll(null); // drain; publishDiagnostics updates diags
-	return diags;
+	poll(null); // 收帧；publishDiagnostics 会更新 diags
+	return diags[curUri] ? diags[curUri] : {};
 };
 
 stop = function(){
@@ -246,8 +489,16 @@ stop = function(){
 	p.writeClose();
 	p.close();
 	p = null;
+	curUri = "";
+	diags = {};
+	opened = {};
 };
 
 isRunning = function(){
 	return p !== null;
+};
+
+// 当前文档的 uri（跨文件跳转时要用）
+currentUri = function(){
+	return curUri;
 };

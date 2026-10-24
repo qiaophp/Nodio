@@ -30,6 +30,12 @@ var canvas = null;
 var visible = false;
 var curItem = null;
 
+// 钩子收进**表**（谁改都看得见 —— 模块级的裸标量会被帧局部副本遮蔽，
+// 外部灌进来的钩子内部永远读到 null，见 capability-gap §1.20.3 的教训）
+var hooks = {
+	onEventCode = null;    // function(item) —— 双击组件 / 右键「查看事件代码」时回调
+};
+
 // Bind the designer to the IDE shell.
 create = function(sh){
 	shell = sh;
@@ -74,9 +80,23 @@ create = function(sh){
 		propGrid.setItems(item ? item.props : {});
 		shell.setStatus("设计器: " ++ tostring(item ? item.name : ""));
 	}
+	// 双击组件 → 事件代码（官方 IDE 的行为：双击控件切到代码视图，
+	// 生成/跳到它的事件处理函数；真正生成由 IDE 侧的 hooks.onEventCode 做，
+	// 设计器不认识编辑器）
+	canvas.onDoubleClick = function(item){
+		if(!item) return;
+		if(hooks.onEventCode) hooks.onEventCode(item);
+	}
 	propGrid.onChange = function(index, value){
 		if(!curItem) return;
 		curItem.props[index].value = value;
+		// 选中「窗体本身」时（点画布空白 / 菜单「窗体设置」）：
+		// 属性没有对应控件，走 applyFormProps 写回 DSG 头的 win.form(...)
+		if(curItem.isForm){
+			canvas.applyFormProps(curItem.props);
+			shell.setStatus("已修改窗体设置: " ++ curItem.props[index].name);
+			return;
+		}
 		canvas.applyProps(curItem);
 		shell.setStatus("已修改属性: " ++ curItem.props[index].name);
 	}
@@ -86,6 +106,7 @@ create = function(sh){
 	var idCvCopy = cvMenu.add("复制", null);
 	var idCvDel  = cvMenu.add("删除", null);
 	cvMenu.addSeparator();
+	var idCvEv   = cvMenu.add("查看事件代码", null);
 	var idCvProp = cvMenu.add("属性", null);
 	canvas.onContextMenu = function(item, x, y){
 		if(!item) return;
@@ -100,6 +121,10 @@ create = function(sh){
 		elseif(id == idCvDel){
 			canvas.remove(item.name);
 			shell.setStatus("已删除控件: " ++ item.name);
+		}
+		elseif(id == idCvEv){
+			// 双击的菜单兜底路径（个别控件类收不到 WM_LBUTTONDBLCLK）
+			if(hooks.onEventCode) hooks.onEventCode(item);
 		}
 		elseif(id == idCvProp){
 			curItem = item;
@@ -126,21 +151,87 @@ layout = function(){
 }
 
 // Show / hide the canvas (the editor keeps its own text).
+//
+// 设计 ↔ 源码视图切换（官方 switchActiveForm 的语义）：
+//   · open  = 切到**设计视图**：画布载入当前文档里的 DSG 块
+//     （源码里有什么设计，画布上就是什么；没有块的文档给空画布）；
+//   · close = 切回**代码视图**：把**当前设计**写回文档里的 DSG 块
+//     （只写编辑器缓冲，不落盘 —— 落盘交给 Ctrl+S）。
+//   两个方向都只在「内容真的不一样」时才动文档。
 open = function(){
 	if(!canvas) return;
 	visible = true;
 	layout();
+	// 设计视图：从当前文档读 DSG 块 → 画布
+	var path = shell ? shell.tabCurPath() : null;
+	if(path){
+		var src = shell.tabGetText(path);
+		if(src){
+			var block = nodio.designer.dsg.extractBlock(src);
+			if(#block) canvas.fromDSG(block);
+			else{
+				// 没有设计块的文档给**空画布**：窗体设置也回到默认
+				//（不带走上一个文档的窗体标题/尺寸）
+				canvas.clear();
+				canvas.form = {text="窗体"; w=759; h=469};
+			}
+		}
+	}
 	canvas.show(true);
-	shell.winform.ed.show(false);
-	shell.setStatus("设计器: 就绪");
+	// ⚠ **不要 hide 官方 richedit**：它的 show()/hide() 在 Nodio 上会触发
+	//   控件重建（官方那套 DPI 初始化路径），**正文直接被清空**，
+	//   而且清空会触发 richedit 的 EN_CHANGE → 编辑器把空文本写回缓存 ——
+	//   于是「开关一次设计器，代码就没了」。
+	//   画布是不透明的浮层（还显式提到 z 序最前），本来就盖得住编辑器，
+	//   根本不需要藏 richedit。
+	// 行号栏要藏掉：设计面是一块**表单表面**，不是代码区，
+	// 留着行号栏既没意义，又会压住画布左边（行号栏是自绘板，层次在前）。
+	try{ shell.editor.gutter.show(false) }catch(e){}
+	// 自动联动左右侧栏：左栏切到「属性」、右栏切到「控件」工具箱
+	try{
+		if(shell.leftDock) shell.leftDock.setSelIndex(2);
+		if(shell.rightDock) shell.rightDock.setSelIndex(1);
+	}catch(eDock){}
+	if( ..string.getenv("NODIO_IDE_DIAG") ){
+		io.print("DIAG designer.open canvasvis=" ++ tostring(canvas.visible)
+			++ " bgvis=" ++ tostring(..win.isVisible(canvas.bg.ctrl.hwnd))
+			++ " bgrect=" ++ tostring(canvas.bg.rect.left) ++ "," ++ tostring(canvas.bg.rect.top)
+			++ "," ++ tostring(canvas.bg.rect.right) ++ "," ++ tostring(canvas.bg.rect.bottom)
+			++ " edvis=" ++ tostring(..win.isVisible(shell.winform.ed.hwnd))
+			++ " gutvis=" ++ tostring(..win.isVisible(shell.editor.gutter.ctrl.hwnd)));
+	}
+	shell.setStatus("设计器: 就绪 (按 Shift+F7 切回代码)");
 }
 
 close = function(){
 	if(!canvas) return;
 	visible = false;
+	var synced = false;
+	// 代码视图：当前设计写回文档的 DSG 块（编辑器缓冲，不落盘）。
+	// 画布空**且**文档本来就没有块时不写 —— 不能往普通脚本里塞空设计。
+	var path = shell ? shell.tabCurPath() : null;
+	if(path){
+		var src = shell.tabGetText(path);
+		if(src){
+			var block = nodio.designer.dsg.extractBlock(src);
+			if(#canvas.items || #block){
+				var ns = nodio.designer.dsg.replaceBlock(src, canvas.toDSG());
+				if(ns != src){
+					shell.tabSetText(path, ns);
+					synced = true;
+					if(shell.setStatus) shell.setStatus("设计已同步到源码（Ctrl+S 保存）");
+				}
+			}
+		}
+	}
 	canvas.show(false);
-	shell.winform.ed.show(true);
-	shell.setStatus("设计器: 已关闭");
+	// richedit 一直没被藏过（见 open 的说明），这里不用再 show(true)：
+	// 官方 richedit 的 show() 会重建控件并清空正文。
+	try{ shell.editor.gutter.show(true) }catch(e){}
+	try{
+		if(shell.leftDock) shell.leftDock.setSelIndex(1); // 切回工程树
+	}catch(eDock2){}
+	if(!synced) shell.setStatus("设计器: 已关闭 (已切回源码)");
 }
 
 toggle = function(){
@@ -163,4 +254,47 @@ toDSG = function(){
 fromDSG = function(text){
 	if(!canvas) return false;
 	return canvas.fromDSG(text);
+}
+
+// ---------- 设计的存取（IDE 入口）----------
+//
+// 设计器的「保存/载入」以前只有 toDSG/fromDSG 两个纯函数，
+// **没有任何入口**能把它接到文件或源码上 —— 画完就丢了。
+// 这里补两层：
+//   ① 独立 .dsg 文件（设计另存为 / 打开 .dsg）
+//   ② 源码里的 /*DSG{{*/ … /*}}*/ 块（官方 aardio 就是这么存的：
+//      窗体源码自带设计标记，打开源码就能看到设计）
+
+// 另存为 .dsg 文件
+saveToFile = function(path){
+	if(!canvas || !path) return false;
+	var text = canvas.toDSG();
+	if(!..string.save(path, text)) return false;
+	if(shell) shell.setStatus("设计已保存: " ++ path);
+	return true;
+}
+
+// 从 .dsg 文件载入
+loadFromFile = function(path){
+	if(!canvas || !path) return false;
+	var text = ..string.load(path);
+	if(text === null || text === undefined) return false;
+	if(!canvas.fromDSG(text)) return false;
+	if(shell) shell.setStatus("已载入设计: " ++ path);
+	return true;
+}
+
+// 把画布上的设计写进源码（替换 DSG 块；原来没有就追加）
+// 返回**新**源码，调用方负责写回编辑器。
+applyToSource = function(src){
+	if(!canvas) return src;
+	return nodio.designer.dsg.replaceBlock(src, canvas.toDSG());
+}
+
+// 从源码里读出 DSG 块并载入画布
+readFromSource = function(src){
+	if(!canvas) return false;
+	var block = nodio.designer.dsg.extractBlock(src);
+	if(!#block) return false;
+	return canvas.fromDSG(block);
 }

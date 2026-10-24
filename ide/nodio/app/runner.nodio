@@ -31,17 +31,37 @@ create = function(winform, exe, outCtl, setStatus){
 			stop();
 			setStatus("就绪");
 		}
+		// ⚠ 显式返回 null：官方 WM_TIMER 会把「返回值既不是 null 也不是 true」
+		//   的定时器**移除**（win/ui/_.aardio:342）——
+		//   这里最后一句是 stop()/setStatus()，返回值会传出去，
+		//   一旦是 false，**运行输出就不再流式刷新**了。
+		return null;
 	};
 
 	return {
 		isRunning = function(){ return proc !== null };
-		run = function(filePath){
+		stop = function(){
+			if(proc){
+				try{ proc.terminate() }catch(e){}
+				try{ proc.close() }catch(e2){}
+				proc = null;
+				stop();
+				outCtl.append("\r\n[已强制停止]\r\n");
+				setStatus("就绪");
+			}
+		};
+		run = function(filePath, workDir){
 			if(proc){ outCtl.append("\r\n[运行中——先等待当前脚本结束]\r\n"); return };
+			if(!workDir){
+				var pi = ..io.splitpath(filePath);
+				if(pi && pi.dir) workDir = pi.dir;
+				else workDir = ..io.fullpath(".");
+			}
 			var cmd = """" ++ exe ++ """ """ ++ filePath ++ """";
-			proc = process.popen(cmd);
+			proc = process.popen(cmd, , {workDir = workDir; showWindow = 1/*_SW_NORMAL*/});
 			if(!proc){ outCtl.append("[启动失败: " ++ exe ++ "]\r\n"); return };
 			outCtl.clear();
-			outCtl.append("[运行] " ++ filePath ++ "\r\n");
+			outCtl.append("[运行] " ++ filePath ++ "\r\n[工作目录] " ++ workDir ++ "\r\n");
 			setStatus("运行中...");
 			wid = winform.setInterval(poll,100);
 		};

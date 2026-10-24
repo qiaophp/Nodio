@@ -13,7 +13,10 @@ nodio.designer.registry.register({
 	drawAs = "button";     // 设计器里的替身类（画不出来的控件用替身代画）
 	category = "我的组件";
 	props = {
-		{"text"; "标题"; "string"};
-		{"enabled"; "可用"; "bool"};
+		// 属性定义是**四元组** {key; 标签; 类型; 分类}：
+		// 第 4 个元素是属性格分组带的分类名（外观/样式/数据/位置/基本），
+		// 省略时按 key 自动归类（text→外观、enabled→样式 …）。
+		{"text"; "标题"; "string"; "外观"};
+		{"enabled"; "可用"; "bool"; "样式"};
 	};
 });
