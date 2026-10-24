@@ -58,6 +58,12 @@ namespace NodioVM
         size_t memPos = 0;
         bool bMem = false;
         bool bClosed = false;
+        // Official io.file default is TEXT mode ('t'; 'b' opts out):
+        // reads translate CRLF -> '\n' and stop at '\0'/'\x1A', writes
+        // translate '\n' -> CRLF. The CRT fd itself stays binary (live
+        // pipes deadlock on CRT text mode), so the translation is done in
+        // the byte layer here (ioFileTextKeep / ioFileWriteTranslate).
+        bool bText = false;
         ~IoFileState() { if (f) fclose(f); }
     };
     // a file state is "open" when it has a disk handle or a payload buffer
@@ -113,6 +119,47 @@ namespace NodioVM
         if (pit == sit->second.tab->map.end()) return nullptr;
         if (pit->second.t != Value::Pointer) return nullptr;
         return (IoFileState*)pit->second.ptr;
+    }
+    // Official io.file TEXT-mode read filter (docs/language-reference/
+    // datatype/newline.md §读写文件的文本模式 + docs/library-guide/builtin/
+    // io/file.md): reads translate CRLF -> '\n' and treat '\0'/'\x1A' as
+    // terminators — a text-mode read never returns those bytes. Puts the
+    // filtered text in `out` and returns the number of RAW input bytes the
+    // output consumed; the caller seeks the fd / rewinds the buffer cursor
+    // by (raw.size() - keep) so the terminator is not swallowed and later
+    // reads stay stopped at it.
+    static size_t ioFileTextKeep(const std::string& raw, std::string& out)
+    {
+        size_t term = raw.find('\0');
+        size_t t2 = raw.find('\x1A');
+        if (t2 != std::string::npos &&
+            (term == std::string::npos || t2 < term))
+            term = t2;
+        size_t keepRaw =
+            (term == std::string::npos) ? raw.size() : term;
+        out.clear();
+        out.reserve(keepRaw);
+        for (size_t k = 0; k < keepRaw; k++)
+        {
+            if (raw[k] == '\r' && k + 1 < keepRaw && raw[k + 1] == '\n')
+                continue; // CRLF -> '\n' (drop the CR)
+            out.push_back(raw[k]);
+        }
+        return keepRaw;
+    }
+    // Text-mode write filter: every '\n' not already preceded by '\r'
+    // becomes CRLF (docs: 「写入时又自动将'\n'转换为'\r\n'」).
+    static void ioFileWriteTranslate(std::string& out)
+    {
+        std::string r;
+        r.reserve(out.size() + out.size() / 8);
+        for (size_t k = 0; k < out.size(); k++)
+        {
+            if (out[k] == '\n' && (k == 0 || out[k - 1] != '\r'))
+                r.push_back('\r');
+            r.push_back(out[k]);
+        }
+        out.swap(r);
     }
     // 逐行读取（裸指针版）：返回 false = 已到末尾。行尾的 CR/LF 不计入结果。
     static bool ioFileReadLineRaw(IoFileState* st, wstring& out)
@@ -3665,9 +3712,18 @@ void Interp::InitBuiltins()
                             if (bLine)
                             {
                                 size_t e = st->memPos;
-                                while (e < st->mem.size() && st->mem[e] != '\n')
+                                while (e < st->mem.size() &&
+                                       st->mem[e] != '\n' &&
+                                       !(st->bText &&
+                                         (st->mem[e] == '\0' ||
+                                          st->mem[e] == '\x1A')))
                                     e++;
-                                if (e < st->mem.size()) e++;   // keep the newline
+                                bool bStopTerm =
+                                    (st->bText && e < st->mem.size() &&
+                                     (st->mem[e] == '\0' ||
+                                      st->mem[e] == '\x1A'));
+                                if (!bStopTerm && e < st->mem.size())
+                                    e++;   // keep the newline
                                 if (e > st->memPos)
                                 {
                                     raw.assign(st->mem.data() + st->memPos,
@@ -3687,6 +3743,15 @@ void Interp::InitBuiltins()
                                 st->memPos += got;
                             }
                             if (raw.empty()) return Value();
+                            if (st->bText)
+                            {
+                                std::string out;
+                                size_t keep = ioFileTextKeep(raw, out);
+                                if (keep < raw.size())
+                                    st->memPos -= (raw.size() - keep);
+                                if (out.empty()) return Value();
+                                return ioFileBytesToValue(out);
+                            }
                             return ioFileBytesToValue(raw);
                         }
                         std::string raw;
@@ -3722,6 +3787,16 @@ void Interp::InitBuiltins()
                             unsigned char ch = 0;
                             while (fread(&ch, 1, 1, st->f) == 1)
                             {
+                                if (st->bText &&
+                                    (ch == '\0' || ch == '\x1A'))
+                                {
+                                    // text-mode terminator: push it back so
+                                    // this and later reads stay stopped here
+                                    // (a pipe seek fails and the byte is
+                                    // swallowed — best effort there)
+                                    _fseeki64(st->f, -1, SEEK_CUR);
+                                    break;
+                                }
                                 raw.push_back((char)ch);
                                 if (ch == '\n') break;
                             }
@@ -3742,6 +3817,17 @@ void Interp::InitBuiltins()
                             raw.resize(got);
                         }
                         if (raw.empty()) return Value();
+                        if (st->bText)
+                        {
+                            std::string out;
+                            size_t keep = ioFileTextKeep(raw, out);
+                            if (keep < raw.size())
+                                _fseeki64(st->f,
+                                          -(long long)(raw.size() - keep),
+                                          SEEK_CUR);
+                            if (out.empty()) return Value();
+                            return ioFileBytesToValue(out);
+                        }
                         return ioFileBytesToValue(raw);
                     });
                     tb2->map[L"readAll"] = NF([st, ioFileBytesToValue,
@@ -3752,6 +3838,15 @@ void Interp::InitBuiltins()
                         {
                             std::string raw(st->mem.data() + st->memPos,
                                             st->mem.size() - st->memPos);
+                            if (st->bText)
+                            {
+                                std::string out;
+                                size_t keep = ioFileTextKeep(raw, out);
+                                st->memPos = st->mem.size() -
+                                             (raw.size() - keep);
+                                if (out.empty()) return Value();
+                                return ioFileBytesToValue(out);
+                            }
                             st->memPos = st->mem.size();
                             if (raw.empty()) return Value();
                             return ioFileBytesToValue(raw);
@@ -3762,6 +3857,17 @@ void Interp::InitBuiltins()
                         while ((got = fread(buf, 1, sizeof(buf), st->f)) > 0)
                             raw.append(buf, got);
                         if (raw.empty()) return Value();
+                        if (st->bText)
+                        {
+                            std::string out;
+                            size_t keep = ioFileTextKeep(raw, out);
+                            if (keep < raw.size())
+                                _fseeki64(st->f,
+                                          -(long long)(raw.size() - keep),
+                                          SEEK_CUR);
+                            if (out.empty()) return Value();
+                            return ioFileBytesToValue(out);
+                        }
                         return ioFileBytesToValue(raw);
                     });
                     tb2->map[L"readBuffer"] = NF([st](vector<Value>& a) -> Value {
@@ -3957,6 +4063,7 @@ void Interp::InitBuiltins()
                         for (auto& v : a)
                             if (!ioFileArgBytes(v, out))
                                 return ioFileFail(L"参数无法序列化", 87);
+                        if (st->bText) ioFileWriteTranslate(out);
                         if (!out.empty() &&
                             fwrite(out.data(), 1, out.size(), st->f) !=
                                 out.size())
@@ -3972,6 +4079,7 @@ void Interp::InitBuiltins()
                             for (auto& v : a)
                                 if (!ioFileArgBytes(v, out))
                                     return ioFileFail(L"参数无法序列化", 87);
+                            if (st->bText) ioFileWriteTranslate(out);
                             out += "\r\n";
                             if (fwrite(out.data(), 1, out.size(), st->f) !=
                                 out.size())
@@ -4084,6 +4192,16 @@ void Interp::InitBuiltins()
                         m3.push_back(L'b');
                         m2 = m3;
                     }
+                    // Official io.file default is TEXT mode ('b' opts out):
+                    // the CRT fd stays binary (pipes), translation is done
+                    // per-call in the byte layer (ioFileTextKeep /
+                    // ioFileWriteTranslate). Text mode applies to DISK
+                    // files and payload resources; files opened from a raw
+                    // OS handle (process.popen pipes, console streams) stay
+                    // byte-exact — JSON-RPC framing (LSP/DAP over popen)
+                    // depends on Content-Length counting raw bytes.
+                    bool bTextMode = (mode.find(L'b') == wstring::npos) &&
+                                     !hOs;
                     if (hOs)
                     {
                         // wrap an OS handle: the CRT fd takes ownership
@@ -4091,10 +4209,11 @@ void Interp::InitBuiltins()
                         // io.file semantics for popen pipes.
                         // CRT text mode is fatal on live pipes: a short
                         // translated read loops on ReadFile until EOF, so
-                        // every fd is binary; io.file is byte-oriented and
-                        // line-ending translation is the caller's job
-                        // (popen.lines trims them, popen.peek reads exact
-                        // byte counts).
+                        // every fd stays binary at the CRT level; the
+                        // official io.file text-mode translation (default
+                        // 't') is done per-call in the byte layer above —
+                        // popen pipes opened through io.file keep exact
+                        // byte semantics by opening with 'b'.
                         int access = _O_RDONLY;
                         if (m2.find(L'+') != wstring::npos)
                             access = _O_RDWR;
@@ -4132,6 +4251,7 @@ void Interp::InitBuiltins()
                             for (size_t k = 0; k < bytes.size(); k++)
                                 st->mem[k] = (char)(unsigned char)bytes[k];
                             st->bMem = true;
+                            st->bText = bTextMode;
                             return ioFileMake(st);
                         }
                         wstring path = ResolveTildeDisk(srcPath);
@@ -4141,6 +4261,7 @@ void Interp::InitBuiltins()
                     }
                     auto st = std::make_shared<IoFileState>();
                     st->f = pf;
+                    st->bText = bTextMode;
                     return ioFileMake(st);
                 });
                 auto fileCls = std::make_shared<Table>();

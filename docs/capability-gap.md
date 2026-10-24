@@ -3866,3 +3866,54 @@ av.video.kernel  ←  av.film  ←  autos.skills.codingFilm
 * **1 项不现实**：`web.layout`（第三方 32 位商业库），它连带的 3 项在 x86 上同样失败；
 * 剩下的 **24 项不需要做任何事** —— 那是官方模块自己的契约（守卫 / 导入顺序 / 自带安装器 /
   依赖缺失），Nodio 复现得**一模一样**（报错文本逐字相同）。
+
+## 1.37 第三十一轮：overlay 收口后全量复测 —— x64 自有缺口归零（ok=943 / fail=26）
+
+### 1.37.1 实测
+
+§1.36.3 定性的 9 项可解缺口随后全部以 overlay 落地（扩展名已迁移 `.nodio`，
+见 `tests/*_overlay_check.ps1` 六套回归锁）：`sevenZip.lzma` 族 4、`web.view` 族 4、
+`raw.fasm` 1、`com.autoComplete` 1。全量 969 模块 sweep 复测：
+
+| | 基线（§1.36） | 本轮实测 |
+|---|---:|---:|
+| x64 ok | 933 | **943**（+10） |
+| x64 fail | 36 | **26**（新增失败 0） |
+
+### 1.37.2 剩余 26 项逐项定性（零 Nodio 自有缺陷）
+
+| 分类 | 项数 | 明细 |
+|---|---:|---|
+| 官方库自身缺依赖 | 3 | `crypt.jwt.algorithm.EdDSA`（BouncyCastle）、`process.ruby` / `process.ruby.simpleHttpServer`（`sevenZip.decoder2.httpFile` 官方库不存在该路径） |
+| 自带安装器/下载器超时 | 6 | `fastcgi.iisInstall`、`java.jdk.v6ora` / `java.jdk.v8ora` / `java.jre.v8ora`、`process.php.7.4` / `process.php.8.3` |
+| 官方契约守卫（先导入父命名空间，报错逐字同官方） | 9 | `py3.export`、`py3.pip`、`sqlite.backup`、`sqlite.base`、`web.acme.httpClient`、`web.form.query`、`web.layout.debug`、`web.view.dev`、`winex.accObject.element` |
+| 官方同款导入顺序（x86 同错，官方冷导入同样失败） | 2 | `win.ui.ctrl.splitter`（`..win.registerClassEx`——其导入头只 import `win.ui.ctrl.metaProperty`，未 import `win`）、`win.ui.ctrl.thread`（裸 `metaProperty()` 依赖 `win.ui.ctrl.metaProperty` 已由父模块载入） |
+| `web.layout` 族（第三方 32 位商业库 HTMLayout.dll，x86 上同样失败） | 5 | `web.layout`、`web.layout.valueObject`、`web.layout.element`、`web.layout.element.style`、`web.layout.event`（官方断言） |
+| 清单伪条目 | 1 | `win.#DEFINE` |
+
+**结论：x64 真缺口只剩 `web.layout` 1 项（第三方 32 位商业库，不现实），
+其余 25 项全部是官方契约 / 环境 / 物理边界。**
+
+### 1.37.3 顺带闭账两条 still-open（roadmap 旧清单）
+
+1. **「console.log 编码原语层 / .join / .getMessage 缺口」——陈旧错账，闭**。
+   实测：`import console` 解析到官方源码库（`io.libpath("console")` =
+   `D:\aardio\lib\console\_.aardio`），60+ 成员全量可用；官方 console **本就没有**
+   `join` / `getMessage` / `isStdout` / `writec` 成员（全库 grep 无定义，只有
+   `..string.join` 引用）；编码原语按官方文档语义逐一核对通过——
+   `string.getUtf` 返回的是 **UTF 标记**（双引号串 = 8 即 UTF-8，
+   `docs/language-reference/datatype/string.md` §41-51），`isUtf16` /
+   `toUtf16` 判别与转换正确（UTF-16 串 6 字节、`isUtf16` 为 true）。
+2. **「io.file 文本模式语义（CRLF 翻译由调用方负责、fd 恒为二进制）」——本轮落地，闭**。
+   按官方文档实现（`docs/language-reference/datatype/newline.md` +
+   `docs/library-guide/builtin/io/file.md`）：io.file / io.open **默认文本模式**
+   （'t'，'b' 退出）——读 CRLF→`'\n'`、写裸 `'\n'`→CRLF、文本模式读把
+   `'\0'`/`'\x1A'` 当终止符（不消耗、后续读停在原地）；CRT fd 恒为二进制
+   （活管道在 CRT 文本模式会死锁），翻译在引擎字节层逐调用完成。
+   **边界（实测定出）**：文本模式只作用于**磁盘文件与载荷资源**；从裸 OS 句柄
+   打开的流（`process.popen` 管道）保持**字节精确**——IDE 的 LSP/DAP 走
+   popen 传 JSON-RPC，Content-Length 按原始字节计数，首版实现曾把管道也
+   翻译导致帧错位（`ide_nav_smoke` 符号树变空实测复现），已改为句柄路径
+   恒二进制。回归：`tests/iofile_text_check.ps1`
+   （13 项十六进制字节级断言，x64 / x86 双绿；VM 90/90、stdlib、publish、
+   IDE 冒烟 / 导航、builtin_api 全绿，新增失败 0）。

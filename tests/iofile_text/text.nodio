@@ -1,0 +1,85 @@
+// io.file 官方文本模式回归夹具。
+//
+// 契约来源：
+//   docs/language-reference/datatype/newline.md §读写文件的文本模式
+//     「读取文件时会自动将回车换行转换为'\n'，而在写入时又自动将'\n'
+//      转换为'\r\n'」「指定'b'标记则启用二进制模式」
+//   docs/library-guide/builtin/io/file.md
+//     「io.file 默认使用文本模式」「文本模式打开文件时,'\0','\x1A'
+//      都被认为是终止符」「需要读取'\x1A'或者'\0'，请务必显式指定'b'模式」
+//
+// 引擎实现：CRT fd 恒为二进制（活管道在 CRT 文本模式下会死锁，
+// process.popen 用 "w+"/"r" 开管道——官方 CRT 文本模式同样做此翻译，
+// 所以引擎在字节层逐调用翻译，语义与官方一致而管道保持安全）。
+// 全部断言用十六进制字节串表达，两架构共用同一期望值。
+
+function hex(s)
+{
+	return string.hex(s);
+}
+
+var p = io.tmpname();
+
+// ---- 1. 写：默认文本模式，'\n' 落盘为 CRLF ----
+var f = io.file(p, "w");
+f.write('a\nb\n');
+f.close();
+io.print("W-TEXT " ++ hex(string.load(p)));          // 期望 610D0A620D0A
+
+// ---- 2. 写：显式 'wt' 与默认一致 ----
+var f1 = io.file(p, "wt");
+f1.write('c\nd');
+f1.close();
+io.print("W-TEXT-EXPLICIT " ++ hex(string.load(p))); // 期望 630D0A64
+
+// ---- 3. 读：默认文本模式，CRLF 读回 '\n' ----
+var f2 = io.file(p, "r");
+var s2 = f2.readAll();
+f2.close();
+io.print("R-TEXT " ++ hex(s2));                      // 期望 630A64
+
+// ---- 4. 读：'b' 退出文本模式，字节原样 ----
+var f3 = io.file(p, "rb");
+var s3 = f3.readAll();
+f3.close();
+io.print("R-BIN " ++ hex(s3));                       // 期望 630D0A64
+
+// ---- 5. '\0' / '\x1A' 是文本模式终止符；'b' 模式读得到 ----
+var f4 = io.file(p, "wb");
+f4.write('x\ny' ++ '\0' ++ 'z\r\n' ++ '\x1A' ++ 'w');
+f4.close();
+var f5 = io.file(p, "rb");
+var s5 = f5.readAll();
+f5.close();
+io.print("R-BIN-TERM " ++ hex(s5));                  // 期望 780A79007A0D0A1A77
+var f6 = io.file(p, "r");
+var s6 = f6.readAll();
+var s6b = f6.readAll();                              // 终止符处停住：后续读为空
+f6.close();
+io.print("R-TEXT-TERM " ++ hex(s6));                 // 期望 780A79（\0 起读不到）
+io.print("R-TEXT-TERM2 " ++ tostring(s6b));          // 期望 null（不越过终止符）
+
+// ---- 6. readLine：文本模式行尾是 '\n'（无 '\r'），终止符处停 ----
+var f7 = io.file(p, "r");
+var l1 = f7.readLine();
+var l2 = f7.readLine();
+var l3 = f7.readLine();
+f7.close();
+io.print("L1 " ++ hex(l1));                          // 期望 780A
+io.print("L2 " ++ hex(l2));                          // 期望 79（停在 \0 前）
+io.print("L3 " ++ tostring(l3));                     // 期望 null
+
+// ---- 7. writeLine：默认文本模式，行尾 CRLF ----
+var f8 = io.file(p, "w");
+f8.writeLine('one');
+f8.close();
+io.print("WL " ++ hex(string.load(p)));              // 期望 6F6E650D0A
+
+// ---- 8. 写：二进制模式 '\n' 原样 ----
+var f9 = io.file(p, "wb");
+f9.write('e\nf');
+f9.close();
+io.print("W-BIN " ++ hex(string.load(p)));           // 期望 650A66
+
+io.remove(p);
+io.print("IOFILE-TEXT-DONE");

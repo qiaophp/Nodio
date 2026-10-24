@@ -967,10 +967,36 @@ Fixed & closed in recent sessions:
       9 项可解、1 项不现实。
     详见 `docs/capability-gap.md` §1.36
 
+> **第三十一轮（overlay 收口复测 + still-open 清账）**。
+> ① **全量 969 模块 sweep 复测**：x64 **ok=943 / fail=26**（§1.36 基线 933/36，
+>    增量即 §1.36.3 定性的 9 项可解缺口的 overlay 落地：lzma 4 + web.view 4 +
+>    fasm 1 + autoComplete 1）。26 项失败**逐项定性为零 Nodio 自有缺陷**：
+>    官方库缺依赖 3、安装器超时 6、官方契约守卫 9、官方同款导入顺序 2
+>    （`win.ui.ctrl.splitter`/`thread`——x86 同错，官方冷导入同样失败，
+>    源码级核实：splitter 只 import `win.ui.ctrl.metaProperty` 不 import `win`）、
+>    web.layout 族 5（第三方 32 位商业库及级联）、清单伪条目 1。
+>    **x64 真缺口只剩 web.layout 1 项（不现实）——引擎/标准库线的自有缺口归零。**
+> ② **still-open 旧三项全部闭账**：
+>    · py2(x86) / golang 守卫——py2 在 x86 76/76 全绿（`tests/test_subsystems.py`
+>      修正幻影模块 `sys.hd`/`crypt.sha256` 后），golang 不在失败清单；
+>    · console.log 编码原语层——**陈旧错账**：console 解析到官方源码库全量可用，
+>      官方本无 `join`/`getMessage` 成员；`string.getUtf` 按官方文档返回 UTF 标记、
+>      `isUtf16`/`toUtf16` 语义核对通过；
+>    · io.file 文本模式——**本轮落地**：io.file/io.open 默认文本模式（'b' 退出），
+>      读 CRLF→`'\n'`、写裸 `'\n'`→CRLF、`'\0'`/`'\x1A'` 终止符（不消耗，后续读
+>      停在原地）；CRT fd 恒为二进制（活管道安全），翻译在字节层逐调用完成。
+>      **边界（实测定出）**：文本模式只作用于磁盘文件与载荷资源；OS 句柄流
+>      （popen 管道）保持字节精确——首版把管道也翻译，LSP/DAP 的
+>      JSON-RPC Content-Length 帧错位（`ide_nav_smoke` 符号树变空复现），已改。
+>      回归 `tests/iofile_text_check.ps1` 13 项字节级断言 x64/x86 双绿；
+>      VM 90/90（双架构）、stdlib、publish、IDE 冒烟、builtin_api 全绿。
+>    详见 `docs/capability-gap.md` §1.37
+
 Still open (the remaining path to 100%):
-1. language-host primitives: py2/py3 (x86), `golang` import self-guard
-2. console.log string-encoding primitive layer (isUtf16/getUtf/toUtf16 semantics), `.join`/`.getMessage` gaps
-3. io.file refinements toward official text-mode semantics (CRLF translation is currently the caller's job; fds are always binary)
+
+*(2026-10-24 清账：旧三项已全部闭账，见上方第三十一轮。引擎/标准库线剩余
+fail 全部为官方契约 / 环境 / 物理边界，自有缺口归零 —— 现状以
+`docs/capability-gap.md` §1.37 的 26 项定性表为准。)*
 
 Behaviour buckets of the 444 sweep errors (named clusters; a long tail
 beyond them): missing hosts ~55 (Java 40, CLR 15), 32-bit-only DLLs on
