@@ -4201,3 +4201,597 @@ builtin_api、stdlib imports、win_clip、publish、ide_nav_smoke 全绿。
 0xC0000005）。最终以重放 + 立即提交（98e5f94）收口。**并行工作期间
 engine/ 目录的单向约定（谁在改谁持有）需要建立**，否则 `git checkout` 式
 回退会再次静默丢工作。
+
+---
+
+## 1.42 第三十六轮：IDE「设置」面落地 + 一个把回归带进沟里的宿主陷阱
+
+### 1.42.1 交付（本轮 IDE 线）
+
+1. **设置面**：主题（dark/light，重启后生效——各 chrome 组件是构造期读一次
+   `theme()`，官方 aardio 同样重开 IDE 才生效）、编辑器字号（6–48pt，**即时
+   生效**：重设 richedit 字体 → 重量行高 → 行号栏字体 → 浮层字号 → 重排）、
+   外部工具（最多 9 个，名称/命令/参数，`%f`=当前文档、`%p`=工程目录，绑定
+   Ctrl+1..9，与官方约定一致）。配置落 `%APPDATA%\Nodio\ide.cfg`，**与官方
+   命令面 `getConfig/setConfig` 共用同一文件**（插件可读到 IDE 设置）；
+   `NODIO_IDE_CFG` 可覆盖配置路径（回归锁隔离用）。
+2. **回归锁**：`tests/ide_settings/sett.nodio` + `tests/ide_settings_check.ps1`
+   —— 36 项断言全绿；`tests/ide_smoke.ps1` 增 SET-FONT / SET-FONT-CFG /
+   SET-THEME / SET-TOOLS 断言。
+3. **全量跑批脚本正式化**：`tests/run_regression.ps1`（15 项）。旧脚本
+   （`%TEMP%\nodio_regress.ps1`）对 **vm / builtin / import 三项没传
+   `-Exe`**，这三项会落到各自的默认路径 —— 「想测 A 二进制、实际测了 B
+   二进制」，A/B 对比时结论直接作废。新脚本 15 项**全部显式传 `-Exe`**。
+
+### 1.42.2 宿主陷阱：火绒按**程序路径**拦截写入 → 整片假红
+
+现象：新建构建目录（`build-verify64`）跑回归，`vm`（t30/t59）、`iofile`、
+`ide_smoke`（manifest 解析）、`ide_settings`（配置落盘）、`ide_ctx` 相继变红，
+症状统一为「写操作返回 null / false」，读操作却正常。看起来像引擎回归，
+实际**引擎无责**：宿主跑着**火绒安全**（`HipsDaemon`/`HipsTray`），它按
+**可执行文件路径**拦截写入。
+
+定位链（每一步都有可复现的对照）：
+
+| 实验 | 结果 |
+|---|---|
+| 同一脚本、同环境，两个二进制分别跑 | 一个全好、一个全红 |
+| 逐字节比对两个二进制 | **仅 4 字节不同**（PE 时间戳），代码完全一致 |
+| 把同一个二进制拷到另一个目录再跑 | **行为随目录翻转**（与 exe 路径绑定，与 CWD 无关） |
+| 插桩打印 `io.createDir` 收到的路径 | 路径**逐字节相同**（52 字节，同 hex），`GetFileAttributesW` 结果也相同 |
+| 换写入位置 | 写仓库目录 ✅ / 写 `%TEMP%` ❌ / 写 `%USERPROFILE%` ❌（仅在被拦的目录启动时） |
+| `Get-MpComputerStatus` | Defender 未运行 → 不是 Defender CFA，而是第三方 HIPS |
+| 进程列表 | `HipsDaemon` + `HipsTray` = 火绒 |
+
+Win32 侧证据：`_wfopen_s(path,"w+b")` 与 `CreateDirectoryW(path)` 双双返回
+`ERROR_ACCESS_DENIED(5)`，而同路径 `"rb"` 正常 —— 只拦「修改」，不拦「读取」。
+
+**结论与处置**：
+
+- 引擎的文件 I/O 没有缺陷，**不要**为这组假红改引擎（本轮曾一度误判为
+  「GC 缓冲池提前析构导致 use-after-free」，靠上面的目录互换实验才排除）。
+- 回归一律用仓库的**正规构建目录**（`build-x64` / `build-x86`）启动
+  `nodio.exe`；临时构建目录需先加入宿主安全软件的信任区，否则红绿不可信。
+- 已把该约束写进 `tests/run_regression.ps1` 的文件头注释。
+
+### 1.42.3 回归（本轮最终态）
+
+| 架构 | VM | ide_smoke | ide_ctx | ide_nav | ide_cmd | ide_plugin | ide_settings | editor | input | iofile | winclip | builtin | stdlib | publish | import | 合计 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| x64 | 90/90 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ 36 项 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **15/15** |
+| x86 | 90/90 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ 36 项 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **15/15** |
+
+（x64 跑在 `build-x64`，x86 跑在 `build-x86`，均为当前工作树重建。）
+
+### 1.42.4 x86 历史崩溃的归因收口
+
+前几轮记录里 x86 的 `0xC0000005`（exe offset 0x43B4）与 x64 冒烟「跑到
+`PROJOBS-START` 后不完成」，本轮**在当前树上均未复现**：
+
+- 崩溃根因是并行会话 GC WIP 的「注册表项未擦除 → Env 地址复用 → 清扫器把
+  活帧当垃圾清空 → shared_ptr 控制块落到 `feeefeee`」，已由 **98e5f94** 修掉
+  （析构按 `bGcRegistered` 补擦除）。
+- 而「写盘类用例整片变红」的那部分，是 §1.42.2 的宿主拦截假象，与引擎无关。
+
+两条线都清掉后，x64 / x86 双架构 15/15 全绿。
+
+
+## 1.43 第三十七轮：IDE「AI」聊天面板（OpenAI 兼容接口）+ 一个把 IDE 一起带走的引擎 GC 悬垂指针
+
+### 1.43.1 交付（AI 线）
+
+1. **三层库**（全部无头可测，回归锁在 `tests/ide_ai/ai.nodio`）：
+   - `lib/nodio/ai/http.nodio` —— WinINet 带头 HTTP 客户端。引擎自带的
+     `web.get/web.post`（`engine/builtins.cpp:8795`）底层是 `util.cpp` 的
+     HttpFetch，**只发 Content-Type、不支持自定义请求头**，而 OpenAI 兼容
+     接口必须带 `Authorization: Bearer <key>`，所以这里自己
+     `raw.loadDll("wininet.dll")` + FFI。
+   - `lib/nodio/ai/cred.nodio` —— Windows 凭据管理器（advapi32 FFI）。
+     **API Key 只存这里，不进明文 `ide.cfg`**（配置文件会被同步/备份带走）。
+   - `lib/nodio/ai/chat.nodio` —— OpenAI 兼容的会话 / 请求体 / 响应解析
+     （纯逻辑，不碰窗口、不碰注册表）。
+2. **面板** `ide/nodio/app/ai.nodio`：右栏「AI」页签从「一块只读 richedit」
+   换成真正的聊天面板 —— 顶栏自绘板（状态文字 + 发送/清空/设置三个自绘按钮）、
+   对话日志、输入框、配置区（接口 / 模型 / 密钥，密钥 `password=true`）。
+   - Enter = 发送，Ctrl+Enter = 换行（子类化输入框 + `::GetKeyState(0x11)`）。
+   - 请求走 **worker 线程**（`thread.create` + `thread.set/get` 共享表 +
+     `winform.setInterval` 轮询）：WinINet 是阻塞调用，放主线程 IDE 会整个
+     卡住（鼠标不响应、窗口不重绘）。
+   - 配置分工：`base_url` / `model` → `ide.cfg`（`app.settings`，只认
+     http/https）；**API Key → 凭据管理器**。
+   - 面板给 dock 的是「可见性代理」`self.ctrl = {show=...}`（与
+     `nodio.ui.searchPanel` 同一套路），**`lib/nodio/ui/dock.nodio` 一行未改**。
+3. **回归锁**：
+   - `tests/ide_ai/ai.nodio` + `tests/ide_ai_check.ps1` —— **83 项断言**，
+     x64 / x86 双架构全绿（含 8 项 API Key 凭据断言）。
+   - `tests/ide_settings/sett.nodio` 增 10 项 AI 配置断言（`ai.baseUrl` 只认
+     http/https、`ai.model` 非空、读写往返），设置锁共 **47 项**。
+   - `tests/ide_smoke.ps1` 增 AI 面板断言：页签显隐、控件在场、会话初始为空，
+     以及**端到端发两条**（成功打本地 mock + 失败打没人监听的端口，
+     见 §1.43.7 的「轮询等待」写法与 §1.43.8 的 mock 服务器）。
+   - `tests/ai_mock_server.py` —— 本地 mock OpenAI 接口（只依赖 Python 标准库），
+     把 AI 面板的**成功回包**路径也变成无头断言（不依赖外网、不碰用户真实 Key）。
+   - 凭据隔离：`nodio.ai.cred.apiKeyTarget()` 读环境变量
+     `NODIO_AI_CRED_TARGET`，回归锁与冒烟都用 `NodioIDE/test/...` 这样的
+     **隔离名** —— 否则 `apiKeyRemove()` 会把用户自己配的那条
+     `NodioIDE/ai/apiKey` 抹掉。IDE 冒烟还额外要求「凭据名里含 `/test/`」
+     才发那条请求（`main.nodio` 的 `aiIsolated` 判断）。
+
+### 1.43.2 坑一：CREDENTIALW 的 `LastWritten` 是 FILETIME（8 字节），不是 SYSTEMTIME（16 字节）
+
+`CredWriteW` 一直返回 `ERROR_INVALID_PARAMETER(87)`，根因是**结构体布局
+整体后移了 8 字节**：把 `LastWritten` 声明成 4 个 INT（16 字节的 SYSTEMTIME），
+后面所有字段的偏移全部 +8 —— Windows 读到的是
+
+```
+BlobSize=0 / Blob=NULL / Persist=12（非法值）/ Attributes=乱指针
+```
+
+直接被参数校验打回。改成 2 个 INT（8 字节）后实测 `sizeof(CREDENTIAL)=80`
+（与 Windows x64 一致），`CredWriteW` 返回 TRUE。
+声明见 `lib/nodio/ai/cred.nodio:69-82`（写路径）/ `:86-99`（读路径）。
+
+**⚠ 写用 ustring 字段、读用 pointer 字段**：`CredentialBlob` 是 `BYTE*`，
+**不是 C 串**（没有结尾 NUL）。写的时候把普通文本赋给 ustring 字段 ——
+序列化器（`engine/ffi.cpp` StructSerialize）会写该字符串自身的 UTF-16 缓冲区
+地址，正好就是 blob 要的「一段 UTF-16 字节」；读回来要用 pointer 字段拿指针
++ `CredentialBlobSize` 拿长度，再 `raw.readW(ptr, ..math.floor(blobSize/2))`。
+
+**⚠ 读 32 位整数不能用 `raw.uint`**：官方 `lib/builtin/raw.aardio` 把它覆盖
+成了「数值包装器」（`raw.uint = lambda(v,ref) number("INT",...)`），它**根本不
+读内存**。拿它读 DWORD 只会拿到指针值本身。
+
+### 1.43.3 坑二：`HttpSendRequestW` 是 **5 参数**原型 —— x86 stdcall 多压 8 字节直接 0xC0000005
+
+本机 SDK 头文件 `Windows Kits\10\Include\10.0.22621.0\um\wininet.h:2605-2611`
+写得很清楚：
+
+```c
+BOOL HttpSendRequestW(HINTERNET hRequest, LPCWSTR lpszHeaders, DWORD dwHeadersLength,
+                      LPVOID lpOptional, DWORD dwOptionalLength);
+```
+
+引擎自己的 `util.cpp:140-142` 也只传 5 个。原先按 7 参声明
+（多传 `dwFlags`/`dwContext`）时：x64 看不出问题（多出来的只是寄存器里的
+垃圾值），**x86 是 stdcall** —— 被调方按自己的原型弹栈，多压的 8 字节把
+调用方的栈冲歪 → 返回地址变成 0 → `0xC0000005`（崩溃报告 `EIP=00000000`）。
+改为 5 参后 x64 / x86 均正常。见 `lib/nodio/ai/http.nodio:52-60`。
+
+**一般性教训**：FFI 声明必须与 SDK 头的**真实原型**一致；x86 的 stdcall
+栈失衡不会在 x64 上暴露，双架构回归是唯一能抓住它的手段。
+
+### 1.43.4 坑三：`HttpQueryInfoW` 返回的是 **UTF-16**
+
+W 版 API 的通例：状态码缓冲区内容是 `"32 00 30 00 30 00"`（"200" 的
+UTF-16LE）。原先按 UTF-8 解、再用 `string.split(s,'\u0000')`（按字符拆）
+只取到首字符 —— 于是状态码恒为 "2"。响应头同理。
+现在统一 `raw.readW(pStatus, ..math.floor(n2/2))`
+（`lib/nodio/ai/http.nodio:209`）。**只有响应正文是原始字节流**（按 UTF-8 解）。
+
+### 1.43.5 坑四：官方 richedit **没有** `append` 方法 —— AI 日志曾经永远空白
+
+`ide/nodio/app/ai.nodio` 的对话日志原来写的是 `self.log.append(text)`，
+而官方 `lib/win/ui/ctrl/richedit.aardio` 只有 `appendText` / `appendLink`，
+**没有 `append`**。这个空调用被 `try/catch` 吞掉 → **面板看起来一切正常，
+聊天记录永远是空白**。
+
+实测（IDE 冒烟里探针）：
+
+```
+type(ctrl.text)="string"  type(ctrl.append)=null
+type(ctrl.appendText)="function"  type(ctrl.clear)="function"
+type(ctrl.setCharformat)="function"  type(ctrl.getText)="function"
+```
+
+修法跟 `app/output.nodio` 一样：**自己留一份 buffer 当真相**，控件只负责显示
+（`ide/nodio/app/ai.nodio:305-314`）。顺带暴露一条通用结论 ——
+**AI 面板这条线上的控件是官方 aardio 控件**（实测 `type(ctrl.text)=="string"`，
+`text` 是字符串属性），`nodio.ui.rect` 里那套「官方控件 text 是属性 /
+引擎原生控件 text 是函数」的双方言在这条线上没出现。
+
+### 1.43.6 坑五：`thread.set` 的共享表**不是 GC 的根** —— 跨线程回包要传字符串
+
+`thread.set` 把值存进进程级的 `g_threadSharedMap`（`engine/builtins.cpp:9117`），
+而收集器的标记阶段只看得见**当前解释器**的根 —— 共享表里的表对象不是根，
+GC 跑起来会把它的**内容清空**（表对象本身还在，于是读回来是个空表）。
+
+所以 AI 面板的 worker 把结果 **JSON 序列化成字符串**再回传
+（`ide/nodio/app/ai.nodio:417`）：字符串不是堆对象，GC 碰不到它。
+
+### 1.43.7 引擎缺陷：worker 线程退出后，GC 会摸到**已释放的线程栈**（0xC0000005）
+
+这是本轮最硬的一个坑，**与 AI 面板无关**，任何 `thread.create` 都会踩到。
+
+**现象**：IDE 冒烟在 AI 发送之后整进程 0xC0000005：
+
+```
+[FATAL CRASH] code=0xC0000005 at addr=0x...5A3ED file= line=10
+  AccessViolation: op=0 target=0x88D1FFEF18
+  RIP=0x...5A3ED RSP=0x88CDFFA770
+```
+
+注意 **faulting target 与 RSP 不在同一个栈**（`0x88D1…` vs `0x88CD…`）——
+主线程解引用了**另一个线程**（已退出的 worker）的栈。
+
+**最小复现（10 行，确定性）** —— `tests/ide_thread_gc.nodio`：
+
+```aardio
+import thread;
+thread.create(function(a){ return a; }, "x");
+for(i=1; 300000; 1){ var junk = {a=i; b="str" ++ i; c={d=i; e={f=i}}}; }
+```
+
+对照实验（同一二进制、同一脚本）：
+
+| 条件 | 结果 |
+|---|---|
+| 默认（自动 GC 开） | **exit = 0xC0000005**（每次必崩） |
+| `NODIO_GC_THRESHOLD=0`（关自动 GC） | exit = 0 ✅ |
+| worker 线程**还活着**时主线程分配 | exit = 0 ✅（不崩） |
+| 主线程只做数值运算、不分配表 | 不崩 |
+
+⇒ 触发条件是「**worker 已退出** + 「主线程随后分配」→ 主线程的收集器跑起来
+→ 摸到了 worker 的东西。
+
+**根因**：`engine/builtins.cpp` 的 `ThreadWorkerProc` 里，worker 的解释器是
+**线程栈上的局部对象**：
+
+```cpp
+Interp wt{ &threadErr };      // ← 住在 worker 的栈上
+```
+
+而 `Interp::globals` 是解释器的**成员**（一个 `Env`）—— 也就是说
+**这个解释器的全局环境就住在那个即将被释放的栈上**。线程一退出，栈被回收；
+但主线程的 GC 仍可能顺着 `Value::envUp` / `Env::parent` 链摸到这个解释器
+拥有的 env → 解引用已释放的栈内存 → 访问违规。
+（收集器其实**已经知道**这类问题：`engine/gc.cpp:540-545` 有
+「另一个解释器在别的线程上跑脚本时，本线程推迟清扫」的护栏；
+但那只挡住了**并发**，挡不住「worker 已经死了、引用还留着」。）
+
+**修法**（本轮已改）：解释器改成**堆分配**，并挂在 `ThreadState` 上随线程状态
+一起保活 —— 线程栈可以释放，解释器不能：
+
+- `engine/common.h:675` —— `ThreadState` 增 `std::shared_ptr<Interp> interp;`
+- `engine/builtins.cpp:968-970` —— `auto wtOwner = std::make_shared<Interp>(&threadErr);`
+  + `job->st->interp = wtOwner;`
+
+改完同一个复现脚本 exit = 0（x64 / x86 都验过），IDE 冒烟也恢复全绿。
+代价是**每个 worker 线程留下一个解释器**（线程状态本来就不回收，
+`g_threadStates` 的条目到进程结束都在），量级可忽略。
+
+**回归锁**：`tests/ide_thread_gc.nodio` + `tests/ide_thread_gc_check.ps1`
+（断言**进程退出码**为 0 —— 崩了就是非 0），已加入
+`tests/run_regression.ps1`（15 项 → **17 项**）。
+
+**冒烟里怎么断言「请求真的跑完了」**：不能用固定时间点。worker 线程第一次跑
+要**自己解析** `nodio.ai.chat` / `nodio.ai.http` 两个模块（每个解释器各有一份
+模块缓存，没有跨线程复用），x86 上这一步比 900ms 检查点还慢 —— 固定点断言会在
+请求还没回来时就打印「没有错误」，看着像通过、其实链路根本没跑完。
+现在的写法是**轮询到 `busy` 变 false 再断言**（100ms 一跳，上限 20s），
+并且**关窗定时器要等它**（`aiCheckDone` 门控），否则窗口会先关掉。
+
+### 1.43.8 把「成功回包」也变成无头断言：本地 mock OpenAI 服务器
+
+上一版冒烟只断言了 AI 面板的**失败**路径（连 `127.0.0.1:1` → 必须出现一条
+`[错误]`）。**成功**路径 —— AI 的回答进日志、进会话 —— 从来没被断言过，
+于是「面板收包那半边」其实是**裸奔**的：解析写错了、角色写错了、
+内容取错了，测试都发现不了。
+
+补法：本地起一个 mock OpenAI 服务器（不依赖外网、不依赖用户真实 Key），
+让 IDE 面板对着它跑一次成功回包。
+
+**`tests/ai_mock_server.py`** —— 只依赖 Python 标准库（`http.server`）：
+
+| 行为 | 返回 |
+|---|---|
+| 绑定 | `127.0.0.1:0`（系统挑空闲端口），stdout 打一行 `READY <port>` 并 flush |
+| `POST <任意路径>` | 200 + OpenAI 形状 JSON，`content = "MOCK-OK 你好，这是 mock 服务器的回包"` |
+| `POST <含 /fail 的路径>` | 500 + `{"error":{"message":"mock failure"}}` |
+| `GET /ping` | 200 `{"pong":true}` |
+
+端口由 `tests/ide_smoke.ps1` 读 `READY` 行取出，用环境变量
+`NODIO_IDE_AI_MOCK_PORT` 传给 IDE（`main.nodio` 读它决定打 mock 还是走
+「只测失败路径」的退化分支 —— 但脚本已把 Python 变成硬依赖，
+所以**正常跑批时那个退化分支不会发生**，它只是手工调试时的兜底）。
+
+> ⚠ **Python 是 IDE 冒烟的硬依赖**。起不来 mock → AI 成功路径根本没法断言 →
+> 这条回归就只剩失败路径，等于白跑。所以脚本**明确报错**（带 stderr 线索），
+> **不做静默降级** —— 静默降级 = 锁不住东西，却看起来是绿的。
+> Python 的找法与 `tests/run_vm_tests.ps1` 一致：先找 PATH，再找
+> `C:\Python311\python.exe`；仓库里本来就有 5 个测试脚本依赖 Python
+> （`run_vm_tests.ps1` / `aardio_*_check.ps1` / `py_overlay_check.ps1` /
+> `webview_overlay_check.ps1` / `fasm_overlay_check.ps1`），不是新引入的负担。
+
+**`ide/nodio/main.nodio`** —— AI 段改成**两段状态机**（`aiPhase`）：
+
+- 阶段 0（成功）：`base_url = http://127.0.0.1:<mockPort>/v1`，发「冒烟-成功」
+  → 断言日志里有 `我: 冒烟-成功` **和** `AI: MOCK-OK`，会话消息数 = 2
+  （user + assistant），`busy` 回到 false。
+- 阶段 1（失败）：`base_url = http://127.0.0.1:1/v1`，发「冒烟-失败」
+  → 断言日志里有 `我: 冒烟-失败` **和** `[错误]`，会话消息数 = 3
+  （失败的那次**用户消息仍留在会话里** —— 面板的约定是「先落用户消息再发请求」）。
+
+新增断言键：`AI-SEND-MOCK` / `AI-SEND-USER` / `AI-SEND-REPLY` /
+`AI-SEND-MSGS` / `AI-SEND-BUSY` / `AI-SEND-ERRUSER` / `AI-SEND-ERR` /
+`AI-SEND-ERRMSGS`。
+
+**坑六：mock 的 stdin 在 `Start-Process -NoNewWindow` 下**立刻 EOF****
+
+原来的 mock 靠「读 stdin 等父进程收工」来退出。实测这条在自动化里**不成立**：
+`Start-Process -NoNewWindow` 不重定向 stdin，子进程继承的是控制台/已关闭的
+管道 → `sys.stdin.read()` **立刻返回** → 随即 `srv.shutdown()`。
+更要命的是 `shutdown()` 的时序：
+
+```
+BaseServer.shutdown()  →  __shutdown_request = True; 等 __is_shut_down
+serve_forever()        →  while not __shutdown_request: ...   # ← 直接不进
+                         finally: __is_shut_down.set()
+```
+
+`shutdown_request` 在 `serve_forever` **真正开始之前**就被置位 → 循环一次都
+不进 → 服务器秒退。症状极具迷惑性：**`READY` 打印了、端口拿到了，一连就
+`Connection refused`**（而不是「连不上服务」）。
+
+改法：**父进程 PID 看门狗**。
+
+```python
+handle = ctypes.windll.kernel32.OpenProcess(0x00100000 /*SYNCHRONIZE*/, False, pid)
+kernel32.WaitForSingleObject(handle, 0xFFFFFFFF /*INFINITE*/)   # 父进程一死就醒
+srv.shutdown()
+```
+
+内核在父进程终止时唤醒这个等待，不用轮询。
+
+> ⚠ **千万别用 `os.kill(pid, 0)` 探活**：Windows 上 `os.kill` 会直接
+> `TerminateProcess` —— 那不是探活，是**把父进程杀了**。
+
+**坑七：`BaseServer.shutdown()` 只在 `serve_forever()` 里能被叫停**
+
+`__is_shut_down` 这个事件**只有 `serve_forever()` 的 finally 会置位**。
+原先 mock 用的是手写 `for _ in range(MAX): srv.handle_request()` 循环，
+此时调 `shutdown()` → `__is_shut_down.wait()` **永久阻塞** → 看门狗线程挂死、
+主线程 `join(timeout=120)` 干等。改用 `serve_forever(poll_interval=0.2)`，
+`shutdown()` 才真正可停。
+
+**坑八：孤儿 mock 进程会让整条调用「看起来卡住」**
+
+`Start-Process -NoNewWindow` 的子进程与父进程**共用控制台**，父进程退出后
+mock 还活着 → 它一直占着控制台句柄 → **调用方的 stdout 管道等不到 EOF**
+→ 整条命令不返回（实测：冒烟脚本早就打印了 `SMOKE OK`，调用方仍在等）。
+三道保险：
+
+1. mock 侧：父进程 PID 看门狗（上面的坑六）；
+2. 脚本侧：`tests/ide_smoke.ps1` 把主体整段包进 `try { … } finally { … }`，
+   `finally` 里 `taskkill /T /F`（连进程树）+ `WaitForExit(3000)` 收掉 mock
+   并删临时日志。（PowerShell 的 `exit` 在 `try` 内**也会**执行 `finally`，
+   所以十几条 `exit 1` 的断言失败路径同样能收干净。）
+3. 兜底扫一遍：按**命令行**扫 `ai_mock_server\.py`，把「上一次被中断
+   （Ctrl+C / 崩了）」留下的孤儿也回收掉 —— 这套做法直接沿用仓库既有的
+   `tests/run_vm_tests.ps1`（它对 `webroot\_srv.py` 就是这么收的：
+   先按 PID 杀树，再按命令行扫一遍）。按**脚本路径**匹配，不按 "python"，
+   免得误伤别的 Python 进程。
+
+收尾后实测：`leftover mock procs = 0`，冒烟命令正常返回。
+
+### 1.43.9 回归（本轮最终态）
+
+| 架构 | ide_smoke | ide_ai | ide_settings | ide_threadgc | 其余 13 项 | 合计 |
+|---|---|---|---|---|---|---|
+| x64 | ✅ | ✅ 83 项 | ✅ 47 项 | ✅ | ✅ | **17/17** |
+| x86 | ✅ | ✅ 83 项 | ✅ 47 项 | ✅ | ✅ | **17/17** |
+
+（x64 跑在 `build-x64`，x86 跑在 `build-x86`，均为当前工作树重建；
+引擎本轮改过 `common.h` + `builtins.cpp`，两个架构都重建过。）
+
+`ide_smoke` 一项在本轮扩成**两段 AI 断言**（成功 + 失败）：
+
+| 断言键 | 含义 | x64 | x86 |
+|---|---|---|---|
+| `AI-SESSION-INIT` | 启动时会话为空 | `0` | `0` |
+| `AI-SEND-START` | 发送动作跑起来了 | `1` | `1` |
+| `AI-SEND-MOCK` | 打的是本地 mock（不是降级路径） | `1` | `1` |
+| `AI-SEND-USER` | 用户消息进了日志 | `1` | `1` |
+| `AI-SEND-REPLY` | **AI 的回答进了日志** | `1` | `1` |
+| `AI-SEND-MSGS` | 会话里多了 assistant 消息（共 2 条） | `2` | `2` |
+| `AI-SEND-BUSY` | 请求结束后回到空闲 | `false` | `false` |
+| `AI-SEND-ERRUSER` | 失败那次用户消息仍留在日志 | `1` | `1` |
+| `AI-SEND-ERR` | 失败时出现 `[错误]` | `1` | `1` |
+| `AI-SEND-ERRMSGS` | 失败后会话共 3 条 | `3` | `3` |
+
+冒烟跑完后实测 **遗留 mock 进程 = 0**（x64 / x86 均是），冒烟命令正常返回。
+
+---
+
+## 1.44 第三十九轮：编辑器字体「时大时小」—— 一个键名写错，Consolas 静默变成了 Segoe UI
+
+### 1.44.1 现象
+
+IDE 的**代码编辑框**里，同一行的中文和英文**大小明显不一致**：英文小一号、
+中文大一号，中文还像是另一种字体（笔画更细、风格不同）。整片代码看上去
+「时大时小」。
+
+截图（`build-x64/Release/shot_font_ide.png`，150% DPI）里第 8 行：
+`// ⚠ 主脚本必须在 app.shell **之前**应用：各 chrome 组件都是…`
+—— 「主脚本必须在」明显比「app.shell」大，且风格不同。
+
+### 1.44.2 根因：`ctrl.setFont` 的键名写错了（`faceName` ≠ `name`）
+
+`lib/nodio/ui/editor.nodio` 设编辑器字体时写的是：
+
+```aardio
+ctrl.setFont({faceName=self.fontName; point=self.fontSize});   // ← 错
+```
+
+但官方 `LOGFONT` 类的字体名字段就叫 **`name`**（`WORD name[32]`），
+而它的构造函数是**逐键原样拷贝**：
+
+```aardio
+// D:\aardio\lib\gdi\_.aardio:7
+class ::LOGFONT{
+  ctor(arg,point){
+    this.name = "Tahoma";
+    ...
+    for(k,v in arg){ if( k!="_struct" ) this[k] = v; }   // ← 认不得的键被当垃圾塞进去，不报错
+    if(this.name =="Tahoma"){ ... elseif(!_WINXP){ this.name = "Segoe UI"; } }   // ← 兜底
+  }
+  WORD name[32];   // ← 字体名
+}
+```
+
+于是 `faceName` 被当成一个**无关的结构体字段**扔掉，`name` 保持默认值
+→ 触发「Tahoma → **Segoe UI**」兜底 → **Consolas 从来没生效过**。
+实际渲染的是 **Segoe UI**（比例字体）→
+
+1. 代码**不等宽**，列对不齐；
+2. Segoe UI 没有汉字字形 → 汉字走 GDI 字体回退（另一套字体）→
+   字面更大、风格也不同 → 「时大时小」。
+
+**为什么能活这么久**：这一行包在 `try{ … }catch(e3){}` 里，**异常被吞掉**；
+而错键名**根本不抛异常**（只是被忽略），所以既没有报错、也没有日志，
+只剩下「看起来怪」。
+
+**实测对照**（`tests/ide_font/font.nodio` 的前三条断言）：
+
+```
+::LOGFONT({faceName="Consolas"; point=11}).name  ==  "Segoe UI"   ← 错键名
+::LOGFONT({name="Consolas";      point=11}).name  ==  "Consolas"   ← 对键名
+```
+
+官方 API 文档也写死了键名：
+
+- `D:\aardio\lib\win\ui\ctrl\edit.aardio:802`
+  `!edit.setFont(混入字体属性) = @.setFont(h=-12;name="Tahoma");`
+- `D:\aardio\lib\win\ui\ctrl\richedit.aardio:799`
+  `setFont = function(f,own = true ){ … f = ::LOGFONT(f) … }`
+
+### 1.44.3 修复
+
+`lib/nodio/ui/editor.nodio` 两处（首次设字体 + `setFontSize`）改成：
+
+```aardio
+ctrl.setFont({name=self.fontName; point=self.fontSize});   // ← name
+```
+
+`point`（pt）仍然是对的：官方 `setFont` 会 `stripPoint` 把它换算成
+像素高度，再除以 DPI 缩放（richedit 自己会缩放，避免二次放大），
+所以**不能**自己再乘 `dpiScale`。
+
+### 1.44.4 顺带修的三处「口径不一致」
+
+| 位置 | 问题 | 改法 |
+|---|---|---|
+| `lib/nodio/ui/editor.nodio`（行号栏画板） | 画板字号单位是**逻辑像素**，却直接塞了 **pt**（`fontSize = self.fontSize`）→ 这块板面的字体比别处小 1/4 | 改用 `self.uiFontSize`（pt × 4/3） |
+| `lib/nodio/ui/editor.nodio`（`setFontSize`） | 同上，改字号后行号栏画板字号跟着错 | 同上，改用 `self.uiFontSize` |
+| `ide/nodio/app/shell.nodio`（分栏对比编辑器） | **硬编码 `fontSize = 11`**，不跟设置走 → 用户改了字号，左右两半对不上 | 改成 `app.settings.fontSizeGet()` |
+| `ide/nodio/main.nodio`（`onEditorFontSize`） | 改字号只通知了主编辑器，分栏那个不动 | 同时 `shell.editor2.setFontSize(n)` |
+
+### 1.44.5 回归锁：`tests/ide_font/` + `tests/ide_font_check.ps1`（9 项）
+
+**怎么断言「字体对不对」**：不去读 HFONT —— 我们引擎的 `::SendMessage`
+回不了指针型返回值（实测 `WM_GETFONT` 恒为 0），改用**等宽性**这个
+可观测特征：等宽字体里 `"iiiiiiiiii"` 与 `"WWWWWWWWWW"` 宽度相同，
+比例字体里差一大截。宽度用 `EM_POSFROMCHAR(0x426)` 量（低 16 位 = x）。
+
+实测灵敏度（同一二进制，只改键名）：
+
+| 设置方式 | `iiiiiiiiii` | `WWWWWWWWWW` | 等宽 |
+|---|---|---|---|
+| `name=`（修好） | 81 px | 81 px | ✅ |
+| `faceName=`（原 bug） | 31 px | 131 px | ❌ |
+
+最后一条是**反证**：故意用错键名再设一次，断言字体确实变回比例 ——
+保证前几条不是「怎么测都过」的假绿。
+
+冒烟里另加两条（`ide/nodio/main.nodio` + `tests/ide_smoke.ps1`）：
+
+```
+DOC-FONT:11/11      ← 主编辑器字号 / 设置里的字号
+DOC-FONT-DIFF:11    ← 分栏对比编辑器的字号
+```
+
+三者必须相等（`tests/ide_smoke.ps1` 逐条比）。
+
+
+
+## 1.44 第三十九轮：import / 加载路径分配治理（普查驱动）
+
+### 1.44.1 工具：全局分配普查（engine/allocstat.cpp，常驻诊断）
+
+NODIO_ALLOC_TRACE=1（或 NODIO_BOOT_TRACE）打开。全局 `operator new/delete`
+override 统计每次堆分配，按 import 三个阶段归账（1=read/lex/parse、
+2=exec、3=模块收尾拷贝），出口打印：总量、阶段表、2 的幂尺寸直方图、
+**阶段×尺寸交叉表**、>64KB 大块分配的**栈位点表**（CaptureStackBackTrace
++ dbghelp 符号化，符号需 prof 构建）。本节所有定位都来自它，不再靠
+调试堆放大倍数猜。
+
+### 1.44.2 普查结论（import win.ui 家族，优化前）
+
+358k 次分配 / 184.8MB：parse 264k 次 90MB（74% 按次数）、exec 90.6k 次
+94MB。尺寸直方图：256B 桶 13.0 万次（= make_shared\<Node\>，AST 节点
+~13 万）、≤32B 桶 14.6 万次（节点小 vector）、>32K 桶仅 775 次却
+133MB（token 向量倍增搬移 churn + exec 大槽向量）。大块栈位点表把
+exec 的鲸鱼钉死在 **`Env::VarAt` 的 `slots.resize`**（175 次 × ~400KB）。
+
+### 1.44.3 五项优化（全部进本轮提交）
+
+1. **PNode 节点池**：`NewPNode()` 统一 9 处 `make_shared<Node>` 为
+   `allocate_shared` + 尺寸恒定 thread_local 自由链表（gc.cpp）。块级
+   回收——块只在引用归零后入链，复用时旧 AST 必已死，无 arena 的生命
+   周期问题；链表上限 10 万块（≈23MB）与槽池预算同量级。256B 桶
+   13.0 万 → 6.5k。
+2. **Lex 预留 + Parser move**：token 向量按 src/3 预留（倍增搬移消失），
+   `Parser ps{ std::move(toks), ... }` 免 64B/token 整份拷贝。
+3. **VarAt 几何增长**：intern id 进程级递增，逐次 +1 resize 每次都要
+   realloc 拷贝整段旧槽；几何步长让容量内的后续写退化为 O(1)。
+4. **槽空间封顶 + 整帧退化（kSlotMax=512）**：尺度病根——槽下标 =
+   全局 intern id，而 `sizeof(Value)=328B`（7 个 shared_ptr +
+   std::function）。晚定义函数的调用帧为几个局部变量要把槽向量撑到
+   max-id × 328B（win.ui 家族 id ~5 万 → 4.4MB/帧），24MB 池预算只够
+   缓存个位数大缓冲，之后每帧 malloc+resize+清零。非驻留帧（池化槽帧）
+   越界时把已有槽位搬进 vars map、整帧退化为 map（一次性
+   O(本帧变量数)，`conv=154` 帧/次 import），槽缓冲归还池；驻留帧
+   （globals/mainEnv，`bSlotsKeep`）保持几何槽不受限。
+5. **BootTrace 计时器全部环境门控（g_bootTrace）**：途中发现的独立
+   问题——语句/Ident/Member/FuncLit 等计时器是无条件 QPC，Ident 是
+   最高频求值，每条语句白付 ~60ns（3 次 QPC + 频率除法）。先读一次
+   环境变量存 `g_bootTrace`（动态初始化），全部累积器按它门控。
+   **注意：第三十五轮台账的 µs 表在今天的 HEAD 上无法复现**（当时
+   计时器已在但表在更早测得？无法考证），本轮一律以同日同机 A/B 为准。
+
+### 1.44.4 数字（同日同机 A/B，HEAD=8175aba 工作树对照）
+
+| 项 | HEAD | 本轮 | 变化 |
+|---|---|---|---|
+| import win.ui 家族（4 轮 min） | 281ms | 250ms | -11% |
+| exec 阶段分配 | 90.6k 次 / 105.7MB | 91.1k 次 / 27.3MB | **字节 -74%** |
+| parse 阶段分配 | 264k 次 / 90MB | 126k 次 / 32.9MB | -52% / -63% |
+| 总分配 | 358k 次 / 184.8MB | 220k 次 / 60.8MB | -39% / -67% |
+| callbench 变参 `f(...)` | 22-29µs | 8.6-12.3µs | **-2.5~3×** |
+| callbench 全局 2 参 / 方法 | — | 打平 | ±0 |
+| callbench 内建 tostring | 329-453ms | 234-376ms | -25% |
+| 冷启动（无 import 脚本） | ~65-83ms | 打平 | 进程创建主导 |
+
+（callbench 每形态 100 万次取空循环差值，交错 4 轮；背景负载可造成
+单轮毛刺，取多数轮的众数区间。）
+
+### 1.44.5 结构挂账：Value = 328B
+
+Value 里 7 个 shared_ptr（112B，每次拷贝 7 次原子操作）+ std::function
+（64B）+ 两个 wstring + params vector。拷贝一个 Value = 328B memcpy +
+7 次 incref/decref——这是 exec 侧剩余成本与调用路径的公共下限，也是
+callbench 打平部分的原因。**FuncData 侧表重构**（函数专属字段收进一个
+shared_ptr，Value 收缩到 ~100B、拷贝 1 次原子操作）挂账下一轮，预计
+同时改善调用路径与 GC 压力。
+
+### 1.44.6 回归（本轮最终态）
+
+x64 17/17、x86 17/17 全绿（run_regression.ps1，槽封顶后与计时器门控后
+各跑一轮）；gcstress uiprobe13 ×4 通过（DONE-2000）；uiprobe13 WS 增量
+20-54MB（PNode 池高水位驻留，上限 23MB + 槽池 24MB）。
+
+### 1.44.7 会话协调
+
+文档第三十六~三十八轮与 §1.42~1.43 为并行 IDE 会话所写（本轮提交时
+仍在工作树未提交，其完整性经核对后与本节一起落账）；其第三十七轮的
+引擎修复（thread.worker 解释器生命周期）已按 hunk 拆分单独提交
+（694a399），归属其轮次。

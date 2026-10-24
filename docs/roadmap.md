@@ -1488,3 +1488,141 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 > ③ 回归：VM 90/90 双架构、gcstress ×3、gcprobe、ide_plugin/ide_command
 >    双架构、iofile_text/builtin_api/stdlib/win_clip/publish/ide_nav 全绿。
 >    详见 `docs/capability-gap.md` §1.41（含并行会话两次回退的冲突记录）。
+
+> **第三十六轮（IDE 设置面 + 回归跑批正式化 + 宿主拦截假红定性）**。
+> ① 「设置」面落地：主题（重启生效，与官方一致）、编辑器字号（6–48pt
+>    即时生效，走量行高→行号栏→浮层→重排整条链）、外部工具（最多 9 个，
+>    `%f`/`%p` 占位，Ctrl+1..9，与官方约定一致）；配置落
+>    `%APPDATA%\Nodio\ide.cfg` 并与官方 `getConfig/setConfig` **共用同一
+>    文件**，`NODIO_IDE_CFG` 可覆盖路径（回归隔离）；新增 36 项设置回归锁。
+> ② 全量回归跑批脚本正式化为 `tests/run_regression.ps1`：15 项**全部显式
+>    传 `-Exe`**（旧脚本漏传 vm/builtin/import 三项，会测到别的二进制，
+>    A/B 对比结论直接作废）。
+> ③ **宿主陷阱定性**：宿主跑着火绒，它按**可执行文件路径**拦截写入 ——
+>    从正规构建目录之外的目录启动 `nodio.exe` 时，写 `%TEMP%`/`%USERPROFILE%`
+>    被拒（`ERROR_ACCESS_DENIED`），读却正常，表现为 t30/t59/iofile/
+>    ide_smoke/ide_settings 整片假红。定位链：同二进制逐字节比对仅差
+>    4 字节时间戳 → 行为却随**目录**翻转 → 插桩确认路径与属性完全相同 →
+>    `HipsDaemon` 在跑。**引擎无责，不要为此改引擎**；回归须用
+>    `build-x64`/`build-x86` 正规目录。详见 `docs/capability-gap.md` §1.42。
+> ④ 回归：**x64 15/15、x86 15/15 全绿**（VM 双架构 90/90，设置 36 项全过）；
+>    前几轮 x86 的 0xC0000005 与 x64 冒烟不完成，随 98e5f94（GC 注册表项
+>    析构擦除）一并消失。
+
+> **第三十七轮（IDE「AI」聊天面板 + 引擎 GC 悬垂指针修复）**。
+> ① 「AI」页签从一块只读 richedit 换成真正的聊天面板（`ide/nodio/app/ai.nodio`）：
+>    顶栏自绘板（发送/清空/设置）、对话日志、输入框、配置区（接口/模型/密钥，
+>    密钥 `password=true`）；Enter 发送 / Ctrl+Enter 换行；请求走 **worker
+>    线程**（WinINet 阻塞调用放主线程会把 IDE 卡死），`winform.setInterval`
+>    轮询回包。配置分工：`base_url`/`model` 落 `ide.cfg`，**API Key 只落
+>    Windows 凭据管理器**（不进明文文件）。底层三层库全部无头可测：
+>    `nodio.ai.http`（WinINet 带头请求）、`nodio.ai.cred`（凭据管理器）、
+>    `nodio.ai.chat`（OpenAI 兼容的会话/请求体/响应解析）。
+> ② **四个 Win32/官方库坑**（详见 `docs/capability-gap.md` §1.43.2–§1.43.6）：
+>    `CREDENTIALW.LastWritten` 是 **FILETIME（8 字节）**不是 SYSTEMTIME（16
+>    字节）（错了 → `CredWriteW` 恒报 87）；`HttpSendRequestW` 是 **5 参数**
+>    原型（按 7 参声明 → **x86 stdcall 栈冲歪 → 0xC0000005**）；
+>    `HttpQueryInfoW` 返回 **UTF-16**（按 UTF-8 解 → 状态码恒为 "2"）；
+>    官方 richedit **没有 `append`** 方法（只有 `appendText`）—— 面板的聊天
+>    日志曾因此**永远空白**；`thread.set` 的共享表**不是 GC 的根** → 跨线程
+>    回包必须传字符串。
+> ③ **引擎缺陷修复**：worker 线程退出后，**主线程的 GC 会摸到已释放的线程栈**
+>    → 0xC0000005（10 行确定性复现，`tests/ide_thread_gc.nodio`）。根因是
+>    worker 的解释器是**线程栈上的局部对象**，而 `Interp::globals` 是它的
+>    成员 → 线程一退出，栈被回收，GC 仍可能顺着 `envUp`/`parent` 摸到它。
+>    修法：解释器改堆分配 + 挂在 `ThreadState` 上保活。**与 AI 面板无关**，
+>    任何 `thread.create` 都会踩到。
+> ④ 回归：新增 `tests/ide_ai_check.ps1`（**83 项**）与
+>    `tests/ide_thread_gc_check.ps1`，跑批脚本 15 项 → **17 项**；
+>    `tests/ide_smoke.ps1` 增 AI 面板端到端断言（轮询到请求结束再断言，
+>    不用固定时间点 —— worker 首次要自己解析模块，x86 比 900ms 还慢）。
+>    **x64 17/17、x86 17/17 全绿**。
+
+> **第三十八轮（AI 面板的「成功回包」也变成无头断言 + mock 孤儿进程治理）**。
+> ① **补上盲区**：上一轮冒烟只断言 AI 面板的**失败**路径，**成功**路径
+>    （AI 的回答进日志 + 进会话）从来没被断言过 —— 面板收包那半边是裸奔的。
+>    补法：`tests/ai_mock_server.py` —— 只依赖 Python 标准库的**本地 mock
+>    OpenAI 接口**（`http.server`）：绑 `127.0.0.1:0`、stdout 打 `READY <port>`、
+>    POST 任意路径回 200 + OpenAI 形状 JSON（内容固定为「MOCK-OK 你好…」）、
+>    路径含 `/fail` 回 500、`GET /ping` 回 200。端口经 `NODIO_IDE_AI_MOCK_PORT`
+>    传给 IDE；**不依赖外网、不碰用户真实 Key**（凭据仍走 `NodioIDE/test/...`
+>    隔离名），没装 Python 就降级成失败路径-only（冒烟不报错）。
+> ② `ide/nodio/main.nodio` 的 AI 段改成**两段状态机**：阶段 0 成功（打 mock）
+>    → 断言日志里有 `AI: MOCK-OK`、会话 2 条消息、`busy` 回 false；阶段 1
+>    失败（打 `127.0.0.1:1`）→ 断言 `[错误]`、会话 3 条消息（失败那次
+>    **用户消息仍留在会话里**）。新增 8 个断言键（`AI-SEND-MOCK/USER/REPLY/
+>    MSGS/BUSY` + `AI-SEND-ERRUSER/ERR/ERRMSGS`）。
+> ③ **三个进程/时序坑**（详见 `docs/capability-gap.md` §1.43.8）：
+>    (a) mock 的 stdin 在 `Start-Process -NoNewWindow` 下**立刻 EOF** →
+>    `shutdown()` 在 `serve_forever` 真正开始前就置位 `__shutdown_request`
+>    → 服务器秒退，症状是「READY 打出来了，一连就 Connection refused」；
+>    改成 **`--parent-pid` 看门狗**（`OpenProcess(SYNCHRONIZE)` +
+>    `WaitForSingleObject`，内核在父进程终止时唤醒，不用轮询）。
+>    ⚠ 探活**不能**用 `os.kill(pid,0)` —— Windows 上它会 `TerminateProcess`，
+>    那是把父进程杀了。
+>    (b) `BaseServer.shutdown()` 只在 `serve_forever()` 里能被叫停 —— 手写
+>    `handle_request()` 循环时调用它会**永久阻塞**（`__is_shut_down` 只有
+>    `serve_forever` 的 finally 才置位）。
+>    (c) **孤儿 mock 进程会让整条调用「看起来卡住」**：它与父进程共用控制台
+>    → 占着控制台句柄 → 调用方 stdout 管道等不到 EOF → 命令不返回
+>    （实测：冒烟早打印了 `SMOKE OK`，调用方仍在等）。三道保险：mock 侧
+>    看门狗 + `tests/ide_smoke.ps1` 侧把主体整段包进 `try/finally` 兜底
+>    `taskkill /T /F`（PowerShell 的 `exit` 在 `try` 内也会执行 `finally`，
+>    十几条 `exit 1` 的失败路径同样收得干净）+ 按命令行扫一遍回收
+>    「上次被中断」留下的孤儿（沿用仓库既有的 `run_vm_tests.ps1` 对
+>    `webroot\_srv.py` 的同一套做法）。收尾实测 **leftover mock procs = 0**。
+>    另：Python 现在是 IDE 冒烟的**硬依赖**（起不来 mock → 成功路径没法断言
+>    → 这条回归等于白跑），所以脚本**明确报错**而不是静默降级；
+>    找 Python 的方式与 `run_vm_tests.ps1` 一致（PATH → `C:\Python311\python.exe`），
+>    仓库里本来就有 5 个测试脚本依赖 Python，不是新引入的负担。
+> ④ 回归：引擎本轮**未再改动**（`common.h` + `builtins.cpp` 沿用上一轮的
+>    GC 悬垂指针修复），两个架构都按当前工作树重建；
+>    **x64 17/17、x86 17/17 全绿**。
+
+> **第三十九轮（编辑器字体「时大时小」—— 一个键名写错，Consolas 静默变成了 Segoe UI）**。
+> ① **现象**：代码编辑框里同一行的中文和英文**大小明显不一致**、风格也不同，
+>    整片代码看上去「时大时小」（截图 `build-x64/Release/shot_font_ide.png`，
+>    150% DPI 下第 8 行「主脚本必须在」明显大于同行的「app.shell」）。
+> ② **根因**：官方 `LOGFONT` 类的字体名字段叫 **`name`**（`WORD name[32]`），
+>    构造函数是 `for(k,v in arg){ this[k] = v; }` —— **逐键原样拷贝**，
+>    认不得的键被当垃圾塞进结构体、**不报错**。而 `lib/nodio/ui/editor.nodio`
+>    写的是 `ctrl.setFont({faceName="Consolas"; point=…})` →
+>    `name` 保持默认值 → 触发「Tahoma → **Segoe UI**」兜底 →
+>    **Consolas 从来没生效过**。于是代码是**比例字体**（列对不齐），
+>    汉字又走 GDI 字体回退（另一套字体、字面更大）→ 「时大时小」。
+>    这一行还包在 `try{…}catch(e3){}` 里，异常被吞，所以既没报错也没日志。
+>    实测对照：`::LOGFONT({faceName=…}).name == "Segoe UI"` vs
+>    `::LOGFONT({name=…}).name == "Consolas"`。
+> ③ **修复**：两处 `setFont` 改用 `name=`（`point` 保持不变 —— 官方
+>    `setFont` 自己会 `stripPoint` 并除以 DPI 缩放，不能再乘 `dpiScale`）；
+>    顺带修三处**口径不一致**：行号栏画板字号把 **pt** 当**逻辑像素**用
+>    （→ `uiFontSize`）、**分栏对比编辑器硬编码 `fontSize = 11`** 不跟设置走
+>    （→ `app.settings.fontSizeGet()`）、改字号时没通知分栏那个编辑器
+>    （→ 同时 `shell.editor2.setFontSize(n)`）。
+> ④ **回归锁**：新增 `tests/ide_font/font.nodio` + `tests/ide_font_check.ps1`
+>    （**9 项**），跑批 17 项 → **18 项**。断言不读 HFONT（我们引擎的
+>    `::SendMessage` 回不了指针型返回值，`WM_GETFONT` 恒为 0），
+>    改用**等宽性**：等宽字体里 `"iiiiiiiiii"` 与 `"WWWWWWWWWW"` 等宽，
+>    比例字体不等宽（实测 81/81 vs 31/131）。末尾一条**反证**：
+>    故意用错键名再设一次，断言字体确实变回比例 —— 保证不是假绿。
+>    冒烟另加 `DOC-FONT:主编辑器/设置` 与 `DOC-FONT-DIFF:分栏编辑器` 两条。
+> ⑤ 回归：**x64 18/18、x86 18/18 全绿**。
+
+
+> **第三十九轮（import / 加载路径分配治理——普查驱动）**。
+> ① 普查工具（allocstat.cpp 常驻）：全局 new/delete override + 阶段归账
+>    + 尺寸直方图 + 阶段×尺寸交叉 + >64KB 大块栈位点（dbghelp 符号化），
+>    NODIO_ALLOC_TRACE=1 门控；定位不再靠调试堆放大倍数猜。
+> ② 优化五项：PNode 节点池（allocate_shared+自由链表，256B 桶 13.0万→6.5k）、
+>    Lex 预留 + Parser move（token 倍增 churn 消失）、VarAt 几何增长、
+>    **槽空间封顶 kSlotMax=512 + 整帧退化 map**（槽下标=全局 intern id 的
+>    尺度病：晚定义帧为几个局部撑 max-id×328B 槽向量；exec 字节 -74%）、
+>    BootTrace 计时器全门控（Ident 无条件 QPC 每语句白付 ~60ns）。
+> ③ 数字（同日同机 A/B，HEAD=8175aba）：import win.ui 家族 281→250ms(-11%)，
+>    exec 分配 105.7→27.3MB，总分配 358k→220k 次 / 185→61MB，callbench
+>    变参 -2.5~3×、其余打平，冷启动打平。
+> ④ 结构挂账：Value=328B（7 shared_ptr + std::function）→ FuncData 侧表
+>    重构挂下轮；round-35 台账 µs 表今日 HEAD 无法复现，以同日 A/B 为准。
+> ⑤ 回归：x64 17/17、x86 17/17（槽封顶后、门控后各一轮），gcstress ×4。
+>    并行 IDE 会话的第三十七轮引擎修复（thread.worker GC 悬垂）按 hunk
+>    拆分先行单独提交（694a399）。
