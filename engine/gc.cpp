@@ -99,20 +99,121 @@ namespace NodioVM
         LiveTableSet().erase(this);
     }
 
+    // ---- Round 34: capture-time (lazy) GC registry for Envs ----
+    // The registry exists so the reachability sweep can find members of
+    // reference cycles (shared_ptr refcounting cannot reclaim those). An
+    // Env can only be a cycle member if a closure captured it
+    // (FuncLit/class-body eval promoting the weak `self` handle into a
+    // shared `envUp`) — every such capture calls GcRegisterEnv, so the
+    // common call frame pays no mutex lock and no hash-set insert/erase
+    // per construction/destruction. Envs that are never captured die by
+    // plain refcounting and never need the sweep.
+    void GcRegisterEnv(Env* e)
+    {
+        if (e->bGcRegistered) return;
+        e->bGcRegistered = true;
+        std::lock_guard<std::recursive_mutex> lk(g_gcRegistryMutex);
+        LiveEnvSet().insert(e);
+    }
+
+    // ---- Round 34: pooled slot buffers for transient frames ----
+    // Call/block frames store their vars in slot vectors (Round 13
+    // accessors). Growing a fresh buffer per call costs a heap block plus
+    // one Value construction per slot, and a call-frame unordered_map
+    // costs a bucket array plus a node per bound var. A thread-local
+    // freelist keeps the grown buffers alive across calls: acquire moves
+    // one out, ~Env moves it back (vector::clear inside clearVars already
+    // keeps the capacity). Stale Values left in a reused buffer stay
+    // invisible (slotBound is zeroed on acquire) and only pin memory
+    // until the buffer is handed out again. The pool is bounded by BYTES
+    // (uiprobe-class GUI churn pinned ~120MB of zombie Values at a fixed
+    // 128-buffer cap): pushing evicts the OLDEST buffer once the budget
+    // is exceeded — the hot path pays nothing (eviction only on push).
+    struct EnvBufPool
+    {
+        std::vector<std::vector<Value>> slotsFree;
+        std::vector<std::vector<uint8_t>> boundFree;
+        // retained capacity in bytes: stale slot Values pin their objects
+        // until the buffer is reused, so retention is capped — a push that
+        // would exceed the budget is refused and the buffer is freed
+        // normally. Eviction (destroying refused buffers' zombies) from
+        // INSIDE a push would re-enter this pool through the ~Env of a
+        // captured frame dying in the cascade — push-time refusal has no
+        // such reentrancy window.
+        size_t nBytes = 0;
+        static constexpr size_t kBudget = 24 * 1024 * 1024;
+    };
+    static thread_local EnvBufPool* t_envBufs = nullptr;
+    static EnvBufPool& EnvBufs()
+    {
+        if (!t_envBufs) t_envBufs = new EnvBufPool();
+        return *t_envBufs;
+    }
+    std::vector<Value> GcAcquireSlotBuf()
+    {
+        EnvBufPool& p = EnvBufs();
+        if (!p.slotsFree.empty())
+        {
+            std::vector<Value> v = std::move(p.slotsFree.back());
+            p.slotsFree.pop_back();
+            return v;
+        }
+        return {};
+    }
+    std::vector<uint8_t> GcAcquireBoundBuf()
+    {
+        EnvBufPool& p = EnvBufs();
+        if (!p.boundFree.empty())
+        {
+            std::vector<uint8_t> v = std::move(p.boundFree.back());
+            p.boundFree.pop_back();
+            return v;
+        }
+        return {};
+    }
+    void GcReleaseSlotBuf(std::vector<Value>&& v)
+    {
+        EnvBufPool& p = EnvBufs();
+        size_t nBytes = v.capacity() * sizeof(Value);
+        if (v.capacity() >= 4 && p.nBytes + nBytes <= p.kBudget)
+        {
+            p.nBytes += nBytes;
+            p.slotsFree.push_back(std::move(v));
+        }
+    }
+    void GcReleaseBoundBuf(std::vector<uint8_t>&& v)
+    {
+        EnvBufPool& p = EnvBufs();
+        if (v.capacity() >= 4 && p.boundFree.size() < 128)
+            p.boundFree.push_back(std::move(v));
+    }
+
     Env::Env()
     {
         g_liveEnvs++;
         g_gcAllocTick++;
         nEpoch = g_gcEpoch.load();
-        std::lock_guard<std::recursive_mutex> lk(g_gcRegistryMutex);
-        LiveEnvSet().insert(this);
+        // registry membership is granted on capture (GcRegisterEnv)
     }
 
     Env::~Env()
     {
         g_liveEnvs--;
-        std::lock_guard<std::recursive_mutex> lk(g_gcRegistryMutex);
-        LiveEnvSet().erase(this);
+        // captured frames were granted registry membership and MUST give
+        // it back here: a destroyed-but-still-listed Env is a dangling
+        // registry entry, and the next sweep trashing that address (heap
+        // reuse) frees a live frame's slots mid-execution. Frames that
+        // were never captured are not in the set — no lock, no lookup.
+        if (bGcRegistered)
+        {
+            std::lock_guard<std::recursive_mutex> lk(g_gcRegistryMutex);
+            LiveEnvSet().erase(this);
+        }
+        if (bSlots && !slots.empty())
+        {
+            GcReleaseSlotBuf(std::move(slots));
+            GcReleaseBoundBuf(std::move(slotBound));
+        }
     }
 
     // ---- marking ----

@@ -327,7 +327,14 @@ Value Interp::Eval(const PNode& n, Env* env)
                 // CallOwner), so enclosing locals like
                 // `fib`/`result` stay visible and mutable.
                 if (env && env->self)
+                {
                     f.envUp = env->self;
+                    // the promotion weak->shared is what makes this frame
+                    // able to take part in a reference cycle: register it
+                    // with the collector exactly here (Round 34 lazy
+                    // registry - construction no longer pays for it)
+                    GcRegisterEnv(env);
+                }
                 for (Env* e = env; e; e = e->parent.get())
                 {
                     if (!f.thisVal)
@@ -861,6 +868,7 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             }
             auto local = std::make_shared<Env>();
             local->self = local;
+            EnvUsePooledSlots(local.get());
             // lexical upvalues: the captured defining frame chain replaces
             // the bare globals jump
             local->parent = f.envUp ? f.envUp : globals.self;
@@ -899,13 +907,9 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                     // keep the raw varargs in a shared vector so the bound
                     // `...` value can also carry mrets — `var a,b = ...`
                     // expands positionally while `var t = ...` still packs
-                    auto vargs = std::make_shared<vector<Value>>();
                     auto tbV = std::make_shared<Table>();
                     for (size_t k = f.params.size() - 1; k < args.size(); k++)
-                    {
-                        vargs->push_back(args[k]);
                         tbV->arr.push_back(args[k]);
-                    }
                     // scripts read varargs through `arg`, while the
                     // `...` spelling expands them at a call site — bind both
                     // names to the same table. An EMPTY table must read as
@@ -916,7 +920,15 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                     //  是表;展开只发生在实参位置的调用点。)
                     Value vDots = tbV->arr.empty() ? Value()
                                                    : Value::Table_(tbV);
-                    if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
+                    if (vDots.tab)
+                {
+                    // mrets ALIASES the packed table's own array (aliasing
+                    // shared_ptr keeps the table alive): one buffer instead
+                    // of a second vector + copy, and the table view and the
+                    // splat view (mrets) always agree.
+                    vDots.mrets = std::shared_ptr<vector<Value>>(tbV, &tbV->arr);
+                    vDots.bDots = true;
+                }
                     local->VarAt(IdDots()) = vDots;
                     local->VarAt(IdArg()) = vDots;
                     // an explicit `arg` parameter (gdip.bitmap's ctor) must
@@ -1320,6 +1332,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 classNsEnv->parent = lexicalParent;
             auto local = std::make_shared<Env>();
             local->self = local;
+            EnvUsePooledSlots(local.get());
             local->parent = f.tab ? classNsEnv
                                   : (f.nsClosure ? definingNsEnv
                                                  : lexicalParent);
@@ -1359,19 +1372,23 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 {
                     if (args.size() > f.fn->names.size() - 1)
                     {
-                        auto vargs = std::make_shared<vector<Value>>();
                         auto tbV = std::make_shared<Table>();
                         for (size_t k = f.fn->names.size() - 1; k < args.size(); k++)
-                        {
-                            vargs->push_back(args[k]);
                             tbV->arr.push_back(args[k]);
-                        }
                         // 官方库的值位置 `...` 就是打包表(builtin/table.aardio
                         // 的 push 用 `#...` / `...[i]` / `...!==null`),展开只
                         // 发生在实参位置的调用点;主值必须是表。
                         Value vDots = tbV->arr.empty() ? Value()
                                                        : Value::Table_(tbV);
-                        if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
+                        if (vDots.tab)
+                {
+                    // mrets ALIASES the packed table's own array (aliasing
+                    // shared_ptr keeps the table alive): one buffer instead
+                    // of a second vector + copy, and the table view and the
+                    // splat view (mrets) always agree.
+                    vDots.mrets = std::shared_ptr<vector<Value>>(tbV, &tbV->arr);
+                    vDots.bDots = true;
+                }
                         local->VarAt(IdDots()) = vDots;
                         local->VarAt(IdArg()) = vDots;
                         for (size_t i = 0; i + 1 < f.fn->names.size(); i++)
@@ -1527,6 +1544,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             // not tostring(the-packed-table).
             auto evalCallArgs = [this, env, &rs](const vector<PNode>& exprs) {
                 vector<Value> res;
+                res.reserve(exprs.size());
                 // every argument is rooted as soon as it is evaluated: a
                 // later argument may run statements, and the collector
                 // must not reclaim an earlier one
@@ -1594,6 +1612,62 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 }
                 return res;
             };
+            // Fast-path argument evaluation. Same as evalCallArgs EXCEPT that
+            // a multi-return argument keeps its `mrets`:
+            // the builtin fast paths below (io.print / print / tostring /
+            // tonumber / error / sleep) act on the PRIMARY value only —
+            // official `io.print(string.match(...))` prints the first capture,
+            // not every capture. evalCallArgs strips `mrets` and expands the
+            // last argument's extra values into separate arguments, which
+            // would change `io.print(f())` from "primary" to "all returns"
+            // (regression: VM t18/t19/t20/t21/t30/t69).
+            // `...` still splats — that part is the official varargs
+            // contract (`tostring(...)` is tostring(first vararg)).
+            auto evalFastArgs = [this, env, &rs](const vector<PNode>& exprs) {
+                vector<Value> res;
+                auto keep = [&res, &rs](const Value& v) {
+                    res.push_back(v);
+                    rs.add(res.back());
+                };
+                for (size_t ai = 0; ai < exprs.size(); ai++)
+                {
+                    auto& a = exprs[ai];
+                    if (a->k == Node::Ident && a->str == L"...")
+                    {
+                        Value vDots = Eval(a, env);
+                        if (vDots.bDots && vDots.mrets)
+                        {
+                            for (auto& item : *vDots.mrets)
+                            {
+                                Value elem = item;
+                                elem.mrets = nullptr;
+                                keep(elem);
+                            }
+                        }
+                        else if (vDots.t == Value::TableT && vDots.tab)
+                        {
+                            for (auto& item : vDots.tab->arr)
+                            {
+                                Value elem = item;
+                                elem.mrets = nullptr;
+                                keep(elem);
+                            }
+                        }
+                        else if (vDots.t != Value::Null)
+                        {
+                            Value elem = vDots;
+                            elem.mrets = nullptr;
+                            keep(elem);
+                        }
+                    }
+                    else
+                    {
+                        // keep `mrets` — the fast path reads the primary value
+                        keep(Eval(a, env));
+                    }
+                }
+                return res;
+            };
             // builtin fast paths: io.print / print
             if (n->a->k == Node::Member && n->a->str == L"print" &&
                 n->a->a->k == Node::Ident && n->a->a->str == L"io")
@@ -1601,7 +1675,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 // strings are byte arrays: write the bytes, not re-encoded
                 // text (a raw byte string must survive untouched).
                 std::string out;
-                for (auto& v : evalCallArgs(n->list))
+                for (auto& v : evalFastArgs(n->list))
                     out += ValueByteForm(ToStringMValue(v));
                 out += "\n";
                 fwrite(out.data(), 1, out.size(), stdout);
@@ -1616,7 +1690,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 if (!vShadow || vShadow == pGlob)
                 {
                     std::string out;
-                    for (auto& v : evalCallArgs(n->list))
+                    for (auto& v : evalFastArgs(n->list))
                         out += ValueByteForm(ToStringMValue(v));
                     out += "\n";
                     fwrite(out.data(), 1, out.size(), stdout);
@@ -1626,7 +1700,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             if (n->a->k == Node::Ident && n->a->str == L"tostring")
             {
-                vector<Value> tsArgs = evalCallArgs(n->list);
+                vector<Value> tsArgs = evalFastArgs(n->list);
                 if (tsArgs.empty()) return Value();
                 Value v = tsArgs[0];
                 vector<Value> extraArgs(tsArgs.begin() + 1, tsArgs.end());
@@ -1649,7 +1723,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             if (n->a->k == Node::Ident && n->a->str == L"tonumber" && n->list.size() == 1)
             {
-                vector<Value> tnArgs = evalCallArgs(n->list);
+                vector<Value> tnArgs = evalFastArgs(n->list);
                 if (tnArgs.size() == 1 && tnArgs[0].t == Value::Num)
                     return tnArgs[0];
             }
@@ -1660,7 +1734,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 // try/catch handler and the top-level report) append it, so
                 // a message that already carries a location is never
                 // decorated twice.
-                vector<Value> errArgs = evalCallArgs(n->list);
+                vector<Value> errArgs = evalFastArgs(n->list);
                 Value vErr = errArgs.empty() ? Value() : errArgs[0];
                 wstring msg = n->list.empty() ? L"运行错误" :
                     L"运行错误: " + vErr.ToString();
@@ -1669,7 +1743,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             if (n->a->k == Node::Ident && n->a->str == L"sleep")
             {
-                vector<Value> slArgs = evalCallArgs(n->list);
+                vector<Value> slArgs = evalFastArgs(n->list);
                 if (!slArgs.empty())
                     Sleep((DWORD)ToNum(slArgs[0]));
                 return Value();
@@ -1810,6 +1884,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             vector<Value> args = evalCallArgs(n->list);
             auto local = std::make_shared<Env>();
             local->self = local;
+            EnvUsePooledSlots(local.get());
             // functions see globals AND the defining frame chain
             // (upvalues). Plain functions capture only globals; nested
             // functions capture their enclosing frame via envUp.
@@ -1856,19 +1931,23 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             if (f.params.size() && f.params.back() == L"..." &&
                 f.fn)
             {
-                auto vargs = std::make_shared<vector<Value>>();
                 auto tbV = std::make_shared<Table>();
                 for (size_t k = f.params.size() - 1; k < args.size(); k++)
-                {
-                    vargs->push_back(args[k]);
                     tbV->arr.push_back(args[k]);
-                }
                 // An EMPTY varargs table must read as null: library code
                 // guards recursion with `if(!...)`, and an empty table is
                 // truthy in the runtime.
                 Value vDots = tbV->arr.empty() ? Value()
                                                : Value::Table_(tbV);
-                if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
+                if (vDots.tab)
+                {
+                    // mrets ALIASES the packed table's own array (aliasing
+                    // shared_ptr keeps the table alive): one buffer instead
+                    // of a second vector + copy, and the table view and the
+                    // splat view (mrets) always agree.
+                    vDots.mrets = std::shared_ptr<vector<Value>>(tbV, &tbV->arr);
+                    vDots.bDots = true;
+                }
                 local->VarAt(IdDots()) = vDots;
                 local->VarAt(IdArg()) = vDots;
                 for (size_t i = 0; i + 1 < f.params.size(); i++)
@@ -2809,6 +2888,7 @@ Value Interp::ExecBlockScoped(const PNode& blk, Env* env)
     auto child = std::make_shared<Env>();
     child->self = child;
     child->parent = env ? env->self : globals.self;
+    EnvUsePooledSlots(child.get());
     // closure captures and namespace-member fallbacks must still see the
     // enclosing scope's namespace/module tables through Find()'s parent walk,
     // so they are intentionally NOT copied into the child frame.
@@ -2994,7 +3074,10 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                 n->b ? n->b->defaults : vector<PNode>());
             vClass.classBody = n->a;
             if (env && env->self)
+            {
                 vClass.envUp = env->self;
+                GcRegisterEnv(env);   // capture-time registry (Round 34)
+            }
             for (Env* e = env; e; e = e->parent.get())
                 if (e->nsTable && !e->bNsInst)
                 {
@@ -4140,6 +4223,7 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             }
             auto local = std::make_shared<Env>();
             local->self = local;
+            EnvUsePooledSlots(local.get());
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;
             local->VarAt(IdOwner()) = Value();   // native-side call: no owner
@@ -4166,17 +4250,13 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             }
             if (f.params.size() && f.params.back() == L"..." && f.fn)
             {
-                auto vargs = std::make_shared<vector<Value>>();
                 auto tbV = std::make_shared<Table>();
                 for (size_t k = f.params.size() - 1; k < args.size(); k++)
-                {
-                    vargs->push_back(args[k]);
                     tbV->arr.push_back(args[k]);
-                }
                 // `arg` is the alias for the varargs table;
                 // `...` expands it at call sites.
                 Value vDots = Value::Table_(tbV);
-                vDots.mrets = vargs;
+                vDots.mrets = std::shared_ptr<vector<Value>>(tbV, &tbV->arr);
                 vDots.bDots = true;
                 local->VarAt(IdDots()) = vDots;
                 local->VarAt(IdArg()) = vDots;

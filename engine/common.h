@@ -1052,8 +1052,12 @@ namespace NodioVM
         wstring srcFile;
         // GC registry (gc.cpp): live frames are tracked so the collector
         // can reclaim frame cycles (a frame holding a closure that
-        // captured that same frame).
+        // captured that same frame). Round 34: membership is granted
+        // lazily - only when a closure captures this frame
+        // (GcRegisterEnv from the envUp promotion sites); frames that are
+        // never captured cannot be cycle members and die by refcounting.
         long nEpoch = 0;
+        bool bGcRegistered = false;
         Env();
         ~Env();
         // true while a namespace or module BODY executes directly in this
@@ -1236,6 +1240,29 @@ namespace NodioVM
     inline void CleanDeadEnv(std::shared_ptr<Env>& env)
     {
         return;
+    }
+
+    // ---- Round 34 (gc.cpp): pooled slot buffers + lazy Env registry ----
+    std::vector<Value> GcAcquireSlotBuf();
+    std::vector<uint8_t> GcAcquireBoundBuf();
+    void GcReleaseSlotBuf(std::vector<Value>&& v);
+    void GcReleaseBoundBuf(std::vector<uint8_t>&& v);
+    void GcRegisterEnv(Env* e);
+
+    // Switch a fresh call/block frame onto pooled slot storage. The
+    // reused buffer may be longer than this frame needs: stale slots stay
+    // invisible because the bound flags are zeroed here, and FindInSelf /
+    // ForEachVar / the accessors all gate on slotBound. The invariant
+    // slotBound.size() >= slots.size() is kept so ForEachVar can index
+    // the flags for every slot.
+    inline void EnvUsePooledSlots(Env* e)
+    {
+        e->slots = GcAcquireSlotBuf();
+        e->slotBound = GcAcquireBoundBuf();
+        e->bSlots = true;
+        if (e->slotBound.size() < e->slots.size())
+            e->slotBound.resize(e->slots.size(), 0);
+        std::fill(e->slotBound.begin(), e->slotBound.end(), 0);
     }
 
     // Invariant guard for the GC frame stack. The stack is popped with
