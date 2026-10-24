@@ -1,4 +1,4 @@
-# cleanup_residue.ps1 — 清理官方 aardio 在本机留下的「更新残留 + 僵尸进程」
+﻿# cleanup_residue.ps1 — 清理官方 aardio 在本机留下的「更新残留 + 僵尸进程」
 #
 # 现象（2026-10 实测）：
 #   官方 aardio 的 std 更新机制会把正在被占用的旧文件改名成
