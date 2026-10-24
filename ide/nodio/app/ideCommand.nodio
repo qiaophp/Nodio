@@ -20,9 +20,11 @@ var impl = null;
 joined = lambda() !!mgr;
 
 // 进程内直调（不经过 COPYDATA；IDE 内脚本/回归夹具用这条）
+// ⚠ command._meta._set 把命令存进实例的 _commands 表（实例成员读取
+// 返回 null——_meta 只有 _set 没有 _get），所以这里也从 _commands 取。
 dispatch = function(name, ...){
 	if(!mgr) return null;
-	var f = mgr[name];
+	var f = mgr._commands ? mgr._commands[name] : null;
 	if(type(f) != "function") return null;
 	return f(...);
 }
@@ -74,6 +76,15 @@ init = function(winform, implTable){
 	cmds.isInProject         = function(path){ return impl.isInProject ? impl.isInProject(path) : null };
 	cmds.getProjectIcon      = function(){ return impl.getProjectIcon ? impl.getProjectIcon() : null };
 	cmds.killOnExit          = function(v){ return impl.killOnExit ? impl.killOnExit(v) : null };
+
+	// 官方路由命令（不在 37 表里，但官方 ide 库的 _get 把 ide.X(...) 变成
+	// send("dispatchIdeCommand","X",...) —— IDE 侧按这个名字建路由）。
+	// 插件视图也走它：官方语义「未注册的命令返回 null」。
+	cmds.dispatchIdeCommand  = function(name, ...){
+		var f = mgr[name];
+		if(type(f) != "function") return null;
+		return f(...);
+	};
 
 	// 注册即入共享注册表（command._meta._set：mmap 登记 hwnd 订阅）
 	for(name, fn in cmds){

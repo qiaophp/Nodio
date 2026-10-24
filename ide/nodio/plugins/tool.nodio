@@ -1,0 +1,37 @@
+// Nodio 内置插件页「助手」——官方 extensions/plugin/pane 的对应物。
+//
+// 官方契约（D:\aardio\extensions\plugin\pane\tool.aardio:6）：
+//   本文件被 IDE loadcode 后以容器窗体调用，parent=... 即 IDE 注入的
+//   右侧栏页容器；子窗体消息由 IDE 主循环派发（尾部的 win.loopMessage()
+//   在宿主内由 IDE 机械剥离，独立运行时仍然需要）。
+//
+// 驱动 IDE 与官方插件同法（官方 ide 库把 ide.X(...) 变成
+// dispatchIdeCommand 路由）：进程内直走 app.ideCommand.dispatch，
+// 跨进程走 ide.command.send —— 两条路都落在同一张 37 命令表上。
+import win.ui;
+
+mainForm = win.form(text="助手";right=270;bottom=600;bgcolor=0x1E1E1E;
+	border="none";exmode="none";mode="child";parent=...)
+mainForm.add(
+	btnTime={cls="button";text="插入时间戳";left=8;top=8;right=126;bottom=34;z=1};
+	btnProject={cls="button";text="工程信息";left=134;top=8;right=252;bottom=34;z=2};
+	tip={cls="richedit";left=8;top=42;right=262;bottom=592;multiline=true;
+		vscroll=true;bgcolor=0x252526;z=3}
+)
+
+mainForm.btnTime.oncommand = function(id, event){
+	app.ideCommand.dispatch("insertCode", "-- " ++ tostring(time()) ++ '\r\n');
+	mainForm.tip.text = "已在光标处插入时间戳";
+};
+
+mainForm.btnProject.oncommand = function(id, event){
+	var p = app.ideCommand.dispatch("getProjectPath");
+	var d = app.ideCommand.dispatch("getProjectDir");
+	var m = app.ideCommand.dispatch("getProjectMainFile");
+	mainForm.tip.text = "工程: " ++ tostring(p)
+		++ '\r\n' ++ "目录: " ++ tostring(d)
+		++ '\r\n' ++ "启动文件: " ++ tostring(m);
+};
+
+mainForm.show();
+win.loopMessage();

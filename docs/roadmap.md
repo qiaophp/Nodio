@@ -1020,6 +1020,24 @@ fail 全部为官方契约 / 环境 / 物理边界，自有缺口归零 —— �
 >    win_clip、builtin_api、stdlib、publish 全绿，新增失败 0。
 >    详见 `docs/capability-gap.md` §1.38
 
+> **第三十四轮（插件视图托管 + 变参语义对齐）**。
+> ① **pluginViewCreate/Show 落地**——官方 37 命令面收口：插件面板按官方契约
+>    （pane 脚本 `win.form(...;mode="child";parent=...)`，IDE loadcode 后
+>    `fn(container)` 变参注入容器）宿主进 dock 插件页签
+>    （`dock.addPluginTab` 可见性/布局联动）；样品插件
+>    `ide/nodio/plugins/tool.nodio` 随 IDE 自动注册；
+>    顺带修复 `ideCommand.dispatch` 读错登记表（`_commands` 而非 `_meta`）。
+> ② **变参语义定案**——一轮误判与回退：parameter.md「不放在最后面只能取
+>    第一个值」说的是多返回值实参而非 `...`；官方库惯用法
+>    `#...`/`...[i]`/`...!==null`（vmtests/mytable.aardio）证明值位置
+>    `...` 就是打包表。定案：值位置=打包表、实参调用点=整体展开、
+>    `{...}` 数组槽=官方转换数组、具名槽 `k=...`=首变参（pane 契约依赖）。
+>    连带修复 6 条内建快速路径绕过 `...` 展开的问题（统一走 evalCallArgs）。
+> ③ **回归**：VM 90/90 双架构、ide_plugin_check（新增）双架构、
+>    ide_command/iofile_text/builtin_api/stdlib/win_clip/publish/
+>    ide_nav_smoke 全绿。
+>    详见 `docs/capability-gap.md` §1.40
+
 Behaviour buckets of the 444 sweep errors (named clusters; a long tail
 beyond them): missing hosts ~55 (Java 40, CLR 15), 32-bit-only DLLs on
 x64 ~76 (excluded from the denominator per the boundary), GUI-interactive

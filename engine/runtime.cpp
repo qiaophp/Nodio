@@ -364,16 +364,43 @@ Value Interp::Eval(const PNode& n, Env* env)
                     if (n->list[i + 1]->k == Node::Ident && n->list[i + 1]->str == L"...")
                     {
                         Value vDots = Eval(n->list[i + 1], env);
-                        if (vDots.t == Value::TableT && vDots.tab)
+                        if (vDots.t == Value::Null)
+                            continue;   // 空 ... → 官方按 null 键处理(等价擦除)
+                        // 数组槽 {...}:官方多值上下文,整个变参表展开;
+                        // 具名槽 k=...:官方单值上下文取第一个变参 ——
+                        // 官方 pane 脚本的 win.form(parent=...) 依赖这条,
+                        // 之前把键丢掉整表塞进 arr,parent 就没了。
+                        bool bNamed = (n->list[i]->k != Node::Num);
+                        if (!bNamed)
                         {
-                            for (auto& elem : vDots.tab->arr)
-                                tb->arr.push_back(elem);
+                            // 数组槽:官方「{...} 不定参数转换为数组」——展开全部
+                            if (vDots.bDots && vDots.mrets)
+                            {
+                                for (auto& elem : *vDots.mrets)
+                                {
+                                    Value em = elem;
+                                    em.mrets = nullptr;
+                                    tb->arr.push_back(em);
+                                }
+                            }
+                            else if (vDots.t == Value::TableT && vDots.tab)
+                            {
+                                for (auto& elem : vDots.tab->arr)
+                                    tb->arr.push_back(elem);
+                            }
                             continue;
                         }
-                        else if (vDots.t == Value::Null)
-                        {
-                            continue;
-                        }
+                        Value vFirst = (vDots.bDots && vDots.mrets &&
+                                        !vDots.mrets->empty())
+                            ? (*vDots.mrets)[0]
+                            : vDots;
+                        Value k = Eval(n->list[i], env);
+                        vFirst.mrets = nullptr;
+                        if (vFirst.t == Value::Null)
+                            tb->map.erase(k.ToString());
+                        else
+                            tb->map[k.ToString()] = vFirst;
+                        continue;
                     }
                     Value k = Eval(n->list[i], env);
                     Value v = Eval(n->list[i + 1], env);
@@ -884,6 +911,9 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                     // names to the same table. An EMPTY table must read as
                     // null: library code guards recursion with `if(!...)`,
                     // and an empty table is truthy in the runtime.
+                    // (官方库的值位置 `...` 就是打包表:builtin/table.aardio
+                    //  的 push 用 `#...` / `...[i]` / `...!==null` —— 主值必须
+                    //  是表;展开只发生在实参位置的调用点。)
                     Value vDots = tbV->arr.empty() ? Value()
                                                    : Value::Table_(tbV);
                     if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
@@ -1336,6 +1366,9 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                             vargs->push_back(args[k]);
                             tbV->arr.push_back(args[k]);
                         }
+                        // 官方库的值位置 `...` 就是打包表(builtin/table.aardio
+                        // 的 push 用 `#...` / `...[i]` / `...!==null`),展开只
+                        // 发生在实参位置的调用点;主值必须是表。
                         Value vDots = tbV->arr.empty() ? Value()
                                                        : Value::Table_(tbV);
                         if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
@@ -1484,146 +1517,14 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
 // ---- EvalCall ----
 Value Interp::EvalCall(const PNode& n, Env* env)
         {
-            // builtin fast paths: io.print / print
-            if (n->a->k == Node::Member && n->a->str == L"print" &&
-                n->a->a->k == Node::Ident && n->a->a->str == L"io")
-            {
-                // strings are byte arrays: write the bytes, not re-encoded
-                // text (a raw byte string must survive untouched).
-                std::string out;
-                for (auto& arg : n->list)
-                    out += ValueByteForm(ToStringMValue(Eval(arg, env)));
-                out += "\n";
-                fwrite(out.data(), 1, out.size(), stdout);
-                fflush(stdout);
-                return Value();
-            }
-            if (n->a->k == Node::Ident && n->a->str == L"print")
-            {
-                Value* vShadow = env ? env->Find(NameId(L"print"), L"print") : nullptr;
-                Value* pGlob = globals.FindInSelf(NameId(L"print"));
-                // Only take the global console print fast path if not shadowed by a local or namespace member
-                if (!vShadow || vShadow == pGlob)
-                {
-                    std::string out;
-                    for (auto& arg : n->list)
-                        out += ValueByteForm(ToStringMValue(Eval(arg, env)));
-                    out += "\n";
-                    fwrite(out.data(), 1, out.size(), stdout);
-                    fflush(stdout);
-                    return Value();
-                }
-            }
-            if (n->a->k == Node::Ident && n->a->str == L"tostring")
-            {
-                if (n->list.empty()) return Value();
-                Value v = Eval(n->list[0], env);
-                vector<Value> extraArgs;
-                for (size_t ai = 1; ai < n->list.size(); ai++)
-                    extraArgs.push_back(Eval(n->list[ai], env));
-                if (v.t == Value::TableT && v.tab)
-                {
-                    auto im = v.tab->map.find(L"_meta");
-                    if (im != v.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
-                    {
-                        auto it = im->second.tab->map.find(L"_tostring");
-                        if (it != im->second.tab->map.end() && (it->second.t == Value::Func || it->second.native))
-                        {
-                            return CallOwner(it->second, v, extraArgs);
-                        }
-                    }
-                }
-                // A string is returned unchanged (official strings are byte
-                // arrays), so its byte representation survives the call.
-                if (v.t == Value::Str) return v;
-                return Value::Str_(ToStringM(v));
-            }
-            if (n->a->k == Node::Ident && n->a->str == L"tonumber" && n->list.size() == 1)
-            {
-                Value v0 = Eval(n->list[0], env);
-                if (v0.t == Value::Num) return v0;
-            }
-            if (n->a->k == Node::Ident && n->a->str == L"error")
-            {
-                // error(): raise a runtime error message.  The location is
-                // NOT baked into the message here: the report points (the
-                // try/catch handler and the top-level report) append it, so
-                // a message that already carries a location is never
-                // decorated twice.
-                Value vErr = n->list.empty() ? Value() : Eval(n->list[0], env);
-                wstring msg = n->list.empty() ? L"运行错误" :
-                    L"运行错误: " + vErr.ToString();
-                (*err) = msg;
-                return Value();
-            }
-            if (n->a->k == Node::Ident && n->a->str == L"sleep")
-            {
-                if (!n->list.empty())
-                    Sleep((DWORD)ToNum(Eval(n->list[0], env)));
-                return Value();
-            }
-            Value f;
-            Value vThis;
-            bool bMethod = false;
             // the callee and its receiver live in C++ locals across the
             // call — keep them reachable for the collector
             GcRootScope rs;
-            if (n->a->k == Node::Member)
-            {
-                if (n->a->bRoot)
-                {
-                    f = GetMember(Value(), n->a->str, false, /*bOwnerCall=*/false);
-                }
-                else
-                {
-                    bMethod = true;
-                    vThis = Eval(n->a->a, env);
-                    f = GetMember(vThis, n->a->str, false, /*bOwnerCall=*/true);
-                }
-            }
-            else if (n->a->k == Node::Index)
-            {
-                bMethod = true;
-                vThis = Eval(n->a->a, env);
-                Value idx = Eval(n->a->b, env);
-                f = GetMember(vThis, idx.ToString(), n->a->bDirect, /*bOwnerCall=*/false);
-            }
-            else
-            {
-                f = Eval(n->a, env);
-            }
-            rs.add(f);
-            rs.add(vThis);
-            static thread_local int s_callDepth = 0;
-            struct CallDepthGuard {
-                int& d;
-                CallDepthGuard(int& x) : d(x) { d++; }
-                ~CallDepthGuard() { d--; }
-            } cdg(s_callDepth);
-            if (s_callDepth > 500)
-            {
-                // depth-guard contract: runaway recursion surfaces a
-                // catchable 运行错误 (栈溢出) instead of an
-                // uncatchable OS EXCEPTION_STACK_OVERFLOW. 500
-                // frames fit the host's 16 MB reserve (~14 KB C++ stack
-                // per call); the guard must stay well below the
-                // physical crash point.
-                wstring fnName = f.fname;
-                if (fnName.empty() && n->a->k == Node::Member) fnName = n->a->str;
-                else if (fnName.empty() && n->a->k == Node::Ident) fnName = n->a->str;
-                // S-2: no location here — the report point appends the
-                // file and the line, so it is never written twice.
-                (*err) = L"运行错误: 栈溢出 (超过最大调用深度) 函数: " + fnName;
-                return Value();
-            }
-            {
-                static bool bDbg = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
-                if (bDbg && (n->line == 113 || n->line == 7))
-                {
-                    fwprintf(stderr, L"[DEBUG CALL %d] f.t=%d bMethod=%d vThis.t=%d fn=%s\n",
-                             n->line, (int)f.t, bMethod, (int)vThis.t, f.fname.c_str());
-                }
-            }
+            // `...` call-argument splatting lives HERE (one implementation),
+            // and every builtin fast path below must go through it: the
+            // official varargs contract is that `f(...)` expands the vararg
+            // list at the call site — `tostring(...)` is tostring(first),
+            // not tostring(the-packed-table).
             auto evalCallArgs = [this, env, &rs](const vector<PNode>& exprs) {
                 vector<Value> res;
                 // every argument is rooted as soon as it is evaluated: a
@@ -1693,6 +1594,145 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 }
                 return res;
             };
+            // builtin fast paths: io.print / print
+            if (n->a->k == Node::Member && n->a->str == L"print" &&
+                n->a->a->k == Node::Ident && n->a->a->str == L"io")
+            {
+                // strings are byte arrays: write the bytes, not re-encoded
+                // text (a raw byte string must survive untouched).
+                std::string out;
+                for (auto& v : evalCallArgs(n->list))
+                    out += ValueByteForm(ToStringMValue(v));
+                out += "\n";
+                fwrite(out.data(), 1, out.size(), stdout);
+                fflush(stdout);
+                return Value();
+            }
+            if (n->a->k == Node::Ident && n->a->str == L"print")
+            {
+                Value* vShadow = env ? env->Find(NameId(L"print"), L"print") : nullptr;
+                Value* pGlob = globals.FindInSelf(NameId(L"print"));
+                // Only take the global console print fast path if not shadowed by a local or namespace member
+                if (!vShadow || vShadow == pGlob)
+                {
+                    std::string out;
+                    for (auto& v : evalCallArgs(n->list))
+                        out += ValueByteForm(ToStringMValue(v));
+                    out += "\n";
+                    fwrite(out.data(), 1, out.size(), stdout);
+                    fflush(stdout);
+                    return Value();
+                }
+            }
+            if (n->a->k == Node::Ident && n->a->str == L"tostring")
+            {
+                vector<Value> tsArgs = evalCallArgs(n->list);
+                if (tsArgs.empty()) return Value();
+                Value v = tsArgs[0];
+                vector<Value> extraArgs(tsArgs.begin() + 1, tsArgs.end());
+                if (v.t == Value::TableT && v.tab)
+                {
+                    auto im = v.tab->map.find(L"_meta");
+                    if (im != v.tab->map.end() && im->second.t == Value::TableT && im->second.tab)
+                    {
+                        auto it = im->second.tab->map.find(L"_tostring");
+                        if (it != im->second.tab->map.end() && (it->second.t == Value::Func || it->second.native))
+                        {
+                            return CallOwner(it->second, v, extraArgs);
+                        }
+                    }
+                }
+                // A string is returned unchanged (official strings are byte
+                // arrays), so its byte representation survives the call.
+                if (v.t == Value::Str) return v;
+                return Value::Str_(ToStringM(v));
+            }
+            if (n->a->k == Node::Ident && n->a->str == L"tonumber" && n->list.size() == 1)
+            {
+                vector<Value> tnArgs = evalCallArgs(n->list);
+                if (tnArgs.size() == 1 && tnArgs[0].t == Value::Num)
+                    return tnArgs[0];
+            }
+            if (n->a->k == Node::Ident && n->a->str == L"error")
+            {
+                // error(): raise a runtime error message.  The location is
+                // NOT baked into the message here: the report points (the
+                // try/catch handler and the top-level report) append it, so
+                // a message that already carries a location is never
+                // decorated twice.
+                vector<Value> errArgs = evalCallArgs(n->list);
+                Value vErr = errArgs.empty() ? Value() : errArgs[0];
+                wstring msg = n->list.empty() ? L"运行错误" :
+                    L"运行错误: " + vErr.ToString();
+                (*err) = msg;
+                return Value();
+            }
+            if (n->a->k == Node::Ident && n->a->str == L"sleep")
+            {
+                vector<Value> slArgs = evalCallArgs(n->list);
+                if (!slArgs.empty())
+                    Sleep((DWORD)ToNum(slArgs[0]));
+                return Value();
+            }
+            Value f;
+            Value vThis;
+            bool bMethod = false;
+            if (n->a->k == Node::Member)
+            {
+                if (n->a->bRoot)
+                {
+                    f = GetMember(Value(), n->a->str, false, /*bOwnerCall=*/false);
+                }
+                else
+                {
+                    bMethod = true;
+                    vThis = Eval(n->a->a, env);
+                    f = GetMember(vThis, n->a->str, false, /*bOwnerCall=*/true);
+                }
+            }
+            else if (n->a->k == Node::Index)
+            {
+                bMethod = true;
+                vThis = Eval(n->a->a, env);
+                Value idx = Eval(n->a->b, env);
+                f = GetMember(vThis, idx.ToString(), n->a->bDirect, /*bOwnerCall=*/false);
+            }
+            else
+            {
+                f = Eval(n->a, env);
+            }
+            rs.add(f);
+            rs.add(vThis);
+            static thread_local int s_callDepth = 0;
+            struct CallDepthGuard {
+                int& d;
+                CallDepthGuard(int& x) : d(x) { d++; }
+                ~CallDepthGuard() { d--; }
+            } cdg(s_callDepth);
+            if (s_callDepth > 500)
+            {
+                // depth-guard contract: runaway recursion surfaces a
+                // catchable 运行错误 (栈溢出) instead of an
+                // uncatchable OS EXCEPTION_STACK_OVERFLOW. 500
+                // frames fit the host's 16 MB reserve (~14 KB C++ stack
+                // per call); the guard must stay well below the
+                // physical crash point.
+                wstring fnName = f.fname;
+                if (fnName.empty() && n->a->k == Node::Member) fnName = n->a->str;
+                else if (fnName.empty() && n->a->k == Node::Ident) fnName = n->a->str;
+                // S-2: no location here — the report point appends the
+                // file and the line, so it is never written twice.
+                (*err) = L"运行错误: 栈溢出 (超过最大调用深度) 函数: " + fnName;
+                return Value();
+            }
+            {
+                static bool bDbg = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
+                if (bDbg && (n->line == 113 || n->line == 7))
+                {
+                    fwprintf(stderr, L"[DEBUG CALL %d] f.t=%d bMethod=%d vThis.t=%d fn=%s\n",
+                             n->line, (int)f.t, bMethod, (int)vThis.t, f.fname.c_str());
+                }
+            }
             if (f.t == Value::Class)
             {
                 vector<Value> args = evalCallArgs(n->list);

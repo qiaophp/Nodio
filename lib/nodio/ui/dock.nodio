@@ -155,12 +155,53 @@ dock = function(winform, opt){
 		self.strip.setIcon(i, icon);
 	}
 
+	// ---------- 插件视图页（官方 pluginViewCreate 语义）----------
+	// 官方右侧栏页签是独立 aardio 脚本（extensions/plugin/pane/*.aardio）：
+	// 脚本自带 win.form(mode="child";parent=...)，parent 由 IDE 注入。
+	// 容器窗体由 dock 创建（页签的宿主落点），插件脚本以它为 parent 自行
+	// 布局；子窗体消息由 IDE 主循环派发。返回容器窗体（作为脚本 parent=
+	// ... 的变参注入物）。同名页签复用已有容器。
+	self.addPluginTab = function(caption, icon){
+		for(i=1;#self.tabs;1){
+			if(self.tabs[i] == caption){
+				if(icon) self.strip.setIcon(i, icon);
+				return self.pages[i].plugin;
+			}
+		}
+		var container = ..win.form(text=caption; border="none";
+			exmode="none"; mode="child"; parent=self.winform);
+		..table.push(self.tabs, caption);
+		var page = {caption=caption; ctrl=null; obj=null};
+		page.plugin = container;
+		..table.push(self.pages, page);
+		..table.push(self.contents, container);
+		self.strip.addTab(caption, icon);
+		self.layout();
+		self.__applyVisibility();
+		return container;
+	}
+
+	// 按页签名切换（官方 pluginViewShow 语义）
+	self.selectCaption = function(caption){
+		for(i=1;#self.tabs;1){
+			if(self.tabs[i] == caption){
+				self.__select(i);
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// 只显示选中页的内容
 	self.__applyVisibility = function(){
 		for(i=1;#self.pages;1){
-			var c = self.pages[i].ctrl;
-			if(!c) continue;
-			c.show(i == self.selIndex);
+			var p = self.pages[i];
+			if(p.plugin){
+				p.plugin.show(i == self.selIndex);
+				continue;
+			}
+			if(!p.ctrl) continue;
+			p.ctrl.show(i == self.selIndex);
 		}
 	}
 
@@ -211,6 +252,11 @@ dock = function(winform, opt){
 		var cr = self.__contentRect();
 		for(i=1;#self.pages;1){
 			var p = self.pages[i];
+			if(p.plugin){
+				// 插件容器是独立子窗体（插件脚本 parent=... 的落点）
+				..nodio.ui.setRect(p.plugin, cr.left, cr.top, cr.right, cr.bottom);
+				continue;
+			}
 			if(!p.ctrl) continue;
 			if(p.obj && p.obj.layout){
 				// 自绘组件：让它自己摆（内部坐标也要跟着更新）

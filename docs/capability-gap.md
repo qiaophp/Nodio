@@ -4043,3 +4043,50 @@ console.log("PROBE_DONE");
   IDE 线是否切回官方 `ctrl.setPos` 由 IDE/LSP 工作线自行决定（涉及 `ide/`、
   `lib/nodio/` 写禁区，本轮不触碰）。
 - 三个探针留在 `tests/` 作回归证据。
+
+## 1.40 第三十四轮：插件视图托管（pluginViewCreate/Show）+ 变参语义对齐
+
+### 1.40.1 背景
+
+§1.38 把官方 37 命令全部注册后，`pluginViewCreate`/`pluginViewShow` 仍是注册桩。
+官方契约（docs/official-ide-reference.md §2）：插件面板是
+`extensions/plugin/pane/*.aardio` 脚本，内部 `win.form(...;mode="child";parent=...)`，
+IDE 端 loadcode 该脚本并调用 `fn(container)` —— 容器以变参注入，面板脚本用
+`parent=...` 接住。
+
+### 1.40.2 变参语义对齐（一次误判与回退，全部有据）
+
+- **初始误读**：parameter.md「可变参数不放在最后面就只能取第一个值」——该句说的是
+  **多返回值实参**（string.unpack 例子），不是 `...` 本身。据此把 4 处绑定的
+  `...` 主值改成「第一个变参」→ VM 套件 8 项红（t18/t19/t20/t21/t30/t43/t47/t69）。
+- **定案证据**：`tests/vmtests/mytable.aardio` 的
+  `push = function(a,...){ if(...!==null) for(i=1;#...) table.append(a,...[i]); }`
+  —— 官方库惯用法 `#...` / `...[i]` / `...!==null` 证明**值位置的 `...` 就是打包表**。
+- **最终语义**（逐条对应证据）：
+  - 值位置 `...` = 打包表（mrets 挂链供展开点使用）；
+  - 实参位置 `f(...)` 调用点 = 整体展开（mrets）；
+  - `var a,b = ...` 位置展开（既有行为，回归锁定）；`{...}` 数组槽 = 官方
+    「不定参数转换为数组」全展开；
+  - **具名槽 `k=...` 取第一个变参** —— 官方 pane 契约 `win.form(parent=...)`
+    的实现选择；此前具名槽把键丢掉、整表塞进数组，parent 直接丢失。
+- **连带真修复**：6 条内建快速路径（io.print/print/tostring/tonumber/error/sleep）
+  原先绕过 `...` 展开（手写实参求值）——统一改走提升后的 `evalCallArgs`，
+  原生调用点同样正确展开变参；实参求值 lambda 连同 GcRootScope 一并提升。
+
+### 1.40.3 IDE 侧
+
+- `app/ideCommand.nodio` dispatch 修复：命令登记在 `mgr._commands`
+  （`_meta` 只重载了 `_set`），原实现读 `mgr[name]` 恒 null；
+- `pluginViewCreate`：剥掉 pane 源尾部的 `win.loopMessage()` → loadcode →
+  `fn(container)`；`pluginViewShow`：dock 选中对应页签并显示；
+- `lib/nodio/ui/dock.nodio` `addPluginTab(caption, icon)`：child form 容器页签，
+  `__applyVisibility`/布局联动识别 `p.plugin` 页；
+- 样品插件 `ide/nodio/plugins/tool.nodio`（`NODIO_RUN` 目录自动注册内置 pane）。
+
+### 1.40.4 回归
+
+- VM 90/90 双架构（x64 / x86）——含误判期间 8 项红全部回绿；
+- `tests/ide_plugin_check.ps1`（新增，无头 IDE 冒烟）：PLUGIN-CREATE / SHOW / TAB
+  三断言，x64 / x86 双绿；
+- ide_command 双进程锁双架构、iofile_text 13 项字节断言、builtin_api、
+  stdlib imports、win_clip、publish（run_publish_tests）、ide_nav_smoke 全绿。

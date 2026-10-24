@@ -2184,6 +2184,149 @@ var startupOpenStart = function(){
 	return true;
 }
 
+// ---------- 官方 ide.command 外部命令面 ----------
+//
+// 官方 aardio.exe 注册了一张可被外部进程/插件驱动的命令表
+// （docs/official-ide-reference.md §1 的 37 条）；这里把同一张表挂到
+// 共享注册表上——外部工具/插件 ide.command.join() 后按名 send 即可
+// 驱动本 IDE。实现闭包引用 main 的既有函数，不经 hooks 改造。
+var ideCmdImpl = {};
+ideCmdImpl.showStatus = function(text){
+	shell.setStatus(text);
+	return true;
+};
+ideCmdImpl.gotoLine = function(n){
+	n = tonumber(n);
+	if(!n) return false;
+	shell.editor.gotoLine(n);
+	return true;
+};
+ideCmdImpl.save = function(){
+	saveFile();
+	return true;
+};
+ideCmdImpl.saveAll = function(){
+	saveAllFiles();
+	return true;
+};
+ideCmdImpl.getActiveCode = function(){
+	return curFile ? shell.tabGetText(curFile) : null;
+};
+ideCmdImpl.setActiveCode = function(text){
+	if(!curFile || text === null) return false;
+	shell.tabSetText(curFile, text);
+	return true;
+};
+ideCmdImpl.insertCode = function(text){
+	if(!curFile || text === null) return false;
+	var e = shell.editor;
+	var t = shell.tabGetText(curFile);
+	var nt = e.replaceTextAt(t, e.curLine : 1, e.curCol : 1, 0, text);
+	if(nt === null) return false;
+	shell.tabSetText(curFile, nt);
+	return true;
+};
+ideCmdImpl.openDocument = function(path){
+	if(!path) return false;
+	openFile(path);
+	return true;
+};
+ideCmdImpl.newDocument = function(){
+	if(shell.hooks.onNewFile) shell.hooks.onNewFile();
+	return true;
+};
+ideCmdImpl.newForm = ideCmdImpl.newDocument;   // 官方语义：新建窗体文档
+ideCmdImpl.getMainHwnd = function(){
+	return shell.winform.hwnd;
+};
+ideCmdImpl.getActiveViewHwnd = function(){
+	try{ return shell.editor.ctrl.hwnd }catch(e){ return shell.winform.hwnd }
+};
+ideCmdImpl.redrawCodeEditor = function(){
+	try{ shell.editor.ctrl.invalidate() }catch(e){}
+	return true;
+};
+ideCmdImpl.projectIsOpened = lambda() proj != null;
+ideCmdImpl.isInProject = function(path){
+	if(!proj || !path) return false;
+	var full = ..io.fullpath(path);
+	for(i=1;#proj.files;1){
+		if(..io.fullpath(proj.files[i].path) == full) return true;
+	}
+	return false;
+};
+ideCmdImpl.getProjectPath = lambda() proj ? proj.path : null;
+ideCmdImpl.getProjectDir  = lambda() proj ? proj.root : null;
+ideCmdImpl.getProjectMainFile = lambda() proj ? proj.start : null;
+ideCmdImpl.getProjectProperty = function(k){ return cfgRead("projprop." ++ (k : "")) };
+ideCmdImpl.setProjectProperty = function(k, v){ return cfgWrite("projprop." ++ (k : ""), tostring(v : "")) };
+ideCmdImpl.getConfig = function(k){ return cfgRead(k) };
+ideCmdImpl.setConfig = function(k, v){ return cfgWrite(k, tostring(v : "")) };
+ideCmdImpl.switchActiveForm = function(){
+	if(shell.hooks.onDesigner) shell.hooks.onDesigner();
+	return app.designer.isActive();
+};
+ideCmdImpl.getActiveForm = lambda() app.designer.isActive() ? "design" : "code";
+ideCmdImpl.getSelectedControl = lambda() app.designer.canvasSelected();
+ideCmdImpl.setSelectedControl = function(name){ return app.designer.canvasSelect(name) };
+ideCmdImpl.getControlParam = function(name, k){ return app.designer.canvasGetParam(name, k) };
+ideCmdImpl.setControlParam = function(name, k, v){ return app.designer.canvasSetParam(name, k, v) };
+ideCmdImpl.refreshStdLib = function(){
+	try{ app.library.scanLib() }catch(e){ return false }
+	return true;
+};
+ideCmdImpl.refreshUserLib = ideCmdImpl.refreshStdLib;
+ideCmdImpl.createProcessEx = function(path, args){
+	var p = ..process.popen(path, args);
+	return p ? p.pid : null;
+};
+ideCmdImpl.loadPrivateFont = function(path){
+	if(!path) return false;
+	// FR_PRIVATE(0x10)：进程私有字体，不写系统字体表
+	var n = ::Gdi32.AddFontResourceExW(path, 0x10, 0);
+	return n ? true : false;
+};
+ideCmdImpl.killOnExit = function(v){
+	return cfgWrite("killOnExit", tostring(v : ""));
+};
+
+ideCmdImpl.pluginViewCreate = function(name, path){
+	if(!name || !path) return false;
+	var container = shell.rightDock.addPluginTab(name);
+	if(!container) return false;
+	var code = ..string.load(path);
+	if(!code) return false;
+	// 宿主契约（官方 pane 同款）：子窗体消息由 IDE 主循环派发，脚本尾部的
+	// win.loopMessage() 机械替换为 null;（独立运行不受影响，只有 IDE 内
+	// 加载走这条路径）
+	var tok = "win.loopMessage()";
+	var p = ..string.indexOf(code, tok);
+	while(p){
+		code = ..string.left(code, p - 1) ++ "null;" ++ ..string.slice(code, p + 17);
+		p = ..string.indexOf(code, tok);
+	}
+	var fn = loadcode(code);
+	if(!fn) return false;
+	fn(container);   // 官方 pane 契约：parent=... 变参注入
+	return true;
+};
+ideCmdImpl.pluginViewShow = function(name){
+	return shell.rightDock.selectCaption(name);
+};
+
+app.ideCommand.init(shell.winform, ideCmdImpl);
+
+// 内置插件页（官方 extensions/plugin/pane 的对应物）——注册失败不阻断启动
+var __paneErr = null;
+try{
+	var __ideDir = ..io.splitpath(..string.getenv("NODIO_RUN") : "").dir;
+	if(__ideDir){
+		app.ideCommand.dispatch("pluginViewCreate", "助手",
+			__ideDir ++ "plugins\tool.nodio");
+	}
+}catch(__paneErr){ io.print("PLUGIN-REG-ERR:" ++ tostring(__paneErr)); }
+
+
 // ---------- smoke mode (headless test hook) ----------
 if( ..string.getenv("NODIO_IDE_SMOKE") ){
 	io.print("SMOKE-BRANCH");
@@ -2222,6 +2365,25 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 	io.print("DOCK-LEFT-STRIP:" ++ tostring(shell.leftDock.strip ? 1 : 0));
 	io.print("DOCK-RIGHT-CONTENT:" ++ tostring(shell.rightDock.content(1) ? 1 : 0));
 	io.print("DOCK-BOTTOM-CONTENT:" ++ tostring(shell.bottomDock.content(2) ? 1 : 0));
+
+	// 插件视图（官方 pluginViewCreate/Show 契约：loadcode + parent=... 注入）
+	try{
+		var pluginPath = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_plugin.nodio");
+		..io.writeFile(pluginPath, `import win.ui;
+mainForm = win.form(text="SmokePane";right=270;bottom=400;bgcolor=0x333333;border="none";exmode="none";mode="child";parent=...)
+mainForm.add(
+	btn={cls="button";text="ok";left=10;top=10;right=110;bottom=40}
+);
+mainForm.show();
+win.loopMessage();`);
+		io.print("PLUGIN-CREATE:" ++ tostring(app.ideCommand.dispatch("pluginViewCreate", "SmokePane", pluginPath)));
+		io.print("PLUGIN-SHOW:" ++ tostring(app.ideCommand.dispatch("pluginViewShow", "SmokePane")));
+		var __paneFound = false;
+		for(i=1;#shell.rightDock.tabs;1){
+			if(shell.rightDock.tabs[i] == "SmokePane") __paneFound = true;
+		}
+		io.print("PLUGIN-TAB:" ++ tostring(__paneFound));
+	}catch(eP2){ io.print("PLUGIN-ERR:" ++ tostring(eP2)); }
 	io.print("LAYOUT-OK:" ++ tostring(shell.clientWH()));
 
 	// 几何断言：自绘组件与官方控件必须落在预期位置
@@ -2889,113 +3051,5 @@ catch(e5){}
 try{
 	..nodio.ui.redrawAll();
 }catch(e6){}
-
-// ---------- 官方 ide.command 外部命令面 ----------
-//
-// 官方 aardio.exe 注册了一张可被外部进程/插件驱动的命令表
-// （docs/official-ide-reference.md §1 的 37 条）；这里把同一张表挂到
-// 共享注册表上——外部工具/插件 ide.command.join() 后按名 send 即可
-// 驱动本 IDE。实现闭包引用 main 的既有函数，不经 hooks 改造。
-var ideCmdImpl = {};
-ideCmdImpl.showStatus = function(text){
-	shell.setStatus(text);
-	return true;
-};
-ideCmdImpl.gotoLine = function(n){
-	n = tonumber(n);
-	if(!n) return false;
-	shell.editor.gotoLine(n);
-	return true;
-};
-ideCmdImpl.save = function(){
-	saveFile();
-	return true;
-};
-ideCmdImpl.saveAll = function(){
-	saveAllFiles();
-	return true;
-};
-ideCmdImpl.getActiveCode = function(){
-	return curFile ? shell.tabGetText(curFile) : null;
-};
-ideCmdImpl.setActiveCode = function(text){
-	if(!curFile || text === null) return false;
-	shell.tabSetText(curFile, text);
-	return true;
-};
-ideCmdImpl.insertCode = function(text){
-	if(!curFile || text === null) return false;
-	var e = shell.editor;
-	var t = shell.tabGetText(curFile);
-	var nt = e.replaceTextAt(t, e.curLine : 1, e.curCol : 1, 0, text);
-	if(nt === null) return false;
-	shell.tabSetText(curFile, nt);
-	return true;
-};
-ideCmdImpl.openDocument = function(path){
-	if(!path) return false;
-	openFile(path);
-	return true;
-};
-ideCmdImpl.newDocument = function(){
-	if(shell.hooks.onNewFile) shell.hooks.onNewFile();
-	return true;
-};
-ideCmdImpl.newForm = ideCmdImpl.newDocument;   // 官方语义：新建窗体文档
-ideCmdImpl.getMainHwnd = function(){
-	return shell.winform.hwnd;
-};
-ideCmdImpl.getActiveViewHwnd = function(){
-	try{ return shell.editor.ctrl.hwnd }catch(e){ return shell.winform.hwnd }
-};
-ideCmdImpl.redrawCodeEditor = function(){
-	try{ shell.editor.ctrl.invalidate() }catch(e){}
-	return true;
-};
-ideCmdImpl.projectIsOpened = lambda() proj != null;
-ideCmdImpl.isInProject = function(path){
-	if(!proj || !path) return false;
-	var full = ..io.fullpath(path);
-	for(i=1;#proj.files;1){
-		if(..io.fullpath(proj.files[i].path) == full) return true;
-	}
-	return false;
-};
-ideCmdImpl.getProjectPath = lambda() proj ? proj.path : null;
-ideCmdImpl.getProjectDir  = lambda() proj ? proj.root : null;
-ideCmdImpl.getProjectMainFile = lambda() proj ? proj.start : null;
-ideCmdImpl.getProjectProperty = function(k){ return cfgRead("projprop." ++ (k : "")) };
-ideCmdImpl.setProjectProperty = function(k, v){ return cfgWrite("projprop." ++ (k : ""), tostring(v : "")) };
-ideCmdImpl.getConfig = function(k){ return cfgRead(k) };
-ideCmdImpl.setConfig = function(k, v){ return cfgWrite(k, tostring(v : "")) };
-ideCmdImpl.switchActiveForm = function(){
-	if(shell.hooks.onDesigner) shell.hooks.onDesigner();
-	return app.designer.isActive();
-};
-ideCmdImpl.getActiveForm = lambda() app.designer.isActive() ? "design" : "code";
-ideCmdImpl.getSelectedControl = lambda() app.designer.canvasSelected();
-ideCmdImpl.setSelectedControl = function(name){ return app.designer.canvasSelect(name) };
-ideCmdImpl.getControlParam = function(name, k){ return app.designer.canvasGetParam(name, k) };
-ideCmdImpl.setControlParam = function(name, k, v){ return app.designer.canvasSetParam(name, k, v) };
-ideCmdImpl.refreshStdLib = function(){
-	try{ app.library.scanLib() }catch(e){ return false }
-	return true;
-};
-ideCmdImpl.refreshUserLib = ideCmdImpl.refreshStdLib;
-ideCmdImpl.createProcessEx = function(path, args){
-	var p = ..process.popen(path, args);
-	return p ? p.pid : null;
-};
-ideCmdImpl.loadPrivateFont = function(path){
-	if(!path) return false;
-	// FR_PRIVATE(0x10)：进程私有字体，不写系统字体表
-	var n = ::Gdi32.AddFontResourceExW(path, 0x10, 0);
-	return n ? true : false;
-};
-ideCmdImpl.killOnExit = function(v){
-	return cfgWrite("killOnExit", tostring(v : ""));
-};
-
-app.ideCommand.init(shell.winform, ideCmdImpl);
 
 return win.loopMessage();
