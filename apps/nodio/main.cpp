@@ -366,6 +366,81 @@ int wmain(int argc, wchar_t** argv)
         return strErr.empty() ? 0 : 1;
     }
 
+    // support CLI packaging: `nodio.exe --publish <entry> [-o <out.exe>] [--gui] [--icon <ico>]`
+    // or `nodio.exe publish <entry> [-o <out.exe>]` or `nodio.exe -p <entry>`
+    if (argc > 1 && (wcscmp(argv[1], L"--publish") == 0 ||
+                     wcscmp(argv[1], L"-p") == 0 ||
+                     wcscmp(argv[1], L"publish") == 0))
+    {
+        EnsureConsole(false);
+        if (argc < 3)
+        {
+            WriteStderrUtf8(L"用法: nodio [--publish|-p|publish] <entry_script> [-o <out.exe>] [--gui] [--icon <icon.ico>]");
+            return 1;
+        }
+
+        NodioPublish::Options opt;
+        opt.strEntry = argv[2];
+        opt.bConsole = true;
+
+        for (int i = 3; i < argc; i++)
+        {
+            if ((wcscmp(argv[i], L"-o") == 0 || wcscmp(argv[i], L"--out") == 0) && i + 1 < argc)
+            {
+                opt.strOut = argv[++i];
+            }
+            else if (wcscmp(argv[i], L"--gui") == 0 || wcscmp(argv[i], L"-g") == 0)
+            {
+                opt.bConsole = false;
+            }
+            else if (wcscmp(argv[i], L"--icon") == 0 && i + 1 < argc)
+            {
+                opt.strIcon = argv[++i];
+            }
+            else if (wcscmp(argv[i], L"--ver") == 0 && i + 1 < argc)
+            {
+                opt.strVersion = argv[++i];
+            }
+            else if (wcscmp(argv[i], L"--lib") == 0 && i + 1 < argc)
+            {
+                opt.strLibDir = argv[++i];
+            }
+        }
+
+        if (opt.strLibDir.empty())
+        {
+            wchar_t szLib[MAX_PATH] = L"";
+            if (GetEnvironmentVariableW(L"NODIO_LIBDIR", szLib, MAX_PATH) > 0)
+                opt.strLibDir = szLib;
+            else if (GetFileAttributesW(L"D:\\Nodio\\lib") != INVALID_FILE_ATTRIBUTES)
+                opt.strLibDir = L"D:\\Nodio\\lib";
+            else if (GetFileAttributesW(L"D:\\aardio\\lib") != INVALID_FILE_ATTRIBUTES)
+                opt.strLibDir = L"D:\\aardio\\lib";
+        }
+
+        if (opt.strOut.empty())
+        {
+            std::wstring entry = opt.strEntry;
+            size_t sl = entry.find_last_of(L"\\/");
+            std::wstring dir = sl == std::wstring::npos ? L"" : entry.substr(0, sl);
+            std::wstring base = sl == std::wstring::npos ? entry : entry.substr(sl + 1);
+            size_t dot = base.find_last_of(L'.');
+            if (dot != std::wstring::npos) base = base.substr(0, dot);
+            opt.strOut = dir.empty() ? L"dist" : dir + L"\\dist";
+            CreateDirectoryW(opt.strOut.c_str(), nullptr);
+            opt.strOut += L"\\" + base + L".exe";
+        }
+
+        std::wstring strErr;
+        if (!NodioPublish::Publish(opt, strErr))
+        {
+            WriteStderrUtf8(L"错误位置:发布\n错误信息:" + strErr);
+            return 1;
+        }
+        WriteStderrUtf8(L"发布完成: " + opt.strOut);
+        return 0;
+    }
+
     // a script path as the first command-line argument runs it directly:
     // forward it into the NODIO_RUN harness below.
     // The self-hosted IDE's F5 spawns `nodio.exe <script>` and streams the
