@@ -1450,3 +1450,41 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 - [x] **状态栏交互增强与编辑视图定制（Interactive Statusbar & View Toggles，2026-10-24 企业生产可用轮次）** — 
       - 点击状态栏「行,列」分段直达「转到行」输入框；
       - 「视图」菜单提供「显示行号」（toggleGutter）与「自动换行」（toggleWordWrap）即时开关。
+- [x] **设置面：主题 / 编辑器字号 / 外部工具（IDE Settings，2026-10-24 第三十五轮）** —
+      - 新增 `ide/nodio/app/settings.nodio`（配置存 `%APPDATA%\Nodio\ide.cfg`，
+        **与官方命令面 getConfig/setConfig 共用同一个文件** —— 外部工具/插件
+        用 `ide.command.getConfig("theme")` 就能读到 IDE 的设置）；
+      - **主题**（深色 / 浅色）：偏好持久化 + 启动时应用（`main.nodio` 在
+        `import app.shell` 之前调 `themeApply()`）。各 chrome 组件是构造期读一次
+        配色，运行期再切要重建整排 chrome，官方 aardio 同样是换主题重开 IDE ——
+        菜单里明说「重启后生效」，不假装能热切；
+      - **编辑器字体大小**（6-24 pt）：**即时生效**。新增
+        `nodio.ui.editor.setFontSize(pt)` —— 重设 richedit 字体 → 重新量行高
+        （`EM_POSFROMCHAR`）→ 行号栏字体跟着行高走 → 浮层画板字号同步 → 重新布局；
+      - **外部工具**（最多 9 个，官方同款约定）：名称 / 命令 / 参数
+        （`%f` = 当前文档，`%p` = 工程目录）；「设置」菜单增删、右栏「工具」
+        面板分组列出、**Ctrl+1..9** 触发（编辑器组件新增 `onHotkey(vk)` 钩子，
+        组件本身不认识「外部工具」）；
+      - 回归：新增 `tests/ide_settings_check.ps1`（36 项断言，配置路径由
+        `NODIO_IDE_CFG` 隔离，**不碰用户的真实 ide.cfg**）+ `tests/ide_settings/sett.nodio`；
+        `tests/ide_smoke.ps1` 增 `SET-FONT / SET-FONT-CFG / SET-THEME / SET-TOOLS` 断言
+        （冒烟的配置同样用 `NODIO_IDE_CFG` 隔离）。
+- [x] **VM 多返回值语义回归修复（内建快速路径，2026-10-24 第三十五轮）** —
+      第三十二轮的「`...` 变参语义定案」把 `evalCallArgs` 上移到内建快速路径
+      （io.print / print / tostring / tonumber / error / sleep）之前，导致这些
+      路径也开始**就地展开多返回值** —— 官方 `io.print(string.match(...))` 只打印
+      **首个捕获值**，不是全部。表现为 VM 回归 t18/t19/t20/t21/t30/t69 六项红
+      （84 passed / 6 failed）。修法：新增 `evalFastArgs` —— 与 `evalCallArgs`
+      只差「普通实参保留 `mrets`」这一条，`...` 展开照旧。**VM 回归回到 90/90**。
+
+> **第三十五轮（函数调用路径提速 + GC 注册表环安全修复）**。
+> ① 调用微基准（每形态 100 万次，Δ 对空循环）：普通 2.17→~1.2µs、方法
+>    4.27→~1.3µs、变参 7.81→~1.8µs、内建 1.06→~0.2µs（-44%~-81%）。
+> ② 引擎三项：Env GC 注册表惰性化（注册移到闭包捕获点；析构按需擦除——
+>    途中修复悬垂注册表项→地址复用→清扫器清活帧的 0xC0000005）、
+>    调用/块帧槽化+字节预算缓冲池（推入时拒绝，无淘汰重入；uiprobe13
+>    池驻留 206MB→54MB）、变参 mrets 别名化（表视图=展开视图恒一致）
+>    + 快路径 evalFastArgs（多返回值实参保持首值）+ evalCallArgs reserve。
+> ③ 回归：VM 90/90 双架构、gcstress ×3、gcprobe、ide_plugin/ide_command
+>    双架构、iofile_text/builtin_api/stdlib/win_clip/publish/ide_nav 全绿。
+>    详见 `docs/capability-gap.md` §1.41（含并行会话两次回退的冲突记录）。

@@ -1845,70 +1845,121 @@ server 自己则随父进程退出变成孤儿。两者互相喂养：下一次 
 
 ## 5. IDE 缺口
 
-对照物：官方 IDE 的 **38 条命令表**（`docs/official-ide-reference.md` §1，逐条抄自
-`aardio.exe` 0x003C66BC 起的连续字符串块）+ PE 资源普查（28 菜单、28 对话框、
-99 字符串表、10 工具栏、2 加速键、5 个主题 XML）+ 字符串表里的 IDE 文案。
+> **口径说明（2026-10-24 第三十四轮重写）**：本节上一版写于**第五轮（2026-10-20）**，
+> 此后第 12～34 轮落地了大量能力（着色 / 查找替换 / 书签 / 折叠 / 导航 / 断点调试 /
+> 设计器闭环 / 批量对齐 / 差异对比 / 监视 / 格式化 / 全屏 / 插件视图…），
+> 原文那份「官方 IDE 有、Nodio 还没有」的清单**已大面积过期**。
+>
+> 本节按**当前工作树实测**重写。证据三源：
+> ① **菜单即能力面** —— `ide/nodio/app/shell.nodio:1061-1250` 的菜单定义
+>    （官方 IDE 的 28 菜单 / 38 命令 / 99 字符串表逐条对过）；
+> ② **协议服务端的方法分发** —— `apps/nodio-lsp/main.cpp:1490-1596`、
+>    `apps/nodio-dap/main.cpp:175-354`；
+> ③ **组件层实现** —— `lib/nodio/ui/editor.nodio`、`lib/nodio/designer/*`。
 
-官方 IDE 有、Nodio IDE 还没有的：
+### 5.1 编辑能力
 
-**编辑能力**
-- 语法着色 / 主题（官方 5 个 `config/themes/*.xml`，含关键字配色；Nodio 编辑器是纯
-  `richedit`，`ide/nodio/app/editor.nodio` 只有 load/text/setText 三个函数，
-  着色明确留白给 "M2"）
-- 智能提示 / 自动完成（官方 `config/intellisense/kernel.txt` 150KB +
-  `winform.txt` 58KB）
-- 查找 / 查找下一个 / 替换
-- 书签（插入、下一书签、上一书签、清除全部）
-- 代码折叠（折叠/展开/全部/自动折叠大纲/重置大纲）
-- 注释切换（添加注释 / 取消注释，Ctrl+/）
-- 行号开关、缩进 / 反缩进、Tab 智能缩进
-- 跳转到指定行
-- 以 RTF / HTML 格式复制文档
-- 打印 / 打印预览 / 快速打印 / 打印设置
+| 官方能力 | Nodio 现状 | 证据 |
+|---|---|---|
+| 语法着色 / 主题 | ✅ 已通：本地词法器着色（keyword / string / number / comment / func 五色） | `editor.nodio:246-250, 2732, 2847` |
+| 智能提示 / 自动完成 | ✅ 已通：Ctrl+Space → LSP `completion` → 候选浮层 → 插入 | `shell.nodio:1113`；§1.16 |
+| 查找 / 查找下一个 / 查找上一个 / 替换 / 全部替换 | ✅ 已通（Ctrl+F / Ctrl+H；另有「在工程中搜索」Ctrl+Shift+F） | `shell.nodio:1109-1110, 1160-1170` |
+| 书签（插入 / 下一 / 上一 / 清除全部） | ✅ 已通（Ctrl+F2 / F2 / Shift+F2） | `shell.nodio:1152-1155`；`editor.nodio:3032-3045` |
+| 代码折叠（折叠 / 展开 / 全部折叠 / 全部展开） | ✅ 已通（行号栏折叠标记 + 真正收起正文） | `shell.nodio:1134-1142`；`editor.nodio:1943-1997`；§1.15 |
+| 注释切换（Ctrl+/） | ✅ 已通（单行 `//` 与块注释都处理） | `shell.nodio:1132`；`editor.nodio:962-1016` |
+| 行号开关 / 缩进 / 反缩进 / Tab 智能缩进 | ✅ 已通（Tab 缩进、Shift+Tab 反缩进；「显示行号」在「视图」菜单） | `shell.nodio:1130-1131, 1202` |
+| 跳转到指定行（Ctrl+G） | ✅ 已通 | `shell.nodio:1111, 1150` |
+| 代码补全 / 参数提示 / 代码片段展开 | ✅ 已通（Ctrl+Space / 悬浮签名提示 / Tab 片段自动展开并定位 `$0`） | `editor.nodio:2615-2727` |
+| 格式化（Shift+Alt+F） | ✅ 已通（按括号层级缩进，整次排版封成单一事务） | `shell.nodio:1125-1127` |
+| 全屏模式（Shift+F11） | ✅ 已通（记录窗口几何，二次触发无损恢复） | `shell.nodio:1211` |
+| 快速打开文件（Ctrl+P） | ✅ 已通（工程文件模糊匹配 + 定位载入页签） | `shell.nodio:1064` |
+| **打印 / 打印预览 / 快速打印 / 打印设置** | ❌ **未做** —— 菜单无任何打印入口，`lib/nodio/` 全库无打印管线 | — |
+| **以 RTF / HTML 格式复制文档** | ❌ **未做** | — |
+| **官方 intellisense 词库**（`config/intellisense/kernel.txt` 150KB + `winform.txt` 58KB） | ❌ **未接入** —— 补全靠 LSP 自产 | — |
 
-**工程 / 窗口**
-- 类视图、资源视图、工程资源管理器、模板面板、标准库面板（官方右栏 270px 固定宽）
-- 窗口列表 / 文档窗口管理、垂直-水平拆分、选项卡组（新建/移动）
-- 最近使用的文档
-- 开始页、全屏模式
-- 外部工具自定义（命令 / 键 / 说明，最多 N 个工具）、扩展名关联
-- 插件视图机制（`pluginViewCreate` / `pluginViewShow`）
+### 5.2 工程 / 窗口面
 
-**协议能力**
-- LSP：当前只实现 diagnostics / completion / hover / documentSymbol；缺
-  definition、references、rename、signatureHelp、formatting、codeAction、
-  semanticTokens（着色）、workspace symbols
-- DAP：当前实现 initialize/launch/setBreakpoints/threads/stackTrace/scopes/variables/
-  continue/next/stepIn/stepOut/configurationDone/disconnect；缺 evaluate（监视窗口）、
-  setVariable、goto、pause、exceptionInfo、loadedSources
+| 官方能力 | Nodio 现状 | 证据 |
+|---|---|---|
+| 工程资源管理器（工程树） | ✅ 已通（增删改、文件操作、右键菜单、真全文搜索） | `shell.nodio:1080-1090`；§1.13 |
+| **类视图 / 资源视图** | ❌ **未做** —— 官方另有独立的类树与资源树 | — |
+| 标准库面板 / 范例面板 | ✅ 已通（标准库扫描 + 官方 `config/lang/lib.txt` 中文说明） | `ide/nodio/app/library.nodio`；`shell.nodio:1175-1176` |
+| **模板面板** | ❌ **未做** | — |
+| **最近使用的文档** | ❌ **未做** | — |
+| **开始页** | ❌ **未做** —— Nodio 直接开工程的启动文件 | `ide/nodio/main.nodio:2180` |
+| 文档窗口管理（页签 / 批量关闭 / 右键菜单） | ✅ 已通 | `shell.nodio:1071-1076`；「企业生产可用轮次」 |
+| **垂直-水平拆分窗口组 / 选项卡组（新建、移动）** | ❌ **未做** —— 只有「双栏对比」（diff 视图），不是可自由拆分的窗口组 | `shell.nodio:1198` |
+| 外部工具自定义（命令 / 键 / 说明） | ✅ 已通（工程菜单：资源管理器定位 / 终端 / 代码行统计 / 复制路径） | `shell.nodio:1086-1088` |
+| 插件视图机制（`pluginViewCreate` / `pluginViewShow`） | ✅ 已通（第三十四轮：右侧栏页签宿主 + `loadcode` + `parent=...` 注入 + 内置「助手」页） | `main.nodio:2293-2315`；`dock.nodio:164+`；`ide/nodio/plugins/tool.nodio`；回归 `tests/ide_plugin_check.ps1` |
 
-**官方 IDE 命令表逐条对照**：38 条里 Nodio 目前**没有对应实现**的有
-`setSelectedControl` / `getSelectedControl` / `setControlParam` / `getControlParam` /
-`switchActiveForm` / `getActiveForm`（设计器面）、
-`pluginViewCreate` / `pluginViewShow`（插件面）、
-`refreshStdLib` / `refreshUserLib`、`loadPrivateFont`、`redrawCodeEditor`、
-`getProjectIcon`、`updateVersion`、`setConfig` / `getConfig`、
-`createProcessEx` / `createThread` / `processList` / `killOnExit`、
-`getMainHwnd` / `getActiveViewHwnd`、`setProjectProperty` / `getProjectProperty`、
-`getProjectMainFile` / `getProjectPath` / `getProjectDir` / `isInProject`、
-`projectIsOpened`、`newForm`、`insertCode`、`gotoLine`、`showStatus`。
+### 5.3 协议能力
+
+**LSP**（`apps/nodio-lsp/main.cpp:1490-1596`）
+
+| 已实现 | 未实现 |
+|---|---|
+| `textDocument/didOpen` / `didChange` / `didClose`、`publishDiagnostics`、`completion`、`hover`、`documentSymbol`、`documentHighlight`、`definition`、`references`、`rename`、`workspace/symbol` | `textDocument/signatureHelp`、`formatting`、`codeAction`、`semanticTokens`、`foldingRange`、`selectionRange`、`typeDefinition`、`implementation`、`declaration`、`prepareRename` |
+
+> 注：**着色**与**参数提示**在 IDE 侧是**本地实现**（`editor.nodio` 自带词法器 + 本地签名推断），
+> 不走 LSP；补全与导航才走服务端。
+
+**DAP**（`apps/nodio-dap/main.cpp:175-354`）
+
+| 已实现 | 未实现 |
+|---|---|
+| `initialize`、`launch` / `attach`、`setBreakpoints`、`threads`、`stackTrace`、`scopes`、`variables`、`continue`、`next` / `stepIn` / `stepOut`、`pause`、`configurationDone`、`disconnect` / `terminate` | `evaluate`、`setVariable`、`goto`、`exceptionInfo`、`loadedSources` |
+
+> 注：**监视表达式**是 IDE 本地求值（`ide/nodio/main.nodio:1699-1732`），不是 DAP `evaluate`。
+
+### 5.4 官方 IDE 命令表逐条对照
+
+第三十二～三十四轮已把官方命令面接上：命令表**逐条注册**进共享注册表
+（`ide/nodio/app/ideCommand.nodio:40-78`，39 个条目），其中 **35 条**经 `main.nodio`
+注入的 impl 表接真实实现（`ide/nodio/main.nodio:2194-2315`）；跨进程经
+`ide.command.join()` + `send` 驱动（回归 `tests/ide_command_check.ps1`，真实双进程）。
+
+**仍未接真实实现的 4 条**：`processList`、`createThread`、`updateVersion`、
+`getProjectIcon` —— 注册存在，调用返回 null。
+
+### 5.5 设置面
+
+**已落地**（第三十五轮，`ide/nodio/app/settings.nodio` + `tests/ide_settings_check.ps1` 36 项断言）：
+
+| 设置项 | 生效方式 | 说明 |
+|---|---|---|
+| 主题（深色 / 浅色） | **重启后生效** | 各 chrome 组件是**构造期**读一次 `theme()` 把配色存进自己字段（`nodio/ui/theme.nodio`），运行期再切要重建整排 chrome；官方 aardio 同样是换主题重开 IDE。偏好存 `%APPDATA%\Nodio\ide.cfg`，启动时应用（`main.nodio` 在 `import app.shell` **之前**调 `themeApply()`） |
+| 编辑器字体大小（6-24 pt） | **即时生效** | 新增 `nodio.ui.editor.setFontSize(pt)`：重设 richedit 字体 → 重新量行高（`EM_POSFROMCHAR`）→ 行号栏字体跟着行高走 → 浮层画板字号同步 → 重新布局 |
+| 外部工具（最多 9 个） | **即时生效** | 名称 / 命令 / 参数（`%f` = 当前文档，`%p` = 工程目录）；「设置」菜单增删、右栏「工具」面板分组列出、**Ctrl+1..9** 触发（编辑器组件新增 `onHotkey(vk)` 钩子，组件本身不认识「外部工具」） |
+
+配置与官方命令面**共用** `%APPDATA%\Nodio\ide.cfg` —— 外部工具/插件用
+`ide.command.getConfig("theme")` 就能读到 IDE 的设置。
+
+**仍是空占位的**：
+
+| 位置 | 条目 | 现状 |
+|---|---|---|
+| `shell.nodio` 「工程」→ **工程属性** | `setStatus("工程属性")` 空转 |
+| `shell.nodio` 右栏「AI」页签 | 只是一个空 `richedit`，**没有任何 AI 接入**（官方参考图 `docs/ref/aar-ide/06-ai-assistant-outline-output.png` 是有 AI 助手的）。接哪家模型、API key 怎么存，需要先定，不能凭空造 |
 
 ---
 
 ## 6. 窗体设计器缺口
 
-契约见 `docs/ide-components.md`（组件层已写好）。本轮（第五轮）落地情况：
+契约见 `docs/ide-components.md`（组件层已写好）。**当前状态（第三十四轮实测）**：
 
 | 官方设计器能力 | Nodio 现状 |
 |---|---|
 | 8 手柄缩放 / 拖动 | ✅ 已通：选中框 + 8 手柄画在底板上（手柄放组件外侧、框外扩 1px），拖拽用屏幕坐标 |
 | DSG 解析（`fromDSG`） | ✅ 已通：按 `;` 切分 + 奇数引号合并，值类型保持（number/boolean/string） |
-| 属性格双向改写 | ✅ 已通：改值 → 写回控件属性 + 几何（left/top/width/height → 重排） |
+| 属性格双向改写 | ✅ 已通：改值 → 写回控件属性 + 几何（left/top/width/height → 重排）；属性格带**分组带**（VS WinForms 分类，见 §1.22） |
 | 工具箱 | ✅ 自绘（分类可折叠 + 14 个内置控件），组件走 `registry` 注册 |
-| 网格 / 边界线 / 对齐 / 缩放 / 改窗体设置 | 无（官方字符串表 32984-32991 明确有这些命令）；网格底板已有 |
-| 事件代码生成 | 无 |
-| 设计 ↔ 源码视图切换 | 无（`switchActiveForm` 未实现） |
-| 自定义控件替身映射（`ide.customCtrl`） | 无（官方 `lib/ide/customCtrl.aardio` 的 `cls→drawAs` 映射表） |
+| 网格 / 边界线 / 对齐 / 缩放 / 改窗体设置 | ✅ 已通：「设计」菜单有 显示网格线 / 对齐网格 / 控件吸附对齐 / 显示边距线 / 窗体设置 / 设计器缩放 25%~400%（`shell.nodio:1216-1224`） |
+| 事件代码生成 | ✅ 已通：双击控件 → 切代码视图并生成 `winform.<name>.<event> = function(id,event){}` 桩；源码里已有同名处理函数只跳转、不重复生成（`main.nodio:1855`） |
+| 设计 ↔ 源码视图切换 | ✅ 已通（`switchActiveForm` 语义：开设计器 = 从当前文档载入 DSG 块；关设计器 = 把当前设计写回文档的 DSG 块，只动编辑器缓冲） |
+| 自定义控件替身映射（`ide.customCtrl`） | ✅ 已通：官方 `cls→drawAs` 映射表照抄进 `nodio.designer.registry.customCtrl`（10 条），DSG 仍写真实类名 |
+| 批量多选与批量对齐 | ✅ 已通（Ctrl/Shift 多选；左/右/顶/底/水平/垂直居中/等宽/等高 8 条批处理指令，`shell.nodio:1226-1233`） |
+| 设计器撤销 / 重做 | ✅ 已通（画布独立 `undoStack`/`redoStack`，上限 50 步，Ctrl+Z / Ctrl+Y） |
+| 缩放与控件间磁性对齐吸附线 | ✅ 已通（25%~400% 缩放 + 5 逻辑像素内智能吸附 + 橙色辅助线） |
 
 ---
 
@@ -4090,3 +4141,63 @@ IDE 端 loadcode 该脚本并调用 `fn(container)` —— 容器以变参注入
   三断言，x64 / x86 双绿；
 - ide_command 双进程锁双架构、iofile_text 13 项字节断言、builtin_api、
   stdlib imports、win_clip、publish（run_publish_tests）、ide_nav_smoke 全绿。
+
+## 1.41 第三十五轮：函数调用路径提速（-44%~-81%）+ GC 注册表惰性化的环安全修复
+
+### 1.41.1 背景
+
+第三十轮残留清单（roadmap）里引擎线剩「函数调用 ~1.8µs/次」。微基准
+（`callbench`，每形态 100 万次、取对空循环差值）基线（x64）：
+
+| 形态 | 基线 µs/次 | 本轮后 µs/次 | 降幅 |
+|---|---|---|---|
+| 全局函数 2 参 | 2.17 | 1.1~1.3 | -40%~-49% |
+| 局部函数 2 参 | 2.70 | ~1.3 | -51% |
+| 方法调用 | 4.27 | 1.2~1.3 | -69%~-72% |
+| 变参 `f(...)` | 7.81 | 1.7~1.8 | -77%~-79% |
+| 定参+`...` 混合 | 7.97 | 1.7~2.0 | -75%~-78% |
+| 内建 tostring | 1.06 | 0.17~0.20 | -81%~-84% |
+
+（区间为多轮实测；并行会话的 IDE 进程同核争抢可让墙钟数字虚胖 ~3×，
+以安静时段为准。）
+
+### 1.41.2 引擎工作（全部双架构回归锁定）
+
+1. **Env GC 注册表惰性化**：注册表本为「清扫器找环成员」存在，而 Env 能成环
+   当且仅当被闭包捕获（FuncLit/类体求值把弱 `self` 提升为共享 `envUp`）——
+   注册从构造移到捕获点（`GcRegisterEnv`），普通调用帧的构造/析构不再付
+   互斥锁 + 哈希集插入/擦除。
+   **途中踩出并修复一个真崩溃**：被捕获而注册的 Env 析构时若不擦除注册表项，
+   悬垂指针在新 Env 复用同一地址后会被清扫器当作垃圾清空——活帧的槽在执行中
+   被清 → 正在使用的 shared_ptr 控制块落到 `feeefeee` 填充上（cdb 定案
+   `lock xadd [rbx+8]`）→ 0xC0000005 + 内存暴涨。析构按 `bGcRegistered`
+   补擦除；普通帧仍然零锁零查找。
+2. **调用帧/块帧槽化 + 字节预算缓冲池**：第 13 轮只槽化了常驻 Env，调用帧
+   仍是 `unordered_map`（每调用桶数组 + 每参数节点分配/释放）。5 个帧创建点
+   （EvalCall/CallThisOwner/InstantiateClass/CallVmFunc/ExecBlockScoped）切到
+   池化槽向量（线程局部 freelist，acquire 清 bound 标记，僵尸值不可见）。
+   池按**字节预算（24MB）在推入时拒绝**——不做淘汰：淘汰销毁僵尸值的级联
+   （~Env 重入池）正是首次实现堆损坏（`RtlpLogHeapFailure`）的根源。
+   uiprobe13 工作集增量：无界池 206MB → 推入预算 ~54MB（低于无池对照 86MB）。
+3. **变参 mrets 别名化**：aliasing shared_ptr 直接指向打包表自身数组——
+   省一次 vector 分配 + 整份拷贝，且 `#...`/`...[i]`（表视图）与调用点展开
+   （mrets 视图）恒一致；别名指向 vector 对象本身，表增长只重分配缓冲。
+4. **快路径实参求值（evalFastArgs）**：6 条内建快速路径（io.print/print/
+   tostring/tonumber/error/sleep）的手写实参求值统一为独立 lambda——与
+   evalCallArgs 的唯一差别是**多返回值实参保持首值**（官方 parameter.md
+   「可变参数不放在最后面就只能取第一个值」），`...` 仍整体展开；
+   evalCallArgs 补 `reserve`。
+
+### 1.41.3 回归
+
+VM 90/90 双架构；gcstress ×3（exit=0，uiprobe13）；gcprobe；ide_plugin
+双架构；ide_command 双进程锁双架构；iofile_text 13 项字节断言；
+builtin_api、stdlib imports、win_clip、publish、ide_nav_smoke 全绿。
+
+### 1.41.4 会话冲突记录（工程过程，供后续协调）
+
+本轮引擎改动两次被同仓库的并行会话以其 `.round34-wip.patch` 快照覆盖回退
+（该快照含池化但**缺 §1.41.2-1 的析构擦除修复**，直接应用会重新引入
+0xC0000005）。最终以重放 + 立即提交（98e5f94）收口。**并行工作期间
+engine/ 目录的单向约定（谁在改谁持有）需要建立**，否则 `git checkout` 式
+回退会再次静默丢工作。
