@@ -233,7 +233,7 @@ namespace NodioVM
             {
                 if (wcscmp(szPause, L"0") == 0)
                 {
-                    it.globals.vars[NameId(L"_CONSOLE_NO_PAUSE")] = Value::Bool_(true);
+                    it.globals.VarAt(NameId(L"_CONSOLE_NO_PAUSE")) = Value::Bool_(true);
                     it.roots[L"_CONSOLE_NO_PAUSE"] = Value::Bool_(true);
                 }
             }
@@ -279,6 +279,8 @@ namespace NodioVM
         auto mainEnv = std::make_shared<Env>();
         mainEnv->self = mainEnv;
         mainEnv->parent = it.globals.self;
+        // Round 13: the main-script frame is resident too — slot it.
+        mainEnv->bSlots = true;
         // S-2: the main script owns its own file — a runtime error in it
         // reports "<script>:<line>" instead of a bare line number.
         if (pScriptFile && !pScriptFile->empty())

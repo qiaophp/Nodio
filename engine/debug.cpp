@@ -65,15 +65,16 @@ void Interp::DumpVars(Env* env)
             {
                 for (const wchar_t* g : { L"User32", L"Kernel32", L"type" })
                 {
-                    auto i = globals.vars.find(NameId(g));
-                    if (i != globals.vars.end())
-                        list.push_back({ NameOf(i->first), i->second });
+                    Value* pv = globals.FindInSelf(NameId(g));
+                    if (pv)
+                        list.push_back({ g, *pv });
                 }
             }
             if (env)
             {
-                for (auto& kv : env->vars)
-                    list.push_back({ NameOf(kv.first), kv.second });
+                // Round 13: slot-aware (env may be the slotted mainEnv)
+                env->ForEachVar([&](uint32_t gid, Value& v)
+                    { list.push_back({ NameOf(gid), v }); });
             }
             for (auto& kv : list)
             {
@@ -209,8 +210,9 @@ bool Interp::DebugPipeStop(int nLine, Env* env)
                 std::vector<std::pair<wstring, Value>> list;
                 if (e)
                 {
-                    for (auto& kv : e->vars)
-                        list.push_back({ NameOf(kv.first), kv.second });
+                    // Round 13: slot-aware (e may be the slotted mainEnv)
+                    e->ForEachVar([&](uint32_t gid, Value& v)
+                        { list.push_back({ NameOf(gid), v }); });
                 }
                 for (auto& kv : list)
                 {

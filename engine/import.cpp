@@ -201,11 +201,11 @@ Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
                     for (auto& kv : mod.tab->scopeVars)
                         if (!vOld.tab->scopeVars.count(kv.first))
                             vOld.tab->scopeVars[kv.first] = kv.second;
-                    globals.vars[NameId(names[0])] = vOld;
+                    globals.VarAt(NameId(names[0])) = vOld;
                     return vOld;
                 }
                 roots[names[0]] = mod;
-                globals.vars[NameId(names[0])] = mod;
+                globals.VarAt(NameId(names[0])) = mod;
                 return mod;
             }
             // bind a dotted import path into the root namespaces
@@ -872,7 +872,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 auto modEnv2 = std::make_shared<Env>();
                 modEnv2->self = modEnv2;
                 modEnv2->parent = globals.self;
-                modEnv2->vars[IdOwner()] = modPlaceholder2;
+                modEnv2->VarAt(IdOwner()) = modPlaceholder2;
                 // S-2: the module frame owns its source file, so a runtime
                 // error inside it can be attributed to the file the line
                 // number really comes from.  An embedded module has no
@@ -910,9 +910,8 @@ Value Interp::DoImport(const PNode& n, Env* env)
                 if (mod2.t != Value::TableT)
                 {
                     Value curNs;
-                    auto itFirst = globals.vars.find(NameId(n->names[0]));
-                    if (itFirst != globals.vars.end())
-                        curNs = itFirst->second;
+                    if (Value* pvF = globals.FindInSelf(NameId(n->names[0])))
+                        curNs = *pvF;
                     for (size_t ni = 1; ni < n->names.size(); ++ni)
                     {
                         if (curNs.t == Value::TableT && curNs.tab)
@@ -1148,7 +1147,7 @@ Value Interp::DoImport(const PNode& n, Env* env)
             auto modEnv = std::make_shared<Env>();
             modEnv->self = modEnv;
             modEnv->parent = globals.self;
-            modEnv->vars[IdOwner()] = modPlaceholder;
+            modEnv->VarAt(IdOwner()) = modPlaceholder;
             // S-2: the module frame owns its source file — a runtime error
             // inside it reports "<this file>:<line>" instead of a bare line
             // number that could belong to any imported package.
@@ -1193,9 +1192,8 @@ Value Interp::DoImport(const PNode& n, Env* env)
             if (mod.t != Value::TableT)
             {
                 Value curNs;
-                auto itFirst = globals.vars.find(NameId(n->names[0]));
-                if (itFirst != globals.vars.end())
-                    curNs = itFirst->second;
+                if (Value* pvF = globals.FindInSelf(NameId(n->names[0])))
+                    curNs = *pvF;
                 for (size_t ni = 1; ni < n->names.size(); ++ni)
                 {
                     if (curNs.t == Value::TableT && curNs.tab)
@@ -1263,9 +1261,9 @@ Value Interp::DoImport(const PNode& n, Env* env)
                             const wstring& nm = n->names[ni];
                             if (ns.t != Value::TableT || !ns.tab)
                             {
-                                auto ig = globals.vars.find(NameId(nm));
-                                if (ig != globals.vars.end())
-                                    ns = ig->second;
+                                Value* pvG = globals.FindInSelf(NameId(nm));
+                                if (pvG)
+                                    ns = *pvG;
                                 else break;
                             }
                             else

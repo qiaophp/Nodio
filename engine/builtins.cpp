@@ -859,7 +859,7 @@ DWORD WINAPI ThreadWorkerProc(LPVOID pv)
     local->parent = wt.globals.self;
     Interp::GcFrameScope fsThread(wt, local);
     if (job->owner.t != Value::Null)
-        local->vars[IdOwner()] = job->owner;
+        local->VarAt(IdOwner()) = job->owner;
 for (size_t i = 0; i < job->params.size(); i++)
     {
         if (job->params[i] == L"...")
@@ -876,10 +876,10 @@ for (size_t i = 0; i < job->params.size(); i++)
             }
             Value vD = tbV->arr.empty() ? Value() : Value::Table_(tbV);
             if (vD.tab) { vD.mrets = vargs; vD.bDots = true; }
-            local->vars[IdDots()] = vD;
+            local->VarAt(IdDots()) = vD;
             break;
         }
-        local->vars[NameId(job->params[i])] =
+        local->VarAt(NameId(job->params[i])) =
             i < job->args.size() ? job->args[i] : Value();
     }
     wt.nReturn = 0;
@@ -1298,7 +1298,7 @@ void Interp::InitBuiltins()
         {
             // ---- global call() builtin: call(fn, owner, ...)
             // returns ok, ret (metaProperty machinery depends on it)
-            globals.vars[NameId(L"call")] =
+            globals.VarAt(NameId(L"call")) =
                 NF([this](vector<Value>& a) -> Value {
                 auto finish = [this](bool ok, Value r) -> Value {
                     Value vOk = Value::Bool_(ok);
@@ -5258,7 +5258,7 @@ void Interp::InitBuiltins()
                 timeMeta->map[L"_timeCtor"] = timeCtor;
                 tb->map[L"_call"] = timeCtor;
                 tb->map[L"_meta"] = Value::Table_(timeMeta);
-                globals.vars[NameId(L"time")] = Value::Table_(tb);
+                globals.VarAt(NameId(L"time")) = Value::Table_(tb);
                 roots[L"time"] = Value::Table_(tb);
 
                 tb->map[L"is"] = NF([](vector<Value>& a) -> Value {
@@ -7693,14 +7693,14 @@ void Interp::InitBuiltins()
                     vector<Value> ua{ Value::Str_(L"User32.dll") };
                     if (uDll.native)
                     {
-                        globals.vars[NameId(L"User32")] = uDll.native(ua);
-                        roots[L"User32"] = globals.vars[NameId(L"User32")];
+                        globals.VarAt(NameId(L"User32")) = uDll.native(ua);
+                        roots[L"User32"] = globals.VarAt(NameId(L"User32"));
                     }
                     vector<Value> ka{ Value::Str_(L"Kernel32.dll") };
                     if (uDll.native)
                     {
-                        globals.vars[NameId(L"Kernel32")] = uDll.native(ka);
-                        roots[L"Kernel32"] = globals.vars[NameId(L"Kernel32")];
+                        globals.VarAt(NameId(L"Kernel32")) = uDll.native(ka);
+                        roots[L"Kernel32"] = globals.VarAt(NameId(L"Kernel32"));
                     }
                     // Preload common system library roots (::Shell32 / ::Gdi32 / ::Comctl32)
                     // crtReopen() uses ::Msvcrt to reopen
@@ -7722,7 +7722,7 @@ void Interp::InitBuiltins()
                                 return Value::Pointer_(pf); });
                             dv.tab->map[L"_open_osfhandle"] = NF([](vector<Value>&) -> Value {
                                 return Value::Num_(-1.0); });
-                            globals.vars[NameId(L"Msvcrt")] = dv;
+                            globals.VarAt(NameId(L"Msvcrt")) = dv;
                             roots[L"Msvcrt"] = dv;
                         }
                     }
@@ -7739,7 +7739,7 @@ void Interp::InitBuiltins()
                         Value dv = uDll.native(da);
                         wstring nm(DLLS[di]);
                         nm = nm.substr(0, nm.size() - 4);
-                        globals.vars[NameId(nm)] = dv;
+                        globals.VarAt(NameId(nm)) = dv;
                         roots[nm] = dv;
                     }
                 }
@@ -7836,8 +7836,8 @@ void Interp::InitBuiltins()
                 tb->map[L"callback"] = fnCallback;
                 tb->map[L"tostdcall"] = fnCallback;
                 tb->map[L"tocdecl"] = fnTocdecl;
-                globals.vars[NameId(L"tostdcall")] = fnCallback;
-                globals.vars[NameId(L"tocdecl")] = fnTocdecl;
+                globals.VarAt(NameId(L"tostdcall")) = fnCallback;
+                globals.VarAt(NameId(L"tocdecl")) = fnTocdecl;
 
                 auto tbThread = GetRoot(L"thread").tab;
                 if (tbThread)
@@ -8060,8 +8060,8 @@ void Interp::InitBuiltins()
                 });
                 tb->map[L"isArray"] = fnIsArray;
                 tb->map[L"isArrayLike"] = fnIsArray;
-                globals.vars[NameId(L"isArray")] = fnIsArray;
-                globals.vars[NameId(L"isArrayLike")] = fnIsArray;
+                globals.VarAt(NameId(L"isArray")) = fnIsArray;
+                globals.VarAt(NameId(L"isArrayLike")) = fnIsArray;
                 tb->map[L"append"] = NF([](vector<Value>& a) {
                     // official contract (pinned by the official testCase):
                     // table.append(arr, v1, v2, ...) appends EVERY arg;
@@ -8101,7 +8101,7 @@ void Interp::InitBuiltins()
                     return Value::Num_((double)t->arr.size());
                 });
                 tb->map[L"push"] = fnPush;
-                globals.vars[NameId(L"push")] = fnPush;
+                globals.VarAt(NameId(L"push")) = fnPush;
 
                 // table.unpack(t[, from[, to]]) / table.unpackArgs(t) —
                 // expand the array part as extra return values (popen.read,
@@ -8401,7 +8401,7 @@ void Interp::InitBuiltins()
                     return v;
                 });
                 tb->map[L"pop"] = fnPop;
-                globals.vars[NameId(L"pop")] = fnPop;
+                globals.VarAt(NameId(L"pop")) = fnPop;
 
                 auto fnSplice = NF([](vector<Value>& a) -> Value {
                     auto res = std::make_shared<Table>();
@@ -8425,7 +8425,7 @@ void Interp::InitBuiltins()
                     return Value::Table_(res);
                 });
                 tb->map[L"splice"] = fnSplice;
-                globals.vars[NameId(L"splice")] = fnSplice;
+                globals.VarAt(NameId(L"splice")) = fnSplice;
                 // ---- round 43: array ops ----
                 // table.insert(t, val, pos=1) — in official standard library:
                 //   table.insert(t, val) -> inserts val at position 1 (head of table)
@@ -8927,7 +8927,7 @@ void Interp::InitBuiltins()
                 // "input satisfied" returns WAIT_OBJECT_0+count (the
                 // caller then pumps and retries); without one it is a
                 // plain WaitForMultipleObjects.
-                globals.vars[NameId(L"__waitForMultipleObjects")] =
+                globals.VarAt(NameId(L"__waitForMultipleObjects")) =
                     NF([](vector<Value>& a) -> Value {
                         if (a.size() < 3)
                             return Value::Num_(0xFFFFFFFF);
@@ -9007,7 +9007,7 @@ void Interp::InitBuiltins()
                 // returns the MSG table, false when the queue is empty,
                 // null on WM_QUIT (table still filled so callers can read
                 // the exit code)
-                globals.vars[NameId(L"__messagePeek")] =
+                globals.VarAt(NameId(L"__messagePeek")) =
                     NF([fillMsgTable, msgHwnd, msgRange](
                            vector<Value>& a) -> Value {
                         MSG m;
@@ -9024,7 +9024,7 @@ void Interp::InitBuiltins()
                 // getMessage: blocking GetMessageW; an explicit PM_NOREMOVE
                 // option switches to a non-blocking PeekMessageW that
                 // returns false when no message is queued
-                globals.vars[NameId(L"__messageGet")] =
+                globals.VarAt(NameId(L"__messageGet")) =
                     NF([fillMsgTable, msgHwnd, msgRange](
                            vector<Value>& a) -> Value {
                         MSG m;
@@ -9049,7 +9049,7 @@ void Interp::InitBuiltins()
                         return vMsg;
                     });
                 // translate+dispatch a MSG table fetched by peek/get
-                globals.vars[NameId(L"__messageTranslateDispatch")] =
+                globals.VarAt(NameId(L"__messageTranslateDispatch")) =
                     NF([](vector<Value>& a) -> Value {
                         if (a.empty() || a[0].t != Value::TableT ||
                             !a[0].tab)
@@ -10033,7 +10033,7 @@ void Interp::InitBuiltins()
             }
 
             // first-class scalar builtins (also reachable via fast paths)
-            globals.vars[NameId(L"tostring")] = NF([](vector<Value>& a) {
+            globals.VarAt(NameId(L"tostring")) = NF([](vector<Value>& a) {
                 if (a.empty()) return Value::Str_(L"null");
                 Interp* it = g_interpCurrent;
                 if (it && a[0].t == Value::TableT && a[0].tab)
@@ -10134,9 +10134,9 @@ void Interp::InitBuiltins()
                 }
                 return Value();
             });
-            globals.vars[NameId(L"type")] = vType;
+            globals.VarAt(NameId(L"type")) = vType;
             roots[L"type"] = vType;
-            globals.vars[NameId(L"topointer")] = NF([this](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"topointer")) = NF([this](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t == Value::Null) return Value::Pointer_(nullptr);
                 INT_PTR offset = a.size() > 1 ? (INT_PTR)(long long)BNum(a[1]) : 0;
                 if (a[0].t == Value::Pointer) return Value::Pointer_((char*)a[0].ptr + offset);
@@ -10284,22 +10284,22 @@ void Interp::InitBuiltins()
                 }
                 return Value();
             });
-            globals.vars[NameId(L"tonumber")] = fnToNumber;
+            globals.VarAt(NameId(L"tonumber")) = fnToNumber;
             roots[L"tonumber"] = fnToNumber;
-            globals.vars[NameId(L"sleep")] = NF([](vector<Value>& a) {
+            globals.VarAt(NameId(L"sleep")) = NF([](vector<Value>& a) {
                 if (!a.empty()) Sleep((DWORD)BNum(a[0]));
                 return Value(); });
-            globals.vars[NameId(L"_HINSTANCE")] = Value::Pointer_(GetModuleHandleW(nullptr));
-            globals.vars[NameId(L"_HAPPICON")] = Value::Pointer_(LoadIconW(nullptr, IDI_APPLICATION));
-            globals.vars[NameId(L"_INVALID_HANDLE_VALUE")] = Value::Pointer_(INVALID_HANDLE_VALUE);
-            roots[L"_HINSTANCE"] = globals.vars[NameId(L"_HINSTANCE")];
-            roots[L"_HAPPICON"] = globals.vars[NameId(L"_HAPPICON")];
-            roots[L"_INVALID_HANDLE_VALUE"] = globals.vars[NameId(L"_INVALID_HANDLE_VALUE")];
+            globals.VarAt(NameId(L"_HINSTANCE")) = Value::Pointer_(GetModuleHandleW(nullptr));
+            globals.VarAt(NameId(L"_HAPPICON")) = Value::Pointer_(LoadIconW(nullptr, IDI_APPLICATION));
+            globals.VarAt(NameId(L"_INVALID_HANDLE_VALUE")) = Value::Pointer_(INVALID_HANDLE_VALUE);
+            roots[L"_HINSTANCE"] = globals.VarAt(NameId(L"_HINSTANCE"));
+            roots[L"_HAPPICON"] = globals.VarAt(NameId(L"_HAPPICON"));
+            roots[L"_INVALID_HANDLE_VALUE"] = globals.VarAt(NameId(L"_INVALID_HANDLE_VALUE"));
             {
                 BOOL isWow64 = FALSE;
                 IsWow64Process(GetCurrentProcess(), &isWow64);
                 bool bWin64 = (sizeof(void*) == 8) || (isWow64 != FALSE);
-                globals.vars[NameId(L"_WIN_64")] = Value::Bool_(bWin64);
+                globals.VarAt(NameId(L"_WIN_64")) = Value::Bool_(bWin64);
                 roots[L"_WIN_64"] = Value::Bool_(bWin64);
 
                 typedef void (WINAPI *RtlGetNtVersionNumbersFn)(DWORD*, DWORD*, DWORD*);
@@ -10312,19 +10312,19 @@ void Interp::InitBuiltins()
                         DWORD dwMajor = 0, dwMinor = 0, dwBuild = 0;
                         fnRtl(&dwMajor, &dwMinor, &dwBuild);
                         dwBuild &= 0xFFFF;
-                        globals.vars[NameId(L"_WIN_VER_MAJOR")] = Value::Num_(dwMajor);
-                        globals.vars[NameId(L"_WIN_VER_MINOR")] = Value::Num_(dwMinor);
-                        globals.vars[NameId(L"_WIN_VER_BUILD")] = Value::Num_(dwBuild);
-                        roots[L"_WIN_VER_MAJOR"] = globals.vars[NameId(L"_WIN_VER_MAJOR")];
-                        roots[L"_WIN_VER_MINOR"] = globals.vars[NameId(L"_WIN_VER_MINOR")];
-                        roots[L"_WIN_VER_BUILD"] = globals.vars[NameId(L"_WIN_VER_BUILD")];
+                        globals.VarAt(NameId(L"_WIN_VER_MAJOR")) = Value::Num_(dwMajor);
+                        globals.VarAt(NameId(L"_WIN_VER_MINOR")) = Value::Num_(dwMinor);
+                        globals.VarAt(NameId(L"_WIN_VER_BUILD")) = Value::Num_(dwBuild);
+                        roots[L"_WIN_VER_MAJOR"] = globals.VarAt(NameId(L"_WIN_VER_MAJOR"));
+                        roots[L"_WIN_VER_MINOR"] = globals.VarAt(NameId(L"_WIN_VER_MINOR"));
+                        roots[L"_WIN_VER_BUILD"] = globals.VarAt(NameId(L"_WIN_VER_BUILD"));
 
                         bool bWinXP = (dwMajor < 6);
                         bool bWin7Later = (dwMajor > 6 || (dwMajor == 6 && dwMinor >= 1));
                         bool bWin10Later = (dwMajor >= 10);
-                        globals.vars[NameId(L"_WINXP")] = Value::Bool_(bWinXP);
-                        globals.vars[NameId(L"_WIN7_LATER")] = Value::Bool_(bWin7Later);
-                        globals.vars[NameId(L"_WIN10_LATER")] = Value::Bool_(bWin10Later);
+                        globals.VarAt(NameId(L"_WINXP")) = Value::Bool_(bWinXP);
+                        globals.VarAt(NameId(L"_WIN7_LATER")) = Value::Bool_(bWin7Later);
+                        globals.VarAt(NameId(L"_WIN10_LATER")) = Value::Bool_(bWin10Later);
                         roots[L"_WINXP"] = Value::Bool_(bWinXP);
                         roots[L"_WIN7_LATER"] = Value::Bool_(bWin7Later);
                         roots[L"_WIN10_LATER"] = Value::Bool_(bWin10Later);
@@ -10341,7 +10341,7 @@ void Interp::InitBuiltins()
                         buf.tab->map[L"_meta"] = a[0];
                     return buf;
                 });
-                globals.vars[NameId(L"gcdata")] = fnGcData;
+                globals.VarAt(NameId(L"gcdata")) = fnGcData;
                 roots[L"gcdata"] = fnGcData;
             }
 
@@ -10393,9 +10393,8 @@ void Interp::InitBuiltins()
                     auto it = roots.find(k);
                     if (it != roots.end())
                         return it->second;
-                    auto ig = globals.vars.find(NameId(k));
-                    if (ig != globals.vars.end())
-                        return ig->second;
+                    if (Value* pvG = globals.FindInSelf(NameId(k)))
+                        return *pvG;
                     {
                         std::lock_guard<std::recursive_mutex> lk(g_threadSharedMutex);
                         auto ish = g_threadSharedMap.find(k);
@@ -10407,7 +10406,7 @@ void Interp::InitBuiltins()
                 gmeta->map[L"_set"] = NF([this](vector<Value>& a) -> Value {
                     if (a.size() < 2 || a[0].t != Value::Str)
                         return Value();
-                    globals.vars[NameId(a[0].s)] = a[1];
+                    globals.VarAt(NameId(a[0].s)) = a[1];
                     roots[a[0].s] = a[1];
                     {
                         std::lock_guard<std::recursive_mutex> lk(g_threadSharedMutex);
@@ -10419,8 +10418,8 @@ void Interp::InitBuiltins()
                 gtab->map[L"self"] = Value::Table_(gtab);
                 roots[L"global"] = Value::Table_(gtab);
                 roots[L"self"] = Value::Table_(gtab);
-                globals.vars[NameId(L"global")] = Value::Table_(gtab);
-                globals.vars[IdSelf()] = Value::Table_(gtab);
+                globals.VarAt(NameId(L"global")) = Value::Table_(gtab);
+                globals.VarAt(IdSelf()) = Value::Table_(gtab);
 
                 // ---- the (debug) introspection module ----
                 auto dbg = std::make_shared<Table>();
@@ -10460,16 +10459,16 @@ void Interp::InitBuiltins()
             }
 
             // ---- fibers (纤程): create / resume / yield / status ----
-            globals.vars[NameId(L"create")] = NF([](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"create")) = NF([](vector<Value>& a) -> Value {
                 return a.empty() ? Value() : FiberCreate(a[0]); });
-            globals.vars[NameId(L"resume")] = NF([](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"resume")) = NF([](vector<Value>& a) -> Value {
                 if (a.empty())
                     return Value();
                 vector<Value> args;
                 for (size_t i = 1; i < a.size(); i++)
                     args.push_back(a[i]);
                 return FiberResume(a[0], args, nullptr); });
-            globals.vars[NameId(L"yield")] = NF([](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"yield")) = NF([](vector<Value>& a) -> Value {
                 vector<Value> args;
                 for (auto& v : a) args.push_back(v);
                 return FiberYield(args); });
@@ -10550,7 +10549,7 @@ void Interp::InitBuiltins()
                 return f;
             };
             // print(...) — each argument through tostring, then io.print
-            globals.vars[NameId(L"print")] = NF([](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"print")) = NF([](vector<Value>& a) -> Value {
                 wstring out;
                 for (size_t i = 0; i < a.size(); i++)
                 {
@@ -10573,7 +10572,7 @@ void Interp::InitBuiltins()
                 return Value(); });
             // assert(value,message,...) — truthy: return all arguments;
             // falsy: throw @message
-            globals.vars[NameId(L"assert")] = NF([this](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"assert")) = NF([this](vector<Value>& a) -> Value {
                 if (!a.empty() && a[0].Truthy())
                 {
                     if (a.size() > 1)
@@ -10596,7 +10595,7 @@ void Interp::InitBuiltins()
             // `assert2(2, resume(fib))` yields the resumed values (the
             // fiber.generator iterator relies on this to
             // hand for-in the yielded value, not the ok flag)
-            globals.vars[NameId(L"assert2")] = NF([this](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"assert2")) = NF([this](vector<Value>& a) -> Value {
                 if (a.size() > 1 && a[1].Truthy())
                 {
                     if (a.size() > 2)
@@ -10616,7 +10615,7 @@ void Interp::InitBuiltins()
                 (*err) = L"运行错误: " + msg;
                 return Value(); });
             // assertf — inverse assertion: throws when the value is truthy
-            globals.vars[NameId(L"assertf")] = NF([this](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"assertf")) = NF([this](vector<Value>& a) -> Value {
                 if (!a.empty() && a[0].Truthy())
                 {
                     wstring msg = a.size() > 1 ? BStr(a[1])
@@ -10626,7 +10625,7 @@ void Interp::InitBuiltins()
                 }
                 return a.empty() ? Value() : a[0]; });
             // eval(codeString) — compiles and runs an expression immediately
-            globals.vars[NameId(L"eval")] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"eval")) = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t != Value::Str)
                     return Value();
                 wstring src = BStr(a[0]);
@@ -10707,7 +10706,7 @@ void Interp::InitBuiltins()
                     return Value();
                 return r; });
             // loadcode(code|filepath) — a function object, or null + message
-            globals.vars[NameId(L"loadcode")] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"loadcode")) = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t != Value::Str)
                     return Value();
                 wstring src = BStr(a[0]), text;
@@ -10750,7 +10749,7 @@ void Interp::InitBuiltins()
                 }
                 return MakeVmFunc(fn); });
             // loadcodex(code|filepath|function,...) — run now, return values
-            globals.vars[NameId(L"loadcodex")] = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"loadcodex")) = NF([this, MakeVmFunc](vector<Value>& a) -> Value {
                 if (a.empty())
                     return Value();
                 Value f;
@@ -10801,7 +10800,7 @@ void Interp::InitBuiltins()
                     args.push_back(a[i]);
                 return this->CallVmFunc(f, args); });
             // reduce(array,reducer,initialValue)
-            globals.vars[NameId(L"reduce")] = NF([this](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"reduce")) = NF([this](vector<Value>& a) -> Value {
                 if (a.size() < 2 || a[0].t != Value::TableT || !a[0].tab)
                     return Value();
                 auto& arr = a[0].tab->arr;
@@ -10833,7 +10832,7 @@ void Interp::InitBuiltins()
                 }
                 return prev; });
             // switch(switchValue,caseTable,default,...)
-            globals.vars[NameId(L"switch")] = NF([this](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"switch")) = NF([this](vector<Value>& a) -> Value {
                 if (a.size() < 2 || a[1].t != Value::TableT || !a[1].tab)
                 {
                     (*err) = L"运行错误: switch 参数@2必须是表对象";
@@ -10861,7 +10860,7 @@ void Interp::InitBuiltins()
                     args.push_back(a[i]);
                 return this->CallVmFunc(fn, args); });
             // invoke(f,owner,...) — call with an explicit owner, errors throw
-            globals.vars[NameId(L"invoke")] = NF([this](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"invoke")) = NF([this](vector<Value>& a) -> Value {
                 if (a.empty())
                     return Value();
                 Value owner = a.size() > 1 ? a[1] : Value();
@@ -10870,7 +10869,7 @@ void Interp::InitBuiltins()
                     args.push_back(a[i]);
                 return this->CallOwner(a[0], owner, args); });
             // callex(errHandler, fn, owner, ...) — standard official signature
-            globals.vars[NameId(L"callex")] = NF([this](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"callex")) = NF([this](vector<Value>& a) -> Value {
                 if (a.empty())
                     return Value::Bool_(false);
                 Value handler;
@@ -10996,16 +10995,16 @@ void Interp::InitBuiltins()
                 }
                 return vRes;
             });
-            globals.vars[NameId(L"rget")] = fnRget;
+            globals.VarAt(NameId(L"rget")) = fnRget;
             roots[L"rget"] = fnRget;
             // execute(commandLine) — run a system command and wait
-            globals.vars[NameId(L"execute")] = NF([](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"execute")) = NF([](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t != Value::Str)
                     return Value();
                 int rc = _wsystem(BStr(a[0]).c_str());
                 return Value::Num_((double)rc); });
             // errput(message) — report without throwing
-            globals.vars[NameId(L"errput")] = NF([](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"errput")) = NF([](vector<Value>& a) -> Value {
                 wstring out;
                 for (size_t i = 0; i < a.size(); i++)
                 {
@@ -11026,16 +11025,16 @@ void Interp::InitBuiltins()
                     fflush(stderr);
                 }
                 return Value(); });
-            globals.vars[NameId(L"collectgarbage")] = NF([](vector<Value>&) -> Value {
+            globals.VarAt(NameId(L"collectgarbage")) = NF([](vector<Value>&) -> Value {
                 // run a full mark & sweep cycle now
                 Interp* p = g_interpCurrent;
                 if (p) p->CollectGarbage(nullptr);
                 return Value::Num_((double)(p ? p->nGCRuns : 0));
             });
-            globals.vars[NameId(L"__gcdump")] = NF([](vector<Value>&) -> Value {
+            globals.VarAt(NameId(L"__gcdump")) = NF([](vector<Value>&) -> Value {
                 GcDumpLive();
                 return Value(); });
-            globals.vars[NameId(L"setlocale")] = NF([](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"setlocale")) = NF([](vector<Value>& a) -> Value {
                 int cat = LC_ALL;
                 if (a.size() > 1 && a[0].t == Value::Num)
                     cat = (int)a[0].n;
@@ -11048,7 +11047,7 @@ void Interp::InitBuiltins()
                     return Value::Str_(buf);
                 return Value(); });
             // setprivilege(name,enable) — enable/disable a process privilege
-            globals.vars[NameId(L"setprivilege")] = NF([](vector<Value>& a) -> Value {
+            globals.VarAt(NameId(L"setprivilege")) = NF([](vector<Value>& a) -> Value {
                 if (a.empty() || a[0].t != Value::Str)
                     return Value::Bool_(false);
                 bool bEnable = !(a.size() > 1 && !a[1].Truthy());
@@ -11075,7 +11074,7 @@ void Interp::InitBuiltins()
                 CloseHandle(hTok);
                 return Value::Bool_(ok && e == ERROR_SUCCESS); });
             // dumpcode — no bytecode emitter yet
-            globals.vars[NameId(L"dumpcode")] = NF([](vector<Value>&) -> Value {
+            globals.VarAt(NameId(L"dumpcode")) = NF([](vector<Value>&) -> Value {
                 return Value(); });
             // Preload builtin (VM preloads builtin on startup)
             {

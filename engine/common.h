@@ -957,6 +957,20 @@ namespace NodioVM
         // human-readable name is needed (dumps, mirrors back to
         // wstring-keyed Table maps).
         std::unordered_map<uint32_t, Value> vars;
+        // Round 13: RESIDENT envs (the Interp::globals root and the
+        // main-script frame) store their vars in a slot vector indexed by
+        // (intern id - 1). The intern table only ever grows, so an id's
+        // slot is stable for the env's lifetime; a parallel bound-flag
+        // byte separates "no entry" from "entry holding Null", exactly
+        // matching the map's find() semantics. Call frames keep the map —
+        // their transient ids (loop counters, temporaries) would blow the
+        // slot vectors' memory. ALL vars access must go through the
+        // accessors below (FindInSelf/VarAt/EraseVar/CountVar/ForEachVar/
+        // clearVars): they dispatch on bSlots, so a single code path serves
+        // both storages and a write can never land in the wrong one.
+        bool bSlots = false;
+        std::vector<Value> slots;
+        std::vector<uint8_t> slotBound;
         shared_ptr<Table> nsTable;   // namespace scope: bare names land here
         shared_ptr<Table> modTable;  // file/module scope table: scopeVars
         // S-2: the source file that owns the code running in this frame.
@@ -998,6 +1012,72 @@ namespace NodioVM
         // targets `other` and must go through the metatable's _set — that is
         // how the official tracker installs its wndproc message table.
         Table* instTable = nullptr;
+
+        // ---- Round 13 unified var accessors (slot table or map) ----
+        // Lookup in THIS env only (no chain walk). Returns nullptr when
+        // the id has no entry here.
+        Value* FindInSelf(uint32_t id)
+        {
+            if (bSlots)
+            {
+                size_t s = (size_t)id - 1;
+                return (s < slots.size() && slotBound[s]) ? &slots[s] : nullptr;
+            }
+            auto it = vars.find(id);
+            return it != vars.end() ? &it->second : nullptr;
+        }
+        // map operator[] semantics: create a default (Null) entry when
+        // absent, return a reference to it. NOTE: like unordered_map, a
+        // growth (resize) invalidates references previously handed out by
+        // this call — never nest two VarAt calls on the same env in one
+        // expression, and never hold the reference across another VarAt.
+        Value& VarAt(uint32_t id)
+        {
+            if (bSlots)
+            {
+                size_t s = (size_t)id - 1;
+                if (s >= slots.size())
+                {
+                    slots.resize(s + 1);
+                    slotBound.resize(s + 1, 0);
+                }
+                slotBound[s] = 1;
+                return slots[s];
+            }
+            return vars[id];
+        }
+        void EraseVar(uint32_t id)
+        {
+            if (bSlots)
+            {
+                size_t s = (size_t)id - 1;
+                if (s < slots.size()) { slotBound[s] = 0; slots[s] = Value(); }
+                return;
+            }
+            vars.erase(id);
+        }
+        size_t CountVar(uint32_t id)
+        {
+            return FindInSelf(id) ? 1 : 0;
+        }
+        // Iterate every bound entry: f(id, Value&). Read-only use (GC
+        // marking, dumps). Do not add entries from inside the callback.
+        template <class F> void ForEachVar(F&& f)
+        {
+            if (bSlots)
+            {
+                for (size_t s = 0; s < slots.size(); s++)
+                    if (slotBound[s]) f((uint32_t)(s + 1), slots[s]);
+                return;
+            }
+            for (auto& kv : vars) f(kv.first, kv.second);
+        }
+        void clearVars()
+        {
+            if (bSlots) { slots.clear(); slotBound.clear(); return; }
+            vars.clear();
+        }
+
         Value* Find(const wstring& k)
         {
             return FindById(NameId(k), k);
@@ -1014,9 +1094,8 @@ namespace NodioVM
             // 1. Local frames (frames that have a parent)
             for (Env* e = this; e && e->parent; e = e->parent.get())
             {
-                auto it = e->vars.find(id);
-                if (it != e->vars.end())
-                    return &it->second;
+                if (Value* pv = e->FindInSelf(id))
+                    return pv;
             }
             // 2. Built-in primitives like `type`, `call`, `loadcode` etc. are never shadowed by namespace members
             static auto isBuiltinPrimitive = [](const wstring& name) {
@@ -1035,9 +1114,8 @@ namespace NodioVM
             {
                 Env* root = this;
                 while (root->parent) root = root->parent.get();
-                auto it = root->vars.find(id);
-                if (it != root->vars.end())
-                    return &it->second;
+                if (Value* pv = root->FindInSelf(id))
+                    return pv;
             }
             // 3. Namespace members in ambient namespace scopes
             for (Env* e = this; e; e = e->parent.get())
@@ -1071,9 +1149,8 @@ namespace NodioVM
             // 4. Global variables (root env where parent == nullptr)
             Env* root = this;
             while (root->parent) root = root->parent.get();
-            auto it = root->vars.find(id);
-            if (it != root->vars.end())
-                return &it->second;
+            if (Value* pv = root->FindInSelf(id))
+                return pv;
 
             return nullptr;
         }

@@ -179,7 +179,11 @@ namespace NodioVM
         if (!e || m.envs.count(e)) return;
         m.envs.insert(e);
         if (m.bTrackPaths) m.ePath[e] = GcMark::Hop{ from, edge, true };
-        for (auto& kv : e->vars) GcMarkValue(kv.second, m, e, L"$" + kv.first);
+        // Round 13: slot-aware — mainEnv (resident, slotted) reaches this
+        // through gcFrames; a bare vars loop would see an empty map and
+        // drop every main-script local from the mark set.
+        e->ForEachVar([&](uint32_t gid, Value& v)
+            { GcMarkValue(v, m, e, L"$" + NameOf(gid)); });
         if (e->nsTable) GcMarkTable(e->nsTable.get(), m, e, L"@nsTable");
         if (e->modTable) GcMarkTable(e->modTable.get(), m, e, L"@modTable");
         if (e->parent) GcMarkEnv(e->parent.get(), m, e, L"@parent");
@@ -298,20 +302,22 @@ namespace NodioVM
                 keys += kv.first;
             }
             // where does this table still live?
-            for (auto& kv : I.globals.vars)
-                if (kv.second.tab.get() == t) { where += L" global." + NameOf(kv.first); }
+            I.globals.ForEachVar([&](uint32_t gid, Value& v)
+                { if (v.tab.get() == t) { where += L" global." + NameOf(gid); } });
             for (auto& kv : I.roots)
                 if (kv.second.tab.get() == t) { where += L" root." + kv.first; }
             for (auto& kv : I.modules)
                 if (kv.second.tab.get() == t) { where += L" module." + kv.first; }
             // what does the root namespace map point at?
-            for (auto& kv : I.globals.vars)
-                if (kv.first == NameId(L"gdip"))
+            I.globals.ForEachVar([&](uint32_t gid, Value& v)
                 {
-                    wchar_t buf[64];
-                    swprintf_s(buf, 64, L" [globals.gdip=%p]", (void*)kv.second.tab.get());
-                    where += buf;
-                }
+                    if (gid == NameId(L"gdip"))
+                    {
+                        wchar_t buf[64];
+                        swprintf_s(buf, 64, L" [globals.gdip=%p]", (void*)v.tab.get());
+                        where += buf;
+                    }
+                });
             for (auto& kv : I.roots)
                 if (kv.first == L"gdip")
                 {
@@ -562,9 +568,11 @@ namespace NodioVM
                     fwprintf(stderr, L"[GC] dead table %p [%s]",
                              (void*)t, keys.c_str());
                     // which known root does it look like?
-                    for (auto& kv : I.globals.vars)
-                        if (kv.second.tab.get() == t)
-                            fwprintf(stderr, L" ==globals.%s", NameOf(kv.first).c_str());
+                    I.globals.ForEachVar([&](uint32_t gid, Value& v)
+                        {
+                            if (v.tab.get() == t)
+                                fwprintf(stderr, L" ==globals.%s", NameOf(gid).c_str());
+                        });
                     for (auto& kv : I.roots)
                         if (kv.second.tab.get() == t)
                             fwprintf(stderr, L" ==root.%s", kv.first.c_str());
@@ -625,7 +633,7 @@ namespace NodioVM
                     {
                         if (n++ >= 8) { keys += L",..."; break; }
                         if (!keys.empty()) keys += L",";
-                        keys += kv.first;
+                        keys += NameOf(kv.first);
                     }
                     bool bInStack = false;
                     for (auto& fr : I.gcFrames)
@@ -635,8 +643,8 @@ namespace NodioVM
                              (void*)e->modTable.get(), (void*)e->parent.get(),
                              (int)bInStack, I.gcFrames.size());
                 }
-                for (auto& kv : e->vars) trash.push_back(std::move(kv.second));
-                e->vars.clear();
+                e->ForEachVar([&](uint32_t, Value& v) { trash.push_back(std::move(v)); });
+                e->clearVars();
                 e->nsTable.reset();
                 e->modTable.reset();
             }

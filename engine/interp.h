@@ -28,6 +28,9 @@ namespace NodioVM
         wstring* err = nullptr;
         std::shared_ptr<Env> globalsSelf;
         Env globals;
+        // Round 13: the root env is resident for the interp's whole
+        // lifetime — store its vars in the intern-id slot table.
+        Interp() { globals.bSlots = true; }
         int nBreak = 0, nContinue = 0, nReturn = 0;
         Value ret;
         // M2: static self for meta callbacks fired from static helpers

@@ -332,15 +332,15 @@ Value Interp::Eval(const PNode& n, Env* env)
                 {
                     if (!f.thisVal)
                     {
-                        auto itThis = e->vars.find(IdThis());
-                        if (itThis != e->vars.end() && itThis->second.t != Value::Null)
-                            f.thisVal = std::make_shared<Value>(itThis->second);
+                        Value* pvThis = e->FindInSelf(IdThis());
+                        if (pvThis && pvThis->t != Value::Null)
+                            f.thisVal = std::make_shared<Value>(*pvThis);
                     }
                     if (!f.ownerVal)
                     {
-                        auto itOwner = e->vars.find(IdOwner());
-                        if (itOwner != e->vars.end() && itOwner->second.t != Value::Null)
-                            f.ownerVal = std::make_shared<Value>(itOwner->second);
+                        Value* pvOwner = e->FindInSelf(IdOwner());
+                        if (pvOwner && pvOwner->t != Value::Null)
+                            f.ownerVal = std::make_shared<Value>(*pvOwner);
                     }
                     if (!f.nsClosure && e->nsTable && !e->bNsInst)
                     {
@@ -838,7 +838,7 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             // the bare globals jump
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;
-            local->vars[IdOwner()] = owner;
+            local->VarAt(IdOwner()) = owner;
             // the callee frame, the receiver and the call arguments live
             // in C++ locals — the collector needs them as roots
             gcFrames.push_back(local);
@@ -848,22 +848,22 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             rs.add(ths);
             rs.addAll(args);
             if (f.thisVal)
-                local->vars[IdThis()] = *f.thisVal;
+                local->VarAt(IdThis()) = *f.thisVal;
             else
-                local->vars[IdThis()] = ths;
+                local->VarAt(IdThis()) = ths;
             for (size_t i = 0; i < f.params.size(); i++)
             {
                 uint32_t pid = ParamIdAt(f, i);
                 if (i < args.size() && args[i].t != Value::Null)
-                    local->vars[pid] = args[i];
+                    local->VarAt(pid) = args[i];
                 else if (f.pdefaults && i < f.pdefaults->size() &&
                          (*f.pdefaults)[i])
-                    local->vars[pid] =
+                    local->VarAt(pid) =
                         Eval((*f.pdefaults)[i], local.get());
                 else if (i < args.size())
-                    local->vars[pid] = args[i];
+                    local->VarAt(pid) = args[i];
                 else
-                    local->vars[pid] = Value();
+                    local->VarAt(pid) = Value();
             }
             if (f.params.size() && f.params.back() == L"..." && f.fn)
             {
@@ -887,21 +887,21 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                     Value vDots = tbV->arr.empty() ? Value()
                                                    : Value::Table_(tbV);
                     if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
-                    local->vars[IdDots()] = vDots;
-                    local->vars[IdArg()] = vDots;
+                    local->VarAt(IdDots()) = vDots;
+                    local->VarAt(IdArg()) = vDots;
                     // an explicit `arg` parameter (gdip.bitmap's ctor) must
                     // win over the vararg alias — restore it
                     for (size_t i = 0; i + 1 < f.params.size(); i++)
                         if (f.params[i] == L"arg" && i < args.size())
-                            local->vars[IdArg()] = args[i];
+                            local->VarAt(IdArg()) = args[i];
                 }
                 else
                 {
-                    local->vars[IdDots()] = Value();
-                    local->vars[IdArg()] = Value();
+                    local->VarAt(IdDots()) = Value();
+                    local->VarAt(IdArg()) = Value();
                     for (size_t i = 0; i < f.params.size(); i++)
                         if (f.params[i] == L"arg" && i < args.size())
-                            local->vars[IdArg()] = args[i];
+                            local->VarAt(IdArg()) = args[i];
                 }
             }
             Value old = ret;
@@ -1164,9 +1164,8 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                 if (it != roots.end())
                     return it->second;
                 // ::Name also reaches plain globals (::User32 etc.)
-                auto ig = globals.vars.find(NameId(key));
-                if (ig != globals.vars.end())
-                    return ig->second;
+                if (Value* pvG = globals.FindInSelf(NameId(key)))
+                    return *pvG;
 
                 // bare :: system API (::SetWindowPointer, ::PostMessage, ...)
                 // official aardio resolves these across the system DLLs;
@@ -1215,7 +1214,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                                 if (dv.t == Value::TableT && dv.tab)
                                 {
                                     roots[key] = dv;
-                                    globals.vars[NameId(key)] = dv;
+                                    globals.VarAt(NameId(key)) = dv;
                                     return dv;
                                 }
                             }
@@ -1229,7 +1228,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                 {
                     fwprintf(stderr, L"[ROOTMISS] key=%s roots=%d globals=%d\n",
                              key.c_str(), (int)roots.count(key),
-                             (int)globals.vars.count(NameId(key)));
+                             (int)globals.CountVar(NameId(key)));
                     fflush(stderr);
                 }
             }
@@ -1278,7 +1277,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
             if (f.tab)
             {
                 classNsEnv->nsTable = f.tab;
-                classNsEnv->vars[IdSelf()] = f;
+                classNsEnv->VarAt(IdSelf()) = f;
             }
             shared_ptr<Env> lexicalParent = f.envUp ? f.envUp : globals.self;
             if (f.nsClosure)
@@ -1299,8 +1298,8 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
             local->bInstInit = true;
             local->instTable = inst.get();   // the instance under construction
             if (bMethod)
-                local->vars[IdOwner()] = vThis;   // owner = dot-left
-            local->vars[IdThis()] = vInst;
+                local->VarAt(IdOwner()) = vThis;   // owner = dot-left
+            local->VarAt(IdThis()) = vInst;
             // the instance frame is a GC root while the constructor runs
             gcFrames.push_back(local);
             GcRootScope rsInst;
@@ -1310,23 +1309,23 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
 
             if (f.fn)
             {
-                local->vars[IdThis()] = vInst;
+                local->VarAt(IdThis()) = vInst;
                 for (size_t i = 0; i < f.fn->names.size(); i++)
                 {
                     uint32_t pid = (i < f.fn->nameIds.size())
                                        ? f.fn->nameIds[i]
                                        : NameId(f.fn->names[i]);
                     if (i < args.size() && args[i].t != Value::Null)
-                        local->vars[pid] = args[i];
+                        local->VarAt(pid) = args[i];
                     else if (f.pdefaults &&
                              i < f.pdefaults->size() &&
                              (*f.pdefaults)[i])
-                        local->vars[pid] =
+                        local->VarAt(pid) =
                             Eval((*f.pdefaults)[i], local.get());
                     else if (i < args.size())
-                        local->vars[pid] = args[i];
+                        local->VarAt(pid) = args[i];
                     else
-                        local->vars[pid] = Value();
+                        local->VarAt(pid) = Value();
                 }
                 if (f.fn->names.size() && f.fn->names.back() == L"...")
                 {
@@ -1342,19 +1341,19 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                         Value vDots = tbV->arr.empty() ? Value()
                                                        : Value::Table_(tbV);
                         if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
-                        local->vars[IdDots()] = vDots;
-                        local->vars[IdArg()] = vDots;
+                        local->VarAt(IdDots()) = vDots;
+                        local->VarAt(IdArg()) = vDots;
                         for (size_t i = 0; i + 1 < f.fn->names.size(); i++)
                             if (f.fn->names[i] == L"arg" && i < args.size())
-                                local->vars[IdArg()] = args[i];
+                                local->VarAt(IdArg()) = args[i];
                     }
                     else
                     {
-                        local->vars[IdDots()] = Value();
-                        local->vars[IdArg()] = Value();
+                        local->VarAt(IdDots()) = Value();
+                        local->VarAt(IdArg()) = Value();
                         for (size_t i = 0; i < f.fn->names.size(); i++)
                             if (f.fn->names[i] == L"arg" && i < args.size())
-                                local->vars[IdArg()] = args[i];
+                                local->VarAt(IdArg()) = args[i];
                     }
                 }
                 Value oldRet = ret;
@@ -1390,26 +1389,25 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                     CleanDeadEnv(local);
                     return ctorRet;
                 }
-                auto itThis = local->vars.find(IdThis());
-                if (itThis != local->vars.end() &&
-                    itThis->second.t == Value::TableT)
+                Value* pvThis = local->FindInSelf(IdThis());
+                if (pvThis && pvThis->t == Value::TableT)
                 {
-                    if (itThis->second.tab != vInst.tab && vInst.tab)
+                    if (pvThis->tab != vInst.tab && vInst.tab)
                     {
                         auto rebindVal = [&](Value& val) {
                             if (val.t == Value::Func && val.thisVal &&
                                 val.thisVal->tab == vInst.tab)
                             {
-                                *val.thisVal = itThis->second;
+                                *val.thisVal = *pvThis;
                             }
                         };
                         for (auto& kv : vInst.tab->map)
                         {
                             rebindVal(kv.second);
-                            if (itThis->second.tab->map.find(kv.first) == itThis->second.tab->map.end())
-                                itThis->second.tab->map[kv.first] = kv.second;
+                            if (pvThis->tab->map.find(kv.first) == pvThis->tab->map.end())
+                                pvThis->tab->map[kv.first] = kv.second;
                         }
-                        for (auto& kv : itThis->second.tab->map)
+                        for (auto& kv : pvThis->tab->map)
                         {
                             rebindVal(kv.second);
                         }
@@ -1417,9 +1415,9 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                         {
                             rebindVal(kv.second);
                         }
-                        local->nsTable = itThis->second.tab;
+                        local->nsTable = pvThis->tab;
                     }
-                    vInst = itThis->second;
+                    vInst = *pvThis;
                 }
                 if (vInst.tab && f.tab)
                 {
@@ -1466,7 +1464,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
 
             if (f.classBody)
             {
-                local->vars[IdThis()] = vInst;
+                local->VarAt(IdThis()) = vInst;
                 Value oldRet = ret;
                 int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                 nReturn = nBreak = nContinue = 0;
@@ -1475,10 +1473,9 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 local->bClassBody = false;
                 nReturn = oldR; nBreak = oldB; nContinue = oldC;
                 ret = oldRet;
-                auto itThis = local->vars.find(IdThis());
-                if (itThis != local->vars.end() &&
-                    itThis->second.t == Value::TableT)
-                    vInst = itThis->second;
+                Value* pvThisTail = local->FindInSelf(IdThis());
+                if (pvThisTail && pvThisTail->t == Value::TableT)
+                    vInst = *pvThisTail;
             }
             GcFrameCheck(gcFrames, local.get(), "classBody");
             gcFrames.pop_back();
@@ -1506,8 +1503,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             if (n->a->k == Node::Ident && n->a->str == L"print")
             {
                 Value* vShadow = env ? env->Find(NameId(L"print"), L"print") : nullptr;
-                auto itGlob = globals.vars.find(NameId(L"print"));
-                Value* pGlob = (itGlob != globals.vars.end()) ? &itGlob->second : nullptr;
+                Value* pGlob = globals.FindInSelf(NameId(L"print"));
                 // Only take the global console print fast path if not shadowed by a local or namespace member
                 if (!vShadow || vShadow == pGlob)
                 {
@@ -1786,35 +1782,35 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             if (bMethod)
             {
                 if (f.thisVal)
-                    local->vars[IdThis()] = *f.thisVal;
+                    local->VarAt(IdThis()) = *f.thisVal;
                 else
-                    local->vars[IdThis()] = vThis;   // obj.fn() receiver as this
+                    local->VarAt(IdThis()) = vThis;   // obj.fn() receiver as this
                 // owner = the dot-left object of this call
-                local->vars[IdOwner()] = vThis;
+                local->VarAt(IdOwner()) = vThis;
             }
             else
             {
                 if (f.thisVal)
-                    local->vars[IdThis()] = *f.thisVal;
+                    local->VarAt(IdThis()) = *f.thisVal;
                 if (f.ownerVal)
-                    local->vars[IdOwner()] = *f.ownerVal;
+                    local->VarAt(IdOwner()) = *f.ownerVal;
                 else
-                    local->vars[IdOwner()] = Value();
+                    local->VarAt(IdOwner()) = Value();
             }
             for (size_t i = 0; i < f.params.size(); i++)
             {
                 uint32_t pid = ParamIdAt(f, i);
                 if (i < args.size() && args[i].t != Value::Null)
-                    local->vars[pid] = args[i];
+                    local->VarAt(pid) = args[i];
                 else if (f.pdefaults &&
                          i < f.pdefaults->size() &&
                          (*f.pdefaults)[i])
-                    local->vars[pid] =
+                    local->VarAt(pid) =
                         Eval((*f.pdefaults)[i], local.get());
                 else if (i < args.size())
-                    local->vars[pid] = args[i];
+                    local->VarAt(pid) = args[i];
                 else
-                    local->vars[pid] = Value();
+                    local->VarAt(pid) = Value();
             }
             // "..." varargs: leftover arguments as a 1-based table.
             // Spelled `arg` in scripts and `...` at call sites, so
@@ -1835,11 +1831,11 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 Value vDots = tbV->arr.empty() ? Value()
                                                : Value::Table_(tbV);
                 if (vDots.tab) { vDots.mrets = vargs; vDots.bDots = true; }
-                local->vars[IdDots()] = vDots;
-                local->vars[IdArg()] = vDots;
+                local->VarAt(IdDots()) = vDots;
+                local->VarAt(IdArg()) = vDots;
                 for (size_t i = 0; i + 1 < f.params.size(); i++)
                     if (f.params[i] == L"arg" && i < args.size())
-                        local->vars[IdArg()] = args[i];
+                        local->VarAt(IdArg()) = args[i];
             }
             Value old = ret;
             int oldR = nReturn;
@@ -2374,13 +2370,16 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 // as a lexical variable in any enclosing env frame (stopping
                 // before globals, which is not a local var frame).
                 Env* eFound = nullptr;
-                // iterator of the slot found below, reused for the write:
-                // one hash probe instead of a second vars[name] lookup
-                std::unordered_map<uint32_t, Value>::iterator itFound;
+                // pointer of the slot found below, reused for the write:
+                // one lookup instead of a second FindByName. Safe across
+                // the statements below: nothing VarAt()s into eFound's
+                // OWN env before the write (globals.VarAt resizes only
+                // the globals slot table, a different object).
+                Value* pvFound = nullptr;
                 for (Env* e = env; e && e->parent; e = e->parent.get())
                 {
-                    itFound = e->vars.find(NameIdOf(target->str, target->nid));
-                    if (itFound != e->vars.end())
+                    pvFound = e->FindInSelf(NameIdOf(target->str, target->nid));
+                    if (pvFound)
                     {
                         eFound = e;
                         break;
@@ -2420,7 +2419,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 }
                 else if (eFound)
                 {
-                    itFound->second = val;
+                    *pvFound = val;
                     if (eFound->bNsBody && eFound->nsTable)
                     {
                         eFound->nsTable->map[target->str] = val;
@@ -2438,7 +2437,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                         eFound->modTable->map[target->str] = val;
                         eFound->modTable->scopeVars[target->str] = val;
                         if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
-                            globals.vars[NameIdOf(target->str, target->nid)] = val;
+                            globals.VarAt(NameIdOf(target->str, target->nid)) = val;
                     }
                     else if (eFound->bNsInst && eFound->nsTable && eFound->bClassBody)
                     {
@@ -2468,13 +2467,13 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                             while (eClass && (!eClass->nsTable || eClass->bNsInst)) eClass = eClass->parent.get();
                             if (eClass && eClass->nsTable)
                             {
-                                eClass->vars[NameIdOf(target->str, target->nid)] = val;
+                                eClass->VarAt(NameIdOf(target->str, target->nid)) = val;
                                 eClass->nsTable->map[target->str] = val;
                                 eClass->nsTable->scopeVars[target->str] = val;
                             }
                             else
                             {
-                                eNs->vars[NameIdOf(target->str, target->nid)] = val;
+                                eNs->VarAt(NameIdOf(target->str, target->nid)) = val;
                                 eNs->nsTable->map[target->str] = val;
                                 eNs->nsTable->scopeVars[target->str] = val;
                             }
@@ -2482,11 +2481,11 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                     }
                     else
                     {
-                        eNs->vars[NameIdOf(target->str, target->nid)] = val;
+                        eNs->VarAt(NameIdOf(target->str, target->nid)) = val;
                         eNs->nsTable->map[target->str] = val;
                         eNs->nsTable->scopeVars[target->str] = val;
                         if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
-                            globals.vars[NameIdOf(target->str, target->nid)] = val;
+                            globals.VarAt(NameIdOf(target->str, target->nid)) = val;
                     }
                 }
                 else if (eMod && eMod->modTable)
@@ -2498,15 +2497,15 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                         for (auto& kv : val.tab->map)
                             eMod->modTable->map[kv.first] = kv.second;
                     }
-                    eMod->vars[NameIdOf(target->str, target->nid)] = val;
+                    eMod->VarAt(NameIdOf(target->str, target->nid)) = val;
                     eMod->modTable->map[target->str] = val;
                     eMod->modTable->scopeVars[target->str] = val;
                     if (target->str.size() >= 3 && target->str.substr(0, 3) == L"___")
-                        globals.vars[NameIdOf(target->str, target->nid)] = val;
+                        globals.VarAt(NameIdOf(target->str, target->nid)) = val;
                 }
                 else
                 {
-                    globals.vars[NameIdOf(target->str, target->nid)] = val;   // default global
+                    globals.VarAt(NameIdOf(target->str, target->nid)) = val;   // default global
                     // engine-provided root namespaces are pre-registered in
                     // `roots`, and NsPath/DoImport consult that map first.
                     // Leaving the two copies apart made `namespace process{}`
@@ -2657,7 +2656,7 @@ void Interp::DoAssign(const PNode& target, const Value& v, Env* env,
                 }
                 else if (target->bRoot)
                 {
-                    globals.vars[NameIdOf(target->str, target->nid)] = val;   // '..' root
+                    globals.VarAt(NameIdOf(target->str, target->nid)) = val;   // '..' root
                     roots[target->str] = val;
                 }
             }
@@ -2969,7 +2968,7 @@ Value Interp::EvalClass(const PNode& n, Env* env)
             classEnv->parent = env ? env->self : globals.self;
             classEnv->nsTable = tb;
             classEnv->bNsBody = true;
-            classEnv->vars[IdSelf()] = vClass;
+            classEnv->VarAt(IdSelf()) = vClass;
             GcFrameScope fsClass(*this, classEnv);
             for (auto& st : n->a->list)
             {
@@ -3039,7 +3038,7 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                                  n->names[0].c_str());
                         fflush(stderr);
                     }
-                    globals.vars[NodeNameIdAt(n, 0)] = vClass;
+                    globals.VarAt(NodeNameIdAt(n, 0)) = vClass;
                     roots[n->names[0]] = vClass;
                 }
             }
@@ -3070,15 +3069,15 @@ Value Interp::EvalClass(const PNode& n, Env* env)
                 }
                 if (ns.t == Value::Null)
                 {
-                    auto itG = globals.vars.find(NameId(n->names[0]));
-                    if (itG != globals.vars.end() &&
-                        (itG->second.t == Value::TableT || itG->second.t == Value::Class))
-                        ns = itG->second;
+                    Value* itG = globals.FindInSelf(NameId(n->names[0]));
+                    if (itG &&
+                        (itG->t == Value::TableT || itG->t == Value::Class))
+                        ns = *itG;
                     else
                     {
                         auto tbN = std::make_shared<Table>();
                         ns = Value::Table_(tbN);
-                        globals.vars[NodeNameIdAt(n, 0)] = ns;
+                        globals.VarAt(NodeNameIdAt(n, 0)) = ns;
                     }
                 }
                 for (size_t k = 1; k + 1 < n->names.size(); k++)
@@ -3207,11 +3206,11 @@ Value Interp::Exec(const PNode& n, Env* env)
                     if (bNoNs)
                     {
                         Env* eFound = nullptr;
-                        std::unordered_map<uint32_t, Value>::iterator itFound;
+                        Value* pvFound = nullptr;
                         for (Env* e = env; e && e->parent; e = e->parent.get())
                         {
-                            itFound = e->vars.find(NameIdOf(n->a->str, n->a->nid));
-                            if (itFound != e->vars.end())
+                            pvFound = e->FindInSelf(NameIdOf(n->a->str, n->a->nid));
+                            if (pvFound)
                             {
                                 eFound = e;
                                 break;
@@ -3278,7 +3277,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                             if (bFast)
                             {
                                 Value vOut = Value::Num_(dVal);
-                                itFound->second = vOut;
+                                *pvFound = vOut;
                                 return vOut;
                             }
                         }
@@ -3314,7 +3313,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     if (name.empty()) return;
                     Value val = v;
                     val.mrets = nullptr;
-                    env->vars[id] = val;
+                    env->VarAt(id) = val;
                     if (env->bNsBody)
                     {
                         if (env->nsTable)
@@ -3415,9 +3414,9 @@ Value Interp::Exec(const PNode& n, Env* env)
                 nsEnv->parent = env ? env->self : globals.self;
                 nsEnv->nsTable = ns.tab;
                 nsEnv->bNsBody = true;
-                nsEnv->vars[IdSelf()] = ns;
+                nsEnv->VarAt(IdSelf()) = ns;
                 for (auto& kv : ns.tab->scopeVars)
-                    nsEnv->vars[NameId(kv.first)] = kv.second;
+                    nsEnv->VarAt(NameId(kv.first)) = kv.second;
                 GcFrameScope fsNs(*this, nsEnv);
                 Value r = ExecBlock(n->a, nsEnv.get());
                 for (auto& kv : nsEnv->vars)
@@ -3438,7 +3437,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 local->parent = env ? env->self : globals.self;
                 if (v.t == Value::TableT && v.tab)
                     local->nsTable = v.tab;
-                local->vars[IdOwner()] = v;
+                local->VarAt(IdOwner()) = v;
                 GcFrameScope fs(*this, local);
                 return ExecBlock(n->b, local.get());
             }
@@ -3573,7 +3572,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     loopVarName = n->a->a->str;
                     loopVarId = NameIdOf(loopVarName, n->a->a->nid);
                     Value initVal = Eval(n->a->b, env);
-                    loopEnv->vars[loopVarId] = initVal;
+                    loopEnv->VarAt(loopVarId) = initVal;
                 }
                 else if (n->a && n->a->k == Node::VarDecl && !n->a->names.empty())
                 {
@@ -3582,7 +3581,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     Value initVal;
                     if (!n->a->defaults.empty() && n->a->defaults[0])
                         initVal = Eval(n->a->defaults[0], env);
-                    loopEnv->vars[loopVarId] = initVal;
+                    loopEnv->VarAt(loopVarId) = initVal;
                 }
                 else
                 {
@@ -3658,8 +3657,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                 // the environment.
                 auto findLoopVar = [&]() -> Value* {
                     if (loopVarId == 0) return nullptr;
-                    auto it = loopEnv->vars.find(loopVarId);
-                    return (it == loopEnv->vars.end()) ? nullptr : &it->second;
+                    return loopEnv->FindInSelf(loopVarId);
                 };
                 bool bConstLimit = bLimitForm && n->b && n->b->k == Node::Num;
                 double dConstLimit = bConstLimit ? n->b->num : 0;
@@ -3802,14 +3800,14 @@ Value Interp::Exec(const PNode& n, Env* env)
                         iterEnv->parent = env ? env->self : globals.self;
                         Value r0 = r;
                         r0.mrets = nullptr;
-                        iterEnv->vars[NodeNameIdAt(n, 0)] = r0;
+                        iterEnv->VarAt(NodeNameIdAt(n, 0)) = r0;
                         for (size_t ni = 1; ni < n->names.size(); ni++)
                         {
                             size_t mi = ni - 1;
                             Value rm = (r.mrets && mi < r.mrets->size())
                                     ? (*r.mrets)[mi] : Value();
                             rm.mrets = nullptr;
-                            iterEnv->vars[NodeNameIdAt(n, ni)] = rm;
+                            iterEnv->VarAt(NodeNameIdAt(n, ni)) = rm;
                         }
                         GcFrameScope fsIter(*this, iterEnv);
                         Value rb = ExecBlock(n->b, iterEnv.get());
@@ -3824,9 +3822,9 @@ Value Interp::Exec(const PNode& n, Env* env)
                     auto iterEnv = std::make_shared<Env>();
                     iterEnv->self = iterEnv;
                     iterEnv->parent = env ? env->self : globals.self;
-                    iterEnv->vars[NodeNameIdAt(n, 0)] = Value::Str_(k);
+                    iterEnv->VarAt(NodeNameIdAt(n, 0)) = Value::Str_(k);
                     if (n->names.size() > 1)
-                        iterEnv->vars[NodeNameIdAt(n, 1)] = v;
+                        iterEnv->VarAt(NodeNameIdAt(n, 1)) = v;
                     GcFrameScope fsStep(*this, iterEnv);
                     Value r = ExecBlock(n->b, iterEnv.get());
                     if (nBreak) { nBreak--; return 1; }
@@ -3869,9 +3867,9 @@ Value Interp::Exec(const PNode& n, Env* env)
                             auto iterEnv = std::make_shared<Env>();
                             iterEnv->self = iterEnv;
                             iterEnv->parent = env ? env->self : globals.self;
-                            iterEnv->vars[NodeNameIdAt(n, 0)] = vk;
+                            iterEnv->VarAt(NodeNameIdAt(n, 0)) = vk;
                             if (n->names.size() > 1)
-                                iterEnv->vars[NodeNameIdAt(n, 1)] = v;
+                                iterEnv->VarAt(NodeNameIdAt(n, 1)) = v;
                             GcFrameScope fsKey(*this, iterEnv);
                             Value r = ExecBlock(n->b, iterEnv.get());
                             if (nBreak) { nBreak--; return Value(); }
@@ -3905,7 +3903,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                     cEnv->self = cEnv;
                     cEnv->parent = env ? env->self : globals.self;
                     if (!n->names.empty())
-                        cEnv->vars[NodeNameIdAt(n, 0)] = Value::Str_(msg);
+                        cEnv->VarAt(NodeNameIdAt(n, 0)) = Value::Str_(msg);
                     GcFrameScope fsCatch(*this, cEnv);
                     ExecBlock(n->b, cEnv.get());
                 }
@@ -3988,7 +3986,7 @@ Value Interp::GetRoot(const wstring& name)
             auto tb = std::make_shared<Table>();
             Value v = Value::Table_(tb);
             roots[name] = v;
-            globals.vars[NameId(name)] = v;   // bare name resolves to root namespace
+            globals.VarAt(NameId(name)) = v;   // bare name resolves to root namespace
             return v;
         }
 
@@ -4033,7 +4031,7 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
             else
             {
                 // both maps must name the SAME value: a script-level
-                // `class X {}` replaces globals.vars[X] while roots[X] may
+                // `class X {}` replaces globals.VarAt(X) while roots[X] may
                 // still hold the engine's placeholder table, and a namespace
                 // opened afterwards would then extend the stale one
                 // NB: the two maps are distinct containers, so their
@@ -4044,9 +4042,8 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
                     cand = ir->second;
                 else
                 {
-                    auto ig = globals.vars.find(NameId(names[0]));
-                    if (ig != globals.vars.end())
-                        cand = ig->second;
+                    if (Value* pvG = globals.FindInSelf(NameId(names[0])))
+                        cand = *pvG;
                 }
                 if (!cand.tab && env)
                 {
@@ -4064,14 +4061,14 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
                 {
                     ns = cand;
                     roots[names[0]] = ns;
-                    globals.vars[NameId(names[0])] = ns;
+                    globals.VarAt(NameId(names[0])) = ns;
                 }
                 else
                 {
                     auto tb = std::make_shared<Table>();
                     ns = Value::Table_(tb);
                     roots[names[0]] = ns;
-                    globals.vars[NameId(names[0])] = ns;
+                    globals.VarAt(NameId(names[0])) = ns;
                 }
             }
             for (size_t i = 1; i < names.size() && ns.tab; i++)
@@ -4107,7 +4104,7 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             local->self = local;
             local->parent = f.envUp ? f.envUp : globals.self;
             local->nsTable = f.nsClosure;
-            local->vars[IdOwner()] = Value();   // native-side call: no owner
+            local->VarAt(IdOwner()) = Value();   // native-side call: no owner
             // the callee frame and the call arguments live in C++ locals
             // — the collector needs them as roots
             gcFrames.push_back(local);
@@ -4118,16 +4115,16 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             {
                 uint32_t pid = ParamIdAt(f, i);
                 if (i < args.size() && args[i].t != Value::Null)
-                    local->vars[pid] = args[i];
+                    local->VarAt(pid) = args[i];
                 else if (f.pdefaults &&
                          i < f.pdefaults->size() &&
                          (*f.pdefaults)[i])
-                    local->vars[pid] =
+                    local->VarAt(pid) =
                         Eval((*f.pdefaults)[i], local.get());
                 else if (i < args.size())
-                    local->vars[pid] = args[i];
+                    local->VarAt(pid) = args[i];
                 else
-                    local->vars[pid] = Value();
+                    local->VarAt(pid) = Value();
             }
             if (f.params.size() && f.params.back() == L"..." && f.fn)
             {
@@ -4143,11 +4140,11 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
                 Value vDots = Value::Table_(tbV);
                 vDots.mrets = vargs;
                 vDots.bDots = true;
-                local->vars[IdDots()] = vDots;
-                local->vars[IdArg()] = vDots;
+                local->VarAt(IdDots()) = vDots;
+                local->VarAt(IdArg()) = vDots;
                 for (size_t i = 0; i + 1 < f.params.size(); i++)
                     if (f.params[i] == L"arg" && i < args.size())
-                        local->vars[IdArg()] = args[i];
+                        local->VarAt(IdArg()) = args[i];
             }
             Value oldRet = ret;
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;
