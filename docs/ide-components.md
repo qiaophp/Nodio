@@ -402,13 +402,41 @@ opt = { left=0; top=0; right=220; bottom=400 }
 
 | 成员 | 说明 |
 |---|---|
-| `pg.setItems(items)` | `items = { {name="标题"; value=""; type="string"} ; ... }` |
+| `pg.setItems(items)` | `items = { {key="text"; name="标题"; value=""; type="string"; cat="外观"} ; ... }` |
 | `pg.getItems()` | 取回 |
-| `pg.onChange = function(index, value){}` | 值被改写时回调 |
+| `pg.onChange = function(index, value){}` | 值被改写时回调（`index` 是**属性序号**，不是显示行号） |
+| `pg.collapseCategory(cat, flag)` | 折叠/展开分类（`flag` 省略 = 取反） |
+| `pg.isCollapsed(cat)` | 分类是否折叠着 |
 | `pg.layout(l,t,r,b)` | 改位置 |
 
 实现：**自绘**两列（名称/值），点值列进入编辑（临时 `edit` 控件盖在单元格上，
 z 序更高），回车提交并触发 `onChange`；值可回写到控件属性与几何。
+
+### 7.1 分组带（VS WinForms 属性窗口的「分类」）
+
+属性按**分类**分成若干带，每带一个折叠箭头（`▼` 展开 / `▸` 折叠），
+点带即折叠/展开该分类；**没有属性的分类不画带**。
+
+分类顺序跟 VS 一致：`外观(Appearance) → 样式(Behavior) → 数据(Data) → 位置(Layout) → 基本(Misc)`。
+规范表里没有的分类（比如自定义组件自带的分类）按**首次出现**顺序接在后面。
+
+分类由**属性键**决定：`nodio.designer.registry.categoryOf(key)`
+（`text/align/color/font` → 外观，`left/top/width/height` → 位置，
+`checked/password/readonly/enabled/visible` → 样式，`items/columns/tabs/value` → 数据，
+其余 → 基本）。属性项自带 `cat` 字段时以它为准。
+
+组件注册表的属性定义是**四元组** `{key; 标签; 类型; 分类}`，第 4 个元素就是分类名：
+
+```aardio
+nodio.designer.registry.register({
+    name = "演示按钮"; cls = "button"; drawAs = "button";
+    props = { {"text";"标题";"string";"外观"}; {"enabled";"可用";"bool";"样式"} };
+})
+```
+
+⚠ **显示行 ≠ 属性序号**：显示行里夹着分组带，两者不是一回事。
+`onChange` 的 `index` 是**属性序号**；就地编辑框的 y 必须按**显示行**算
+（用属性序号算会落到别的行上）。
 
 ## 8. `nodio.designer.canvas` — 设计画布
 
@@ -426,6 +454,12 @@ opt = { left=0; top=0; right=600; bottom=400; background=0xF0F0F0 }
 | `cv.items` | item 数组：`{name; spec; x; y; w; h; props; ctrl}` |
 | `cv.select(name)` / `cv.selected` | 选中 |
 | `cv.onSelect = function(item){}` / `cv.onChange = function(item){}` | 回调 |
+| `cv.onDoubleClick = function(item){}` | **双击组件**（官方 IDE 用它生成事件代码；button/edit/static/listbox/combobox 等标准控件类带 `CS_DBLCLKS`，双击消息能到子类化过程；收不到的控件用右键菜单兜底） |
+| `cv.form` | **窗体设置** `{text; w; h}`（设计坐标=逻辑像素；DSG 头 `win.form(text=..;right=..;bottom=..)` 的来源。改它走 `applyFormProps`） |
+| `cv.selectForm()` / `cv.applyFormProps(props)` | 选中窗体本身（点画布空白处 / 「设计」菜单「窗体设置」）/ 把属性格改动写回 form 状态 |
+| `cv.snap` | **对齐网格**（默认 true）：拖动/缩放时坐标吸附到 GRID_SIZE 整数倍；属性格的精确值不吸附 |
+| `cv.margins` | 边距参考线 `{left;top;right;bottom}`（设计坐标；null=不画） |
+| `cv.onContextMenu = function(item, x, y){}` | 右键（x,y 屏幕坐标） |
 | `cv.applyProps(item)` | 把属性/几何回写到控件 |
 | `cv.toDSG()` | 生成 `/*DSG{{*/ ... /*}}*/` 文本 |
 | `cv.fromDSG(text)` | 解析并载入 |
@@ -438,6 +472,73 @@ opt = { left=0; top=0; right=600; bottom=400; background=0xF0F0F0 }
 2. 组件是**真实控件**（`winform.add` 到主窗体），所见即所得。
 3. 选中框与 8 个手柄画在**底板**上（手柄放组件外侧、选中框外扩 1px，否则被组件盖住）。
 4. 拖动/缩放用**屏幕坐标**算增量（控件在拖动过程中会跟着鼠标走，lParam 会漂移）。
+5. **底板重绘后必须把组件区域再刷一遍**（`__refresh()` 里对每个组件
+   `invalidate()` + `UpdateWindow`）—— 底板是 `plus` 自绘板，内容直绘到窗体背景上，
+   绘制顺序在子控件之前，底板一重绘就会盖掉组件的像素，而组件不会自动重绘。
+   不补这一步的现象是「画布上只看得见网格，看不见控件」。
+6. 摆放组件时用 `..win.setPos(..., 0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/)`
+   提到底板之上 —— 官方 `win.ui` 的 `add` 只在**同一次调用内部**按 `z` 排序，
+   跨调用只按创建顺序，层次容易反。
+7. 组件的 `text` 属性**建完控件要再写一次**（官方控件建的时候不吃 `tParam.text`），
+   否则画布上的按钮是个空壳，属性格里却有标题。
+
+### 8.1 事件代码生成与设计 ↔ 源码同步（app.designer，switchActiveForm 语义）
+
+设计器与源码的关系是**同一份东西的两个视图**（官方 `switchActiveForm` 的语义）：
+
+| 动作 | 行为 |
+|---|---|
+| 打开设计器（切到设计视图） | 从**当前文档**读 `/*DSG{{*/ … /*}}*/` 块 → 画布；没有块的文档给空画布 |
+| 关闭设计器（切回代码视图） | 把**当前设计**写回文档的 DSG 块（**只写编辑器缓冲不落盘**，落盘交给 Ctrl+S） |
+| 双击组件 / 右键「查看事件代码」 | 切回代码视图，源码里出现（或跳到）它的事件处理函数 |
+
+两个方向都只在「内容真的不一样」时才动文档；画布空**且**文档本来没有块时
+不写 —— 不能往普通脚本里塞空设计；同步是**替换**不是追加（块只有一份）。
+
+事件名按官方控件库的默认事件（对照 `D:\aardio\lib\win\ui\ctrl\*.aardio`
+的 `_commandFuncnames` 与事件成员文档）：
+
+| 控件类 | 默认事件 | 桩 |
+|---|---|---|
+| button / checkbox / radio / groupbox | `oncommand` | `winform.<name>.oncommand = function(id,event){ }` |
+| combobox / listbox | `onSelChange` | `winform.<name>.onSelChange = function(id,event){ }` |
+| edit / richedit | `onChange` | `winform.<name>.onChange = function(){ }` |
+| listview / treeview / tab | `onnotify` | `winform.<name>.onnotify = function(id,code,ptr){ }` |
+
+- 自定义组件在 registry spec 里自带 `event` 字段即可覆盖；没有的类
+  双击时提示「没有默认事件」，不生成。
+- **已有同名处理函数只跳转、不重复生成**（官方同款行为）；
+- 插入点：有 DSG 块插在块结束标记后面，没有就追加到文件末尾；
+  光标直接落到函数体那一行。
+- 生成入口走 `app.designer.hooks.onEventCode`（设计器不认识编辑器；
+  钩子必须收进**表**——模块级裸标量会被帧局部副本遮蔽，见 §1.20.3）。
+
+### 8.2 官方 ide.customCtrl 替身映射（unknown 类怎么画）
+
+`nodio.designer.registry.customCtrl` 照抄官方 `lib/ide/customCtrl.aardio`
+（radio/vlistview/close/ipaddress/textbox/custom.button/custom.edit/
+custom.checkbox/custom.radio/custom.trackbar）。画布 `__findSpec` 的解析顺序：
+
+1. **注册表精确匹配** —— Nodio 能直接画的类原样画（如 radio，虽然官方
+   也把它映射到 radiobutton，但 Nodio 自己就能画）；
+2. **映射表命中** → 借替身类的属性表，但 **DSG 仍写真实类名**
+   （`spec.cls` 保持原类、`spec.drawAs` = 替身类）——官方工程的
+   `textbox` 画成 edit，写回的 DSG 官方 IDE 也认；
+3. 都没有 → 兜底原样画（drawAs = cls，属性表为空）。
+
+### 8.3 窗体设置（DSG 头）
+
+- 画布空白处单击 = 选中**窗体本身**（`selectForm`）：属性格给
+  标题/宽度/高度三行，改动走 `applyFormProps` 写回 `cv.form`；
+- `toDSG()` 把 `cv.form` 生成到 DSG 头 `win.form(text=..;right=..;bottom=..)`，
+  `fromDSG()` 解析回头（属性顺序不保证，各自独立匹配）；
+- 没有设计块的文档（普通脚本）打开设计器时 form 回默认
+  （窗体/759/469）——不带走上一个文档的窗体尺寸；
+- 属性格的精确值**不吸附网格**；吸附只发生在拖动/缩放手势上。
+
+回归：`tests/ide_smoke.ps1` 的 `EVENT-STUB / EVENT-STUB-DUP / EVENT-CODE-VIEW /
+SYNC-ITEMS / SYNC-WRITEBACK / SYNC-BLOCKS / CUSTOMCTRL-MAP / CUSTOMCTRL-DRAW /
+FORM-SET / SNAP`。
 
 ## 9. `nodio.designer.dsg` — DSG 解析/生成
 
@@ -506,8 +607,15 @@ opt = { left=0; top=0; right=600; bottom=400; background=0xF0F0F0 }
 | `ed.setDiagnostics(list)` | 槽内诊断标记（波浪线 + 错误色）+ 行号栏诊断圆点。`list` 每项 `{line=1基; col=0基; endLine; endCol; msg; sev}`，`sev` 1=错误 2=警告 |
 | `ed.toggleFold(line)` / `ed.foldAll()` / `ed.unfoldAll()` | 代码折叠（见 §11.7） |
 | `ed.isFoldable(line)` / `ed.isFolded(line)` | 某行是不是折叠头 / 是不是已折叠 |
+| `ed.requestComplete()` | 触发代码补全（算前缀 → 调 `onComplete` 回调，见 §11.8） |
+| `ed.showCompletion(items)` | 展示候选（`items` 每项 `{label; kind; detail}`；`kind` 是 LSP CompletionItemKind） |
+| `ed.hideCompletion()` / `ed.completionVisible()` | 关掉 / 查询候选浮层 |
+| `ed.completionMove(delta)` / `ed.completionAccept()` | 上下移动选择 / 插入选中候选 |
+| `ed.onDefinition` / `ed.onReferences` / `ed.onRename` | 导航回调 `function(line, col, word)`：`line` 1 基行号、`col` 1 基**列**（单词首字符）、`word` 光标处的标识符（见 §11.9） |
+| `ed.gotoLineCol(line, col)` | 跳到指定行（1 基）+ 列（1 基），跨文件跳转的落点 |
+| `ed.replaceTextAt(text, line, col, len, newText)` | 在**文本**里按 (行, 列, 长) 替换一段，返回新文本；列/长是 1 基 UTF-16 码元（见 §11.9） |
 | `ed.layout(l,t,r,b)` / `ed.gutterWidth()` / `ed.control()` | 布局与访问底层控件 |
-| 回调 | `onCursor(line,col)` / `onChange(text)` / `onDirty(dirty)` / `onGotoLine()` |
+| 回调 | `onCursor(line,col)` / `onChange(text)` / `onDirty(dirty)` / `onGotoLine()` / `onComplete(line,col)` |
 
 ### 11.2 位置单位（最容易踩的坑）
 
@@ -603,6 +711,103 @@ opt = { left=0; top=0; right=600; bottom=400; background=0xF0F0F0 }
   自己用矩形拼的实心小三角，不依赖字体字形）；点标记即折叠/展开；
 - 折叠区按 aardio 花括号配对识别（字符串/注释里的花括号不算）。
 
+### 11.8 代码补全浮层
+
+**分工**：组件负责「算前缀 / 画浮层 / 键盘导航 / 插入」，
+IDE 负责「问 LSP 要候选」——两边用 `onComplete(line,col)` 出、
+`showCompletion(items)` 进两个回调解耦，换后端不用改组件。
+
+| 环节 | 做法 |
+|---|---|
+| 前缀 | 光标处往左扫 ASCII 标识符（`__wordAtCursor`）；返回 `{word; line; col; start}`，`start` 是 1-based 的 richedit 位置 |
+| 过滤 | `showCompletion` 里用 `string.startsWith(label, prefix, true)`（忽略大小写）筛；**一个都不匹配就退回全量**（我们的 LSP 给的是全量候选） |
+| 浮层 | 自绘 plus 画板（`transparent=true`，z=70），宽度跟着最长候选走（170~340 逻辑像素），最多 8 行、超出滚动（`compScroll` 保证选中项在可见区） |
+| 键盘 | `Ctrl+Space` 请求、`↑↓` 选择、`Enter/Tab` 插入、`Esc` 取消 |
+
+三个必须记住的坑：
+
+1. **`Ctrl+Space` 的请求不能放在窗口过程里**：`onComplete` 会同步问 LSP
+   （最多 1 秒），在按键处理里阻塞会卡住窗口过程 → 用
+   `__scheduleComplete()`（`setTimeout(...,1)`）推迟到下一轮消息循环。
+2. **吃掉按键还不够，WM_CHAR 也要跟着吃**：`TranslateMessage` 早一步就把
+   `WM_KEYDOWN` 翻译成 `WM_CHAR` 投回控件 → 只吃 KEYDOWN 的话，
+   Tab 会「既缩进又插制表符」、Ctrl+Space 会「多出一个空格」。
+   组件用 `__eatChar` 记住刚吃掉的键的字符码，下一个 WM_CHAR 若是它就一起吞。
+3. **`string.sub(s,start,end)` 的第三个参数是结束位置（含），不是长度** ——
+   按长度写会得到空串（前缀算出来永远是空的）。
+
+### 11.9 代码导航（F12 / Shift+F12 / F2 / Ctrl+点击）
+
+组件只负责**识别意图 + 报出位置**，跳转和查询由 IDE 做
+（IDE 要同步问 LSP，不能在窗口过程里做）。
+
+| 回调 | 触发 | 签名 |
+|---|---|---|
+| `ed.onDefinition` | `F12`、`Ctrl+点击` | `function(line, col, word)` |
+| `ed.onReferences` | `Shift+F12` | `function(line, col, word)` |
+| `ed.onRename` | `F2` | `function(line, col, word)` |
+
+`line` 是 1 基行号，`col` 是**单词首字符**的 1 基列号，`word` 是光标处的标识符。
+
+**取词用的是 `__wordAtPos`，不是 `__wordAtCursor`**：
+补全要的是「光标**前面**那段前缀」，而点击可能落在单词**开头**
+（此时前缀是空的）或单词**中间**。`__wordAtPos` 改成**夹住**位置 ——
+先看光标前面那个字符，不是标识符再看光标后面那个，然后向左右扩展成完整单词。
+
+**两个和 LSP 换算有关的 API**：
+
+| API | 干什么 |
+|---|---|
+| `ed.gotoLineCol(line, col)` | 落点。LSP 给的列是 **0 基 UTF-16 码元**，编辑器内部是 **1 基** |
+| `ed.replaceTextAt(text, line, col, len, newText)` | 跨文件重命名时改文本。aardio 字符串是 **UTF-8 字节**，LSP 的列是 **UTF-16 码元** —— 单位不同，必须换算（否则中文标识符旁边就错位） |
+
+`replaceTextAt` 内部用 `string.unpack` 拿字节数组，再用 `__byteOfCol`
+（UTF-16 码元列 → 字节偏移）定位，替换后用 `string.join` 拼回去 ——
+**按 `\n` 切行时每行还带 `\r`**（CRLF 文件），`string.split` 保留分隔符以外的
+全部内容，所以拼回去还是原来的换行符。
+
+> ⚠ `string.left(s,n)` 是「前 n 个字符」，**去掉前缀要用 `string.slice(s,k)`**；
+> `string.replace` 返回**两个**值（结果 + 替换次数），直接 return 会把次数漏出去。
+
+## 11.10 导航栏（面包屑）
+
+VS 的导航栏长在**编辑区正上方**：跟着光标显示
+「工程 › 目录 › 文件 › 命名空间 › 函数」，点哪一段就跳到哪一段。
+
+组件只负责**画 + 命中 + 上报**，内容由 IDE 算好塞进来。
+
+| API | 说明 |
+|---|---|
+| `ed.setNavChain(chain)` | 设置分段。`chain` 是段数组：`{text; kind; line; col; path}`，`kind` = `"dir"` / `"file"` / `"symbol"` |
+| `ed.onNavClick` | `function(seg)` —— 点了某一段（IDE 决定怎么跳） |
+| `ed.navHeight()` | 导航栏高度（物理像素），布局要给它让位 |
+
+### 三个坑（都实测过）
+
+1. **必须用 `redraw()`，不能用 `invalidate()`**。
+   `invalidate()` 只置脏位，更新区域（`rcPaint`）可能是残缺的 ——
+   GDI+ 按裁剪区把自绘内容裁掉一块。表现是**导航栏永远停第一次画出来的样子**
+   （内容更新了但画面不变）。`nodio.ui.board` 的 `redraw()` 走
+   `InvalidateRect(整块) + UpdateWindow` 才是整块重绘。
+
+2. **导航栏占了编辑区顶部一条，查找条与补全浮层要跟着下移**。
+   `__layoutFind` 里 `y = r.top + navHeight() + px(8)`；
+   补全浮层的 `__layoutCompletion` 里绝对 y 要加 `navHeight()`
+   —— `__posOf` 给的是 **richedit 客户区**坐标，而 richedit 摆在导航栏下面。
+
+3. **层级链必须在 IDE 侧本地算**。
+   符号树（`documentSymbol`）只在文档变化时向 LSP 拉一次；
+   光标移动只做纯内存遍历 —— 每动一下都同步问一次 LSP 会把编辑器卡死。
+
+### 层级链的判定是「包含」不是「在上方」
+
+`line <= 光标行 <= endLine` 才算在符号里面。只看起始行的话，
+光标停在一个**刚结束的函数之后**的顶层语句上时，会被误算成
+「还在那个函数里」。所以服务端的 `documentSymbol` 必须带 `endLine`
+（由 AST 子树的最大行号算出，见 `docs/capability-gap.md` §1.20）。
+
+变量（kind 13）**不是作用域**，不参与面包屑。
+
 ## 12. `nodio.ui.filedlg` — 系统文件对话框（打开/另存为）
 
 | API | 说明 |
@@ -687,3 +892,75 @@ dock 的 `__applyVisibility` 调的正是 `ctrl.show(flag)` —— 这样页签�
 IDE 侧（`main.nodio`）在工程树刷新时一并收集：工程根目录下的**文本文件**
 （按扩展名白名单过滤，二进制搜了没意义还刷屏），再交给 `setScope`。
 打开中的文档可以用 `texts` 覆盖成内存里的版本（未保存的改动也能搜到）。
+
+## 15. `app.lspClient` — 语言服务客户端
+
+LSP 走 `Content-Length` 分帧的 JSON-RPC over stdio（`apps/nodio-lsp.exe`）。
+
+### 15.1 公开 API
+
+| API | 说明 |
+|---|---|
+| `start(exePath, filePath, docText)` | 起服务 + `initialize` + 首次 `didOpen`；返回 `"ok"` / `"spawn-failed"` |
+| `openDoc(path, docText)` | 切换**当前文档**（首次 `didOpen`，之后 `didChange`） |
+| `pushDoc(path, docText)` | 推送某个文件的最新内容，**不**改当前文档（重命名后回灌索引用） |
+| `didChange(docText)` | 当前文档内容变了 |
+| `setProject(root, files)` | 告知工程根目录 + 源文件清单（建立项目级符号索引） |
+| `completion(line, character)` | 候选；`line`/`character` 是 **0 基** |
+| `hover(line, character)` | 悬停文本 |
+| `symbols()` | 当前文档的**层级**大纲：`[{name; kind; line; endLine; col; children}]` |
+| `definition(line, character)` | 转到定义 → `{path; line; col; len}`（`line` 1 基，`col` 0 基） |
+| `references(line, character)` | 查找引用 → 同上 |
+| `rename(line, character, newName)` | 重命名 → 同上（要改的位置清单） |
+| `workspaceSymbols(query)` | 项目符号搜索 → `{name; kind; path; line; col}` |
+| `getDiags()` | 当前文档的诊断 |
+| `stop()` / `isRunning()` | 收工 / 状态 |
+
+### 15.2 五个必须记住的坑
+
+1. **`files` 必须是数组表**：`JSON.stringify` 只把带 `_type="array"` 的表
+   当数组输出，普通表会被写成对象。构造方式：
+   ```aardio
+   var files = [ @{_type="array"} ];
+   ..table.push(files, "app/shell.nodio");
+   ```
+2. **`uriToPath` 去掉前缀要用 `slice(s,9)`**：`string.left(s,n)` 是
+   「前 n 个字符」，用 `left(s,#s-8)` 会把**尾巴**切掉。
+   另外 `string.replace` 返回**两个**值（结果 + 替换次数），
+   直接 `return` 会把次数漏出去。
+3. **多文档要按 uri 分别记 `didOpen`/`didChange`**：只有一个 uri 的话，
+   切标签页后补全/诊断/定义查询全都作用在旧文件上。
+4. **编辑器缓冲是 CRLF，磁盘文件常常是 LF**。两者都要能正常解析 ——
+   服务端的 JSON 解码器必须**完整实现 JSON 转义**（`\r` 尤其关键，
+   漏掉它会把每个换行变成一个 `r` 标识符，IDE 于是对自己的源码报假语法错误；
+   见 `docs/capability-gap.md` §1.19）。**不要**在客户端另存一份 LF 副本，
+   那会让编辑器文本、服务端索引、诊断行列三者对不上。
+5. **服务端回包把非 ASCII 转义成 `\uXXXX`**：`Content-Length` 是**字节数**，
+   而 aardio 侧 `string.mid` 的长度参数是**字节上限**、起始却是**字符序号**，
+   两者混用时原始 UTF-8 字节会让帧长度算不准。转义成纯 ASCII 后
+   「字节数 == 字符数」，一个数字就够（`apps/nodio-lsp/main.cpp` 的 `JStr`）。
+   客户端 `JSON.parse` 能解开 `\uXXXX`（实测通过）。
+6. **`documentSymbol` 的位置在 `range`/`selectionRange` 里，没有 `location`**。
+   老代码读 `v.location.range.start.line` → 行号恒为 0（整棵树都没有位置），
+   而且把 `children` 丢掉了 —— 导航栏面包屑的层级链就靠它。
+   现在 `symbols()` 返回**层级树**，位置取 `selectionRange.start`
+   （`line` 1 基 / `col` 0 基），并额外带回 `endLine`（符号结束行）。
+
+### 15.3 诊断按 uri 分开存
+
+`publishDiagnostics` 通知带 `uri`，客户端按 uri 存进 `diags[uri]`，
+`getDiags()` 取当前文档的那一份 —— 多文档切换时诊断不能互相覆盖。
+
+## 16. 底部「引用」面板
+
+底部 dock 新增一页（第 5 页）：`nodio.ui.list`，列是 `文件 / 行 / 说明`。
+
+- **查找引用**（`Shift+F12`）：每行 `{cells={短路径; 行号; 符号名}; tag={path; line; col}}`；
+- **项目符号搜索**（`Ctrl+Shift+T`）：同一个面板，`说明` 列放符号名。
+
+双击（`onDoubleClick`）→ 打开文件（没开就顺手打开）→ `gotoLineCol` 落点。
+
+> 「引用」和「符号」共用一个面板是有意的：两者都是「一堆位置，双击跳过去」，
+> 形状完全一样，分两个页签反而增加记忆负担。
+> ⚠ 行号栏/列表里显示的**行号是 1 基**，LSP 给的是 0 基 —— 转换点只有一处
+> （`main.nodio` 的 `navFindReferences` / `navGotoDefinition`）。

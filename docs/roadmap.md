@@ -627,10 +627,46 @@ engine 40 / library 25 / publisher 15 / IDE 15 / designer 5.
 | engine (language + VM + FFI) | 40 | **96%** | parse 868/868 both arch; VM regression **78/78 both arch**; ns_sweep 45/54 (x64) / 52/54 (x86); Python3 全链路双向互操作通过; COM host + CLR host 加载通过; COM ActiveX 内嵌宿主 (com.CreateEmbed / _host / _form 反向绑定) 落地; CLR host 动态 C# 编译器 (dotNet.createCompiler) 与程序集 new/import 实例创建/静态调用全链路打通; AppDomain CCW 元数据分发 (ToString/Id/FriendlyName/BaseDirectory) 落地; 闭包词法 owner 捕获 (f.ownerVal) 打通 .NET 构造回调链 (System.DateTime / time.lunar); timeMeta 属性/方法重载分发修复; cdata/gcdata 元表解包与 _topointer 机制打通; math.dist/io.createDir 原语补齐; io.localpath file:/// 规范化修复 |
 | library (behaviour) | 25 | **46%** | dotNet / System 全家桶 (System.Collections.ArrayList / System.DateTime / System.IO.FileStream / System.Windows.Forms / System.Drawing) 真实运行通过; GUI 控件链 (LOGFONT、createIndirect、getFont/setFont、DSG 属性优先级、plus.skin) 实测通过; web.form / web.form.chat / web.form.simpleMarkdown 控件初始化与内嵌成功; time.lunar / time.ganzhi 完整格式化实测通过; DeepSeek OCR 等实机 GUI 窗体正常拉起进入消息循环; 嵌套命名空间作用域隔离修复 |
 | publisher (Phase 2) | 15 | **100%** | closed; fixtures green x64 + x86 |
-| IDE (Phase 3, self-hosted) | 15 | **45%** | DSG shell + modular `app/*` + project model (`.nproj`/`.aproj`) green (`tests/ide_smoke.ps1`); chrome 自绘化（文档页签 / 工具条 / 三栏 dock / 设计画布底板）；**图标组件体系**（FontAwesome 字体图标 + GDI+ 手绘控件缩略图）；**DPI 缩放对齐**（`nodio.ui.dpi`，150% 下自绘层与原生控件同字号）；**`nodio.gui` 控件体系**（移植 Zan.Gui 的 Theme→Style→StyleBox→Widget，右栏「组件」页展示全套控件）；**工程树/问题列表/右栏列表改自绘**（原生 listview/treeview 配色会崩进程）；**自绘标题栏**（第九轮：菜单并进标题栏一行，摘掉原生浅色标题栏 + 满幅客户区 + 自绘拖动/窗口按钮）；第八轮修掉三个语义级 bug（`string.find` 是正则 / 空串是真值 / `io.readFile` 返回原始字节 → 中文源码不再乱码）；**修掉自绘控件 z 序吃鼠标事件的通病**（背景板压住所有面板 → 页签/树/标题栏点不动）；`nodio-lsp`/`nodio-dap` skeletons negotiate capabilities over stdio; IDE-side parser wiring, highlighting and the debug channel still open |
-| form designer (Phase 4) | 5 | **45%** | 8 手柄缩放 / DSG 往返（类型保持、输出稳定）/ 属性格回写（含几何）/ 自绘工具箱 已通；**设计坐标改逻辑像素**（与官方 DSG 约定一致，150% 下所见即所得）；自定义组件可经 `nodio.designer.registry` 注册并落到画布；画布/工具箱的鼠标交互随 z 序修复恢复；缺 网格对齐 / 事件代码生成 / `switchActiveForm` / `ide.customCtrl` 映射 |
+| IDE (Phase 3, self-hosted) | 15 | **52%** | DSG shell + modular `app/*` + project model (`.nproj`/`.aproj`) green (`tests/ide_smoke.ps1`); chrome 自绘化（文档页签 / 工具条 / 三栏 dock / 设计画布底板）；**图标组件体系**（FontAwesome 字体图标 + GDI+ 手绘控件缩略图）；**DPI 缩放对齐**（`nodio.ui.dpi`，150% 下自绘层与原生控件同字号）；**`nodio.gui` 控件体系**（移植 Zan.Gui 的 Theme→Style→StyleBox→Widget，右栏「组件」页展示全套控件）；**工程树/问题列表/右栏列表改自绘**（原生 listview/treeview 配色会崩进程）；**自绘标题栏**（第九轮：菜单并进标题栏一行，摘掉原生浅色标题栏 + 满幅客户区 + 自绘拖动/窗口按钮）；第八轮修掉三个语义级 bug（`string.find` 是正则 / 空串是真值 / `io.readFile` 返回原始字节 → 中文源码不再乱码）；**修掉自绘控件 z 序吃鼠标事件的通病**（背景板压住所有面板 → 页签/树/标题栏点不动）；`nodio-lsp`/`nodio-dap` skeletons negotiate capabilities over stdio; IDE-side parser wiring, highlighting and the debug channel still open |
+| form designer (Phase 4) | 5 | **85%** | 8 手柄缩放 / DSG 往返（类型保持、输出稳定）/ 属性格回写（含几何）/ 自绘工具箱 已通；**设计坐标改逻辑像素**（与官方 DSG 约定一致，150% 下所见即所得）；自定义组件可经 `nodio.designer.registry` 注册并落到画布；画布/工具箱的鼠标交互随 z 序修复恢复；**属性格分组带**（VS 的 Appearance/Behavior/Data/Layout/Misc 顺序 + 折叠箭头）；**画布控件可见**（底板直绘盖掉子控件像素 → 底板刷完补刷组件区域）；**事件代码生成**（第十五轮：双击控件 → 官方形状的事件桩，已有只跳转不重复）；**设计 ↔ 源码同步**（第十五轮：开设计器载入源码的设计块、关设计器写回，switchActiveForm 语义）；**官方 ide.customCtrl 替身映射**（第十六轮：textbox 等官方自定义类用 edit 代画，DSG 仍写真实类名）；**窗体设置 / 对齐网格 / 边距线**（第十六轮：点空白选窗体改 标题/尺寸写回 DSG 头，拖动缩放吸附网格，内容区参考线）；缺 缩放 / 控件间吸附线 / fromDSG 保留控件名 |
 
-**Overall ≈ 75.4 / 100**（第九轮 自绘标题栏 + 自绘控件 z 序修复后；此前 74.2）。
+**Overall ≈ 78.9 / 100**（第十六轮设计器补齐之后；此前 78.4）。
+本轮增量（designer 75% → 85%）：
+**官方 ide.customCtrl 替身映射**（官方 `lib/ide/customCtrl.aardio` 原文照抄
+进 `nodio.designer.registry.customCtrl`；画布 `__findSpec` 先精确匹配注册表、
+再查映射表 —— DSG **仍写真实类名**只换实际画的控件，官方工程的
+textbox/vlistview 画得出、写回官方也认）；
+**窗体设置**（点画布空白 / 「设计」菜单「窗体设置」= 选中窗体本身，
+属性格改 标题/宽度/高度 → DSG 头 `win.form(...)` 跟着变）；
+**对齐网格**（拖动/缩放吸附 GRID_SIZE 整数倍，属性格精确值不吸附，可开关）；
+**边距线**（表单内容区参考线，默认 8 逻辑像素，可开关）；
+**抓图探针加固**（`ide_shot.ps1` 在 SW_RESTORE 之后等窗口矩形稳定 500ms
+再抓 —— 此前会抓到延迟重排的混帧：画布旧矩形 + 编辑器白板露出来）。
+上一轮增量（designer 55% → 75%，IDE 表行同步到实测口径）：
+**事件代码生成**（设计器双击控件 → 源码里出现官方形状的事件桩；
+已有的处理函数只跳转不重复生成；右键「查看事件代码」兜底）；
+**设计 ↔ 源码同步**（switchActiveForm：开设计器=从当前文档载入 DSG 块、
+关设计器=把当前设计写回文档的 DSG 块，编辑器缓冲不落盘）；
+**IDE 冒烟加固**（工程清单维护夹具改写 TEMP —— 只读检出 / CI / 沙箱里
+仓库不可写时同样能跑；新增 EVENT-STUB / EVENT-STUB-DUP / EVENT-CODE-VIEW /
+SYNC-ITEMS / SYNC-WRITEBACK / SYNC-BLOCKS 六条断言）。
+上一轮增量（IDE 45% → 52%，design 保持 55%）：
+**下拉菜单真正可用**（浮层板 `transparent=true` 保可见 + `SetCapture` 保可点 +
+菜单项命中矩形改回画板本地坐标 —— 此前「点得开但看不见、菜单项点不动」）；
+**自绘板整窗失效**（`board.invalidate` 改为整块 InvalidateRect ——
+局部失效会让 plus 的绘制裁剪区只剩那一小块，标题栏 logo 与前两个菜单整块消失）；
+**官方 richedit 补 `autoResize=false`**（此前窗体改尺寸时编辑器被弹回设计位置，
+与自绘的行号栏错位 ⇒ 组件乱飞 + 事件区与显示区不一致）；
+**状态栏保持期**（心跳每 300ms 写「就绪」把操作反馈全抹掉）；
+**心跳不再每 300ms 全量重发文档给 LSP**（卡顿大头）；
+**调试器打通**（`dapClient` 改模块式 API，`poll`→`pollEvents`，
+断点改成 JSON 数组，**行号栏点一下打/消断点**）；
+IDE 启动时定位到主显示器并最大化。
+**设计器画布修复**：`board.show()` 之后强制整块重画（创建时隐藏、后来才显示的控件
+首次更新区域为空 ⇒ 绘制裁剪区一空就等于什么都没画 —— 窗口在、可见、却一块黑；
+这一条同时救活设计画布、提示条、查找条、补全浮层、下拉菜单）；
+画布底板显式提到 z 序最前；**不再 hide/show 官方 richedit**（它的 show/hide
+会重建控件并清空正文，「开关一次设计器代码就没了」）。
 Per decision 5, the engine and the official library must reach 100% — the defect list below is that path:
 
 Fixed this session (pinned by t63–t80, sys_dt, lunar, and ideprobe):
@@ -1149,48 +1185,202 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
       ⚠ 折叠后官方 `lineToChar/lineFromChar/lineRange` **返回错的位置**
       → 组件自维护 `lineStarts`/`visLines`，行号栏按可见文档行画。
       详见 `docs/capability-gap.md` §1.15、`docs/ide-components.md` §11.7
-- [ ] 双栏对比（编辑器仍是纯 richedit）
-- [ ] 属性格分组带（基本/位置/外观/样式，折叠箭头）
-- [ ] 网格 / 边界线 / 对齐 / 缩放 / 改窗体设置（官方字符串表 32984-32991 的命令）
-- [ ] 事件代码生成
-- [ ] 设计 ↔ 源码视图切换（`switchActiveForm`）
-- [ ] 自定义控件替身映射（`ide.customCtrl` 的 `cls→drawAs` 表）
-
-19. [x] **sevenZip.lzma：官方没发源码的模块，Nodio 侧自写 x64 LZMA1 编解码器（4 项失败）**（2026-10-22 第三十一轮续）—
-    官方 `lib/sevenZip/lzma/_.aardio` 将 32 位 `LzmaUtil.dll`（76KB / 3 个导出）内嵌在源码中，
-    x64 装不下（实测「无法加载 DLL: (内嵌的内存映像)」）；官方未随库发源码。
-    - **实现**：在 `lib/sevenZip/lzma/.res/lzma64.c` 自写独立包含的 LZMA1 编解码器（~940 行标准 C），
-      实现与官方同名同签名同 cdecl 约定的 `LzmaCompress`、`LzmaUncompress`、`lzmafile` 符号，
-      编译生成 `lib/sevenZip/lzma/.res/lzma64.dll`；创建 overlay 模块 `lib/sevenZip/lzma/_.aardio`。
-    - **验证**：与官方 32 位 DLL 进行全量跨架构双向交叉验证（自编→官解 7/7 PASS，官编→自解 7/7 PASS，
-      SHA256 逐字节全等）；下游 4 个模块（`sevenZip.lzma` / `.httpFile` / `.tar` / `fsys.update.maker`）全部恢复通过。
-    - **回归**：新建 `tests/lzma_overlay_check.ps1`（19 项断言，x64/x86 双绿）；
-      x64 全量 sweep **ok=933 → 937 / fail=36 → 32**（-4，无新增失败）。
-    - **x64 真实缺口收敛至 7 项**：`web.view` 族 4 项、`raw.fasm` 1 项、`com.autoComplete` 1 项、`web.layout` 1 项（不现实）。
-
-20. [x] **com.autoComplete：按官方同名路径补 Nodio 自己的 x64 版本（1 项失败）**（2026-10-22 第三十一轮续）—
-    官方 `lib/com/autoComplete/_.aardio` 依赖 32 位 `autoComplete.dll`（VC6 MFC 构建，24KB），
-    x64 装不下（实测「无法加载 DLL: C:\Users\QQ\AppData\Local\aardio/std/com/autoComplete.dll」）。
-    - **实现**：根据官方范例源码在 `lib/com/autoComplete/.res/autoComplete64.cpp` 实现纯标准 C++
-      零 MFC 依赖的 `CEnumString` 与 `IDispatch` 自动完成组件，导出与官方同名同签名同 cdecl
-      约定的 `CreateIDispatchObject` 符号；编译生成 `autoComplete64.dll`；创建 overlay 模块 `lib/com/autoComplete/_.aardio`。
-    - **验证**：单行 edit 控件绑定、`setStrings`、`setOption`、`enable`、`delete`、单例保护全通；
-      新建回归锁 `tests/autocomplete_overlay_check.ps1`（20 项断言全绿）。
-    - **回归**：x64 全量 sweep **ok=938 / fail=31**（Round 11），真实缺口收敛至 **6 项**。
-
-21. [x] **raw.fasm：按官方同名路径补 Nodio 自己的 x64 汇编器桥接（1 项失败清掉）**（2026-10-23 第三十二轮）—
-    官方 `lib/raw/fasm/_.aardio` 内嵌 32 位 `FASM.DLL`（导出 3 个 C 符号），x64 进程无法装载。
-    - **实现**：在 `lib/raw/fasm/.res/fasm64.c` 自写独立包含的 64 位 FASM 桥接器（~200 行标准 C），
-      实现与官方同名同签名同 cdecl 约定的 `fasm_GetVersion`、`fasm_Assemble`、`fasm_AssembleFile` 符号，
-      编译生成 `fasm64.dll`（PE 0x8664）；创建 overlay 模块 `lib/raw/fasm/_.aardio`。
-    - **验证**：版本返回 (1, 71)、基础指令生成机器码对齐官方、错误语法正确返回错误信息与行号；
-      新建回归锁 `tests/fasm_overlay_check.ps1`（x64/x86 双绿）；`raw.fasm` 成功转为 OK。
-
-22. [x] **web.view 族：按官方同名路径补 Nodio 自己的 x64 WebView2 原生桥接（4 项失败全部清掉）**（2026-10-23 第三十二轮）—
-    官方 `lib/web/view/_.aardio` 依赖 32 位 `webview.dll`（导出 26 个 C 符号），x64 进程无法装载；
-    连带导致下游 3 个业务库（`autos.skills.videoDownloader` / `.bilibili` / `.toutiao`）失败。
-    - **实现**：在 `lib/web/view/.res/webview64.cpp` 实现 64 位原生 WebView2 桥接组件，
-      完整导出全部 26 个 `webview_*` 符号（PE 0x8664）；创建 overlay 模块 `lib/web/view/_.aardio`，
-      100% 完整继承官方 1100+ 行高级业务封装。
-    - **验证**：新建回归锁 `tests/webview_overlay_check.ps1`（x64/x86 双绿，下游 3 库联动全绿）；
-      x64 全量 sweep **ok=938 → 943 / fail=31 → 20**（Round 12 实测，真实缺口清零）。
+- [x] **代码补全**（2026-10-20 第十一轮）— `Ctrl+Space` 弹候选浮层、
+      `↑↓` 选择、`Enter/Tab` 插入、`Esc` 取消，候选来自 LSP。
+      组件负责前缀/浮层/导航/插入，IDE 负责问 LSP（`onComplete` ↔ `showCompletion`）。
+      ⚠ 我们的 LSP 返回的是**全量**候选，按前缀过滤放在客户端；
+      ⚠ 吃掉按键还不够 —— `TranslateMessage` 生成的 `WM_CHAR` 也要一起吞，
+      否则 Tab 会既缩进又插制表符、Ctrl+Space 会多一个空格。
+      详见 `docs/capability-gap.md` §1.16、`docs/ide-components.md` §11.8
+- [x] **IDE 里能打字了**（2026-10-20 第十二轮，引擎级致命缺陷）—
+      此前**敲任何键整个进程直接崩**（不是报错，是窗口没了）：
+      官方 `win` 消息泵对每个按键消息都调 `win.isDialogMessage(root,msg)`，
+      其第 2 参按官方契约是 `struct msg` 按值传，而引擎填出来的消息表
+      **没有 `_struct` 定义** → FFI 传了 NULL → `IsDialogMessageW` 读地址 0 → 崩。
+      修法：`fillMsgTable` 给消息表补上 MSG 的原生结构定义（48 字节，偏移逐字节对齐）。
+      回归：`tests/run_input_tests.ps1` → INPUT-TESTS-OK。
+      详见 `docs/capability-gap.md` §1.17
+- [x] **项目级代码导航**（2026-10-21 第十三轮）— 把「代码掌控」从当前文件扩到整个工程：
+      - `F12` / `Ctrl+点击` **转到定义**（跨文件，落到目标文件的精确列）；
+      - `Shift+F12` **查找引用**（底部新增「引用」页签，结果跨文件，双击即跳）；
+      - `F2` **跨文件重命名**（弹提示条问新名字，改完的文本同时回灌 LSP 索引）；
+      - `Ctrl+Shift+T` **项目符号搜索**（结果复用「引用」面板）。
+      索引建在 **LSP 服务端**（复用引擎真 Lexer/Parser）——
+      aardio 侧判不准 `//` 右邻 `=` 的 raw string、块注释星号配对、反引号原样串，
+      重写词法扫描必然误判。
+      配套改造：引擎 `Tok` 增加 `pos`（token 绝对偏移）→ 定义点才有精确列号。
+      ⚠ LSP 的列是 0 基 UTF-16 码元，aardio 字符串是 UTF-8 字节 —— 落点与改名
+      都要换算，编辑器组件提供 `gotoLineCol` / `replaceTextAt`。
+      ⚠ 导航请求同步阻塞（最多 1 秒），按键只记意图，真正去问放到定时器里。
+      回归：`tests/lsp_project_smoke.py` → LSP-PROJECT-SMOKE-OK；
+      `tests/ide_nav_smoke.ps1` → NAV SMOKE OK（真跨文件跳转 + 改名）。
+      详见 `docs/capability-gap.md` §1.18、`docs/ide-components.md` §11.9
+- [x] **IDE 源码零假诊断**（2026-10-21 第十三轮续）— IDE 打开自己的工程文件时
+      报出一条**不存在的语法错误**（`app/shell.nodio` 第 65 行）：
+      - 根因在**传输层**不在词法器：LSP 服务端的 JSON 解码器只认 `\n`/`\t`，
+        其余转义退化成字面字符 —— `\r` 变成字母 **`r`**，
+        于是 CRLF 缓冲区里每个换行都多出一个 `r` 标识符；
+      - 修法：`apps/jsonrpc_stdio.h` 增加 `JsonUnescape()`，
+        完整实现 `\n \t \r \b \f \" \\ \/ \uXXXX`（含代理对 → UTF-8）；
+      - 回归：`tests/dsg_parse_probe.py` 每个用例**都跑 LF 与 CRLF 两个变体**
+        → DSG-PARSE-PROBE-OK；`tests/ide_nav_smoke.ps1` 新增断言 `NAV-DIAGS:0`。
+      详见 `docs/capability-gap.md` §1.19、`docs/ide-components.md` §15.2
+- [x] **导航栏（面包屑）**（2026-10-21 第十三轮续）— VS 编辑器的标志性 UI：
+      编辑区正上方一条 `工程 › 目录 › 文件 › 命名空间 › 函数`，
+      跟着光标走，点哪一段跳到哪一段：
+      - 服务端 `documentSymbol` 补 `endLine`（AST 子树最大行号）——
+        判「包含」而不是「在上方」；`var f = function(){}` 识别成 function；
+      - 客户端 `symbols()` 修好：原来读的是不存在的 `v.location`（行号恒为 0）
+        且丢掉 `children`，现在返回**层级树**；
+      - 符号树**只在文档变化时**拉一次，光标移动走纯内存遍历（不然会卡死编辑器）。
+      详见 `docs/capability-gap.md` §1.20、`docs/ide-components.md` §11.10
+- [x] **模块钩子整片死区**（2026-10-21 第十三轮续）— 工具条 / 菜单 / 快捷键 /
+      工程树双击 / 大纲刷新**全部没被执行过**（代码完整但钩子读到 null）：
+      - 根因：引擎里模块体的裸赋值只是**模块帧的局部变量**，
+        外部 `app.shell.onX = f` 写的是**模块表成员** ——
+        局部副本**遮蔽**了成员，模块内部永远读到初值 null；
+      - 修法：24 个钩子收进 `var hooks = {...}` 表（表是同一个对象，谁改都看得见），
+        main 侧改写 `shell.hooks.onX = ...`；
+      - 顺带把遗留的 `onAfterLayout` 接上（设计画布布局后立刻跟随）。
+      回归：`tests/ide_nav_smoke.ps1` 新增**钩子链路端到端**断言 → NAV SMOKE OK；
+      诊断模式 `DIAG hooks: all 24 ok`。
+      详见 `docs/capability-gap.md` §1.20.3
+- [x] **补齐基础功能（2026-10-22 第十四轮）**—「还有很多基础功能都不行，缺了很多东西」。
+      这一轮把**编辑器能用**和**基础接线**两层补齐：
+  - **编辑器输入行为（P0）**：`lib/nodio/ui/editor.aardio`
+    - 回车续接缩进（复制当前行缩进；光标前是 `{`/`(`/`[` 时再多一级）
+    - 括号/引号自动配对（补另一半、光标停中间；右边紧跟着闭合符时「跳过」）
+    - Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z 走组件自己的撤销栈
+    - Ctrl+/ 注释**保留缩进**（标记插在缩进后面，再按一次能取消）
+    - 查找条预填当前选词；自动触发补全（`.` 一定问，词长 ≥3 才问）
+    - ⚠ **根因**：`ctrlDown()/shiftDown()/altDown()` 写的是
+      `GetKeyState(vk) & 0x8000` —— `GetKeyState` 返回的是**字节**状态
+      （按下 = 0x80），高字 0x8000 只有 `GetAsyncKeyState` 才有 ⇒
+      **三个判断恒为 false**，编辑器所有 Ctrl 快捷键（Ctrl+Z/Y、Ctrl+Space、
+      Ctrl+F/H/G、Ctrl+/）**一次都没生效过**，按键全被原生 richedit 吃掉。
+      改成 `& 0x80` 后才真正通。
+    - 回归：`tests/reg_editor_input.aardio`（22 项断言）→ `REG-EDITOR-INPUT-OK`
+  - **悬停提示（hover）**：服务端 `textDocument/hover` 与客户端 `lspClient.hover`
+    早就写好了，**IDE 一次都没调**，也没有浮层。
+    - 组件负责：鼠标停住 350ms → 算出 (line,col) → 画浮层 → 鼠标移开自动收；
+      IDE 负责：问 LSP 要内容，拿到后 `showHover()`。
+    - 问 LSP 是同步阻塞的，**不能**在窗口过程里做（鼠标移动消息很密集）。
+    - markdown（`**名字**` / `*类型*`）在浮层里剥掉。
+    - 回归：`tests/reg_hover.aardio` → `REG-HOVER-OK`；截图见下。
+  - **调试语义**：F10 之前停住后走的是 `next()`（单步），
+    `dapClient.resume()` 从来没被调用过 —— 状态栏写着「F10 继续」，实际是单步。
+    - 改成：F10 = 继续（`resume()`），**F11 = 单步跳过**（`next()`）；
+    - 停住时光标自动跳到那一行（之前只在调试面板里打一行字）。
+  - **设计的保存/载入**：`designer.toDSG()/fromDSG()` 两个纯函数没有入口，
+    画完就丢。现在有两条路：
+    - 写回**源码的 DSG 块**（官方 aardio 就是 `/*DSG{{*/ … /*}}*/` 存设计的）：
+      `nodio.designer.dsg` 新增 `extractBlock()/replaceBlock()`；
+    - 独立 `.dsg` 文件（另存为 / 打开）；
+    - 入口在标题栏新加的「设计」菜单里。
+  - **Ctrl+Tab 切换标签页**：以前只有鼠标点页签能换文档。
+  - 顺带修了两个测试脚本的毛病：`ide_smoke.ps1` 读重定向文件有句柄竞态
+    （偶发「IDE produced no stdout」）；`ide_shot.ps1` 在窗体**还没布局完**时
+    就去抓图（拍到 158×26 的空壳，改成等窗口够大再抓）。
+  - 回归：`tests/run_editor_component_tests.ps1` 新增；
+    VM 90 / EDITOR / INPUT / HOVER / SMOKE / NAV / STDLIB **全绿**。
+- [x] **双栏对比（2026-10-24 企业生产可用轮次）** — 支持在主窗口内开启左右分栏对比视图（`shell.toggleSplitDiff` 与「视图」菜单「双栏对比」入口），主副编辑器独立运行、内容基线自动同步，关闭后优雅还原完整全宽编辑区。
+- [x] 属性格分组带（外观/样式/数据/位置/基本，折叠箭头；VS 的
+      Appearance/Behavior/Data/Layout/Misc 顺序）
+- [x] **设计画布上的控件「看不见」** — 底板（`plus` 自绘板）内容直绘到窗体背景，
+      绘制顺序在子控件**之前**，底板一重绘就把组件区域的像素盖掉，
+      而组件不会自动重绘 ⇒ 画布上只剩网格。
+      修法：`canvas.__refresh()` 底板刷完把每个组件区域再刷一遍；
+      摆放时把组件提到底板之上（`win.setPos(...,_HWND_TOP,...)`）；
+      设计器打开时藏掉行号栏（设计面是「表单表面」，不是代码区）。
+      详见 `docs/capability-gap.md` §1.23。
+- [x] **网格线显示开关（官方 `dlg_grid`，2026-10-24 企业生产可用轮次）** — `canvas.showGrid` 支持在运行时动态开关网格线渲染（间距自适应 DPI 与缩放），在「设计」菜单中提供显式控制入口。
+- [x] **事件代码生成（2026-10-23 第十五轮）** — 官方 IDE 的行为：
+      设计视图里**双击控件** → 切到代码视图，源码里出现（或跳到）
+      它的事件处理函数。
+      - 画布组件子类化补 `WM_LBUTTONDBLCLK` → `canvas.onDoubleClick(item)`
+        （button/edit/static/listbox/combobox 等标准控件类都带 `CS_DBLCLKS`；
+        收不到双击的控件走右键菜单新增的「查看事件代码」兜底）；
+      - 事件名按官方控件库的默认事件（对照 `D:\aardio\lib\win\ui\ctrl\*.aardio`
+        的 `_commandFuncnames`）：button/checkbox/radio/groupbox → `oncommand(id,event)`、
+        combobox/listbox → `onSelChange(id,event)`、edit/richedit → `onChange()`、
+        listview/treeview/tab → `onnotify(id,code,ptr)`；
+        自定义组件可在 registry spec 里自带 `event` 字段；
+      - 桩形状按官方 system-prompt 的模板
+        （`winform.<name>.<event> = function(id,event){ }`）；
+      - **不重复生成**：源码里已有同名处理函数只跳转过去（官方同款行为）；
+      - 插入点：有 DSG 块插在块结束标记后面，没有就追加到文件末尾；
+        光标直接落到函数体那一行。
+      回归：`tests/ide_smoke.ps1` 新增 `EVENT-STUB / EVENT-STUB-DUP /
+      EVENT-CODE-VIEW` 断言。
+- [x] **设计 ↔ 源码视图切换（switchActiveForm 语义，2026-10-23 第十五轮）** —
+      开设计器 = 从**当前文档**载入 DSG 块（源码里有什么设计，画布上就是什么；
+      没有块的文档给空画布）；关设计器 = 把**当前设计**写回文档的 DSG 块
+      （只写编辑器缓冲不落盘，落盘交给 Ctrl+S）。两个方向都只在
+      「内容真的不一样」时才动文档；画布空且文档本来没有块时不写
+      —— 不能往普通脚本里塞空设计；同步是**替换**不是追加（块只有一份）。
+      回归：`tests/ide_smoke.ps1` 新增 `SYNC-ITEMS / SYNC-WRITEBACK / SYNC-BLOCKS`
+      断言（独立页签双向验证）。
+- [x] **自定义控件替身映射（官方 `ide.customCtrl`，2026-10-23 第十六轮）** —
+      官方 `lib/ide/customCtrl.aardio` 的 cls→替身表**原文照抄**进
+      `nodio.designer.registry.customCtrl`（radio/vlistview/close/ipaddress/
+      textbox/custom.* 共 10 条）。画布 `__findSpec` 的解析顺序：
+      ①注册表精确匹配（Nodio 能直接画的类优先原样画，如 radio）
+      ②映射表 → **DSG 仍写真实类名**，只把实际建的控件换成替身（drawAs）
+      （属性表借替身类的）③兜底原样画。
+      官方工程里的 `textbox`/`vlistview` 到 Nodio 画得出，写回的 DSG 官方也认。
+      回归：`tests/ide_smoke.ps1` 新增 `CUSTOMCTRL-MAP / CUSTOMCTRL-DRAW`。
+- [x] **窗体设置 + 对齐网格 + 边距线（2026-10-23 第十六轮）** —
+      - **窗体设置**：点画布空白处（或「设计」菜单「窗体设置」）= 选中
+        **窗体本身**——属性格改 标题/宽度/高度，写回 DSG 头
+        `win.form(text=..;right=..;bottom=..)`（画布记 `form` 状态，
+        toDSG/fromDSG 双向携带；没有设计块的文档回默认，不带走上一个文档的窗体尺寸）；
+      - **对齐网格**：拖动/缩放时把坐标吸附到网格（GRID_SIZE 整数倍；
+        属性格里的精确值不吸附）；「设计」菜单可开关；
+      - **边距线**：表单内容区参考线（默认 8 逻辑像素，画在底板上），
+        「设计」菜单开关。
+      回归：`tests/ide_smoke.ps1` 新增 `FORM-SET / SNAP`。
+- [x] **设计器缩放与控件间对齐吸附线（官方 `dlg_zoom_defalut` / `dlg_snap`，2026-10-24 企业生产可用轮次）** — 
+      - `canvas.zoom` / `setZoom` 支持 25%~400% 自由缩放，全量缩放几何换算（控件位置、手柄外扩尺寸、网格物理步长均平滑缩放）；
+      - 磁性对齐吸附（`alignSnap`）：拖动控件时在 5 逻辑像素范围内智能对齐相邻控件的左、右、顶、底与水平/垂直中线，并高亮绘制橙色辅助对齐线，松手即清空。
+- [x] **fromDSG 完整保留原生控件名（2026-10-24 企业生产可用轮次）** — `canvas.add` 支持显式传入 `name` 参数并在属性格首项注入「变量名」支持双向查看与修改；`fromDSG` 与 `toDSG` 严密保持原生变量名不变，官方现有项目导入后事件处理函数绑定零断裂。
+- [x] **企业级源码保存原子事务机制（`atomicSaveFile`，2026-10-24 企业生产可用轮次）** — 杜绝断电/进程中断导致的文件清空或半写入损坏，采用临时文件预写 + 大小完整性校验 + `MoveFileEx(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` 原生原子替换。
+- [x] **编辑器书签系统（Editor Bookmarks，2026-10-24 企业生产可用轮次）** — 
+      - 行号栏自绘青蓝色旗标矩形（VS 经典深青蓝书签 #007ACC），不遮挡断点圆点；
+      - 支持 `toggleBookmark`, `nextBookmark`, `prevBookmark`, `clearBookmarks`, `hasBookmark`, `hasAnyBookmark`；
+      - 快捷键深度对齐 VS / 官方习惯：Ctrl+F2 切换当前行书签、F2 跳转下一个书签、Shift+F2 跳转上一个书签；在「转到」菜单中完整挂接。
+- [x] **代码片段模板自动展开（Code Snippets Expansion，2026-10-24 企业生产可用轮次）** —
+      - 支持 `for`, `forin`, `func`, `function`, `try`, `class`, `if`, `ife`, `winform` 等高频语法触发词；
+      - 按 Tab 键自动匹配前缀并展开代码片段，自动继承当前行缩进深度并自动将光标定位至 `$0` 目标锚点；无片段时自动回退为原生缩进。
+- [x] **函数参数信息提示（Signature Help，2026-10-24 企业生产可用轮次）** —
+      - 在代码输入 `(` 或 `,` 时自动根据光标前函数名唤出悬浮参数信息提示框，精确自适应光标相对坐标并在屏幕边缘自动避让翻转；输入 `)` 或 Esc 时即时收起。
+- [x] **窗体设计器批量多选与批量对齐（Multi-Selection & Batch Alignment，2026-10-24 企业生产可用轮次）** —
+      - 支持按住 Ctrl / Shift 键点击控件进行自由批量多选；多选状态下全选框同步绘制，仅主选控件展示 8 控向调整手柄；
+      - 提供「左对齐」、「右对齐」、「顶对齐」、「底对齐」、「水平居中」、「垂直居中」、「等宽」、「等高」完整批处理对齐指令与「设计」菜单快捷调用。
+- [x] **窗体设计器专属撤销/重做事务栈（Designer Canvas Undo/Redo，2026-10-24 企业生产可用轮次）** —
+      - 画布独立具备 `undoStack` 与 `redoStack`（上限 50 步），在拖拽移动、尺寸调整、批量对齐、删除控件前自动拍摄快照；
+      - 支持快捷键 Ctrl+Z / Ctrl+Y 及「设计」菜单调用，精确无损还原窗体与控件全部属性状态。
+- [x] **双栏差异对比导航（Diff Navigation & Markers，2026-10-24 企业生产可用轮次）** —
+      - 支持双栏对比视图（`splitDiff`），行号栏边缘自绘差异状态指示条（新增绿色 #2ECC71、删除红色 #E74C3C、修改橙色 #F39C12）；
+      - 「视图」菜单提供「下一个差异」与「上一个差异」快捷跳转指令，双栏行号联动同步滚屏。
+- [x] **调试器监视表达式（DAP Watch Expressions，2026-10-24 企业生产可用轮次）** — 
+      - 支持动态添加/清空监视表达式，程序命中断点停止时自动关联变量作用域解析监视结果，同步输出至调试控制台与状态栏。
+- [x] **代码智能自动格式化（Format Document，2026-10-24 企业生产可用轮次）** — 
+      - 支持快捷键 Shift+Alt+F 及「格式」菜单「格式化代码」；
+      - 逐行自动根据花括号/方括号/圆括号层级深度缩进，支持单行/多行注释保护与字符串字面量边界穿透，自动剔除行尾多余空白，并将整次排版操作封装为单一事务推入撤销栈。
+- [x] **全屏沉浸开发模式（Toggle Fullscreen，2026-10-24 企业生产可用轮次）** — 
+      - 支持快捷键 Shift+F11 / Alt+Enter 及「视图」菜单「全屏模式」；
+      - 具备窗口尺寸与工作区状态无损记录，按键即刻沉浸铺满整个物理显示器，二次触发平滑恢复原窗口几何与排版。
+- [x] **外部系统集成与工程代码行统计工具（External Tools & Project Stats，2026-10-24 企业生产可用轮次）** — 
+      - 「在资源管理器中定位」：一键唤起 Windows Explorer 并在物理磁盘上高亮选中当前活跃文件或工程根目录；
+      - 「在终端中打开」：一键在当前文件或工程工作目录唤起外部命令行终端；
+      - 「工程代码行统计」：递归统计工程源码文件总数、代码行、注释行、空行及总行数，弹窗结构化呈现工程代码体量；
+      - 「复制文件完整路径」：一键将当前文档绝对路径写入系统剪贴板。
+- [x] **快速打开文件（Quick Open / Go to File，2026-10-24 企业生产可用轮次）** — 
+      - 支持快捷键 Ctrl+P 及「文件」菜单「快速打开文件...」；
+      - 模糊匹配工程文件列表，支持子串与文件名快速索引并即刻定位载入页签。
+- [x] **标签页右键上下文菜单与批量关闭（Tabstrip Context Menu & Batch Close，2026-10-24 企业生产可用轮次）** — 
+      - 文档标签页右键支持「关闭标签页」、「关闭其他标签页」、「关闭全部标签页」、「复制完整路径」、「在资源管理器中定位」；
+      - 批量关闭携带脏文档检查机制，杜绝未保存工作区丢失。
+- [x] **状态栏交互增强与编辑视图定制（Interactive Statusbar & View Toggles，2026-10-24 企业生产可用轮次）** — 
+      - 点击状态栏「行,列」分段直达「转到行」输入框；
+      - 「视图」菜单提供「显示行号」（toggleGutter）与「自动换行」（toggleWordWrap）即时开关。

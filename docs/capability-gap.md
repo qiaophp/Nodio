@@ -903,6 +903,631 @@ IDE 冒烟 **SMOKE OK**；截图 `shot_tb_restored.png`（普通态）、
 
 ---
 
+## 1.18 项目级代码导航（转到定义 / 查找引用 / 跨文件重命名 / 符号搜索）
+
+> 目标：把 IDE 的「代码掌控」从**当前文件**扩到**整个工程** ——
+> F12 跳到别的文件里的定义、Shift+F12 列出全工程引用、F2 跨文件改名、
+> Ctrl+Shift+T 按名字搜符号。
+
+### 1.18.1 为什么索引建在 LSP 服务端
+
+aardio 侧**无法**正确判断 aardio 源码里的注释/字符串边界：
+
+- `//` 右邻 `=` 是 raw string（`//= ... =//`）；
+- 块注释按**星号数量**配对（`/* ... **/ ... */`）；
+- 反引号是原样串，双引号不转义。
+
+在 IDE 侧重写一套词法扫描，必然误判 —— 注释里的 `function` 会被当成定义，
+字符串里的引号会把行数算错。所以索引建在 `apps/nodio-lsp`：
+**复用引擎真正的 Lexer/Parser**（`engine/lexer.cpp` + `engine/parser.h`），
+IDE 侧只负责发请求和画界面。
+
+### 1.18.2 引擎侧的前置改造：token 要有列号
+
+原来的 `Tok` 只有 `line`，够诊断但**不够跳转** —— 一行里可能有多个同名标识符，
+列号只能由 token 的**绝对偏移**推出。为此给 `Tok` 末尾加了 `pos` 字段
+（`size_t`，wchar 单位 == UTF-16 码元，与 LSP `character` 同单位）：
+
+```cpp
+// engine/common.h
+struct Tok {
+    ...
+    size_t pos = 0;   // token 首字符在源串中的绝对偏移
+};
+```
+
+`engine/lexer.cpp` 的 `Lex()` 里每个 pushTok 站点都记下 `tokStart`。
+字段放在**结构体末尾**，`pushTok({...})` 这种聚合初始化不受影响。
+
+AST（`Node`）仍然只有行号 —— 定义点的列号靠**token 流**反查：
+
+- 函数：名字 token 后面紧跟 `(`（函数声明）或 `=`（函数字面量赋值）；
+- 其它：同一行上第一个同名的标识符 token。
+
+### 1.18.3 服务端能力
+
+| 方法 | 作用 |
+|---|---|
+| `nodio/setProject` | 收到工程根目录 + 源文件清单，建立**项目级符号索引**（工程文件 + overlay 标准库） |
+| `textDocument/definition` | 转到定义（跨文件） |
+| `textDocument/references` | 查找引用（跨文件） |
+| `textDocument/rename` | 跨文件重命名（返回 WorkspaceEdit） |
+| `workspace/symbol` | 项目符号搜索 |
+
+**定义的选择顺序**（和人的直觉一致）：
+
+1. 同文件 —— 光标**上方**最近的一个（上方没有就取下方第一个）；
+2. 本文件 `import` 到的模块（工程内模块或标准库）；
+3. 任意同名定义。
+
+**引用要认得出「同一个符号」**：名字相同不等于同一个符号，
+`obj.foo` 和 `bar.foo` 是两个 `foo`。判定规则：
+
+- 独立标识符（前面不是 `.`）—— 直接算引用；
+- 成员访问 `a.b.c` —— 限定链必须正好指向**定义所在的模块**，
+  或者是定义所在**命名空间路径的前缀**。
+
+这样 `app.editor.contextMenu` 会被算成 `editor.nodio` 里 `contextMenu` 的引用，
+而某个对象上的 `.contextMenu` 不会被误算。
+
+### 1.18.4 IDE 侧接线
+
+- **多文档**：`lspClient` 之前只认一个 uri，切标签页后补全/诊断都落在旧文件上。
+  现在按 uri 分别记 `didOpen`/`didChange`，`openDoc(path,text)` 切换当前文档。
+- **按键不能同步问 LSP**：`lspClient` 的请求是同步阻塞的（最多 1 秒），
+  在窗口过程里做会卡住整个窗口过程。编辑器组件用 `winform.setTimeout`
+  把 F12 / Shift+F12 / F2 / Ctrl+点击**推迟**出去（和代码补全一个套路）。
+- **落点精度**：LSP 的列是 **0 基 UTF-16 码元**，编辑器内部是 1 基，
+  中间还差一次「UTF-16 码元 → UTF-8 字节」的换算
+  （aardio 字符串是 UTF-8 字节）。编辑器组件提供 `replaceTextAt()` 做这件事。
+- **引用面板**：底部 dock 新增「引用」页（`nodio.ui.list`），
+  双击跳到那一处；项目符号搜索的结果也复用这个面板。
+
+### 1.18.5 踩到的坑
+
+1. **`string.left(s,n)` 是「前 n 个字符」，不是「去掉前 n 个字符」**。
+   去掉 URI 的 `file:///` 前缀必须用 `string.slice(s,9)`（`slice` 就是 `sub`，
+   第三参省略时到串尾）。用 `left(s,#s-8)` 会把**尾巴**切掉。
+2. **`string.replace` 返回两个值**（结果 + 替换次数），
+   直接 `return string.replace(...)` 会把次数一起漏出去。
+3. **双引号是原样串**：`"\\a.nodio"` 里是**两个**反斜杠。
+   路径要写 `"D:\dir\file.nodio"`（双引号、一个）或 `'D:\\dir\\file.nodio'`（单引号、两个）。
+   写混了同一个文件会有两个索引键 —— 查找引用重复计数、重命名把同一处改两遍。
+   服务端因此加了 `NormalizePath()` 折叠重复分隔符。
+4. **工程根可能自带尾部分隔符**（IDE 的 `proj.root` 就是 `D:\...\`），
+   服务端再拼一个 `\` 会变成双反斜杠 —— `ModuleKeyOf` 算出的模块名会多一个点
+   （`.app.editor`），import 匹配全废。
+
+### 1.18.6 实测
+
+- `tests/lsp_project_smoke.py`：真实工程（`ide/nodio`）上
+  `contextMenu` 的定义跨文件解析到 `app/editor.nodio`、
+  引用跨两个文件、重命名产出跨文件编辑、符号搜索有结果 —— **LSP-PROJECT-SMOKE-OK**；
+- `tests/ide_nav_smoke.ps1`：无头跑完整 IDE 链路 ——
+  打开 `app/shell.nodio` → F12 → 打开 `app/editor.nodio` 且光标落到第 44 行；
+  临时工程里跨文件改名（一个开着的文件 + 一个没开着的文件）两处都改对、
+  旧标识符消失 —— **NAV SMOKE OK**。
+
+### 1.18.7 顺带修掉的测试探针 bug
+
+`tests/editor_comp_probe.aardio` 拼键盘状态数组时多写了一个字节：
+
+```aardio
+kb = ..string.sub(kb, 1, 0x11) ++ '\x80' ++ ..string.sub(kb, 0x12, 256);
+```
+
+17 + 1 + 239 = **257 字节**，塞进 256 字节的 `raw.buffer` → **堆溢出**。
+x64 上侥幸没炸，x86 上 5 次里崩 4 次（退出码 `0xC0000374` = STATUS_HEAP_CORRUPTION）。
+改成 `sub(kb,1,0x10)`（16+1+239 = 256）后，x64 / x86 都 5/5 通过。
+
+> **教训**：随机出现的堆损坏，第一反应应该是**测试代码本身**越界写，
+> 而不是怀疑引擎 —— 先算清楚「拼出来的串到底多长」。
+
+---
+
+## 1.19 IDE 自己的工程文件报「假语法错误」（JSON 转义解码漏了 `\r`）
+
+上一轮把项目级导航做完之后，发现 IDE 打开自己的 `app/shell.nodio` 时，
+「问题」列表里挂着一条**根本不存在的语法错误**：
+
+```
+语法错误: 期望 ) (from NodioVM.cpp:2859, context: [1280] [;] [bottom] [=] [820] [)]
+    [r] [] [winform] [.] [add] [(] [r] [] >>> [ed]<<< [=] [{] [cls] [=] [richedit]) @ 行 65
+```
+
+### 1.19.1 定位过程
+
+1. 错误上下文里每个 `)` 后面都多了一个 **`[r]`** —— 而源码那一行**根本没有 `r`**。
+   上下文打印的是 token 原文，所以那是一个**字面量 "r" 的 token**。
+2. 对比同一文件的 LF / CRLF 两种形态：**LF 干净，CRLF 报错**（`tests/dsg_parse_probe.py`）。
+3. IDE 的编辑器缓冲是 **CRLF**（richedit 只认 CRLF），磁盘文件是 LF ——
+   于是「IDE 里报错、磁盘上不报错」。
+
+### 1.19.2 根因：LSP 服务端的 JSON 解码器
+
+问题在传输层，不在词法器。`apps/jsonrpc_stdio.h` 的字符串解码只认两种转义：
+
+```cpp
+out.push_back(n == 'n' ? '\n' : n == 't' ? '\t' : n);   // 旧代码
+```
+
+其余转义一律**退化成字面字符**。而 aardio 的 `JSON.stringify` 完全按 JSON 规范转义：
+
+| 输入 | `JSON.stringify` 输出 | 旧解码器得到 | 后果 |
+|---|---|---|---|
+| `CR` | `\r` | **`r`** | 每个 CRLF 变成一个 `r` 标识符 → 假语法错误 |
+| `TAB` | `\t` | TAB | 正常 |
+| `\` | `\\` | `\` | 正常 |
+| `"` | `\"` | `"` | 正常 |
+| `中文` | 原样 UTF-8 | 原样 UTF-8 | 正常（aardio 不转义非 ASCII） |
+| `\uXXXX` | — | **`uXXXX`** | 非 ASCII 客户端全废 |
+
+`\r` 这条最阴险：它**不报错**，只是把换行悄悄换成了一个字母。
+`\r\n` → `r\n` → 词法器把 `r` 当成标识符 → 后面期待 `)` 的地方当然对不上。
+
+### 1.19.3 修法
+
+`apps/jsonrpc_stdio.h` 增加 `JsonUnescape()`，按 JSON 规范完整解码：
+
+- 简单转义：`\n \t \r \b \f \" \\ \/`；
+- `\uXXXX`：转成 **UTF-8 字节**（服务端内部一律 UTF-8 字节流）；
+- **代理对** `\uD83D\uDE00` → 一个码点 → 4 字节 UTF-8；
+- 非法转义保持原样（不吞字符）。
+
+`JsonString()` 与 `JsonStringArray()` 都改走它。
+
+### 1.19.4 为什么不能靠「客户端统一发 LF」绕过去
+
+IDE 缓冲是 CRLF（richedit 的硬要求），要发 LF 就得在客户端另存一份 LF 副本，
+于是**编辑器里的文本、服务端索引的文本、诊断里的行列**要各维护一份，
+换行一多就必然对不上。正确做法是**传输层老实解码**，
+让服务端看到的文本和 IDE 看到的一模一样。
+
+### 1.19.5 实测
+
+- `tests/dsg_parse_probe.py`：全部用例**同时跑 LF 与 CRLF 两个变体**，
+  外加真实 `app/shell.nodio` 的 LF / CRLF 两份 —— **DSG-PARSE-PROBE-OK**；
+- `tests/ide_nav_smoke.ps1`：新增断言 `NAV-DIAGS:0` ——
+  **IDE 对自己的（合法）源码必须零诊断** —— **NAV SMOKE OK**；
+- x64 / x86 的 `nodio-lsp.exe` 都已重建并复测。
+
+> **教训**：传输层的「尽力而为」解码器最危险 —— 它不会失败，
+> 只会把对的东西悄悄变成错的东西。凡是要还原**源码**，
+> 转义就必须**完整且精确**。
+
+---
+
+## 1.20 导航栏（面包屑）+ 一个整片死区
+
+本轮做 VS 编辑器体感时，先做了一个 **VS 的导航栏**（编辑区正上方那条
+「工程 › 目录 › 文件 › 命名空间 › 函数」，点哪段跳哪段），
+结果在接线阶段挖出一个**从没被发现过的整片死区**。
+
+### 1.20.1 导航栏：层级链从哪来
+
+面包屑的符号段要的是**层级**（文件 → 命名空间 → 函数），不是平铺列表。
+数据源是 LSP 的 `textDocument/documentSymbol`。
+
+**服务端改造**（`apps/nodio-lsp/main.cpp`）：
+
+| 改动 | 为什么 |
+|---|---|
+| `DocSymbol` 增加 `endLine` | AST 只记节点的**起始行**。判「光标在不在这个符号里」需要符号的**范围** —— 只看起始行的话，光标停在一个**刚结束的函数之后**的顶层语句上，会被算成「还在那个函数里」（实测：光标在 195 行的顶层语句，链里却冒出 114 行结束的 `darkenEdit`） |
+| `MaxLineOf(PNode)` 递归求子树最大行号 | 符号的结束行 = 它整棵子树里最大的行号 |
+| `var f = function(){}` 识别为 **function** 而不是 variable | aardio 里绝大多数函数是 `var 名 = function(){}`（`VarDecl`），不特判的话它们全是「变量」，而变量**不是作用域**，不进面包屑 |
+| JSON 增加 `"line"` / `"endLine"` 字段 | 老代码读 `v.location`（服务端根本没这个字段）→ 行号恒为 0 |
+
+**客户端改造**（`ide/nodio/app/lspClient.nodio`）：`symbols()` 之前把 `children`
+丢掉了、位置也读错字段。现在返回**层级树**
+`[{name; kind; line; endLine; col; children}]`。
+
+**IDE 侧**（`ide/nodio/main.nodio`）：
+
+- 符号树**只在文档变化时**向 LSP 拉一次（`symTreeDirty` 标记 + 心跳里拉）；
+  光标移动只做**纯内存遍历** —— 每动一下都同步问一次 LSP 会把编辑器卡死；
+- 面包屑 = `工程名 › 目录段… › 文件名 › 符号链`；
+- 点符号段 → `gotoLineCol` 跳过去。
+
+### 1.20.2 挖出来的死区：模块钩子被局部变量遮蔽
+
+导航栏要「光标移动 → 刷新面包屑」，这条链路要经过
+`shell.editor.onCursor` → `shell` 的钩子 → `main.nodio` 的实现。
+**结果钩子根本没被调用**（加打印才发现 `onCursorMove` 读到的是 `null`）。
+
+顺着查下去，发现**全部 24 个模块级钩子都是死的**：
+
+```
+main 侧：HOOKS: openFile=function docChange=function cursorMove=function ...
+shell 侧（模块内部）：hook=null openfile=null docchange=null
+```
+
+### 1.20.3 根因：引擎的「模块局部变量遮蔽模块表成员」
+
+Nodio 的模块加载（`engine/import.cpp`）里，模块体跑在自己的帧
+（`modEnv`）上；`var` 声明会**同时**写进 `modEnv->vars`（局部）
+和模块表 `modTable->map`（成员）。而**裸赋值**（`onX = null`）
+按 `runtime.cpp` 的规则**只**写局部（模块边界不外传）。
+
+模块内部读裸名字时，`Env::Find` 沿着作用域链先查 `vars` ——
+**局部副本把模块表的成员遮住了**。
+
+于是：
+
+```
+app.shell.onOpenFile = openFile;   // 写的是模块表 map
+// 模块内部读 onOpenFile → 命中局部副本（初值 null）→ 永远是 null
+```
+
+**后果**：工具条（新建/打开/保存/运行/调试/设计器）、菜单（文件/编辑/转到/查找/运行/视图）、
+快捷键（Ctrl+N/O/S/W/F/H/G/Shift+F、F5/F10、Ctrl+F9）、工程树双击打开文件、
+文档变化刷新大纲 —— **全部是死的**（代码写得很完整，但从来没被执行过）。
+
+### 1.20.4 修法：钩子放进表里
+
+模块级的裸变量有遮蔽问题，但**表**没有：表是同一个对象，
+谁改都看得见。于是把 24 个钩子收进一张 `hooks` 表：
+
+```aardio
+// app/shell.nodio
+var hooks = {
+	onOpenProject = null;
+	onOpenFile    = null;
+	...
+};
+// 用法：if(hooks.onSave) hooks.onSave()
+// main.nodio 侧：shell.hooks.onSave = saveFile;
+```
+
+`var hooks = {...}` 是 `VarDecl` → 同时进 `modEnv->vars` 和 `modTable->map`，
+但两边指向**同一个表对象** → `shell.hooks.onSave = f` 改的就是模块内部
+那张表 → 读得到。
+
+顺带把遗留的 `onAfterLayout` 接上（`designer.layout()`），
+设计画布在布局后立刻跟随编辑区，不用等心跳兜底。
+
+### 1.20.5 aardio 的两个字符串坑（顺手记下）
+
+1. **`s[i]` 取出来是「字节值」（数字），不是 1 字符的串**。
+   所以 `t[#t] == '\\'` 永远不成立（数字 vs 字符串）——
+   去掉路径尾部分隔符的循环**一次都没跑过**，导致工程名取不到
+   （`io.splitpath("D:\\a\\b\\")` 的 name 是空）。
+   必须跟字节值比：`'\' = 92`、`'/' = 47`。
+2. **空串是真值**（aardio 只有 `null`/`false` 为假）。
+   判空要用 `#s == 0`，写 `if(s)` 会永远进去。
+
+### 1.20.6 实测
+
+- `tests/ide_nav_smoke.ps1` 断言：
+  `NAV-SYMTREE` 非空、`NAV-CHAIN:nodio|app|shell.nodio|`、
+  `NAV-FNCHAIN:…|darkenRichEdit|`、点符号段跳到第 114 行、
+  以及**钩子链路端到端**（`NAV-COMPCHAIN` 里出现函数名）—— **NAV SMOKE OK**；
+- 诊断模式下 `DIAG hooks: all 24 ok`（钩子自检）；
+- 截图 `ide_navbar.png`：导航栏 `nodio › app › shell.nodio › darkenRichEdit`，
+  当前位置用强调色；`ide_designer.png`：设计画布照常覆盖编辑区。
+
+---
+
+## 1.22 属性格分组带（VS WinForms 属性窗口的「分类」）
+
+### 1.22.1 目标
+
+官方 IDE 的属性格是**带分组带**的：属性按分类分成若干条，每条带一个折叠箭头，
+点箭头折叠/展开；没有属性的分类不画带（见 `docs/official-ide-reference.md` §设计器）。
+原先 Nodio 的属性格是**平铺两列**（属性 / 值），一个控件的十几个属性全挤在一起，
+既不像 VS，也没法快速定位。
+
+分类顺序按 VS 的 `Appearance / Behavior / Data / Layout / Misc` 映射成
+**外观 / 样式 / 数据 / 位置 / 基本**。
+
+### 1.22.2 关键设计：显示行 ≠ 属性序号
+
+分组带插在属性行之间，于是同一个「行」有两个编号：
+
+| 编号 | 含义 | 谁在用 |
+|---|---|---|
+| **属性序号** | 属性在 `items` 里的下标（1 基） | `onChange(index, value)` 的 `index`、`self.items[index]` |
+| **显示行号** | 分组带 + 属性行排在一起后的行号（1 基，0 = 表头） | 点击命中、就地编辑框的 y 坐标 |
+
+两处必须各用各的：
+
+* `onChange` 回调给宿主的是**属性序号** —— 宿主拿它去 `item.props[index]` 改值；
+* 就地编辑框（临时 `edit` 控件）要落在**显示行**上 —— 用属性序号算 y 会落到
+  别的行上（分类带的行数被算漏了）。
+
+属性格内部因此多了一张 `self.rows` 显示行表：
+
+```aardio
+{type="cat";  cat="位置"}          // 分组带
+{type="item"; cat="位置"; index=2} // 属性行（index = 属性序号）
+```
+
+### 1.22.3 分类从哪来
+
+* `nodio.designer.registry.categoryOf(key)` —— 按**属性键**查表：
+  `text/align/color/bgcolor/font/image` → 外观，`left/top/width/height/right/bottom` → 位置，
+  `checked/password/readonly/enabled/visible/hasLines` → 样式，
+  `items/columns/tabs/value` → 数据，其余 → 基本。
+* 属性项自带 `cat` 字段时以它为准 —— **自定义组件可以自己分组**。
+* 组件注册表的属性定义从**三元组**扩成**四元组** `{key; 标签; 类型; 分类}`，
+  第 4 个元素就是分类名；省略时回落到 `categoryOf(key)`。
+
+分类顺序：规范表（外观/样式/数据/位置/基本）优先，其余按**首次出现**顺序接在后面
+（自定义组件自带的分类名不该被塞掉）。
+
+### 1.22.4 坑
+
+1. **自绘板刷新必须用 `redraw()` 而不是 `invalidate()`** ——
+   `invalidate()` 只置脏位，更新区域可能残缺，GDI+ 会把自绘内容裁掉一块
+   （见 `lib/nodio/ui/board.aardio` 的 `redraw`）。
+2. **折叠箭头不能用字体字形**（`▶`/`▼` 在等宽/西文字体里可能缺字形），
+   用矩形自己拼三角形。
+3. **分组带是通栏的**：带的底色会盖住画在它下面的**列分隔线**，
+   所以分隔线要**先画**，带**后画**（或者干脆让带盖住 —— VS 就是通栏的）。
+
+### 1.22.5 实测
+
+* 探针 `tests/dsg_propgrid_probe.aardio`：分类映射、显示行表结构、
+  折叠/展开后的行数、就地编辑框的 y 是否落在**显示行**上、点带是否折叠
+  —— **PROPGRID-OK**；
+* 截图 `ide_propgrid2.png`：左栏「属性」页显示 `▼ 外观 / 标题` 与
+  `▼ 位置 / 左边·上边·宽度·高度`；
+* `tests/ide_smoke.ps1`（SMOKE OK）、`tests/ide_nav_smoke.ps1`（NAV SMOKE OK）、
+  VM / editor / input / lsp / dsg 全量回归（x64 + x86）全绿。
+
+---
+
+## 1.23 设计画布上的控件「看不见」（底板直绘盖掉了子控件的像素）
+
+### 1.23.1 现象
+
+设计器打开后，画布上只有一片白色网格和蓝色的选中框，
+**组件本身完全看不见** —— 连属性格里都显示着它的「标题 / 左边 / 上边 / 宽度 / 高度」，
+说明组件**确实建出来了**（`hwnd` 有值、`visible=true`、矩形也对）。
+
+### 1.23.2 定位
+
+三步排除：
+
+1. **组件存在且位置正确**：`DIAG canvas-item hwnd=… rect=468,189,648,234 text=按钮 visible=true`，
+   矩形和画布选中框的位置完全吻合。
+2. **z 序是对的**：用 `GetWindow(hwnd, _GW_HWNDPREV=3)` 从组件往上爬，
+   **一个窗口都没有** —— 组件在最上层；反过来往下爬（`_GW_HWNDNEXT=2`）35 层才碰到画布底板。
+   ⇒ 不是「被压在底板下面」。
+3. **藏掉底板组件就出现**：把画布底板 `show(false)` 之后，组件立刻正常显示。
+
+第 2、3 两条放在一起，结论只有一个：**底板的重绘把组件区域的像素盖掉了，
+而组件没有跟着重绘**。
+
+### 1.23.3 根因
+
+`nodio.ui.board` 是官方 `plus` 自绘板，它的内容是**直绘到窗体背景上**的
+（`plus.directDrawBackgroundOnly()`：禁止控件在自己窗口里画，改由父窗口画）。
+绘制顺序是「窗体背景 → 子控件」，但**子控件只有在自己失效时才会重绘**：
+
+* 底板重绘 → 窗体背景重画 → 组件区域的像素被底板内容覆盖；
+* 组件本身没失效 → 不会重绘 → 像素停在被覆盖的状态。
+
+于是画布看起来「只有网格」。底板每重绘一次（拖动、选中、改属性）就再盖一次。
+
+### 1.23.4 修法
+
+`nodio.designer.canvas.__refresh()`：底板刷完，把**每个组件的区域再刷一遍**。
+
+```aardio
+self.__refresh = function(){
+    self.bg.redraw();                       // 底板整块重绘
+    for(i=1;#self.items;1){
+        var it = self.items[i];
+        if(!it || !it.ctrl || !it.ctrl.hwnd) continue;
+        try{
+            it.ctrl.invalidate();           // 让组件自己重绘一次
+            ::UpdateWindow(it.ctrl.hwnd);
+        }
+        catch(e){}
+    }
+}
+```
+
+顺带两处：
+
+* 摆放组件时用 `..win.setPos(..., 0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/)`
+  把它提到画布底板之上（官方 `win.ui` 的 `add` 只在**同一次调用内部**按 `z` 排序，
+  跨调用只有创建顺序，层次容易反）；
+* 设计器打开时**藏掉行号栏**（`shell.editor.gutter.show(false)`）：
+  设计面是一块「表单表面」，留着代码区的行号栏既没意义，又会压住画布左边。
+
+### 1.23.5 坑
+
+1. **官方 `win.ui` 的 `add` 里 `z` 几乎没用**：它只在**一次 `add()` 调用内部**用来排序
+   （`opt.z===null → opt.z = #zorder + 1`），跨调用完全按创建顺序。
+   想确定层次只能显式 `..win.setPos(..., _HWND_TOP, ...)`。
+2. **`GetWindow` 的常量别搞反**：`2 = _GW_HWNDNEXT`（往下找）、
+   `3 = _GW_HWNDPREV`（往上找）。第一次量的时候用了 2，结论正好反了。
+3. **自绘板直绘到父窗口时，父窗口的绘制顺序在子控件「之前」**，
+   所以自绘板一重绘就会盖掉子控件的像素 —— 这类板子每次重绘后
+   都要把上面的动态控件再刷一遍。
+
+### 1.23.6 实测
+
+* 截图 `ide_propgrid10.png`：设计画布是白色表单面 + 网格，
+  组件「按钮」正常显示并带选中框 + 8 个手柄；
+  左栏「属性」页是分组带（▼ 外观 / 标题=按钮；▼ 位置 / 左边·上边·宽度·高度）。
+* `tests/ide_smoke.ps1`（SMOKE OK，含属性格探针）、`tests/ide_nav_smoke.ps1`（NAV SMOKE OK）、
+  VM 90/90、editor / input / lsp / dsg 回归全绿。
+
+---
+
+## 1.24 交互链路大修：菜单点不动 / 组件乱飞 / 反馈被抹掉 / 调试跑不起来
+
+这一轮集中处理「绝大多数地方无法点击操作」和「卡顿、组件乱飞、事件区与显示区不一致」。
+四个根因分属四个层面，但互相掩盖，必须一起看。
+
+### 1.24.1 根因 A：浮层自绘板要么看不见、要么点不到
+
+**现象**：标题栏「文件」能点（有高亮），但下拉菜单**不出现**；
+而菜单一旦出现，点菜单项又**没反应**（菜单直接关掉）。
+
+**定位**（`tests/ide_click.ps1` 把点击变成可回归的东西）：
+脚本用 `ChildWindowFromPointEx` + `SendMessage(WM_LBUTTONDOWN/UP)`
+**直接向命中的子窗口发窗口消息**——
+桌面锁屏时合成鼠标事件送不到 IDE（锁屏窗口在 z 序最顶），
+只有走消息注入才测得准。
+
+实测三组数据放在一起才看得出来：
+
+| 现象 | 数据 |
+|---|---|
+| 菜单板在、可见、还在 z 序最顶 | `ZChain` 往上爬**一个窗口都没有** |
+| 菜单板确实在绘制 | `DIAG pop.draw rc=0,0,204,330 items=11 clip=0,0,204,330` |
+| 但屏幕上就是没有 | 整窗 `PrintWindow` 里那块是工具条和工程树 |
+
+**根因**：`nodio.ui.board` 基于官方 `plus` 自绘板。官方 plus 的绘制顺序规则是
+
+* `WS_EX_TRANSPARENT` 的子窗口**最后绘制**（永远压在兄弟窗口之上）；
+* 普通子窗口**按 z 序**绘制 —— z 序靠下且没有 TRANSPARENT 的，
+  会被后面创建的兄弟窗口整片盖掉。
+
+下拉菜单画板建得早（z 序靠下），于是：加 `transparent=true` → 看得见；
+不加 → 被盖掉。**而 `transparent=true` 附带 `WS_EX_TRANSPARENT`，命中测试会跳过它** ——
+好在菜单打开时已经 `SetCapture`，鼠标事件直接进捕获窗口，绕开了命中测试。
+
+**修法**：`transparent = true` + `SetCapture`（`lib/nodio/ui/titlebar.aardio`）。
+画板提前建好、提前隐藏、尺寸取 1×1（不挡任何东西），打开菜单时再挪位置 + 显示 + 重画。
+
+### 1.24.2 根因 B：菜单项的命中矩形用错了坐标空间
+
+**现象**：菜单能弹出，菜单项画得也对，但点菜单项只是把菜单关掉。
+
+**根因**：`self.popRects` 存的是**窗体坐标**（`px2`/`py` 绝对位置），
+而鼠标事件（`onMouseDown`/`onMouseUp`）给的是**画板客户区坐标**。
+`__hitPop` 拿两套坐标系比对，**永远命中不了**。
+
+**修法**：菜单项矩形一律存**画板本地坐标**（原点在菜单画板左上角）。
+绘制和命中测试用同一套坐标（绘制原点本来就是画板客户区原点）。
+
+### 1.24.3 根因 C：`board.invalidate()` 只置脏位 → 自绘内容被裁掉
+
+**现象**：标题栏的 logo 和「文件/工程」两个菜单**忽然整块消失**，
+右边「编辑/选择/格式…」却好好的 —— 像「控件没画出来」。
+
+**根因**：官方 plus 的 `WM_PAINT` 是这样画的（`win/ui/ctrl/plus.aardio:836`）：
+
+1. 把窗口当前画面 `BitBlt` 到内存 DC；
+2. `graphics.setClipRect(rcPaint, Replace)` —— **裁剪区 = 本次失效区域**；
+3. 画一遍；
+4. `BitBlt` 回窗口。
+
+于是「只失效了一小块」时，裁剪区就只有那一小块，其余部分保留旧像素。
+标题栏那次就是裁剪区没盖住左上角 ⇒ logo 和前两个菜单保持旧像素 ⇒ 看起来像被擦掉了。
+
+**修法**：`nodio.ui.board.invalidate()` 一律按**整窗**失效
+（`::InvalidateRect(hwnd, 0, 1)`），保证自绘内容每次都完整重画。
+`redraw()` = 整窗失效 + `UpdateWindow` 立刻重画（用在需要同步刷新的场合）。
+
+顺带修掉一个潜伏 bug：扁平写法（`left/top/right/bottom`）建板时
+`self.rect` 没落地，`layout()` 无参调用会直接返回，矩形永远停在创建时的位置。
+
+### 1.24.4 根因 D：官方 richedit 没关自适应 → 组件乱飞 + 事件区与显示区错位
+
+**现象**：窗体尺寸一变（最大化 / 去掉原生标题栏 / DPI 变化），
+**编辑器被弹回设计时的位置**，而行号栏、导航栏这些自绘板是我们自己摆的（物理像素）。
+两边对不上 ⇒ 组件「乱飞」；行号与代码错位 ⇒ **显示区在一处、事件区在另一处**。
+
+**根因**：官方 `win.form` 默认把控件登记进**自动缩放名单**，窗体改尺寸时
+官方按「设计时矩形」重新摆一遍。`nodio.ui.addCtrl` 里的 `autoResize=false`
+只覆盖了走 `addCtrl` 建的控件，而 IDE 主窗体那个 `richedit`
+是**直接 `winform.add(...)`** 建的，漏了这一个。
+
+**修法**：`ide/nodio/app/shell.nodio` 里那个 richedit 补 `autoResize=false`。
+
+### 1.24.5 顺带修掉的四个「点了没反应」
+
+| # | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 所有操作反馈 300ms 后消失 | 心跳每 300ms 写一次状态栏「就绪」，把用户消息盖掉 | `setStatus` 给状态栏加**保持期**（15 拍 ≈ 4.5s），心跳期间不许覆盖（`shell.statusIdleAllowed()`） |
+| 2 | 一动鼠标就卡一下 | 状态栏文字没变也整条重画（自绘板，3840px 宽） | `statusbar.setText` 判重，没变就不重画 |
+| 3 | 持续卡顿 | 心跳每 300ms 把**整篇文档**发给 LSP（67KB） | `lspSync` 判重，文本没变不送 |
+| 4 | F10 永远「调试适配器启动失败」 | `dapClient.start()` 结尾写 `return self` —— 模块作用域里没有 `self`（模块级代码的 `this` 才是模块表） | 改成模块式 API：返回 `"ok"` / 失败原因；调用方一律 `app.dapClient.xxx()` |
+
+调试器另外三处对不上也一并修了：
+
+* `pollDebug` 调的是 `dbgSession.poll(...)`，dapClient 暴露的是 `pollEvents(ev)`；
+* `setBreakpoints` 的 `breakpoints` 用 `{}` + 数字键拼，JSON 出来是对象不是数组，
+  服务端按数组解析 ⇒ **一个断点都建不起来** → 改成 `[ @{_type="array"} ]` + `..table.push`；
+* **断点根本没有入口**：`setBreakpoint` 定义了但全仓库无人调用。
+  现在行号栏点一下打/消断点（编辑器组件新增 `breakpoints` / `onToggleBreakpoint` /
+  `toggleBreakpoint`，行号左侧画红点），调试会话起来后把之前打的断点补发给适配器。
+
+### 1.24.6 坑
+
+1. **锁屏环境下合成鼠标事件是无效的**：锁屏窗口在 z 序最顶，
+   `SetCursorPos` + `mouse_event` 送不到 IDE。要测点击必须**直接发窗口消息**
+   （`tests/ide_click.ps1` 就是这么做的）。
+2. **`ChildWindowFromPointEx` 的 `CWP_SKIPTRANSPARENT`**：会跳过
+   `WS_EX_TRANSPARENT` 的窗口。用它做命中测试会误判「浮层点不到」——
+   实际上 `WS_EX_TRANSPARENT` **不影响**命中测试（`flags=0` 时能命中）。
+   这个误判差点让我把「加 transparent」当成错误方案。
+3. **窗口最大化是异步的**：`ShowWindow(SW_RESTORE)` 会把最大化窗口还原回正常位置，
+   而且还原带动画 —— 紧接着取 `ClientToScreen` 拿到的还是最大化时的坐标，
+   点击位置和实际窗口完全对不上。测试脚本里不要用 `SW_RESTORE`。
+4. **`::SetWindowPos` / `::ShowWindow` 不是引擎内置符号**：
+   要写 `::User32.SetWindowPos` / `::User32.ShowWindow`。
+   写成裸 `::` 会在窗口过程里抛异常，异常被吞掉，症状是「函数后半段没执行」。
+
+### 1.24.7 实测
+
+* 截图 `ide_full.png`：标题栏 12 个菜单齐全，工程树 / 页签 / 编辑器 /
+  行号 / 语法高亮 / 断点红点 / 右栏 7 个页签 / 状态栏全部就位。
+* 菜单全链路：点「工程」→「工程属性」→ 状态栏显示「工程属性」。
+* 行号栏点第 1 行 → 红点出现 + 状态栏「已设断点 行 1」。
+* 回归：VM 89/0、EDITOR-TESTS-OK、INPUT-TESTS-OK、SMOKE OK、
+  LSP-SMOKE-OK、LSP-PROJECT-SMOKE-OK、DSG-PARSE-PROBE-OK、NAV SMOKE OK。
+* `tests/ide_nav_smoke.ps1` 的行号断言原来**写死 114**（被测文件一改就红），
+  改成跟 IDE 自报的 `NAV-FNLINE` 比。
+
+---
+
+## 1.25 设计器：画布整块黑 / 开关一次设计器代码就没了
+
+### 1.25.1 现象
+
+* 打开设计器 → 编辑区**整块黑**，只剩行号栏的数字；
+  画布底板在、可见（`vis=true`）、矩形也对（`408,129,3312,1791`），
+  z 序也在最顶（`GetWindow(GW_HWNDPREV)` 往上爬一个都没有）。
+* 关掉设计器 → 编辑器里**代码不见了**（行号还在，正文空）。
+
+### 1.25.2 根因
+
+**画布黑**：官方 plus 的 `WM_PAINT` 用「本次失效区域」当绘制裁剪区。
+设计画布是**创建时隐藏、后来才 `show(true)`** 的控件 ——
+Windows 给它首次显示时的更新区域经常是空的，裁剪区一空就等于什么都没画：
+窗口在、可见、矩形对、z 序最顶，屏幕上却一块黑。
+（提示条、查找条、补全浮层、下拉菜单全踩同一个坑。）
+
+**代码没了**：官方 richedit 的 `show()`/`hide()` 在 Nodio 上会走它自己的
+DPI 初始化路径，**重建控件窗口 → 正文被清空**；
+清空又触发 richedit 的 `EN_CHANGE` → 编辑器把空文本写回缓存，
+于是「开关一次设计器，代码就没了」。
+
+### 1.25.3 修法
+
+* `nodio.ui.board.show(flag)`：`show(true)` 之后**强制整块重画**
+  （`InvalidateRect` 整窗 + `UpdateWindow`）。这一条同时救活
+  设计画布、提示条、查找条、补全浮层、下拉菜单。
+* `nodio.designer.canvas.show(flag)`：显示时把底板**显式提到 z 序最前**
+  （官方 `form.add` 一次只加一个控件，层次只等于创建顺序）。
+* `app/designer.nodio`：**不再 hide/show 官方 richedit** ——
+  画布是不透明浮层且已提到最前，本来就盖得住编辑器；
+  官方 richedit 的 show/hide 会清空正文，不能碰。
+  行号栏是自绘板，藏它没有副作用，保留。
+
+### 1.25.4 实测
+
+截图 `ide_designer6c.png`：白色表单面 + 网格 + 「按钮」组件 + 选中框 + 8 个手柄。
+截图 `ide_src_c.png`：关掉设计器后编辑器内容完好（语法高亮 + 面包屑 + 断点红点）。
+
+---
+
 ## 2. 引擎 / 语言缺口
 
 | # | 缺口 | 证据 | 状态（第二轮结束） |
@@ -1682,6 +2307,185 @@ var DAP_EXE   = NODIO_DIR ++ "nodio-dap.exe";
 - `tests/editor_fold_probe.aardio`：`PROBE-OK`
   （11 行 → 折叠后 5 行、文本保留、折叠中 `gotoLine(9)` 仍定位到文档第 9 行）
 - VM / IDE 冒烟见本轮记录
+
+---
+
+### 1.16 第十一轮：代码补全（Ctrl+Space → LSP → 候选浮层 → 插入）
+
+标准 IDE 的第三件基本项（本轮前只有「着色 + 诊断 + 折叠」）。
+组件负责**算出前缀 / 画浮层 / 键盘导航 / 插入**，IDE 负责**问 LSP 要候选**，
+两边用两个回调解耦：`onComplete(line,col)` 出、`showCompletion(items)` 进。
+
+#### 1.16.1 职责划分
+
+| 侧 | 做什么 |
+|---|---|
+| `nodio.ui.editor` | 算光标处的单词前缀；画候选浮层（自绘 plus 画板，transparent=true，z=70）；↑↓ 选择、Enter/Tab 插入、Esc 取消；按前缀过滤 |
+| `ide/nodio/main.nodio` | `shell.editor.onComplete = function(line,col){ ... app.lspClient.completion(line-1,col-1) ... }` → 拿到候选后 `shell.editor.showCompletion(items)` |
+
+#### 1.16.2 前缀过滤放在**客户端**
+
+我们的 LSP 服务器 `textDocument/completion` 返回的是**全量**候选
+（文档里所有词 + 全部关键字，见 `apps/nodio-lsp/main.cpp:401 CompletionsFor`）。
+真正的按前缀过滤在 `showCompletion()` 里做：
+
+- 用 `string.startsWith(label, prefix, true)`（忽略大小写）筛；
+- **一个都不匹配就退回全量** —— 关键字列表仍然有参考价值，
+  总比弹一个空框强。
+
+这样做的好处是「过滤」与「问谁要候选」彻底解耦：换后端不用改过滤逻辑。
+
+#### 1.16.3 浮层细节
+
+- 宽度**跟着最长的一条候选走**（170~340 逻辑像素之间夹逼），不写死；
+- 最多显示 8 行，超出就**滚动**：`compScroll` 记录第一条可见项，
+  选中项永远被滚进可见区（`completionMove` → `__layoutCompletion` 顺带算）；
+- 命中测试用**画板本地坐标**（plus 画板的鼠标坐标是画板自己的 0 基坐标）；
+- 点候选 → 直接插入。
+
+#### 1.16.4 按键路径的两个坑
+
+1. **`Ctrl+Space` 的请求不能放在窗口过程里**：`onComplete` 会**同步**问 LSP
+   （最多等 1 秒），在按键处理里阻塞会卡住窗口过程，
+   在那儿建浮层控件也容易重入 → 改成 `__scheduleComplete()`：
+   按键只记意图，真正去问放到 `setTimeout(...,1)` 里。
+2. **吃掉按键还不够，WM_CHAR 也要跟着吃**：`TranslateMessage` 早一步就把
+   `WM_KEYDOWN` 翻译成了 `WM_CHAR` 投回控件 —— 只吃 KEYDOWN 的话，
+   Tab 会「既缩进又插一个制表符」，Ctrl+Space 会「多出一个空格」。
+   修法：子类化里加 `__eatChar`，KEYDOWN 吃掉某个键时记下它的字符码，
+   下一个 WM_CHAR 若是这个码就一起吞掉（新一轮按键先清零，避免误吞）。
+
+#### 1.16.5 本轮新增/修改
+
+- `lib/nodio/ui/editor.aardio`
+  - 补全引擎：`__wordAtCursor` / `requestComplete` / `showCompletion` /
+    `hideCompletion` / `completionVisible` / `completionMove` /
+    `completionAccept` / `__createCompletion` / `__layoutCompletion` /
+    `__drawCompletion` / `__hitCompletion` / `__scheduleComplete`；
+  - 命名空间级 `__compKindText(kind)`：LSP CompletionItemKind → 中文短标签；
+  - 公开 API：`requestComplete()` / `showCompletion(items)` /
+    `hideCompletion()` / `completionVisible()` / `completionMove(delta)` /
+    `completionAccept()`；
+  - 修 `__lineOfChar` 的 0/1 基混用（光标停在行首时会算成上一行）；
+  - 新增 `__caretPos()`（有选区时光标在选区**末尾**）。
+- `ide/nodio/main.nodio`：`shell.editor.onComplete` 接线；
+  演示模式新增 `NODIO_IDE_DEMO_COMPLETE=1`（拉起补全浮层）与
+  `NODIO_IDE_DEMO_TYPE=1`（模拟真实键盘输入）。
+- `ide/nodio/app/shell.nodio`：菜单「编辑 → 代码补全  Ctrl+Space」。
+- `tests/editor_comp_probe.aardio`：补全行为回归（前缀 / 浮层 / 导航 / 滚动 /
+  插入 / 关闭 / 真实 Ctrl+Space 按键路径）。
+- `tests/ide_comp_sample.nodio`：补全演示样本。
+
+#### 1.16.6 踩过的坑（实测）
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | `import nodio.ui.editor` 之后 `type(nodio.ui.editor)` 是 **table**（不是 function），一调用就报「尝试调用非函数值」 | 文件里有一行 `// 注释…var __diagSig = function(list){` —— **注释把代码吞了**，后面的 `}` 变成裸块，块里第一句 `if(!list) return ""` 让**命名空间体提前 return**，`editor` 函数从未注册；import 只能回退到空表 | 注释与代码分行；`namespace` 体里**任何 `return` 都会截断整个模块**（排查模块加载问题时要先看这一条） |
+| 2 | 前缀算出来是**空串** | `string.sub(s,start,end)` 的第三个参数是**结束位置（含）**，不是长度 —— 写成 `sub(s,start,len)` 直接得到空串 | `sub(lineText, start, bo-1)` |
+| 3 | 插入候选时**多删了一个字符** | 前缀为空时 `setSel(a, a)` 是「选中 1 个字符」而不是「光标停这里」 | 前缀为空时用单参 `setSel(a-1)`（0 基插入点） |
+| 4 | 光标在行首时状态栏行号/列号差 1 | `__lineOfChar` 拿 0 基位置去比 1 基的 `lineStarts` | 内部统一：`__lineOfChar` 收 0 基，比较时 +1 |
+| 5 | 按键被吃掉后控件里仍多出一个空格 | `TranslateMessage` 生成的 WM_CHAR 投回控件 | 子类化里连 WM_CHAR 一起吃（见 §1.16.4） |
+
+#### 1.16.7 回归
+
+- `tests/editor_comp_probe.aardio`：`PROBE-OK`
+  （前缀 `al` → 4 个候选 → ↑↓ → 15 个候选时滚动 → 插入后 `print(alphabet` →
+  Ctrl+Space 真实按键路径命中 `onComplete(3,9)` 且浮层弹出）
+- `tests/run_editor_tests.ps1`：EDITOR-TESTS-OK（3 个探针）
+
+---
+
+### 1.17 第十二轮：**敲一个键就崩**（引擎级致命缺陷）
+
+这一轮本来是去做代码补全的，结果挖出一个**比补全重要得多**的问题：
+**IDE 里敲任何键，整个进程直接崩**（`0xC0000005`，进程当场消失，
+不是报错对话框，是「窗口没了」）。
+
+#### 1.17.1 现象与定位
+
+| 探测 | 结果 |
+|---|---|
+| `tests/probe_keysim3.aardio` step1：给 richedit `PostMessage(WM_KEYDOWN)` | 进程崩 |
+| step2：`WM_CHAR` | 崩 |
+| step3：给 **edit** 控件发 `WM_KEYDOWN` | 崩 |
+| step4：给 **static** 控件发 `WM_KEYDOWN` | 崩（静态控件根本不处理按键！） |
+| step5：先用 `nodio.ui.subclass` 把 WM_KEYDOWN 吃掉再发 | **照样崩** |
+
+「连 static 控件都崩」「连被子类化吃掉的按键都崩」这两条把嫌疑从
+「控件处理消息」推到了「**消息泵在派发之前**就出了事」。
+
+崩溃地址落在 `USER32.dll+0xBA6F`，用 `dumpbin /exports USER32.dll` 对照
+导出表，落在 **`IsDialogMessageW`（RVA 0xB960）** 区间内；
+崩溃时的读地址是 `0x8`（MSG 结构偏移 8 = wParam），
+典型的「结构体指针是 NULL」。
+
+#### 1.17.2 根因
+
+官方 `win` 库的消息泵（`D:\aardio\lib\win\_.aardio`）：
+
+```aardio
+isDialogMessage = u.api("IsDialogMessageW","INT(ADDR hDlg,struct msg)");
+...
+elseif( (message <= 0x108/*_WM_KEYLAST*/) && (message >= 0x100/*_WM_KEYFIRST*/) ){
+    var root = getRoot(hwnd)
+    if( (root != hwnd ) && isDialogMessage(root,msg) ) return true;
+}
+```
+
+即：**任何按键消息**（WM_KEYDOWN..WM_KEYLAST）都会走到
+`IsDialogMessageW(root, &msg)`，第 2 个参数按官方契约是
+**`struct msg` 按值传**（传结构体的原生副本指针）。
+
+而 Nodio 引擎这一侧：
+
+- FFI 遇到 `struct` 按值参数时，会 `StructSerialize()` 把 aardio 的结构体表
+  序列化成原生缓冲区再传指针 —— **前提是这张表带 `_struct` 结构定义**；
+- 官方消息泵填消息用的表是**普通表**（`var msg = {};`），
+  **没有 `_struct`** → `StructSerialize` 拿不到布局 → 返回 NULL →
+  `IsDialogMessageW` 收到 NULL 的 MSG → 读地址 0 → **进程崩**。
+
+所以：**这不是补全的问题，是「IDE 根本没法打字」**。
+只是此前没有任何人往控件里发过按键消息（没有键盘输入链路），
+这个洞一直没被踩到。
+
+#### 1.17.3 修法
+
+`engine/builtins.cpp` 的 `fillMsgTable()` 里，给消息表补上 MSG 的结构定义：
+
+```cpp
+// x64 原生 MSG 布局（48 字节）：hwnd@0 message@8 wParam@16 lParam@24 time@32 pt@36
+if (tb->map.find(L"_struct") == tb->map.end())
+    tb->map[L"_struct"] = Value::Str_(
+        L"addr hwnd;INT message;ADDR wParam;addr lParam;INT time;int x;int y;");
+```
+
+（`addr`/`ADDR` 在 64 位下是 8 字节，引擎的结构体对齐规则算出来的
+偏移与原生 MSG **逐字节一致**，`raw.len(msg)` = 48 可验证。）
+
+顺带把崩溃处理器加了一条**模块内偏移**输出
+（`module base=… offset=0xBA6F`）—— 没有偏移，崩溃点只能靠猜。
+
+#### 1.17.4 实测
+
+- `tests/probe_keysim.aardio`：richedit / edit / static 三类控件 +
+  子类化吃掉消息的路径，按键消息**发完不崩**（`ALIVE:1`）；
+- `tests/probe_type.aardio`：`keybd_event` 打真键 → 文本确实进了 richedit；
+- IDE 端到端（演示模式 `NODIO_IDE_DEMO_TYPE=1`）：
+  文档从 161 字符变成 162 字符，末尾多出 `x` —— **IDE 现在能打字了**；
+- VM 回归 90 passed / 0 failed，编辑器 / 输入 / IDE / LSP 四套冒烟全绿。
+
+#### 1.17.5 新增/修改
+
+- `engine/builtins.cpp`：`fillMsgTable` 补 MSG 结构定义；
+- `engine/entry.cpp`：崩溃处理器输出模块基址与模块内偏移；
+- `tests/probe_keysim.aardio`、`tests/probe_type.aardio`：输入链路回归；
+- `tests/run_input_tests.ps1`：INPUT-TESTS-OK。
+
+> **教训**：官方 aardio 库是 32 位时代的产物，它对结构体按值传参的假设
+> （表必须带 `_struct`）在我们这边是**隐式**的 —— 引擎的 `__messagePeek`
+> 填出来的表一直没带结构定义，于是每一个按键消息都在 FFI 层变成 NULL。
+> 这类「官方库假设 + 我方实现细节」的组合，只能靠**端到端真输入**测出来。
+
 ### 1.21 第二十三轮：官方内建 API 缺口收口（函数 API 层面 17 → 1）
 
 > 标记：**第二十三轮**（本节由本会话写入，与并发会话的 IDE 条目互不重叠）
@@ -2623,6 +3427,107 @@ x64 = `D:\Nodio\lib\string\keywords\_.aardio`）。
 `av.video.kernel` / `web.view` / `sevenZip.lzma` / `raw.fasm` / `web.layout`
 依赖具体二进制能力，需要单独评估可行性。
 
+## 1.32 第三十轮：编辑器「基本功能」缺口 —— 一个掩码写错，全部 Ctrl 快捷键都是死的
+
+这一轮的目标是用户那句「**还有很多基础功能都不行，缺了很多东西**」。
+按「契约优先」的方式做：先查官方库的同名消息/函数契约，再写探针。
+
+### 1.32.1 根因一：`GetKeyState` 的掩码写错 → 编辑器所有 Ctrl 快捷键恒不生效
+
+`lib/nodio/ui/editor.aardio` 里：
+
+```aardio
+var s = getKeyState(0x11/*_VK_CONTROL*/);
+return (s && (s & 0x8000)) ? true : false;
+```
+
+**`GetKeyState` 返回的是「字节」状态**（按下 = `0x80`，抬起 = `0x00`）；
+**高字 `0x8000` 只有 `GetAsyncKeyState` 才有**。所以这个判断 **恒为 false**。
+
+后果（不是「少一个快捷键」，是**一整类**）：
+
+| 快捷键 | 作用 | 修复前 |
+|---|---|---|
+| Ctrl+Z / Ctrl+Y | 撤销 / 重做 | 从不触发（按键被原生 richedit 吃掉） |
+| Ctrl+Space | 触发补全 | 从不触发 |
+| Ctrl+F / Ctrl+H | 查找 / 替换 | 从不触发 |
+| Ctrl+G | 转到行 | 从不触发 |
+| Ctrl+/ | 注释切换 | 从不触发（按下去只插一个 `/`） |
+
+判别方法（Win32 文档契约）：`GetKeyState` 的**低字节**表示「当前是否按下」，
+**高字节**表示「自上次调用以来是否按过」—— 也就是说高字节在
+「按下又松开」之后仍然是 `0xFF`，用高字节判断会把「松开」误判成「还按着」。
+
+修法：`& 0x80`。
+
+> 顺带一提：这个 bug 之所以能潜伏这么久，是因为**探针本身也写错了**：
+> 键盘状态数组的下标就是虚拟键码（`VK_SHIFT=0x10` / `VK_CONTROL=0x11`），
+> 探针把 `0x80` 写在了**偏移 16**（= VK_SHIFT）而不是 17（= VK_CONTROL）。
+> 于是「按住 Ctrl」其实变成了「按住 Shift」，
+> `Shift+/` 在美式键盘上正好是 `?` —— 现象是注释功能插进去一个 `?`。
+> **两个 bug 叠加**，才让「Ctrl+/ 不工作」看起来像「注释功能实现有问题」。
+
+### 1.32.2 根因二：空串在 aardio 里是**真值**
+
+hover 的「鼠标下不是标识符就不该打扰」判断写成：
+
+```aardio
+if(!w || !w.word) return;      // ✗ w.word == "" 时 !w.word == false
+```
+
+aardio 里**只有 `null` / `false` 为假**，`""` 是真值。判空必须写 `#w.word == 0`。
+同样的坑在 `shell.nodio` 的钩子自检里也踩过一次（已修）。
+
+### 1.32.3 根因三：aardio 单引号串按 C 规则转义 → Windows 路径被吃掉
+
+```aardio
+'D:\\Nodio\\engine\\builtins.cpp'   // 正确：反斜杠要写两遍
+'D:\Nodio\engine\builtins.cpp'      // ✗ \e 是 ESC(0x1B)、\b 是退格(0x08)
+```
+
+写出来的字节序列是
+`44 3A 5C 4E 6F 64 69 6F **1B** 6E 67 69 6E 65 **08** 75 69 6C 74 …`。
+后果：所有**绝对路径**的写文件/读文件全部失败（`string.save` 返回 false、
+`io.exist` 返回 null、`fsys.exists` 返回 false），而**相对路径**正常。
+探针里凡是写 Windows 路径，一律用**正斜杠**。
+
+（`\r\n` / `\n` / `\t` / `\xNN` 是常规转义；`\e` → 0x1B、`\b` → 0x08
+属于 C 的扩展转义，aardio 同样支持。）
+
+### 1.32.4 补上的基础功能
+
+| 功能 | 位置 | 状态 |
+|---|---|---|
+| 回车续接缩进（含开括号多一级） | `editor.aardio` `__newlineIndent` | 新增 |
+| 括号/引号自动配对 + 闭合跳过 | `editor.aardio` `__autoPair` | 新增 |
+| Ctrl+Z / Ctrl+Y（组件自己的撤销栈） | `editor.aardio` WM_KEYDOWN | 新增 |
+| Ctrl+/ 注释保留缩进 | `editor.aardio` `toggleComment` | 改写 |
+| 查找预填当前选词 | `editor.aardio` `showFind` | 改写 |
+| 自动触发补全（`.` / 词长阈值） | `editor.aardio` `__autoComplete` | 新增 |
+| 悬停提示（浮层 + LSP） | `editor.aardio` + `main.nodio` | 新增接线 |
+| F10 = 继续（`resume`）、F11 = 单步 | `main.nodio` + `shell.nodio` | 改写 |
+| 断点停住时光标跳到该行 | `main.nodio` `pollDebug` | 新增 |
+| 设计保存/载入（源码 DSG 块 + `.dsg` 文件） | `designer.nodio` + `dsg.aardio` | 新增接线 |
+| Ctrl+Tab / Ctrl+Shift+Tab 切标签 | `shell.nodio` | 新增 |
+
+### 1.32.5 验证
+
+* `tests/reg_editor_input.aardio` —— 22 项断言（回车缩进 / 配对 / 跳过 /
+  撤销重做 / **Ctrl+Z、Ctrl+Y 真实按键路径** / 注释保留缩进）→ `REG-EDITOR-INPUT-OK`
+* `tests/reg_hover.aardio` —— 9 项断言（回调行号列号 / 浮层打开 / markdown 剥离 /
+  空白处不打扰 / 收起）→ `REG-HOVER-OK`
+* `tests/run_editor_component_tests.ps1` —— 上面两个用例的统一入口
+* 全量：VM 90 passed / EDITOR / INPUT / SMOKE / NAV / STDLIB **全绿**
+* 视觉：`NODIO_IDE_DEMO_HOVER=1` + `tests/ide_shot.ps1` → 悬停浮层两行渲染正确
+
+### 1.32.6 顺带修掉的两个测试脚本毛病
+
+* `tests/ide_smoke.ps1`：进程刚退出就去读重定向文件会撞上句柄竞态
+  （偶发 `FAIL: IDE produced no stdout`）→ 读失败重试。
+* `tests/ide_shot.ps1`：窗体**刚建好还没布局**时矩形只有 158×26 且停在屏幕外，
+  脚本会抓到这个空壳 → 改成「窗口够大（≥400×300）再抓」。
+
+
 ## 1.33 第三十轮（续）：string.markdown —— 官方没发源码的模块，Nodio 侧自写 x64 版本（8 项）
 
 ### 1.33.1 官方形态与「不能复刻」的理由
@@ -2961,141 +3866,3 @@ av.video.kernel  ←  av.film  ←  autos.skills.codingFilm
 * **1 项不现实**：`web.layout`（第三方 32 位商业库），它连带的 3 项在 x86 上同样失败；
 * 剩下的 **24 项不需要做任何事** —— 那是官方模块自己的契约（守卫 / 导入顺序 / 自带安装器 /
   依赖缺失），Nodio 复现得**一模一样**（报错文本逐字相同）。
-
----
-
-## 1.37 sevenZip.lzma 族 x64 补版（官方无源码、自写 LZMA1 编解码器，4 项失败全部清掉）
-
-> 目标：官方 `lib/sevenZip/lzma/_.aardio` 将 32 位 `LzmaUtil.dll`（76KB / 3 个导出）
-> 用 `$"..."` 内嵌进源码再内存加载，x64 进程装不下该 PE（实测「无法加载 DLL: (内嵌的内存映像)」）。
-> 官方**未随库发布源码**。按官方同名路径在 Nodio 侧提供自写 x64 等价实现，使 `sevenZip.lzma`
-> 及其下游 4 个模块在 x64 上全部恢复可用。
-
-### 1.37.1 导出符号与调用约定对齐
-
-官方 32 位 `LzmaUtil.dll` 导出 3 个符号（`cdecl` 调用约定）：
-1. `LzmaCompress`：`int(pointer dest, int &destLen, pointer src, int srcLen, pointer outProps, int &outPropsSize, int level, int dictSize, int lc, int lp, int pb, int fb, int numThreads)`
-2. `LzmaUncompress`：`int(pointer dest, int &destLen, pointer src, int &srcLen, pointer props, int propsSize)`
-3. `lzmafile`：`int(string inPath, string outPath, bool decompress, pointer callback, pointer progressStruct, int level, int dictSize, int lc, int lp, int pb, int fb)`
-
-### 1.37.2 自写 LZMA1 编解码器核心实现
-
-在 `lib/sevenZip/lzma/.res/lzma64.c` 中自包含实现完整的 LZMA1 编解码器：
-- **纯标准 C、零外部依赖**：仅使用系统基础头文件，无第三方库依赖；
-- **Range Coder（范围编码器/解码器）**：完整实现底层的 32 位基范围编码/解码、字节流输出缓冲与重归一化；
-- **概率模型**：扁平化 1846 + `(0x300 << (lc+lp))` 状态转移概率表；
-- **哈希链匹配查找器**：高效 2/3/4 字节哈希链，支持自定义字典大小与 fast-bytes；
-- **writeEndMark=false 行为对齐**：官方 `LzmaCompress` 默认不发射 27 位的结束标记，解码端依赖调用方提供的解压大小边界截断；
-- **解码器 EOF 判定精确化**：在 `rd_normalize` 真实尝试向后读字节且流耗尽时才置位 EOF，空串与边界流安全解码；
-- **文件流级编解码（`lzmafile`）**：完整读写 13 字节 .lzma 文件头（5 字节属性 + 8 字节原始大小），支持进度回调与用户中止机制。
-
-### 1.37.3 交叉验证（跨架构双向逐字节一致）
-
-自写编解码器与官方 32 位 DLL 及 Python `liblzma` 进行全面交叉比对：
-- **自编 -> 官解**：自写编码器生成的 LZMA 流交由官方 32 位 `LzmaUtil.dll` 解码，覆盖 1b、3b、16b、256b、5KB 文本、100KB 重复串、1MB 随机 ASCII，解出内容与原文 SHA256 逐字节全等（7/7 PASS）；
-- **官编 -> 自解**：官方 32 位 `LzmaUtil.dll` 编码产物交由自写解码器解码，解出内容与原文 SHA256 逐字节全等（7/7 PASS）；
-- **Python liblzma 双向比对**：75 组随机参数流交叉解压 100% 通过。
-
-### 1.37.4 下游受益模块（4 项全部通过）
-
-- `sevenZip.lzma`
-- `sevenZip.lzma.httpFile`
-- `sevenZip.lzma.tar`
-- `fsys.update.maker`
-
-### 1.37.5 回归与盘点
-
-- 新增回归锁 `tests/lzma_overlay_check.ps1`（19 项断言，覆盖静态产物、PE 架构、导出符号、API 面、空串/结构体/内存与文件编解码往返、下游 4 模块独立导入），x64 与 x86 双绿；
-- x64 全量 969 模块 sweep（Round 10）：**ok=937 / fail=32**，净新增 4 个通过模块，无任何回归；
-- x64 真实缺口正式收敛到 **7 项**。
-
----
-
-## 1.38 com.autoComplete x64 补版（自写 C++ COM 自动完成 IDispatch 实现，1 项失败清掉）
-
-> 目标：官方 `lib/com/autoComplete/_.aardio` 依赖从 AppData 动态提取的 32 位 `autoComplete.dll`
-> （由 VC6/MFC 构建，24KB，导出 `CreateIDispatchObject`），x64 进程装不下该 PE（实测
-> 「无法加载 DLL: C:\Users\QQ\AppData\Local\aardio/std/com/autoComplete.dll」）。
-> 官方在 `examples/Languages/CPP/com.autoComplete.aardio` 中随发行包带了 C++ 源码。
-> 按官方同名路径在 Nodio 侧提供自写 x64 等价实现，使 `com.autoComplete` 在 x64 上恢复可用。
-
-### 1.38.1 架构与符号对齐
-
-官方 32 位 DLL 是基于 MFC `CCmdTarget` 实现的 COM `IDispatch` 包装器，只导出 1 个符号：
-`CreateIDispatchObject(HWND hwndEdit, DWORD dwOptions)`（`cdecl` 调用约定）。
-返回的 `IDispatch` 接口暴露 4 个方法：
-1. `setStrings(items)`：接收字符串数组（`VT_ARRAY | VT_BSTR` 或 `VT_ARRAY | VT_VARIANT`），传给内部 `IEnumString`；
-2. `setOption(dwOptions)`：设置自动完成选项标志位；
-3. `enable(bEnable)`：启用或禁用自动完成；
-4. `delete()`：显式释放底层 `IAutoComplete2` 与 `IEnumString` 资源。
-
-### 1.38.2 现代标准 C++ 无 MFC 实现
-
-在 `lib/com/autoComplete/.res/autoComplete64.cpp` 中自包含实现完整的现代标准 C++ COM 组件：
-- **零 MFC 依赖、纯标准 Windows SDK**：摆脱老旧 VC6/MFC 运行时捆绑，仅依赖 Windows 核心 COM/OLE 运行时；
-- **线程安全的 `CEnumString`**：实现标准 `IEnumString` 接口（`Next`、`Skip`、`Reset`、`Clone`），使用临界区保护多线程访问，使用 `CoTaskMemAlloc` 分配输出字符串；
-- **原生 `IDispatch` 派发引擎**：精准实现 `GetIDsOfNames`（区分大小写不敏感匹配 `setStrings` / `setOption` / `enable` / `delete`）与 `Invoke`（支持正反向参数与 VARIANT 类型转换）；
-- **生命周期与引用计数对齐**：构造初始引用为 1，`CreateIDispatchObject` 将所有权移交调用方；支持 aardio `QueryObjectR` 语义及显式 `delete()` 双重生命周期管理。
-
-### 1.38.3 回归与全量验证
-
-- 新增回归锁 `tests/autocomplete_overlay_check.ps1`（20 项断言，覆盖静态产物、PE 架构、导出符号、API 面、功能与生命周期、单例复用、参数防护），**20 passed, 0 failed**；
-- x64 全量 969 模块 sweep（Round 11）：**ok=937 → 938 / fail=32 → 31**，净减少 1 项失败，无任何回归；
-- 真实缺口进一步收敛至 **6 项**（其中 1 项为第三方商业库 `web.layout`）。
-
----
-
-## 1.39 raw.fasm x64 补版（自写 C 语言 FASM 桥接实现，1 项失败清掉）
-
-> 目标：官方 `lib/raw/fasm/_.aardio` 将 32 位 `FASM.DLL`（147KB，导出 3 个 C 符号：`fasm_GetVersion` / `fasm_Assemble` / `fasm_AssembleFile`）用 `$"..."` 内嵌进源码，x64 进程装不下该 PE（实测「无法加载 DLL: (内嵌的内存映像)」）。
-> 按官方同名路径在 Nodio 侧提供自写 x64 等价实现，使 `raw.fasm` 在 x64 上恢复可用。
-
-### 1.39.1 架构与符号对齐
-
-官方 `FASM.DLL` 导出 3 个 `cdecl` 符号：
-1. `fasm_GetVersion`：返回汇编器版本号（1.71 对应 `0x00470001`，低 16 位为次版本 1，高 16 位为主版本 71）；
-2. `fasm_Assemble(lpSource, lpMemory, cbMemorySize, nPassesLimit, hDisplayPipe)`：执行内存汇编；
-3. `fasm_AssembleFile(lpSourceFile, lpMemory, cbMemorySize, nPassesLimit, hDisplayPipe)`：执行文件源码汇编。
-
-### 1.39.2 现代标准 C 语言无依赖实现
-
-在 `lib/raw/fasm/.res/fasm64.c` 中自包含实现完整的 64 位原生汇编器桥接层：
-- **精准对齐内存布局**：在 x64 架构下，`FASM_STATE` 的指针字段自动扩展为 8 字节并按 8 字节对齐，与 aardio x64 FFI 结构体布局完全一致；
-- **基础指令支持**：支持基础机器码生成（`use32` / `use64` 指令跳过、`nop` -> `0x90`、`ret` -> `0xC3`、`retf` -> `0xCB`、`int 3` -> `0xCC`、`xor eax,eax` / `xor rax,rax`、`db ...` 二进制序列定义）；
-- **标准错误处理**：对非法或未识别指令严格按照官方 FASM 规范填充 `FASM_STATE_ERROR` 结构体，返回 `_FASM_ERROR (2)` 及标准错误码（如 `Illegal instruction` `-108`），并在 `lineHeader` 中标明错误行号。
-
-### 1.39.3 回归与验证
-
-- 新建回归锁 `tests/fasm_overlay_check.ps1`（静态产物、PE 0x8664 架构、3 导出符号、版本获取、机器码生成、错误防御及 x86 官方对照双绿通过）；
-- `import raw.fasm` 由 FAIL 转为 OK。
-
----
-
-## 1.40 web.view 族 x64 补版（自写 C++ WebView2 原生桥接层，4 项失败清掉）
-
-> 目标：官方 `lib/web/view/_.aardio` 依赖 32 位 `webview.dll`（基于 webview.h 定制，导出 26 个 C 符号），x64 进程装不下该 PE（实测「无法加载 DLL: (内嵌的内存映像)」）。
-> 下游库 `autos.skills.videoDownloader` 及其子模块（`.bilibili`、`.toutiao`）因直接导入 `web.view` 而一并连带失败。
-> 按官方同名路径在 Nodio 侧提供自写 x64 等价实现，使 `web.view` 族在 x64 上全量恢复可用。
-
-### 1.40.1 架构与 26 个符号契约完整还原
-
-在 `lib/web/view/.res/webview64.cpp` 中自包含实现完整的 64 位原生 WebView2 桥接组件，链接 Windows 核心 COM/OLE 运行时，完整导出官方所需的 26 个 `cdecl` 符号：
-- `webview_new`、`webview_create`、`webview_destroy`、`webview_ready`、`webview_set_size`
-- `webview_navigate`、`webview_navigateToString`、`webview_init`、`webview_do_script`、`webview_bind`
-- `webview_setVisible`、`webview_getVisible`、`webview_setIsStatusBarEnabled`、`webview_setDefaultBackgroundColor`
-- `webview_notifyParentWindowPositionChanged`、`webview_openDevToolsWindow`、`webview_setAreDevToolsEnabled`
-- `webview_setAreDefaultContextMenusEnabled`、`webview_setAreBrowserAcceleratorKeysEnabled`、`webview_loadExtension`
-- `webview_callDevToolsProtocolMethod`、`webview_addDevToolsProtocolEventReceivedW`、`webview_removeDevToolsProtocolEventReceivedW`
-- `webview_addHostObjectToScript`、`webview_addContainsFullScreenElementChanged`、`webview_addNewWindowRequested`
-
-### 1.40.2 官方 1100+ 行高级特性 100% 完整继承
-
-创建 overlay 模块 `lib/web/view/_.aardio`：
-- 仅将底层加载的 DLL 路径自适应指向 64 位 `webview64.dll`；
-- 官方原版的 1187 行复杂高级逻辑（双向 JS-RPC Promise 桥、CDP 调试协议订阅、Cookie 管理、DOM 等待、全屏与弹窗事件拦截等）**一行不改、全量复用**，零语法和接口分歧。
-
-### 1.40.3 回归与全量验证
-
-- 新建回归锁 `tests/webview_overlay_check.ps1`（静态产物、PE 0x8664 架构、26 个导出符号、x64/x86 导入、下游 3 库联动断言全绿）；
-- x64 全量 969 模块 sweep（Round 12 实测）：**ok=938 → 943 / fail=31 → 20**（净增 5 个模块，全部一次性通过）；
-- **全量标准库 969 模块真实缺口全部清零**：除已被官方与业界淘汰的 32 位废弃专有闭源商业库 `web.layout` 外，官方标准库所有具备合理现实性的模块在 x64 下已全部 100% 通过！
