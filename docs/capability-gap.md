@@ -579,7 +579,7 @@ BEFORE-POPUP       ← 进 TrackPopupMenu
 
 | 官方能力 | 实测现象 | 处置 |
 |---|---|---|
-| `ctrl.setPos(x,y,宽,高)` | 内部 `saveScale()+adjust()` 在 Nodio 里触发引擎断言崩溃（`STATUS_BREAKPOINT`） | **禁用**，改用 `nodio.ui.setRect`（原始 `win.setPos`） |
+| `ctrl.setPos(x,y,宽,高)` | 内部 `saveScale()+adjust()` 在 Nodio 里触发引擎断言崩溃（`STATUS_BREAKPOINT`） | **已解禁**（§1.39 复验）：最新引擎上全链双架构可用，崩溃系后续轮次顺带修复；`nodio.ui.setRect` 封装保留 |
 | `plus` 控件做透明 overlay | `plus` 会把**父窗口背景整块 BitBlt 进自己的内存画板**再绘制（`lib/win/ui/ctrl/background.aardio:196-215`）→ 覆盖层必然盖住子控件 | 放弃透明 overlay；选中框/手柄改在**底板**上自绘 |
 | `static` 控件画手柄 | `bgcolor` 依赖窗体 `WM_CTLCOLORSTATIC`，Nodio 里**画不出来**（手柄不可见） | 手柄一律在底板上用 gdip 自绘 |
 
@@ -709,7 +709,7 @@ FFI 本身实测可用）。
 | 路径 | 单位 | 证据 |
 |---|---|---|
 | 官方 `win.ui` 控件矩形 | **逻辑像素** | `form.add{left=240;top=58;right=980;bottom=560}` 实际落在 `359,86,1469,839`（= 逻辑 × 1.5）；官方 `lib/win/ui/ctrl/metaProperty/_.aardio:647` `reloadScale` 用 `dpiScaleX` 重排 |
-| 我们的自绘组件 | **物理像素** | `win.setPos` 不做 DPI 缩放（官方 `ctrl.setPos` 会触发引擎断言，已禁用） |
+| 我们的自绘组件 | **物理像素** | `win.setPos` 不做 DPI 缩放（官方 `ctrl.setPos` 当年触发引擎断言已禁用，§1.39 复验已解禁可用） |
 | GDI+ 字体 | **像素**（`_GdipUnitPixel`，不随 DPI 变） | 官方 `lib/gdip/family.aardio:54` `createFont(...,unit=2)`；`lib/gdi/_.aardio:650` `getDpiScale` |
 
 于是原生控件被官方放大 1.5 倍，自绘的却纹丝不动。
@@ -3983,3 +3983,63 @@ av.video.kernel  ←  av.film  ←  autos.skills.codingFilm
 关停服务端）。附带回归：VM 90/90（x64）+ 89/0/1（x86，t23 剪贴板环境门控）、
 IDE 冒烟/右键/导航、编辑器/输入、iofile_text、win_clip、builtin_api、
 stdlib、publish 全绿，新增失败 0。
+
+## 1.39 第三十三轮（复验）：`ctrl.setPos` 解禁 —— 第五轮的引擎断言崩溃已不存在
+
+### 1.39.1 背景
+
+§1.10.3（第五轮）记档：官方 `ctrl.setPos(x,y,宽,高)` 在 Nodio 里触发引擎断言
+崩溃（`STATUS_BREAKPOINT`），处置为**禁用**、改用 `nodio.ui.setRect`。
+当时的引擎是第五轮时点（`::` 系统 API 表刚落地、官方事件路由刚修通）。
+此后 IDE/LSP 线又有 7 个修复 commit（含 §1.29 的 `win.setPos` after 参数
+只认指针型的修复、P1-13 `::` sysapi 表）与性能线 15 轮改动。本轮目标：
+在最新引擎（HEAD `b5f12e8` 等价物）上复验该崩溃是否仍存在。
+
+### 1.39.2 实测（双架构 6/6 全绿，第 15 轮引擎）
+
+| 探针 | 覆盖场景 | 结果（x86 / x64 一致） |
+|---|---|---|
+| `tests/probe_setpos.aardio` | `win.form` + button，`b.setPos(20,20,120,50)` | `SETPASS 120`（官方 x,y,宽,高 语义正确）、exit 0 |
+| `tests/probe_setpos2.aardio` | `f.getScale()` 直调、`b.saveScale()` 直调（官方 setPos 第二步全链）、`b.adjust()` 直调、`show()` 后 setPos、static 控件、同一控件二次 setPos、null 参数 | `GETSCALE type=number`、`SAVESCALE type=boolean`、`ADJUST_OK`、`SET1 120`/`SET2 100`/`SET3 140`/`SET4 140`（null=不改大小语义正确）、exit 0 |
+| `tests/probe_setpos3.aardio` | child form（第五轮崩溃场景）里 add + setPos + saveScale/adjust 链 + child 自身 setPos | `CHILD_SET1 120`、`CHILD_CHAIN_OK`、`CHILD_SELF_SET 220`、exit 0 |
+
+**结论：崩溃已不可复现。** 官方 `metaProperty.setPos` 全链
+（`win.setPos` → `saveScale()`（内部 `getScale`/`getRect`/`getStyle`/
+`toClientRect`/`table.assign`/锚点除法）→ `adjust()`）在双架构上完全可用。
+
+最小复现探针全文（`tests/probe_*.aardio` 按仓库惯例被 .gitignore 忽略、
+不入库，故内联于此；运行方式 `nodio.exe <探针路径>`，期望打印 SETPASS/
+PROBE_DONE 且 exit 0，崩溃则为 STATUS_BREAKPOINT）：
+
+```aardio
+import win.ui;
+import console;
+var f = win.form(text="setpos-probe"; right=400; bottom=300);
+var b = f.add({cls="button"; text="ok"; left=10; top=10; right=110; bottom=45});
+console.log("ADDED");
+b.setPos(20, 20, 120, 50);
+console.log("SETPASS " ++ b.getRect().width());
+console.log("PROBE_DONE");
+```
+
+### 1.39.3 崩溃为何消失（归因，非本轮修改）
+
+本轮**没有改任何引擎/库代码**。崩溃消失是 IDE/LSP 线后续修复的连带收益，
+两个最可能的根因修复（按时间序）：
+
+1. **P1-13（第五轮内）**：裸 `::` 系统 API 签名表落地 —— `saveScale`/
+   `adjust` 内部依赖的 `::` 调用链从「抛错」变「可用」；
+2. **§1.29（第二十九轮）**：引擎 `win.setPos` 的 `after` 参数只认指针型、
+   数值 `1`(HWND_BOTTOM) 被吞 —— 官方 `ctrl.setPos` 底层正是 `win.setPos`，
+   该修复直接扫清了这条链上的断言点。
+
+无法进一步二分归因（需要重建第五轮时点的引擎做对照，成本高、无行为差异
+价值），按「已修复、以现状实测为准」闭账。
+
+### 1.39.4 处置
+
+- §1.10.3、§1.22 的「已禁用」提法已加解禁注记；第五轮正文的历史叙述保留原文。
+- `nodio.ui.rect` 的 `setRect` 封装**保留不动**（行为正确：物理像素、方言无关），
+  IDE 线是否切回官方 `ctrl.setPos` 由 IDE/LSP 工作线自行决定（涉及 `ide/`、
+  `lib/nodio/` 写禁区，本轮不触碰）。
+- 三个探针留在 `tests/` 作回归证据。
