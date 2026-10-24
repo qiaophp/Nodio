@@ -1948,14 +1948,43 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                 }
                 if (suffix == 'B') retType = ARBool;
             }
-            if (retType == ARInt && suffix == 0)
+            if (retType == ARInt)
             {
-                if (checkName == "LoadCursor" || checkName == "LoadIcon" ||
-                    checkName == "LoadImage" || checkName == "LoadBitmap" ||
-                    checkName == "GetCursor" || checkName == "CreateCursor" ||
-                    checkName == "CreateIcon" || checkName == "CreateIconIndirect" ||
-                    checkName == "GetDC" || checkName == "GetWindowDC" ||
-                    checkName == "CreateCompatibleDC")
+                // x64: this family returns REAL 64-bit pointers, not Win32
+                // interop handles (handles are 32-bit-significant by design,
+                // a mapped view base is not). The official host is 32-bit so
+                // its INT default return was lossless there; on x64 the
+                // truncation handed scripts a bogus pointer — fsys.mmap's
+                // readTable crashed 0xC0000005 exactly there (cdb: movsxd
+                // rdi,[rdi] with the view base's low 32 bits sign-extended).
+                // Upgraded to the full machine word (official bare callers:
+                // fsys.mmap — MapViewOfFile / CreateFileMappingW /
+                // OpenFileMapping; process.* — LoadLibrary*; dotNet host —
+                // GetProcAddress / GetModuleHandleW).
+                if (checkName == "MapViewOfFile" ||
+                    checkName == "MapViewOfFileEx" ||
+                    checkName == "CreateFileMapping" ||
+                    checkName == "OpenFileMapping" ||
+                    checkName == "LoadLibrary" ||
+                    checkName == "LoadLibraryEx" ||
+                    checkName == "GetProcAddress" ||
+                    checkName == "GetModuleHandle" ||
+                    checkName == "VirtualAlloc")
+                {
+                    retType = ARI64;
+                }
+                else if (suffix == 0 &&
+                         (checkName == "LoadCursor" ||
+                          checkName == "LoadIcon" ||
+                          checkName == "LoadImage" ||
+                          checkName == "LoadBitmap" ||
+                          checkName == "GetCursor" ||
+                          checkName == "CreateCursor" ||
+                          checkName == "CreateIcon" ||
+                          checkName == "CreateIconIndirect" ||
+                          checkName == "GetDC" ||
+                          checkName == "GetWindowDC" ||
+                          checkName == "CreateCompatibleDC"))
                 {
                     retType = ARPtr;
                 }

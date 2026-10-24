@@ -1,0 +1,51 @@
+// ide.command 跨进程命令总线回归——服务端。
+//
+// 用官方 ide.command 协议（lib/ide/command.aardio）：join → 注册命令
+// （写共享注册表）→ WM_COPYDATA 到达按名分发 → pushReturnValue 回传。
+// 命令实现经 app.ideCommand.init 注入（global.import 绝对路径拉模块，
+// 与 tests/ide_ctx 的既有做法一致），覆盖「命令名 → IDE 函数」的官方
+// 37 命令注册路径；跨进程的客户端见 client.nodio。
+// 只用官方命令表里的名字——ideCommand 只注册官方 37 命令。
+//
+// 环境变量：
+//   IDECMD_HWND = 服务端写回主窗体句柄的文件路径
+import win.ui;
+import ide.command;
+global.import("D:/Nodio/ide/nodio/app/ideCommand.nodio");
+
+var hwndPath = ..string.getenv("IDECMD_HWND");
+if(!#hwndPath) error("缺少 IDECMD_HWND 环境变量", 2);
+
+var wf = win.form(text="IDECMD-SRV";border="none");
+wf.messageOnly();
+
+var store = {};
+var impl = {};
+impl.setConfig = function(k, v){
+	store[k] = tostring(v : "");
+	return true;
+};
+impl.getConfig = function(k){
+	return store[[k]];
+};
+impl.getMainHwnd = function(){
+	return wf.hwnd;
+};
+impl.projectIsOpened = lambda() false;
+impl.gotoLine = function(n){
+	return tonumber(n) == 42;
+};
+impl.showStatus = lambda(text) text;
+impl.getActiveCode = lambda() "srv-active-code";
+impl.killOnExit = function(v){
+	// 测试语义：外部发 killOnExit 即退出消息循环（真实 IDE 里这只落配置）。
+	// messageOnly 窗体的 close() 不会终结 win.loopMessage，要显式发 WM_QUIT。
+	wf.close();
+	..win.quitMessage();
+	return true;
+};
+
+app.ideCommand.init(wf, impl);
+..string.save(hwndPath, tostring(wf.hwnd));
+
+win.loopMessage();

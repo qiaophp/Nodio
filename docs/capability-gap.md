@@ -3917,3 +3917,69 @@ av.video.kernel  ←  av.film  ←  autos.skills.codingFilm
    恒二进制。回归：`tests/iofile_text_check.ps1`
    （13 项十六进制字节级断言，x64 / x86 双绿；VM 90/90、stdlib、publish、
    IDE 冒烟 / 导航、builtin_api 全绿，新增失败 0）。
+
+## 1.38 第三十二轮：官方 ide.command 外部命令面落地（附带修掉两个引擎级缺陷）
+
+### 1.38.1 背景
+
+官方 aardio.exe 把可被外部进程/插件驱动的能力注册成一张**命令名表**
+（37 条，逐条抄自二进制字符串块，`docs/official-ide-reference.md` §1），
+外部工具/插件经 `ide.command.join()` + `ide.command.send(hwnd,"命令名",...)`
+驱动 IDE。账本里 `import ide` 长期挂着「需要宿主 ide.command.join() 主管道
+已建立」——本轮实测 join **直接 0xC0000005 崩溃**，顺藤摸出两个引擎缺陷。
+
+### 1.38.2 引擎缺陷一：`::Kernel32` 裸调 API 的返回值被截成 32 位（x64）
+
+- **定位**（cdb：崩溃指令 `movsxd rdi, [rdi]`，RDI = 视图基址低 32 位符号扩展）：
+  `::Kernel32.MapViewOfFile(...)` 走 `CreateDirectApiWrapper`
+  （`engine/ffi.cpp`，DLL 表成员的裸调用路径），默认返回类型 `ARInt`，
+  解码 else 分支 `(double)(int)r` 把 64 位映射基址**截成 32 位** →
+  脚本拿到假指针 → `fsys.mmap.readTable()` 解引用即崩。
+- **同族先例**：第五轮修过官方 `win/api.aardio` 把 `::CallWindowProc` 声明成
+  int 返回的 LRESULT 截断——那是**静态声明**路径，这是**裸调默认**路径。
+- **修法**：HWND/HANDLE 按 Win32 互操作规则本就 32 位有效（不动）；
+  返回**真实 64 位指针**的内存映射/模块加载族升为全宽（`ARI64`）：
+  `MapViewOfFile` / `MapViewOfFileEx` / `CreateFileMapping` / `OpenFileMapping` /
+  `LoadLibrary` / `LoadLibraryEx` / `GetProcAddress` / `GetModuleHandle` /
+  `VirtualAlloc`（官方库裸调实证：fsys.mmap、process.*、dotNet host）。
+
+### 1.38.3 引擎缺陷二：`table.tostring(tab, true)` 非标识符键未括号化
+
+- 崩溃修掉后总线仍断：mmap 注册表往返**静默丢数据**。
+  `writeTable` = `table.tostring(tab, true)`（可重新 eval 的字面量）+
+  `readTable` = `eval`。Nodio 的 tostring 把 `[-1]` / `[hwnd数字]` 这类
+  非标识符键写成**裸** `{-1=...}` → 自己的解析器把它读成数组元素
+  （实测 `eval("{-1='v'}")` 得 `{1:-1}`）→ 官方 mmap 协议的保留返回槽
+  `[-1]` 与 hwnd 数字键**双向静默丢失**。
+- **修法**（`engine/builtins.cpp`）：非标识符键一律括号化——数字键
+  `[-1]=...`，字符串键 `['a b']=...`（转义引号）。
+- **边界**：表构造器 `{-1=x}` 官方本就不是合法键写法（官方也是运行时
+  下标赋值 `t[-1]=x`），解析器行为未动。
+
+### 1.38.4 命令面本体
+
+- **`app/ideCommand.nodio`**：官方 37 命令**全部注册**进共享注册表
+  （外部可探测命令存在性；官方语义：未注册的命令 send 返回 null）。
+  有依托的 24 条经 main.nodio 注入的 impl 表接真实现（save/saveAll/
+  openDocument/newDocument/getActiveCode/setActiveCode/insertCode/gotoLine/
+  showStatus/getMainHwnd/getActiveViewHwnd/redrawCodeEditor/projectIsOpened/
+  isInProject/getProjectPath/getProjectDir/getProjectMainFile/getConfig/
+  setConfig/getProjectProperty/setProjectProperty/switchActiveForm/
+  getActiveForm/getSelectedControl/setSelectedControl/getControlParam/
+  setControlParam/refreshStdLib/refreshUserLib/createProcessEx/
+  loadPrivateFont/killOnExit）；pluginViewCreate/pluginViewShow 等暂为
+  注册桩（右侧栏子窗体宿主是独立特性）。
+- `app/designer.nodio` 增画布最小访问面（canvasSelected/canvasSelect/
+  canvasGetParam/canvasSetParam/isActive），命令实现不摸设计器内部。
+- 进程内调用走 `app.ideCommand.dispatch(name, ...)`；跨进程与官方
+  插件/工具完全同法（`ide.command.join()` + `send`）。
+
+### 1.38.5 回归
+
+新增 `tests/ide_command_check.ps1`（x64 / x86 双绿）——**真实双进程**：
+服务端经 `app.ideCommand.init` 注册 37 命令并写出主窗体句柄，客户端进程
+`ide.command.join()` 后逐条 send 官方命令名，断言返回值（setConfig/getConfig
+往返、gotoLine 语义、getMainHwnd 一致性、未注册命令返回 null、killOnExit
+关停服务端）。附带回归：VM 90/90（x64）+ 89/0/1（x86，t23 剪贴板环境门控）、
+IDE 冒烟/右键/导航、编辑器/输入、iofile_text、win_clip、builtin_api、
+stdlib、publish 全绿，新增失败 0。

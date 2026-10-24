@@ -8099,7 +8099,49 @@ void Interp::InitBuiltins()
                             if (vs.empty()) continue;
                             if (!bFirst) s += L";";
                             bFirst = false;
-                            s += kv.first + L"=" + vs;
+                            // A loadable literal must bracket every key that
+                            // is not a plain identifier. The official mmap
+                            // registry stores numeric hwnd keys and the
+                            // reserved [-1] return slot; emitting those bare
+                            // re-parses "-1=x" as an array item and the
+                            // ide.command registry/return roundtrip silently
+                            // loses them (eval("{-1='v'}") yields {1:-1}).
+                            bool bIdentAll =
+                                iswalpha(kv.first[0]) ||
+                                kv.first[0] == L'_';
+                            for (size_t c = 1;
+                                 c < kv.first.size() && bIdentAll; c++)
+                                if (!(iswalnum(kv.first[c]) ||
+                                      kv.first[c] == L'_'))
+                                    bIdentAll = false;
+                            if (bIdentAll)
+                            {
+                                s += kv.first + L"=" + vs;
+                                continue;
+                            }
+                            wstring num = kv.first;
+                            if (!num.empty() && num[0] == L'-')
+                                num = num.substr(1);
+                            bool bNum = !num.empty();
+                            for (wchar_t ch : num)
+                                if (!(ch >= L'0' && ch <= L'9'))
+                                {
+                                    bNum = false;
+                                    break;
+                                }
+                            if (bNum)
+                                s += L"[" + kv.first + L"]=" + vs;
+                            else
+                            {
+                                wstring esc;
+                                for (wchar_t ch : kv.first)
+                                {
+                                    if (ch == L'\'') esc += L"\\'";
+                                    else if (ch == L'\\') esc += L"\\\\";
+                                    else esc += ch;
+                                }
+                                s += L"['" + esc + L"']=" + vs;
+                            }
                         }
                         s += L"}";
                         out += s;

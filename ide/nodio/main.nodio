@@ -16,6 +16,7 @@ import app.dapClient;
 import nodio.designer.registry;
 import nodio.ui.dpi;
 import nodio.ui.board;   // nodio.ui.redrawAll（窗口显示后统一强制重画）
+import app.ideCommand;   // 官方 ide.command 37 命令外部命令面
 import raw;
 
 // ---------- 启动期：延迟绘制（防满屏闪）----------
@@ -2888,5 +2889,113 @@ catch(e5){}
 try{
 	..nodio.ui.redrawAll();
 }catch(e6){}
+
+// ---------- 官方 ide.command 外部命令面 ----------
+//
+// 官方 aardio.exe 注册了一张可被外部进程/插件驱动的命令表
+// （docs/official-ide-reference.md §1 的 37 条）；这里把同一张表挂到
+// 共享注册表上——外部工具/插件 ide.command.join() 后按名 send 即可
+// 驱动本 IDE。实现闭包引用 main 的既有函数，不经 hooks 改造。
+var ideCmdImpl = {};
+ideCmdImpl.showStatus = function(text){
+	shell.setStatus(text);
+	return true;
+};
+ideCmdImpl.gotoLine = function(n){
+	n = tonumber(n);
+	if(!n) return false;
+	shell.editor.gotoLine(n);
+	return true;
+};
+ideCmdImpl.save = function(){
+	saveFile();
+	return true;
+};
+ideCmdImpl.saveAll = function(){
+	saveAllFiles();
+	return true;
+};
+ideCmdImpl.getActiveCode = function(){
+	return curFile ? shell.tabGetText(curFile) : null;
+};
+ideCmdImpl.setActiveCode = function(text){
+	if(!curFile || text === null) return false;
+	shell.tabSetText(curFile, text);
+	return true;
+};
+ideCmdImpl.insertCode = function(text){
+	if(!curFile || text === null) return false;
+	var e = shell.editor;
+	var t = shell.tabGetText(curFile);
+	var nt = e.replaceTextAt(t, e.curLine : 1, e.curCol : 1, 0, text);
+	if(nt === null) return false;
+	shell.tabSetText(curFile, nt);
+	return true;
+};
+ideCmdImpl.openDocument = function(path){
+	if(!path) return false;
+	openFile(path);
+	return true;
+};
+ideCmdImpl.newDocument = function(){
+	if(shell.hooks.onNewFile) shell.hooks.onNewFile();
+	return true;
+};
+ideCmdImpl.newForm = ideCmdImpl.newDocument;   // 官方语义：新建窗体文档
+ideCmdImpl.getMainHwnd = function(){
+	return shell.winform.hwnd;
+};
+ideCmdImpl.getActiveViewHwnd = function(){
+	try{ return shell.editor.ctrl.hwnd }catch(e){ return shell.winform.hwnd }
+};
+ideCmdImpl.redrawCodeEditor = function(){
+	try{ shell.editor.ctrl.invalidate() }catch(e){}
+	return true;
+};
+ideCmdImpl.projectIsOpened = lambda() proj != null;
+ideCmdImpl.isInProject = function(path){
+	if(!proj || !path) return false;
+	var full = ..io.fullpath(path);
+	for(i=1;#proj.files;1){
+		if(..io.fullpath(proj.files[i].path) == full) return true;
+	}
+	return false;
+};
+ideCmdImpl.getProjectPath = lambda() proj ? proj.path : null;
+ideCmdImpl.getProjectDir  = lambda() proj ? proj.root : null;
+ideCmdImpl.getProjectMainFile = lambda() proj ? proj.start : null;
+ideCmdImpl.getProjectProperty = function(k){ return cfgRead("projprop." ++ (k : "")) };
+ideCmdImpl.setProjectProperty = function(k, v){ return cfgWrite("projprop." ++ (k : ""), tostring(v : "")) };
+ideCmdImpl.getConfig = function(k){ return cfgRead(k) };
+ideCmdImpl.setConfig = function(k, v){ return cfgWrite(k, tostring(v : "")) };
+ideCmdImpl.switchActiveForm = function(){
+	if(shell.hooks.onDesigner) shell.hooks.onDesigner();
+	return app.designer.isActive();
+};
+ideCmdImpl.getActiveForm = lambda() app.designer.isActive() ? "design" : "code";
+ideCmdImpl.getSelectedControl = lambda() app.designer.canvasSelected();
+ideCmdImpl.setSelectedControl = function(name){ return app.designer.canvasSelect(name) };
+ideCmdImpl.getControlParam = function(name, k){ return app.designer.canvasGetParam(name, k) };
+ideCmdImpl.setControlParam = function(name, k, v){ return app.designer.canvasSetParam(name, k, v) };
+ideCmdImpl.refreshStdLib = function(){
+	try{ app.library.scanLib() }catch(e){ return false }
+	return true;
+};
+ideCmdImpl.refreshUserLib = ideCmdImpl.refreshStdLib;
+ideCmdImpl.createProcessEx = function(path, args){
+	var p = ..process.popen(path, args);
+	return p ? p.pid : null;
+};
+ideCmdImpl.loadPrivateFont = function(path){
+	if(!path) return false;
+	// FR_PRIVATE(0x10)：进程私有字体，不写系统字体表
+	var n = ::Gdi32.AddFontResourceExW(path, 0x10, 0);
+	return n ? true : false;
+};
+ideCmdImpl.killOnExit = function(v){
+	return cfgWrite("killOnExit", tostring(v : ""));
+};
+
+app.ideCommand.init(shell.winform, ideCmdImpl);
 
 return win.loopMessage();

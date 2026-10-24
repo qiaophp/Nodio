@@ -298,3 +298,41 @@ readFromSource = function(src){
 	if(!#block) return false;
 	return canvas.fromDSG(block);
 }
+
+// —— 官方 ide.command 命令面的画布入口（app.ideCommand 接线用）——
+// 外部命令 setSelectedControl / getSelectedControl / getControlParam /
+// setControlParam / getActiveForm 都要摸到画布状态；画布是本模块的
+// 模块级变量（打开设计器才有），这里给出最小访问面。
+isActive = lambda() visible;
+
+canvasSelected = function(){
+	return canvas ? canvas.selected : null;
+}
+
+canvasSelect = function(name){
+	if(!canvas) return null;
+	return canvas.select(name);
+}
+
+canvasGetParam = function(name, key){
+	if(!canvas || !key) return null;
+	for(i=1;#canvas.items;1){
+		if(canvas.items[i].name == name) return canvas.items[i][key];
+	}
+	return null;
+}
+
+canvasSetParam = function(name, key, v){
+	if(!canvas || !key) return false;
+	for(i=1;#canvas.items;1){
+		var it = canvas.items[i];
+		if(it.name == name){
+			it[key] = v;
+			canvas.__place(it);
+			canvas.__refresh();
+			if(canvas.onChange) canvas.onChange(it);
+			return true;
+		}
+	}
+	return false;
+}

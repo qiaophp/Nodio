@@ -1,0 +1,83 @@
+// app/ideCommand.nodio — 官方 IDE 外部命令面（ide.command 命令表）。
+//
+// 官方 aardio.exe 把「可被外部进程/插件驱动的能力」注册成一张命令名表
+// （docs/official-ide-reference.md §1，37 条，逐条抄自官方二进制的字符串块），
+// 外部进程经 ide.command.join() + ide.command.send(hwnd,"命令名",...) 驱动 IDE。
+// 本模块把同一张命令名表挂到自托管 IDE：注册即写入共享注册表
+// （命令名 → 订阅 hwnd），WM_COPYDATA 到达后按名分发并回传返回值。
+//
+// 实现不在本模块：main.nodio 把 impl 表传进来（闭包持有 IDE 现有函数）。
+// 没有依托的命令也照样注册（返回 null）——官方语义：未注册的命令 send
+// 返回 null，注册了的返回处理值；外部因此可以探测命令是否存在。
+//
+// 进程内调用走 dispatch(name, ...)，跨进程走 ide.command.send。
+import win.ui;
+import ide.command;
+
+var mgr = null;
+var impl = null;
+
+joined = lambda() !!mgr;
+
+// 进程内直调（不经过 COPYDATA；IDE 内脚本/回归夹具用这条）
+dispatch = function(name, ...){
+	if(!mgr) return null;
+	var f = mgr[name];
+	if(type(f) != "function") return null;
+	return f(...);
+}
+
+init = function(winform, implTable){
+	if(mgr) return mgr;
+	impl = implTable : {};
+	ide.command.join();
+	mgr = ide.command(winform);
+
+	// 官方命令表（official-ide-reference.md §1 的 37 条，同序）
+	var cmds = {};
+	cmds.showStatus          = function(text){ return impl.showStatus ? impl.showStatus(text) : null };
+	cmds.gotoLine            = function(n){ return impl.gotoLine ? impl.gotoLine(n) : null };
+	cmds.processList         = function(){ return impl.processList ? impl.processList() : null };
+	cmds.pluginViewShow      = function(name){ return impl.pluginViewShow ? impl.pluginViewShow(name) : null };
+	cmds.pluginViewCreate    = function(name, path){ return impl.pluginViewCreate ? impl.pluginViewCreate(name, path) : null };
+	cmds.setConfig           = function(k, v){ return impl.setConfig ? impl.setConfig(k, v) : null };
+	cmds.getConfig           = function(k){ return impl.getConfig ? impl.getConfig(k) : null };
+	cmds.createProcessEx     = function(path, args){ return impl.createProcessEx ? impl.createProcessEx(path, args) : null };
+	cmds.createThread        = function(path){ return impl.createThread ? impl.createThread(path) : null };
+	cmds.saveAll             = function(){ return impl.saveAll ? impl.saveAll() : null };
+	cmds.save                = function(){ return impl.save ? impl.save() : null };
+	cmds.insertCode          = function(text){ return impl.insertCode ? impl.insertCode(text) : null };
+	cmds.setSelectedControl  = function(name){ return impl.setSelectedControl ? impl.setSelectedControl(name) : null };
+	cmds.getSelectedControl  = function(){ return impl.getSelectedControl ? impl.getSelectedControl() : null };
+	cmds.setControlParam     = function(name, k, v){ return impl.setControlParam ? impl.setControlParam(name, k, v) : null };
+	cmds.getControlParam     = function(name, k){ return impl.getControlParam ? impl.getControlParam(name, k) : null };
+	cmds.switchActiveForm    = function(){ return impl.switchActiveForm ? impl.switchActiveForm() : null };
+	cmds.getActiveForm       = function(){ return impl.getActiveForm ? impl.getActiveForm() : null };
+	cmds.loadPrivateFont     = function(path){ return impl.loadPrivateFont ? impl.loadPrivateFont(path) : null };
+	cmds.redrawCodeEditor    = function(){ return impl.redrawCodeEditor ? impl.redrawCodeEditor() : null };
+	cmds.setActiveCode       = function(text){ return impl.setActiveCode ? impl.setActiveCode(text) : null };
+	cmds.getActiveCode       = function(){ return impl.getActiveCode ? impl.getActiveCode() : null };
+	cmds.newForm             = function(){ return impl.newForm ? impl.newForm() : null };
+	cmds.newDocument         = function(){ return impl.newDocument ? impl.newDocument() : null };
+	cmds.openDocument        = function(path){ return impl.openDocument ? impl.openDocument(path) : null };
+	cmds.refreshStdLib       = function(){ return impl.refreshStdLib ? impl.refreshStdLib() : null };
+	cmds.refreshUserLib      = function(){ return impl.refreshUserLib ? impl.refreshUserLib() : null };
+	cmds.projectIsOpened     = function(){ return impl.projectIsOpened ? impl.projectIsOpened() : null };
+	cmds.setProjectProperty  = function(k, v){ return impl.setProjectProperty ? impl.setProjectProperty(k, v) : null };
+	cmds.getProjectProperty  = function(k){ return impl.getProjectProperty ? impl.getProjectProperty(k) : null };
+	cmds.getProjectMainFile  = function(){ return impl.getProjectMainFile ? impl.getProjectMainFile() : null };
+	cmds.getProjectPath      = function(){ return impl.getProjectPath ? impl.getProjectPath() : null };
+	cmds.getProjectDir       = function(){ return impl.getProjectDir ? impl.getProjectDir() : null };
+	cmds.getMainHwnd         = function(){ return impl.getMainHwnd ? impl.getMainHwnd() : null };
+	cmds.getActiveViewHwnd   = function(){ return impl.getActiveViewHwnd ? impl.getActiveViewHwnd() : null };
+	cmds.updateVersion       = function(){ return impl.updateVersion ? impl.updateVersion() : null };
+	cmds.isInProject         = function(path){ return impl.isInProject ? impl.isInProject(path) : null };
+	cmds.getProjectIcon      = function(){ return impl.getProjectIcon ? impl.getProjectIcon() : null };
+	cmds.killOnExit          = function(v){ return impl.killOnExit ? impl.killOnExit(v) : null };
+
+	// 注册即入共享注册表（command._meta._set：mmap 登记 hwnd 订阅）
+	for(name, fn in cmds){
+		mgr[name] = fn;
+	}
+	return mgr;
+}

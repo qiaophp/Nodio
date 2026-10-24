@@ -998,6 +998,28 @@ Still open (the remaining path to 100%):
 fail 全部为官方契约 / 环境 / 物理边界，自有缺口归零 —— 现状以
 `docs/capability-gap.md` §1.37 的 26 项定性表为准。)*
 
+> **第三十二轮（官方 ide.command 外部命令面 + 两个引擎级缺陷）**。
+> ① **`ide.command.join()` 首次真正跑通**——账本挂了十几轮的「需要宿主
+>    join 主管道」实测是两个引擎缺陷叠加：
+>    · `::Kernel32.MapViewOfFile` 等裸调 API 返回被 `(int)` 截成 32 位
+>      （`CreateDirectApiWrapper` 默认 ARInt）→ fsys.mmap 拿假指针
+>      0xC0000005（cdb 定案：`movsxd rdi,[rdi]` 低 32 位符号扩展）——
+>      与第五轮 LRESULT 截断同族，这次在裸调默认路径。内存映射/模块
+>      加载族升为全宽返回（HWND/HANDLE 按 Win32 互操作规则本就 32 位
+>      有效，不动）；
+>    · `table.tostring(tab,true)` 把 `[-1]`/数字键写成裸 `{-1=...}`，
+>      自己的解析器读成数组元素 → mmap 注册表往返静默丢失（官方 mmap
+>      协议的保留返回槽与 hwnd 键双向丢）→ 非标识符键一律括号化。
+> ② **官方 37 命令面挂进自托管 IDE**（`app/ideCommand.nodio`）：全部注册
+>    （外部可探测存在性），24 条接真实现（文档/编辑器/工程/配置/设计器/
+>    字体/进程），pluginView 暂为注册桩。外部工具/插件与官方同法驱动：
+>    `ide.command.join()` + `send(hwnd,"命令名",...)`；IDE 内脚本走
+>    `app.ideCommand.dispatch`。
+> ③ **回归**：`tests/ide_command_check.ps1` 真实双进程锁（x64/x86 双绿）
+>    + VM 90/90 与 89/0/1、IDE 冒烟/右键/导航、编辑器/输入、iofile_text、
+>    win_clip、builtin_api、stdlib、publish 全绿，新增失败 0。
+>    详见 `docs/capability-gap.md` §1.38
+
 Behaviour buckets of the 444 sweep errors (named clusters; a long tail
 beyond them): missing hosts ~55 (Java 40, CLR 15), 32-bit-only DLLs on
 x64 ~76 (excluded from the denominator per the boundary), GUI-interactive

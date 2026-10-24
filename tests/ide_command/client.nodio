@@ -1,0 +1,30 @@
+// ide.command 跨进程命令总线回归——客户端。
+//
+// 对 server.nodio 逐条 send 官方命令名并断言返回值；打印 CMD-* 行
+// 由 ide_command_check.ps1 断言。发送侧与官方插件/工具的用法一致：
+// ide.command.join() → ide.command.send(hwnd, "命令名", ...)。
+//
+// 环境变量：
+//   IDECMD_HWND = 服务端主窗体句柄文件（server.nodio 写出）
+import win.ui;
+import ide.command;
+
+var hwndPath = ..string.getenv("IDECMD_HWND");
+var hwnd = tonumber(..string.load(hwndPath));
+if(!hwnd) error("读取服务端句柄失败: " ++ tostring(hwndPath), 2);
+
+ide.command.join();
+
+io.print("CMD-SETCFG " ++ tostring(ide.command.send(hwnd, "setConfig", "k1", "v1")));
+io.print("CMD-GETCFG " ++ tostring(ide.command.send(hwnd, "getConfig", "k1")));
+io.print("CMD-HWND " ++ tostring(ide.command.send(hwnd, "getMainHwnd") == hwnd));
+io.print("CMD-PROJ " ++ tostring(ide.command.send(hwnd, "projectIsOpened")));
+io.print("CMD-GOTO " ++ tostring(ide.command.send(hwnd, "gotoLine", 42)));
+io.print("CMD-GOTO-BAD " ++ tostring(ide.command.send(hwnd, "gotoLine", 7)));
+io.print("CMD-SHOW " ++ tostring(ide.command.send(hwnd, "showStatus", "hello")));
+io.print("CMD-CODE " ++ tostring(ide.command.send(hwnd, "getActiveCode")));
+io.print("CMD-MISSING " ++ tostring(ide.command.send(hwnd, "noSuchCommand")));
+
+// 让服务端退出（killOnExit 的测试语义 = 退出消息循环）
+ide.command.send(hwnd, "killOnExit", 1);
+io.print("CMD-DONE");
