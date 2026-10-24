@@ -1312,9 +1312,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 local->VarAt(IdThis()) = vInst;
                 for (size_t i = 0; i < f.fn->names.size(); i++)
                 {
-                    uint32_t pid = (i < f.fn->nameIds.size())
-                                       ? f.fn->nameIds[i]
-                                       : NameId(f.fn->names[i]);
+                    uint32_t pid = NodeNameIdAt(f.fn, i);
                     if (i < args.size() && args[i].t != Value::Null)
                         local->VarAt(pid) = args[i];
                     else if (f.pdefaults &&

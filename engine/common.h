@@ -876,8 +876,8 @@ namespace NodioVM
     // Variable names are interned to uint32 ids so Env::vars uses plain
     // int keys: hot-path lookups (loop bodies, call frames) do zero
     // wstring hashing. The registry only grows — ids are valid for the
-    // whole process lifetime, so a cached id (Node::nid, Node::nameIds)
-    // never goes stale. Id 0 is the "not interned" sentinel and is never
+    // whole process lifetime, so a cached id (Node::nid,
+    // Node::nameSeqOff) never goes stale. Id 0 is the "not interned" sentinel and is never
     // returned. The mutex guards REGISTRATION only: worker threads parse
     // scripts too (thread.create), but readers that already hold an id
     // never touch the registry, so hot paths run lock-free.
@@ -898,9 +898,11 @@ namespace NodioVM
         static std::deque<wstring> t;
         return t;
     }
-    inline uint32_t NameId(const wstring& name)
+    // Inner registration — caller MUST hold NameIntMutex. Round 14: the
+    // name-seq append interns ids and appends the slice in ONE critical
+    // section, and std::mutex is not recursive, so NameId delegates here.
+    inline uint32_t NameIdLocked(const wstring& name)
     {
-        std::lock_guard<std::mutex> lk(NameIntMutex());
         auto& ids = NameIdMap();
         auto it = ids.find(name);
         if (it != ids.end())
@@ -909,6 +911,11 @@ namespace NodioVM
         NameTable().emplace_back(name);
         ids.emplace(NameTable().back(), id);
         return id;
+    }
+    inline uint32_t NameId(const wstring& name)
+    {
+        std::lock_guard<std::mutex> lk(NameIntMutex());
+        return NameIdLocked(name);
     }
     inline const wstring& NameOf(uint32_t id)
     {
@@ -929,6 +936,69 @@ namespace NodioVM
     inline uint32_t IdArg() { static uint32_t id = NameId(L"arg"); return id; }
     inline uint32_t IdDots() { static uint32_t id = NameId(L"..."); return id; }
     inline uint32_t IdSelf() { static uint32_t id = NameId(L"self"); return id; }
+
+    // ---- round 14: name-id side table (per-node id slices) ----
+    // Node::nameIds was a full vector<uint32_t> on EVERY AST node — 24
+    // bytes regardless of use. The ids now live in process-wide paged
+    // storage and a node stores just the +1 offset of its slice
+    // (Node::nameSeqOff, 0 = not annotated).
+    // Layout: 4096 static directory slots (atomic page pointers, never
+    // moved) x 256 ids per heap page = 1,048,576 distinct identifiers.
+    // Pages are allocated once and never freed or moved; appends only
+    // write slots that were never published, so the published region is
+    // immutable. Writers (the parser, possibly on a worker thread) run
+    // under NameIntMutex; readers index with two plain loads:
+    //   page = dirSlot[g >> 8].load(acquire); id = page[g & 255];
+    // A node can only execute after its parse finished, so the slice a
+    // reader indexes was fully appended before the read — the release
+    // store of the page pointer and the acquire load above make the page
+    // itself safe, and the parse→execute ordering makes the contents
+    // visible (x86 TSO publishes stores immediately).
+    inline std::atomic<uint32_t*>& NameSeqSlot(size_t page)
+    {
+        static std::atomic<uint32_t*> s[4096];
+        return s[page];
+    }
+    // Total ids appended so far (writer side, guarded by NameIntMutex).
+    inline uint32_t& NameSeqSize()
+    {
+        static uint32_t n = 0;
+        return n;
+    }
+    // Read one id from a slice. offPlus1 is the Node's nameSeqOff (+1
+    // sentinel, 0 = absent). Lock-free; see layout notes above.
+    inline uint32_t NameSeqAt(uint32_t offPlus1, size_t i)
+    {
+        size_t g = (size_t)offPlus1 - 1 + i;
+        uint32_t* pg = NameSeqSlot(g >> 8).load(std::memory_order_acquire);
+        return pg[g & 255];
+    }
+    // Inner append — caller MUST hold NameIntMutex. Returns the 0-based
+    // global offset of the appended slice.
+    inline uint32_t NameSeqAppendLocked(const vector<wstring>& names)
+    {
+        uint32_t base = NameSeqSize();
+        for (auto& nm : names)
+        {
+            uint32_t id = NameIdLocked(nm);
+            uint32_t n = NameSeqSize();
+            uint32_t* pg = NameSeqSlot(n >> 8).load(std::memory_order_relaxed);
+            if (!pg)
+            {
+                pg = new uint32_t[256]();
+                NameSeqSlot(n >> 8).store(pg, std::memory_order_release);
+            }
+            pg[n & 255] = id;
+            NameSeqSize() = n + 1;
+        }
+        return base;
+    }
+    // Parser-facing append (takes the intern lock).
+    inline uint32_t NameSeqAppend(const vector<wstring>& names)
+    {
+        std::lock_guard<std::mutex> lk(NameIntMutex());
+        return NameSeqAppendLocked(names);
+    }
 
     struct EnvWeakRef
     {
@@ -1221,27 +1291,30 @@ namespace NodioVM
         // Round 12: interned variable-name id for Ident/left-value nodes
         // (0 = not cached — NameIdOf falls back to live interning).
         uint32_t nid = 0;
-        // Parallel to `names` (params / var names): interned ids filled by
-        // the parser. Hot bind sites prefer nameIds[i] when sizes match.
-        vector<uint32_t> nameIds;
+        // Round 14: offset+1 of this node's names' id slice in the
+        // process-wide name-seq pages (see NameSeqSlot above; 0 = not
+        // annotated). Replaces the per-node vector<uint32_t> nameIds —
+        // 24 bytes per node down to 4, and bind sites read ids by
+        // NodeNameIdAt/ParamIdAt without touching a heap vector.
+        uint32_t nameSeqOff = 0;
     };
 
     // Interned id of parameter i of a function value. The FuncLit node
-    // caches ids in Node::nameIds (parser-filled, parallel to names /
-    // Value::params); fall back to live interning when sizes disagree
+    // slice in the name-seq pages is parser-filled, parallel to names /
+    // Value::params; fall back to live interning when sizes disagree
     // (native-constructed function values).
     inline uint32_t ParamIdAt(const Value& f, size_t i)
     {
-        if (f.fn && i < f.fn->nameIds.size() && i < f.params.size())
-            return f.fn->nameIds[i];
+        if (f.fn && f.fn->nameSeqOff && i < f.params.size())
+            return NameSeqAt(f.fn->nameSeqOff, i);
         return NameId(f.params[i]);
     }
 
     // Interned id of names[i] on a node (VarDecl / ForIn bind sites).
     inline uint32_t NodeNameIdAt(const PNode& n, size_t i)
     {
-        if (i < n->nameIds.size() && i < n->names.size())
-            return n->nameIds[i];
+        if (n->nameSeqOff && i < n->names.size())
+            return NameSeqAt(n->nameSeqOff, i);
         return NameId(n->names[i]);
     }
 

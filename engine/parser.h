@@ -2867,8 +2867,8 @@ namespace NodioVM
 
     // ---- round 12: AST name-id annotation ----
     // Called once per parsed program (every ParseBlock() top-level call
-    // site): fills Node::nid for Ident nodes and Node::nameIds for the
-    // names vector, so runtime hot paths (Ident reads, assignments,
+    // site): fills Node::nid for Ident nodes and appends Node::names'
+    // id slice to the process-wide name-seq pages (Node::nameSeqOff), so runtime hot paths (Ident reads, assignments,
     // parameter binding) resolve variables with plain int keys — zero
     // wstring hashing per lookup. Nodes this pass misses keep nid == 0
     // and fall back to live interning (correct, only slower).
@@ -2878,13 +2878,8 @@ namespace NodioVM
             return;
         if (n->k == Node::Ident && n->nid == 0)
             n->nid = NameId(n->str);
-        if (!n->names.empty() && n->nameIds.size() != n->names.size())
-        {
-            n->nameIds.clear();
-            n->nameIds.reserve(n->names.size());
-            for (auto& nm : n->names)
-                n->nameIds.push_back(NameId(nm));
-        }
+        if (!n->names.empty() && n->nameSeqOff == 0)
+            n->nameSeqOff = NameSeqAppend(n->names) + 1;
         AnnotateNameIds(n->a);
         AnnotateNameIds(n->b);
         AnnotateNameIds(n->c);
