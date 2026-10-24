@@ -15,8 +15,13 @@ namespace NodioVM
         size_t i = 0, n = src.size();
         int line = 1;
         bool hadSpace = false;
+        // Start offset of the token currently being lexed. pushTok() copies
+        // it into the token so callers can map a token back to an exact
+        // column (LSP `character` / editor caret position).
+        size_t tokStart = 0;
         auto pushTok = [&](Tok t) {
             t.bLeadingSpace = hadSpace;
+            t.pos = tokStart;
             hadSpace = false;
             out.push_back(t);
         };
@@ -25,7 +30,7 @@ namespace NodioVM
             wchar_t c = src[i];
             if (c == 0xFEFF) { i++; continue; }
             if (c == L'\r') { i++; continue; }
-            if (c == L'\n') { pushTok({ TNL, L"", 0, line++ }); hadSpace = true; i++; continue; }
+            if (c == L'\n') { tokStart = i; pushTok({ TNL, L"", 0, line++ }); hadSpace = true; i++; continue; }
             if (c == L' ' || c == L'\t') { hadSpace = true; i++; continue; }
             // comments
             bool bRightOfAssign = false;
@@ -45,6 +50,7 @@ namespace NodioVM
                 {
                     size_t e = i + 2;
                     while (e < n && src[e] != L'\n' && src[e] != L'\r') e++;
+                    tokStart = i;
                     pushTok({ TStr, src.substr(i + 2, e - i - 2), 0, line });
                     i = e;
                     continue;
@@ -74,6 +80,7 @@ namespace NodioVM
                     continue;
                 }
                 size_t s = i + k;                 // content start
+                size_t strStart = i;              // token start (the "/*")
                 size_t j = s, endPos = wstring::npos;
                 while (j + nStars + 1 <= n)
                 {
@@ -119,6 +126,7 @@ namespace NodioVM
                     for (size_t q = i; q < e && q < n; q++)
                         if (src[q] == L'\n') line++;
                     i = e;
+                    tokStart = strStart;
                     pushTok({ TStr, norm, 0, line });
                     continue;
                 }
@@ -135,6 +143,7 @@ namespace NodioVM
                 // 转义。但两个连续的同类引号表示
                 // 该引号自身，所以 "a""b" 是 a"b，`a``b` 是 a`b。
                 wchar_t q = c;
+                size_t strStart = i;      // token start (the opening quote)
                 i++;
                 wstring s;
                 while (i < n && src[i] != q)
@@ -167,6 +176,7 @@ namespace NodioVM
                     double val = 0;
                     for (size_t k = 0; k < u8.size() && k < 4; k++)
                         val += (double)(((unsigned int)(unsigned char)u8[k]) << (k * 8));
+                    tokStart = strStart;
                     pushTok({ TNum, std::to_wstring((long long)val), val, line });
                     continue;
                 }
@@ -177,6 +187,7 @@ namespace NodioVM
                     i++;
                     bIsRawU = true;
                 }
+                tokStart = strStart;
                 pushTok({ TStr, s, 0, line, false, bIsRawU });
                 continue;
             }
@@ -185,6 +196,7 @@ namespace NodioVM
                 // escaped string: 单引号 = 编译时转义字符串,
                 // C-like \ escapes ('\\' == "\"" per the original docs)
                 wchar_t q = c;
+                size_t strStart = i;      // token start (the opening quote)
                 i++;
                 wstring s;
                 bool bHasByteEscape = false;
@@ -325,6 +337,7 @@ namespace NodioVM
                     double val = 0;
                     for (size_t k = 0; k < u8.size() && k < 4; k++)
                         val += (double)(((unsigned int)(unsigned char)u8[k]) << (k * 8));
+                    tokStart = strStart;
                     pushTok({ TNum, std::to_wstring((long long)val), val, line });
                     continue;
                 }
@@ -339,6 +352,7 @@ namespace NodioVM
                     bIsU = true;
                 }
                 Tok tokStr = { TStr, s, 0, line, false, bIsU, bHasByteEscape };
+                tokStart = strStart;
                 pushTok(tokStr);
                 continue;
             }
@@ -356,6 +370,7 @@ namespace NodioVM
             if ((c >= L'0' && c <= L'9') || bDotNumber)
             {
                 size_t b = i;
+                tokStart = b;
                 if (c == L'0' && i + 1 < n && (src[i + 1] == L'x' || src[i + 1] == L'X'))
                 {
                     i += 2;
@@ -409,7 +424,8 @@ namespace NodioVM
                 while (i < n && IsIdentChar(src[i])) i++;
                 wstring w = src.substr(b, i - b);
                 for (int k = 0; KEYWORDS[k]; k++)
-                    if (w == KEYWORDS[k]) { pushTok({ TKw, w, 0, line }); goto next; }
+                    if (w == KEYWORDS[k]) { tokStart = b; pushTok({ TKw, w, 0, line }); goto next; }
+                tokStart = b;
                 pushTok({ TIdent, w, 0, line });
             next:
                 continue;
@@ -432,6 +448,7 @@ namespace NodioVM
                 size_t l = wcslen(OPS[k].op);
                 if (src.compare(i, l, OPS[k].op) == 0)
                 {
+                    tokStart = i;
                     pushTok({ TPunct, OPS[k].op, 0, line });
                     i += l;
                     bMatched = true;
@@ -439,9 +456,11 @@ namespace NodioVM
                 }
             }
             if (bMatched) continue;
+            tokStart = i;
             pushTok({ TPunct, wstring(1, c), 0, line });
             i++;
         }
+        tokStart = i;
         pushTok({ TEnd, L"", 0, line });
         return out;
     }

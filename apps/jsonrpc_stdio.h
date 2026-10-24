@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <windows.h>
 
 namespace nodio
@@ -81,6 +82,97 @@ namespace nodio
             fflush(stdout);
         }
 
+        // ---- JSON string escape decoding ----
+        //
+        // The transport carries source code, and source code is full of
+        // control characters (CRLF especially). Every escape the JSON spec
+        // defines has to be decoded EXACTLY, because a mis-decoded escape
+        // silently rewrites the payload instead of failing loudly:
+        // decoding "\r" as the literal letter 'r' turned every CRLF line
+        // ending into a stray 'r' token and made the parser report bogus
+        // syntax errors on perfectly valid files.
+        inline int HexVal(char c)
+        {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        }
+
+        inline void AppendUtf8(std::string& out, unsigned cp)
+        {
+            if (cp < 0x80)
+                out.push_back((char)cp);
+            else if (cp < 0x800)
+            {
+                out.push_back((char)(0xC0 | (cp >> 6)));
+                out.push_back((char)(0x80 | (cp & 0x3F)));
+            }
+            else if (cp < 0x10000)
+            {
+                out.push_back((char)(0xE0 | (cp >> 12)));
+                out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back((char)(0x80 | (cp & 0x3F)));
+            }
+            else
+            {
+                out.push_back((char)(0xF0 | (cp >> 18)));
+                out.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
+                out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back((char)(0x80 | (cp & 0x3F)));
+            }
+        }
+
+        // Decode the escape sequence starting at s[i] (s[i] == '\\').
+        // Appends the decoded bytes to `out` and returns how many source
+        // characters were consumed.
+        inline size_t JsonUnescape(const std::string& s, size_t i, std::string& out)
+        {
+            if (i + 1 >= s.size()) { out.push_back('\\'); return 1; }
+            char n = s[i + 1];
+            switch (n)
+            {
+            case 'n': out.push_back('\n'); return 2;
+            case 't': out.push_back('\t'); return 2;
+            case 'r': out.push_back('\r'); return 2;
+            case 'b': out.push_back('\b'); return 2;
+            case 'f': out.push_back('\f'); return 2;
+            case '"': out.push_back('"'); return 2;
+            case '\\': out.push_back('\\'); return 2;
+            case '/': out.push_back('/'); return 2;
+            case 'u':
+            {
+                if (i + 5 >= s.size()) { out.push_back('\\'); out.push_back('u'); return 2; }
+                int h0 = HexVal(s[i + 2]), h1 = HexVal(s[i + 3]);
+                int h2 = HexVal(s[i + 4]), h3 = HexVal(s[i + 5]);
+                if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0)
+                { out.push_back('\\'); out.push_back('u'); return 2; }
+                unsigned cp = (unsigned)((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
+                size_t used = 6;
+                // surrogate pair -> one code point
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 11 < s.size() &&
+                    s[i + 6] == '\\' && s[i + 7] == 'u')
+                {
+                    int g0 = HexVal(s[i + 8]), g1 = HexVal(s[i + 9]);
+                    int g2 = HexVal(s[i + 10]), g3 = HexVal(s[i + 11]);
+                    if (g0 >= 0 && g1 >= 0 && g2 >= 0 && g3 >= 0)
+                    {
+                        unsigned lo = (unsigned)((g0 << 12) | (g1 << 8) | (g2 << 4) | g3);
+                        if (lo >= 0xDC00 && lo <= 0xDFFF)
+                        {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            used = 12;
+                        }
+                    }
+                }
+                AppendUtf8(out, cp);
+                return used;
+            }
+            default:
+                out.push_back(n); return 2;
+            }
+        }
+
         // First string value of a top-level "key": "..." (escapes unescaped
         // for the common cases; returns {} when absent).
         inline std::string JsonString(const std::string& s, const char* key)
@@ -98,8 +190,7 @@ namespace nodio
                 char c = s[i];
                 if (c == '\\')
                 {
-                    char n = s[++i];
-                    out.push_back(n == 'n' ? '\n' : n == 't' ? '\t' : n);
+                    i += JsonUnescape(s, i, out) - 1;
                     continue;
                 }
                 if (c == '"') break;
@@ -124,6 +215,46 @@ namespace nodio
                     s[e] == '+' || s[e] == '.' || s[e] == 'e' || s[e] == 'E'))
                 ++e;
             return e > p ? s.substr(p, e - p) : std::string();
+        }
+
+        // String elements of a top-level "key": [ "a", "b", ... ].
+        // The transport has no JSON DOM, and the project index needs the
+        // whole file list at once, so this reads the array directly.
+        inline std::vector<std::string> JsonStringArray(const std::string& s,
+                                                       const char* key)
+        {
+            std::vector<std::string> out;
+            std::string pat = std::string("\"") + key + "\"";
+            size_t p = s.find(pat);
+            if (p == std::string::npos) return out;
+            p = s.find(':', p + pat.size());
+            if (p == std::string::npos) return out;
+            p = s.find('[', p + 1);
+            if (p == std::string::npos) return out;
+            ++p;
+            while (p < s.size())
+            {
+                while (p < s.size() && (isspace((unsigned char)s[p]) || s[p] == ',')) ++p;
+                if (p >= s.size() || s[p] == ']') break;
+                if (s[p] != '"') break;
+                ++p;
+                std::string v;
+                while (p < s.size() && s[p] != '"')
+                {
+                    char c = s[p];
+                    if (c == '\\' && p + 1 < s.size())
+                    {
+                        p += JsonUnescape(s, p, v) - 1;
+                        ++p;
+                        continue;
+                    }
+                    v.push_back(c);
+                    ++p;
+                }
+                if (p < s.size()) ++p;    // closing quote
+                out.push_back(v);
+            }
+            return out;
         }
 
         // JSON-RPC "id": may be a number or a string. Returns the raw token
