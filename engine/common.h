@@ -669,6 +669,10 @@ namespace NodioVM
         Value result;
         wstring error;
         bool done = false;
+        // The worker thread's interpreter. It must outlive the THREAD
+        // (the thread's stack is freed on exit) because the GC can still
+        // reach envs it owns - see ThreadWorkerProc in builtins.cpp.
+        std::shared_ptr<Interp> interp;
     };
     // heap job packet handed to a raw Win32 thread (thread.create):
     // keeps the VM nodes/args alive for the worker lifetime

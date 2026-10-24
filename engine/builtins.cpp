@@ -945,7 +945,29 @@ DWORD WINAPI ThreadWorkerProc(LPVOID pv)
 {
     auto* job = (ThreadJob*)pv;
     wstring threadErr;
-    Interp wt{ &threadErr };
+    // ⚠⚠ The worker's interpreter must NOT live on the worker's STACK.
+    //
+    //   A thread's stack is released the moment the thread exits, but the
+    //   GC (running later on the MAIN thread) can still reach envs owned by
+    //   this interpreter - `Interp::globals` is an Env **member** of the
+    //   interpreter object, so it dies with the thread's stack, while a
+    //   Value::envUp / Env::parent chain that still points at it survives.
+    //   The collector then dereferences that freed stack memory:
+    //       [FATAL CRASH] code=0xC0000005 (access violation)
+    //   Reproducer (10 lines, deterministic):
+    //       import thread;
+    //       thread.create(function(a){ return a; }, "x");
+    //       for(i=1; 300000; 1){ var junk = {a=i; b="str" ++ i; c={d=i}}; }
+    //   -> crash on the first GC after the worker exited; with
+    //      NODIO_GC_THRESHOLD=0 (collector off) the same script exits 0.
+    //
+    //   Fix: heap-allocate the interpreter and keep it alive with the
+    //   thread state (g_threadStates keeps the state for the process
+    //   lifetime). One interpreter per worker thread stays resident - the
+    //   alternative (letting the thread free it) is exactly the bug.
+    auto wtOwner = std::make_shared<Interp>(&threadErr);
+    Interp& wt = *wtOwner;
+    job->st->interp = wtOwner;
     g_interpCurrent = &wt;
     wt.InitBuiltins();
     if (!job->baseDir.empty())
