@@ -1885,7 +1885,7 @@ server 自己则随父进程退出变成孤儿。两者互相喂养：下一次 
 | **类视图 / 资源视图** | ❌ **未做** —— 官方另有独立的类树与资源树 | — |
 | 标准库面板 / 范例面板 | ✅ 已通（标准库扫描 + 官方 `config/lang/lib.txt` 中文说明） | `ide/nodio/app/library.nodio`；`shell.nodio:1175-1176` |
 | **模板面板** | ❌ **未做** | — |
-| **最近使用的文档** | ❌ **未做** | — |
+| 最近使用的文档 | ✅ 已通（「文件」菜单最近文件动态段，cfg `recent.files` 持久化；§1.48） | `app/settings.nodio`；`app/shell.nodio` |
 | **开始页** | ❌ **未做** —— Nodio 直接开工程的启动文件 | `ide/nodio/main.nodio:2180` |
 | 文档窗口管理（页签 / 批量关闭 / 右键菜单） | ✅ 已通 | `shell.nodio:1071-1076`；「企业生产可用轮次」 |
 | **垂直-水平拆分窗口组 / 选项卡组（新建、移动）** | ❌ **未做** —— 只有「双栏对比」（diff 视图），不是可自由拆分的窗口组 | `shell.nodio:1198` |
@@ -4995,3 +4995,190 @@ gcstress uiprobe13 ×2 通过；字节码/记录 VM/官方样例全绿。
 
 文档第四十轮/§1.45（编辑器字体）为并行 IDE 会话所写，本轮提交时仍在
 工作树未提交，完整性经核对后与本节一起落账；第四十一轮编号顺延其后者。
+
+## 1.47 第四十二轮：发布链路补齐（IDE 发布入口 + 发布器认 .nproj）
+
+### 1.47.1 盘点：为什么是发布链路
+
+用户问「还有什么功能欠缺的补齐」。逐项盘点结论：菜单/钩子面基本齐
+（唯一占位是「工程属性」只 `setStatus`）；**真正的缺口是发布链路**——
+发布器引擎（`publish/publish.cpp`，完整管线：.aproj 规则/语法门/
+import 闭包/payload 追加/PE 补丁）与 CLI 契约早已存在且有回归锁，
+但 **IDE 没有任何发布入口**（能写/能跑/能调试，出不了货）；
+且发布器只自动探测 `default.aproj`，不认 Nodio 原生 `.nproj` 工程清单
+（本仓库 IDE 自己就是 `.nproj`）。「最近文件」列表也是缺口，需设置
+持久化 + 菜单重建支持，推迟到后续轮。
+
+### 1.47.2 发布器：.nproj 清单 + 显式 --proj（C++）
+
+- `publish.h`：`Options` 增 `std::wstring strProj`（显式清单路径）。
+- `publish.cpp:738-757`：清单解析顺序 = **显式 `strProj`**（给了但
+  不存在 → 报「找不到工程清单」防拼错静默退化）→ `default.aproj` →
+  `default.nproj`；`ParseAproj` 原样复用（`<file path= embed= ignored= local=`，
+  `embed` 缺省 false，与官方 .aproj 语义一致；脚本靠 import 闭包进
+  payload，数据文件要显式 `embed="true"`）。
+- `main.cpp:415` CLI 增 `--proj <manifest>`、`:385` 用法串更新；
+  `:554` env 入口增 `NODIO_PUBPROJ`。
+- 新夹具 `tests/m7/proj_nproj/`（main.aardio + default.nproj +
+  custom.nproj + res\note.txt）；`tests/run_publish_tests.ps1` 增第 2 步
+  （default.nproj 自动探测）与第 3 步（`NODIO_PUBPROJ=custom.nproj`），
+  7 项 → **10 项**，收尾标记 `publish regression green (nproj + --proj)`。
+
+### 1.47.3 IDE 侧发布入口（.nodio 脚本层，无需重建引擎）
+
+- `app/runner.nodio`：`endTag` 机制 + 新 `runArgs(argLine, workDir, title)`
+  —— 参数行不含 exe 本身，复用同一套 100ms 流式轮询与结束标记；
+  `run()` 行为不变（既有冒烟的 `[运行结束]` 门不受影响）。
+- `main.nodio`：`publishRun(entry, outExe, manifest, bGui)`（拼
+  `'--publish "<entry>" -o "<out>"'` + 可选 `--proj`/`--gui`，切底栏
+  「输出」页，`runner.runArgs(args, pi.dir, "发布")`）、`publishExe(bGui)`
+  （entry = 工程启动文件或当前文档，草稿先落 `%TEMP%`，`fileDlg.save`
+  弹输出路径，工程打开时显式传 `proj.path`）、真「工程属性」对话框
+  （工程文件/根目录/启动文件/清单数/发布清单存在性）。
+- `app/shell.nodio:1106,1112-1113`：「工程属性」接 `onProjProperties`；
+  工程菜单增「发布为独立 exe（控制台）/（界面程序）」两条显式入口
+  （不做「import win.ui 就自动 --gui」的猜测）。
+
+### 1.47.4 坑：popen 的 startInfo 塞 environment 表实测报错
+
+IDE 进程带着 `NODIO_RUN`（跑 IDE 自己的脚本），发布的产物子进程会
+继承——main.cpp 里 NODIO_RUN harness（464 行）在 payload 模式（586 行）
+**之前**，不清掉产物会去跑 IDE 脚本而不是自己的 payload。最初往
+`process.popen` 第三参 startInfo 塞 `environment` 表 → **必报**
+`尝试调用非函数值 (.indexOf) @ D:\aardio\lib\process\popen.aardio:63`
+（popen 的 ctor 把 startInfo `table.assign` 进 STARTUPINFO，environment
+表传不进去；`process/_.aardio:76-97` 基类 ctor 虽支持但走不到）。
+修法（`main.nodio` 冒烟段）：**spawn 前后临时清父进程 env**——
+`string.getenv` 存 `NODIO_RUN/NODIO_PUBLISH/NODIO_PUBOUT/NODIO_LIBDIR`
+→ `string.setenv(name, "")`（空串 ≡ 删除变量，main.cpp 的
+`GetEnvironmentVariableW > 0` 判定等于未设置）→ spawn → 按原值恢复
+（原未设置则置空串）。定时器回调同线程同步执行，无重入风险。
+
+### 1.47.5 冒烟锁：PUB 三断言（端到端）
+
+`NODIO_IDE_SMOKE` 分支增发布段：token = `"pubtok-" ++ time.tick()`
+（**每次不同**，旧发布产物混进来骗不过）→ `publishRun` → 400ms 轮询
+等 `[发布结束]`（30s 超时打 `PUB-TIMEOUT`）→ `PUB-EXE`（产物落盘）→
+spawn 产物回读 stdout 校验 token 打 `PUB-RUN`。runner 是单槽，冒烟
+顺序定为**先发布、后 F5 回声**（600ms 定时器等 `pubDone` 门，关窗门
+同样加 `pubDone`）。`tests/ide_smoke.ps1:346-352` 断言
+`PUB-START:1 / PUB-EXE:1 / PUB-RUN:1`。
+
+### 1.47.6 回归（本轮最终态）
+
+发布回归 10 项 × 双架构全绿；冒烟 x64/x86 全绿（`PUB-START:1/
+PUB-EXE:1/PUB-RUN:1`，`IDE-SMOKE-OK`，无 `PUB-EXC`/`PUB-TIMEOUT`）；
+全量回归 **x64 18/18、x86 18/18**。途中一次 AI mock 段偶发假红
+（`AI-SEND-REPLY` 未到，重跑即绿，与本轮改动无关）。
+
+## 1.48 第四十三轮：最近文件（「文件」菜单动态段 + cfg 持久化）
+
+### 1.48.1 目标与方案
+
+缺口清单 §5.2「最近使用的文档 ❌ 未做」（上轮挂账项）。方案三句话：
+cfg 一行 `recent.files=路径1|路径2|...`（Windows 文件名不允许 `|`，
+作分隔符安全；`cfgRead` 是单行 key=value，路径里也不可能有换行）；
+「文件」菜单条目**每次重建**（自绘菜单 `nodio.ui.titlebar` 打开下拉时
+**现读** items 表——`__openMenu` 里 `var items = self.menus[idx][2]`，
+所以重建后 `setMenus` 一次即生效，不需要二级子菜单机制）；所有文档
+打开的必经点 `openFile` 一处入队（工程、搜索跳转、钩子打开的文档都收，
+工程本身不收——它已有 `lastProject` 启动恢复机制）。
+
+### 1.48.2 实现（三层）
+
+- `app/settings.nodio`：`recentGet()`（去空、去重、截 10 条）+
+  `recentPush()`（置顶入队，同路径反复打开不撑满列表）。
+- `app/shell.nodio`：「文件」条目提为 `buildFileMenuItems()`（固定段 +
+  最近文件动态段，条目文本 `N.  完整路径`）；菜单表持有为 `menusDef`
+  局部变量；导出 `refreshRecentMenu()`（重建 + `setMenus`）与
+  `fileMenuLabels()`（供回归断言菜单内容）；模块构造尾调一次
+  `refreshRecentMenu()`（启动时把 cfg 里已有的最近文件落进菜单）。
+- `main.nodio`：`openFile` 成功分支（`openTab` 之后）加
+  `recentPush(path) + shell.refreshRecentMenu()`。
+- ⚠ 闭包工厂：循环里直接写 `function(){...p...}` 所有条目可能共享同一
+  循环变量（点哪条都开最后一条），`mkOpen(p)` 把路径绑进**参数**——
+  每次调用是独立的新局部，无条件安全。
+
+### 1.48.3 坑：单变量 for in 对数组拿到的不是元素值
+
+第一版 `recentGet` 写了 `for(seg in ..string.split(v,"|"))`，冒烟四条
+断言**全 0 但无异常**——`split` 结果里拿到的 `seg` 不是路径字符串。
+仓库既有代码里 split 结果**一律**计数循环 + 下标访问（`main.nodio:352`
+navShortPath、`:634`），没有一处 for-in 先例。修法：`var segs =
+..string.split(...)` 后 `for(i=1;#segs;1){ var p = ..string.trim(segs[i]) }`。
+（教训：单变量 for in 只在 `string.lines` 这类**迭代器**上拿值；
+对数组它的语义不同，不要凭直觉用。）
+
+### 1.48.4 回归锁与回归（本轮最终态）
+
+`tests/ide_smoke.ps1` 增四条断言：`RECENT-AUTO:1`（openFile 链路自动
+入队）、`RECENT-TOP-OK:1`（再 push 置顶）、`RECENT-DUP-OK:1`（同路径
+反复 push 不翻倍）、`RECENT-MENU-HIT:1`（菜单重建后含 `1.  <路径>`
+动态条目）。冒烟 x64/x86 全绿。全量回归 **x64 18/18、x86 18/18**
+（x64 首轮 vm/winclip 两个失败均为共享桌面剪贴板争用环境假红——
+§1.45.6 已记录在案的机器问题，重跑即绿；ide_ctx 同轮报
+`SKIP clipboard assertions` 印证）。
+
+## 1.49 第四十四轮：全面审计四连修——递归失控全链清剿（mark/拷贝/重入/解析）
+
+### 1.49.1 审计结论（本轮的动身点）
+
+对 HEAD 做了性能/稳定性/资源三面审计。性能与资源面处于三轮优化后的
+历史最佳（调用 1.9-3.6µs、语句 0.16-0.45µs、exec 相 11.5MB、Value
+136B 全部复核吻合）；但稳定性面挖出 **4 个绕过 500 层调用守卫的递归
+失控向量**，全部段错误（exit 139）无任何报告：
+
+| 向量 | 触发 | 实测阈值（x64,16MB 主线程栈） |
+|---|---|---|
+| GcMark 递归 | 深嵌套表 + 任意 GC 分配波 | 10 万层存活 / 20 万层崩 |
+| DeepCopy 递归 | 深表 thread.create 序列化 | ≤5 万层崩（线程静默死亡） |
+| 解析器递归 | 深嵌套括号源码（纯解析） | 1 万层存活 / 3 万层崩 |
+| 重入无守卫 | CallOwner/CallVmFunc/CallThisOwner（COM 事件、FFI 回调、_call、finalizer、定时器） | 静态确认无计数 |
+
+GC mark 的 P0 不可预测性最高：任何分配密集脚本只要持有深链就可能死
+在下一次 GC 波，且 IDE 内联运行用户脚本时直接杀宿主。
+
+### 1.49.2 四项修复（全部引擎侧）
+
+1. **GcMark 迭代化**（gc.cpp）：GcMarkValue/GcMarkTable/GcMarkEnv 的
+   互递归改为显式工作栈。可达性语义不变；Hop 路径仍只在诊断模式记
+   录，且顺修一个旧诊断错——fromIsEnv 在表/环境两个入口分别写死
+   false/true，跨 env 边界的泄漏路径会查错表，现在随边沿真实传递。
+   env 父链保持递归（深度被调用守卫封顶，~500 层）。
+2. **DeepCopy 迭代化**（util.cpp）：visited 命中壳、Class 侧表重建、
+   "self" 回指新壳、Func 字面量早退、标量/native 尾路（fnData 深拷贝
+   后清 nsClosure/fn）逐路保持。同一张新表的全部目标槽位先落地再填
+   充（unordered_map 插指针稳定性 + 数组先 resize），新建对象受语句
+   纪元保护，拷贝途中 GC 不会扫走半成品。
+3. **重入守卫**（runtime.cpp）：500 层计数器上移为文件级 thread_local，
+   Call 节点、CallThisOwner、CallVmFunc 三处脚本调用入口共用。纯脚本
+   递归每层只计 1 次（Call 节点不经过 CallThisOwner，上限仍是 500 不
+   腰斩），重入混合周期每层 ≥1，总嵌套封顶；触发即设可捕获运行错误
+   （栈溢出），与原守卫同一契约。
+4. **解析深度 + EOF 字符串**（parser.h/lexer.cpp）：语句/表达式两个
+   递归枢纽共用 1000 层计数器，超限报「语法错误: 嵌套过深」——阈值
+   远高于真实代码、远低于物理栈底（x86 帧更小同享余量）。词法器
+   raw/转义两条字符串路径遇 EOF 一律报「字符串未终止」，不再把
+   截断文件静默执行前缀。
+
+### 1.49.3 回归锁（t93-t97，五件）
+
+- t93：20 万层嵌套表 + 5 万次分配波 → 存活（旧引擎段错误）
+- t94：6 万层嵌套表 thread 序列化 → waitOne 取回（旧引擎段错误）
+- t95：2000 层嵌套括号源码 → 精确报「嵌套过深 @ 行 2」（旧行为：静默执行）
+- t96：未终止字符串 → 精确报「字符串未终止 @ 行 4」（旧行为：exit 0 无报告）
+- t97：守卫边界 499 层照常工作 + 1000 层可捕获（锁共享计数器不腰斩上限）
+
+### 1.49.4 验证
+
+四个原崩溃探针（深表+GC 波 / 线程深拷贝 / 30 万括号 / 未闭合引号）
+全部由段错误或静默转为干净报错或存活；vm 套件 94 过/0 挂/1 跳（跳过
+项为既有环境门控）；run_regression 双架构全量绿（见 1.48.5 末注）。
+igcstress uiprobe13 通过。
+
+### 1.49.5 会话协调
+
+文档 §1.47/第四十二轮（发布链路）与 §1.48/第四十三轮（最近文件）为并行 IDE 会话所写，本轮提交时仍
+在工作树未提交，经核对完整后与本节一起落账；第四十四轮编号顺延其
+后者。审计基线时 ide_smoke 的 PUB-RUN 失败已归因其未提交的发布 WIP
+（命令行直发验证引擎+发布器完好）；本轮末该套件随其 WIP 推进恢复。

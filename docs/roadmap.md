@@ -1668,3 +1668,53 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 >    27.3→11.6MB；uiprobe13 WS 增量 20-54→11.7-14.9MB。
 > ⑤ 回归：x64 18/18、x86 18/18，gcstress ×2。第四十轮（编辑器字体，
 >    并行 IDE 会话）未提交内容经核对后随行落账。
+
+> **第四十二轮（发布链路补齐——IDE 发布入口 + 发布器认 .nproj）**。
+>    （详见 `docs/capability-gap.md` §1.47）
+> ① 盘点：菜单/钩子面基本齐（唯一占位「工程属性」），真缺口是发布链路
+>    ——发布器引擎与 CLI 早已存在且有回归锁，但 IDE 无任何发布入口
+>    （能写/跑/调试，出不了货），且发布器只探测 default.aproj 不认
+>    本仓库原生的 .nproj。「最近文件」列表（需设置持久化+菜单重建）推迟。
+> ② 发布器：清单解析顺序 = 显式 `--proj <manifest>`（不存在则报错，
+>    防拼错静默退化）→ default.aproj → default.nproj；ParseAproj 原样
+>    复用（embed 缺省 false，数据文件要 embed="true"，脚本走 import
+>    闭包）；CLI/env 各增一项（--proj / NODIO_PUBPROJ）。发布回归
+>    7→10 项（default.nproj 自动探测 + custom.nproj 显式清单）双架构绿。
+> ③ IDE 侧：runner 增 runArgs（复用流式轮询，run() 行为不变）；
+>    main.nodio 增 publishRun/publishExe/真「工程属性」对话框；工程菜单
+>    增「发布为独立 exe（控制台/界面程序）」两条显式入口（不猜 --gui）。
+> ④ 冒烟锁：NODIO_IDE_SMOKE 增发布段端到端三断言 PUB-START/EXE/RUN
+>    （token=time.tick() 每次不同，防旧产物假绿；runner 单槽 → 先发布
+>    后 F5 回声）。坑：popen startInfo 塞 environment 表实测必报
+>    （popen.aardio:63）→ 改「spawn 前后临时清父进程 env」（空串≡删除
+>    变量，main.cpp `>0` 判定等于未设置）。
+> ⑤ 回归：发布 10 项 ×2 架构、冒烟 ×2 架构全绿；全量 **x64 18/18、
+>    x86 18/18**。
+
+> **第四十三轮（最近文件——「文件」菜单动态段 + cfg 持久化）**。
+>    （详见 `docs/capability-gap.md` §1.48）
+> ① 缺口清单 §5.2「最近使用的文档 ❌」收掉（上轮挂账）。方案：cfg 一行
+>    `recent.files=路径1|路径2|...`（Windows 路径不可能含 |，分隔符安全）；
+>    自绘菜单打开下拉时**现读** items 表 → 「文件」条目每次重建 +
+>    setMenus 即生效，无需二级子菜单机制；openFile 一处入队（工程/搜索
+>    跳转/钩子打开的文档都收，工程本身不收——已有 lastProject 恢复）。
+> ② 实现：settings.recentGet/recentPush（去重置顶、截 10 条）；
+>    shell.buildFileMenuItems（固定段+动态段，条目 N.  完整路径）+
+>    refreshRecentMenu/fileMenuLabels 导出；main.openFile 成功分支入队。
+>    闭包工厂 mkOpen 把路径绑进参数——循环里直接写闭包会共享循环变量。
+> ③ 坑：单变量 for in 对**数组**拿到的不是元素值（第一版 recentGet
+>    四条断言全 0 但无异常）；split 结果一律计数循环+下标（仓库惯例）。
+> ④ 回归锁：冒烟四断言 RECENT-AUTO/TOP-OK/DUP-OK/MENU-HIT；x64/x86
+>    冒烟全绿；全量 **x64 18/18、x86 18/18**（x64 首轮 vm/winclip 失败
+>    为剪贴板争用环境假红，重跑即绿）。
+
+> **第四十四轮（全面审计四连修——递归失控全链清剿）**。
+> ① 审计挖出 4 个绕过 500 层守卫的段错误向量：GcMark 深链递归
+>    （10-20 万层崩，P0）、线程 DeepCopy 深链（≤5 万层崩）、解析器
+>    深括号（纯解析 3 万层崩）、native→脚本重入三入口无计数。
+> ② 修复：mark/拷贝迭代化（显式工作栈，语义逐路保持，顺修 fromIsEnv
+>    诊断错表）；重入计数器上移共享（Call 节点/CallThisOwner/CallVmFunc，
+>    纯脚本上限 500 不变）；解析 1000 层封顶 + 词法器 EOF 字符串报错。
+> ③ 回归锁 t93-t97 五件：深表+GC 波、线程深拷贝、深括号、未终止字符
+>    串、守卫边界不误伤。④ 四个原崩溃探针全部转绿；vm 94/0/1；
+>    双架构全量回归绿。§1.47/1.48（并行会话发布链路、最近文件）随行落账。
