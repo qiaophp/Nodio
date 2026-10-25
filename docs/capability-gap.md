@@ -5293,6 +5293,16 @@ conv 双 0；重建零改动 worktree 后真原样版 x86 收益 2.2×+ 复现�
 /.md，含完整归因与踩坑）保留于仓库根作审计底稿。engine/sysapi.cpp
 剪贴板 API（IDE 线 WIP）未随本提交。
 
+### 1.51.7 合入后补充验证（同日）
+
+e738974 合入后，CLI 级全量回归（Temp 下全新目录构建 perfM-x64/x86）
+双架构七项全绿：vm 96/96 **0 跳过**（t23 剪贴板用例本窗口实际通过——
+此前四轮验证的 OpenClipboard gle=5 环境门已开）、iofile、builtin、
+stdlib、publish、import、winclip 均 exit=0；此前担心的火绒按路径拦截
+写盘假红未复现。run_regression 其余 12 项 ide_*/editor/input 类为真
+GUI 用例，因 IDE 线测量会话活跃（同晚 python mock/probe 特征）未抢跑，
+留待其空闲窗口或 WIP 合入后由 IDE 线自跑。
+
 ## 1.52 第四十七轮：以 RTF / HTML 格式复制（编辑菜单彩色复制两条）
 
 ### 1.52.1 目标与方案
