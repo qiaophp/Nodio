@@ -205,7 +205,13 @@ void* operator new(size_t n)
 void* operator new[](size_t n) { return ::operator new(n); }
 void operator delete(void* p) noexcept
 {
-    if (p) { g_nDel.fetch_add(1, std::memory_order_relaxed); }
+    // Same gate as operator new: with NODIO_ALLOC_TRACE unset the census
+    // must cost nothing beyond one relaxed load. The old unconditional
+    // fetch_add taxed every delete in the process (census: 45.1M deletes
+    // per call5m run) even though the dump refuses to run when g_allocOn
+    // is false.
+    if (p && g_allocOn.load(std::memory_order_relaxed))
+        g_nDel.fetch_add(1, std::memory_order_relaxed);
     free(p);
 }
 void operator delete[](void* p) noexcept { ::operator delete(p); }

@@ -5222,3 +5222,73 @@ vm 套件 96 过/0 挂/0 跳；run_regression 双架构 18/18 全绿。
 
 engine/sysapi.cpp 工作树中并行 IDE 会话的剪贴板 API 注册（IDE 彩色
 复制）未随本轮提交，归其后续轮次。
+
+## 1.51 第四十六轮（性能线）：调用帧池化回退定案与修复落账
+
+### 1.51.1 回退源定案（两层机制，均经实测）
+
+第三十五轮（98e5f94）把瞬时调用帧切到池化槽存储（`EnvUsePooledSlots`，
+5 处：CallThisOwner / InstantiateClass / EvalCall / ExecBlockScoped /
+CallVmFunc）。第一层：槽号 = 全局 intern id − 1，调用帧槽向量为
+O(maxInternId)×sizeof(Value)——328B 时代 ~52KB/帧，第四十一轮 136B 后
+~22KB/帧，税减半但形态不变。第二层：槽池必死（gc.cpp，Round 34 引入）——
+`GcAcquireSlotBuf` 取缓冲不扣 `p.nBytes`，`GcReleaseSlotBuf` 在
+≥kBudget(24MB) 后永久拒收，池吸收 ~285 帧后死亡，稳态每调用重分配。
+第三十九轮 kSlotMax=512 封顶对 import time+console（~100–300 id）的
+普通脚本不触发。allocstat 普查（call5m 5M 调用）：x64 原样 >32K 桶
+4,999,916 次 / 261,375.9MB；x86 原样 16K 桶 4,999,401 次 / 70,234.3MB
+（~14KB/帧，检修轮重测）。
+
+### 1.51.2 修复内容（3 文件，+38/−10）
+
+1. 删 5 处瞬时帧池化调用（runtime.cpp）：调用帧/块帧回 vars map
+   （Round 13 设计原意）；驻留帧（globals/mainEnv）保持 bSlotsKeep 槽化；
+   EvalCall 处留 136B 语境机制注释。
+2. allocstat.cpp `operator delete` 门控：原无条件 `fetch_add`（call5m 单次
+   45.1M 次计税）违文件头自述契约，对齐为与 operator new 相同的
+   `g_allocOn` 门控（NODIO_ALLOC_TRACE=1 行为不变）。
+3. import.cpp BindModule/DoImport QPC 门控：补齐 40d1f72 自述的
+   「先判门再付 QPC」纪律。
+4. 槽池/节点池机制本体保留为死代码；复活须同时修 acquire 按 capacity
+   扣减 nBytes + 按容量段匹配取还。common.h kSlotMax 注释（328B）已随
+   第四十一轮失真，待原作者订正。
+
+### 1.51.3 验证（双架构，A=原样 vs B=修复，5 轮中位）
+
+- x64 安静窗口（7–11% 负载）：call5m 0.413×（11078→4578ms）、
+  callv5m 0.403×（18594→7500ms）、lenfn5m 1.011（噪声证实）；
+  污染窗口（23–76% 负载）首测 0.406×/0.471× 同向。
+- x86（14% 负载，真原样版判源后）：call5m 0.456×（10625→4844）、
+  callv5m 0.439×（18515→8125）。
+- 分配普查（trace 开）：x86 原样 call5m 总流量 72,609.8MB → 修复 3,365.8MB
+  （−95%）；x64 同构 268GB→10.4GB（−96%）。
+- VM 套件四变体（A/B × x64/x86）实质全绿（t23=剪贴板往返为本 RDP 桌面
+  环境门非回归，OpenClipboard gle=5）；TAIL_EQ 全程通过。
+- da414b3 原样 call 路径仍显著慢于第 15 轮基线（定性 1.282）——第四十一轮
+  未消灭池化税，本修复必要。
+
+### 1.51.4 loop5m +6~14% 归因（编译布局类，非机制代价）
+
+x64 上修复版 loop5m 方向性慢 ~6%（15 轮中位 1.064：969→1031ms）、
+安静窗口 5 轮抽中高模态至 1.141；x86 上同一 delta 反而 0.984（方向翻转）。
+五证据链定案为 MSVC 布局效应：删 ~1KB 内联材料使热函数地址平移（.text
+锚点比对逐字节证同）；同点位 ~250B 语义空桩即可把比值重塑回 ~1.05 带；
+动态路径源码级零交集（ForNum/ExecBlock/DoAssign 存储模式 A/B 相同）。
+非本修复语义回退，不影响收益判断；消除可留等尺寸占位或随 engine 大改
+自然重排。另 BOOT_TRACE 的 conv 计数是启动期一次性诊断值，勿作 loop 期
+归因依据。
+
+### 1.51.5 判源规程教训
+
+检修中揪出 x86 A/B 首跑作废：两枚 x86 exe 均构建自修复 worktree（A≡B），
+比值全 ≈1.0 的「x86 无收益」为假象（判源证据：分配谱逐字节相同 +
+conv 双 0；重建零改动 worktree 后真原样版 x86 收益 2.2×+ 复现）。
+规程补充：A/B 基准前两侧 exe 须过「BOOT_TRACE conv 计数 + ALLOC 普查」
+双探针判源，哈希不同≠源头正确。
+
+### 1.51.6 会话协调
+
+本条目为性能线（独立会话）检修定稿、patch 在 50ca35d 上 apply --check
+干净后经用户确认合入。patch 交付物（.perf-fix-round35-callframe-pool.patch
+/.md，含完整归因与踩坑）保留于仓库根作审计底稿。engine/sysapi.cpp
+剪贴板 API（IDE 线 WIP）未随本提交。

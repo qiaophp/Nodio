@@ -147,9 +147,12 @@ bool Interp::ResolveModulePath(const vector<wstring>& names, wstring* outFile) c
 // ---- BindModule ----
 Value Interp::BindModule(const vector<wstring>& names, const Value& mod)
         {
-            LARGE_INTEGER bt0; QueryPerformanceCounter(&bt0);
+            // Same gate discipline as runtime.cpp: no QPC unless
+            // NODIO_BOOT_TRACE is set.
+            LARGE_INTEGER bt0 = {};
+            if (g_bootTrace) QueryPerformanceCounter(&bt0);
             struct BtDone { LARGE_INTEGER t0; ~BtDone() {
-                g_usBind += UsSince(t0); g_nBind++; } } bt{ bt0 };
+                if (t0.QuadPart) { g_usBind += UsSince(t0); g_nBind++; } } } bt{ bt0 };
             static bool bDbg = GetEnvironmentVariableW(L"CMT", nullptr, 0) != 0;
             if (bDbg)
             {
@@ -508,9 +511,12 @@ Value Interp::RunAardioChunkModule(const std::string& raw,
 // ---- DoImport ----
 Value Interp::DoImport(const PNode& n, Env* env)
         {
-            LARGE_INTEGER bt0; QueryPerformanceCounter(&bt0);
+            // Same gate discipline as runtime.cpp: no QPC unless
+            // NODIO_BOOT_TRACE is set.
+            LARGE_INTEGER bt0 = {};
+            if (g_bootTrace) QueryPerformanceCounter(&bt0);
             struct BtDone { LARGE_INTEGER t0; ~BtDone() {
-                g_usImport += UsSince(t0); g_nImport++; } } bt{ bt0 };
+                if (t0.QuadPart) { g_usImport += UsSince(t0); g_nImport++; } } } bt{ bt0 };
             (void)env;
             // global lib root — enabled via NODIO_LIBDIR or configuration;
             // resolution order: overlay lib dir (D:\Nodio\lib) first, then strLibDir

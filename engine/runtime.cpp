@@ -928,7 +928,6 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             }
             auto local = std::make_shared<Env>();
             local->self = local;
-            EnvUsePooledSlots(local.get());
             // lexical upvalues: the captured defining frame chain replaces
             // the bare globals jump
             local->parent = f.fnData->envUp ? f.fnData->envUp : globals.self;
@@ -1392,7 +1391,6 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 classNsEnv->parent = lexicalParent;
             auto local = std::make_shared<Env>();
             local->self = local;
-            EnvUsePooledSlots(local.get());
             local->parent = f.tab ? classNsEnv
                                   : (f.fnData->nsClosure ? definingNsEnv
                                                  : lexicalParent);
@@ -1943,7 +1941,27 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             vector<Value> args = evalCallArgs(n->list);
             auto local = std::make_shared<Env>();
             local->self = local;
-            EnvUsePooledSlots(local.get());
+            // PERF: call frames stay on the vars map (Round 13 design) —
+            // EnvUsePooledSlots is NOT called here (nor at CallThisOwner /
+            // InstantiateClass / ExecBlockScoped / CallVmFunc; those four
+            // sites were removed as well). Slot indexes are (intern id - 1),
+            // which grows with every import/intern, so a pooled call
+            // frame's slot vector is O(maxInternId) * sizeof(Value) per
+            // call. At Round 39 (sizeof(Value)=328B) that was ~52KB per
+            // frame — allocstat census, 5M calls, x64: 4,999,916
+            // allocations >32KB totalling 261GB traffic, one per call.
+            // Round 41's 136B values shrink the bytes but keep the shape.
+            // The kSlotMax=512 cap only helps when maxInternId > 512; a
+            // script that imports time+console lands at ~100-300 ids and
+            // stays on the slow path. The buffer pool cannot rescue it
+            // either: GcAcquireSlotBuf never decrements the pool's nBytes
+            // budget, so once kBudget(24MB) of releases have been absorbed
+            // every later release is rejected and the stock drains to
+            // zero — after warmup every call re-mallocs its buffer.
+            // Resident frames (globals, mainEnv) keep bSlotsKeep slots.
+            // All other Round-35/41 changes (FuncData side table, lazy GC
+            // registry, varargs aliasing, evalFastArgs, PNode pool) are
+            // kept.
             // functions see globals AND the defining frame chain
             // (upvalues). Plain functions capture only globals; nested
             // functions capture their enclosing frame via envUp.
@@ -2959,7 +2977,6 @@ Value Interp::ExecBlockScoped(const PNode& blk, Env* env)
     auto child = std::make_shared<Env>();
     child->self = child;
     child->parent = env ? env->self : globals.self;
-    EnvUsePooledSlots(child.get());
     // closure captures and namespace-member fallbacks must still see the
     // enclosing scope's namespace/module tables through Find()'s parent walk,
     // so they are intentionally NOT copied into the child frame.
@@ -4389,7 +4406,6 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             }
             auto local = std::make_shared<Env>();
             local->self = local;
-            EnvUsePooledSlots(local.get());
             local->parent = f.fnData->envUp ? f.fnData->envUp : globals.self;
             local->nsTable = f.fnData->nsClosure;
             local->VarAt(IdOwner()) = Value();   // native-side call: no owner
