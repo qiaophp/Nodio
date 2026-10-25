@@ -1,0 +1,250 @@
+// tests/editor_probe.aardio — nodio.ui.editor 组件的行为回归。
+//
+// 注意：aardio 里双引号是原样串，`"\n"` 不是换行 —— 本文件统一用单引号。
+import win.ui;
+import nodio.ui.editor;
+
+var f = win.form(text="editor probe";right=1100;bottom=640);
+f.add({
+	ed={cls="richedit";left=60;top=40;right=800;bottom=560;multiline=true;vscroll=true}
+});
+f.show();
+..win.delay(300);
+
+var ed = nodio.ui.editor(f, {
+	ctrl = f.ed;
+	fontSize = 11;
+});
+ed.layout(60, 40, 800, 560);
+..win.delay(300);
+
+var src = '// 这是注释\n';
+src = src ++ 'var x = 1;\n';
+src = src ++ 'function demo(a,b){\n';
+src = src ++ '\tvar s = "hello 世界";\n';
+src = src ++ '\t// 调用\n';
+src = src ++ '\tprint(s);\n';
+src = src ++ '}\n';
+
+ed.setText(src);
+..win.delay(600);
+
+io.print("EOL-LF:" ++ tostring(ed.eol == '\n'));
+io.print("TEXT-LINES:" ++ tostring(#..string.split(ed.getText(), '\n')));
+io.print("CTRL-LINES:" ++ tostring(#..string.split(f.ed.text, '\n')));
+io.print("TEXT-EQ-CTRL:" ++ tostring(ed.getText() == f.ed.text));
+io.print("DIRTY-AFTER-SET:" ++ tostring(ed.isDirty()));
+io.print("LINEHEIGHT:" ++ tostring(ed.lineHeight));
+
+// 行列号
+f.ed.setSel(1,1);
+var line,col = ed.updateCursor();
+io.print("CURSOR:" ++ tostring(line) ++ "," ++ tostring(col));
+
+var base = f.ed.lineToChar(3);
+f.ed.setSel(base + 4, base + 4);
+line,col = ed.updateCursor();
+io.print("CURSOR2:" ++ tostring(line) ++ "," ++ tostring(col));
+
+// 缩进：选中第 3 行再缩进
+var a = f.ed.lineToChar(3);
+var b = f.ed.lineToChar(3) + 3;
+f.ed.setSel(a, b);
+io.print("LTC1:" ++ tostring(f.ed.lineToChar(1)));
+io.print("LTC2:" ++ tostring(f.ed.lineToChar(2)));
+io.print("LTC3:" ++ tostring(f.ed.lineToChar(3)));
+io.print("SEL-A-B:" ++ tostring(a) ++ "," ++ tostring(b));
+ed.indent();
+..win.delay(200);
+io.print("INDENT:" ++ tostring(f.ed.lineText(3)));
+io.print("INDENT-L2:" ++ tostring(f.ed.lineText(2)));
+io.print("DIRTY-AFTER-EDIT:" ++ tostring(ed.isDirty()));
+
+// 取消缩进
+f.ed.setSel(a, b);
+ed.unindent();
+..win.delay(200);
+io.print("UNINDENT:" ++ tostring(f.ed.lineText(3)));
+
+// 注释切换：第 3 行
+f.ed.setSel(a, b);
+ed.toggleComment();
+..win.delay(200);
+io.print("COMMENT:" ++ tostring(f.ed.lineText(3)));
+io.print("COMMENT-L4:" ++ tostring(f.ed.lineText(4)));
+f.ed.setSel(a, b);
+ed.toggleComment();
+..win.delay(200);
+io.print("UNCOMMENT:" ++ tostring(f.ed.lineText(3)));
+
+// 多行缩进：选 2~3 行
+var a2 = f.ed.lineToChar(2);
+var b2 = f.ed.lineToChar(3) + 3;
+f.ed.setSel(a2, b2);
+ed.indent();
+..win.delay(200);
+io.print("MULTI-L2:" ++ tostring(f.ed.lineText(2)));
+io.print("MULTI-L3:" ++ tostring(f.ed.lineText(3)));
+f.ed.setSel(a2, b2);
+ed.unindent();
+..win.delay(200);
+io.print("MULTI-UN-L2:" ++ tostring(f.ed.lineText(2)));
+io.print("MULTI-UN-L3:" ++ tostring(f.ed.lineText(3)));
+
+// 查找
+ed.setText(src);
+f.ed.setFocus();
+..win.delay(300);
+var ok = ed.findNext("print", true);
+io.print("FIND:" ++ tostring(ok));
+var mn,mx = ed.getSelection();
+io.print("FIND-SEL:" ++ tostring(mn) ++ "," ++ tostring(mx));
+io.print("FIND-SELTEXT:[" ++ tostring(f.ed.selText) ++ "]");
+io.print("FIND-GETSEL:[" ++ tostring(f.ed.getSel()) ++ "]");
+io.print("FIND-LINE6:" ++ tostring(f.ed.lineText(6)));
+io.print("FIND-LTC6:" ++ tostring(f.ed.lineToChar(6)));
+line,col = ed.updateCursor();
+io.print("FIND-POS:" ++ tostring(line) ++ "," ++ tostring(col));
+
+// 替换全部
+var n = ed.replaceAll("var", "let");
+io.print("REPLACE-ALL:" ++ tostring(n));
+io.print("REPLACE-TEXT:" ++ tostring(..string.split(ed.getText(), '\n')[2]));
+
+// 查找中文（UTF-16 位置换算）
+ed.setText(src);
+..win.delay(300);
+var ok2 = ed.findNext("世界", true);
+io.print("FIND-CN:" ++ tostring(ok2));
+line,col = ed.updateCursor();
+io.print("FIND-CN-POS:" ++ tostring(line) ++ "," ++ tostring(col));
+io.print("FIND-CN-SEL:" ++ tostring(ed.getSelection()));
+
+// 转到行
+ed.gotoLine(5);
+line,col = ed.updateCursor();
+io.print("GOTO-LINE:" ++ tostring(line) ++ "," ++ tostring(col));
+
+// 撤销 / 重做（组件自己的快照栈：richedit 自带的撤销栈不收程序化替换）
+ed.setText(src);
+..win.delay(300);
+var len0 = ..string.len(ed.getText());
+var a3 = f.ed.lineToChar(3);
+f.ed.setSel(a3, a3 + 3);
+ed.indent();
+..win.delay(200);
+var len1 = ..string.len(ed.getText());
+io.print("UNDO-CAN:" ++ tostring(ed.canUndo()));
+ed.undo();
+..win.delay(200);
+var len2 = ..string.len(ed.getText());
+io.print("UNDO-LEN:" ++ tostring(len0) ++ "," ++ tostring(len1) ++ "," ++ tostring(len2));
+io.print("UNDO-LINE3:[" ++ tostring(f.ed.lineText(3)) ++ "]");
+ed.redo();
+..win.delay(200);
+io.print("REDO-LINE3:[" ++ tostring(f.ed.lineText(3)) ++ "]");
+io.print("REDO-CAN:" ++ tostring(ed.canRedo()));
+
+// 模拟一次键入（WM_CHAR）：撤销应该只退掉这一个字符
+ed.setText('abc');
+..win.delay(200);
+::SendMessage(f.ed.hwnd, 0x102/*_WM_CHAR*/, 68/*'D'*/, 0);
+..win.delay(400);
+io.print("TYPE-TEXT:[" ++ tostring(ed.getText()) ++ "]");
+ed.undo();
+..win.delay(200);
+io.print("TYPE-UNDO:[" ++ tostring(ed.getText()) ++ "]");
+
+// 脏标记是**推导**的：撤销回保存时的状态会自动变干净
+ed.setText(src);
+..win.delay(300);
+io.print("DIRTY-CLEAN:" ++ tostring(ed.isDirty()));
+f.ed.setSel(f.ed.lineToChar(3), f.ed.lineToChar(3) + 3);
+ed.indent();
+..win.delay(200);
+io.print("DIRTY-AFTER-EDIT2:" ++ tostring(ed.isDirty()));
+ed.undo();
+..win.delay(200);
+io.print("DIRTY-AFTER-UNDO:" ++ tostring(ed.isDirty()));
+
+// 查找条
+ed.showFind(true);
+..win.delay(200);
+io.print("FIND-BAR-VISIBLE:" ++ tostring(..win.isVisible(ed.find.ctrl.hwnd)));
+io.print("FIND-ED-VISIBLE:" ++ tostring(..win.isVisible(ed.findEd.hwnd)));
+ed.closeFind();
+..win.delay(200);
+io.print("FIND-BAR-HIDDEN:" ++ tostring(..win.isVisible(ed.find.ctrl.hwnd)));
+
+// 脏标记回调
+var dirtySeen = null;
+ed.onDirty = function(d){ dirtySeen = d };
+ed.markDirty(false);
+..win.delay(100);
+io.print("DIRTY-CB-CLEAR:" ++ tostring(dirtySeen));
+ed.markDirty(true);
+..win.delay(200);
+io.print("DIRTY-CB:" ++ tostring(dirtySeen));
+// 基准文本（setSavedText）：内容与基准不同 → 脏
+ed.setText(src);
+..win.delay(200);
+ed.setSavedText('不一样');
+..win.delay(200);
+io.print("DIRTY-SAVEDTEXT:" ++ tostring(ed.isDirty()));
+ed.setSavedText(ed.getText());
+..win.delay(200);
+io.print("DIRTY-SAVEDTEXT2:" ++ tostring(ed.isDirty()));
+
+// 着色是否生效：读回当前行文字颜色
+ed.setText(src);
+..win.delay(600);
+try{
+	var cf = f.ed.getCharformat();
+	io.print("CHARFORMAT-TEXT:" ++ tostring(cf.textColor));
+}catch(e){
+	io.print("CHARFORMAT-ERR:" ++ tostring(e));
+}
+
+// 诊断标记：setDiagnostics 要能画出槽内**波浪线**
+// ⚠ 口径：getCharformat() 读的是 SCF_DEFAULT（控件默认格式），
+//   要读选区格式必须用 getSelCharformat()（SCF_SELECTION）。
+//   波浪线 = underlineType 8 (CFU_UNDERLINEWAVE)
+var dn = ed.setDiagnostics({
+	{line=2; col=0; endLine=2; endCol=5; msg="语法错误"; sev=1};
+	{line=3; col=0; endLine=3; endCol=3; msg="警告"; sev=2};
+});
+io.print("DIAG-COUNT:" ++ tostring(dn));
+..win.delay(300);
+try{
+	// 读第 2 行首字符的选区格式：波浪线 = underlineType == 8
+	var l2 = f.ed.lineToChar(2);
+	f.ed.setSel(l2, l2 + 4);
+	var cf2 = f.ed.getSelCharformat();
+	io.print("DIAG-UTYPE:" ++ tostring(cf2.underlineType));
+	io.print("DIAG-EFFECTS:" ++ tostring(cf2.effects));
+	io.print("DIAG-TEXT-COLOR:" ++ tostring(cf2.textColor));
+}catch(e2){
+	io.print("DIAG-ERR:" ++ tostring(e2));
+}
+// 未标诊断的行不应有下划线
+try{
+	var l4 = f.ed.lineToChar(4);
+	f.ed.setSel(l4, l4 + 4);
+	var cf4 = f.ed.getSelCharformat();
+	io.print("DIAG-CLEAN-UTYPE:" ++ tostring(cf4.underlineType));
+}catch(e4b){
+	io.print("DIAG-CLEAN-ERR:" ++ tostring(e4b));
+}
+// 清掉诊断
+ed.setDiagnostics({});
+..win.delay(200);
+try{
+	f.ed.setSel(f.ed.lineToChar(2), f.ed.lineToChar(2) + 4);
+	var cf3 = f.ed.getSelCharformat();
+	io.print("DIAG-CLEARED-UTYPE:" ++ tostring(cf3.underlineType));
+}catch(e3){
+	io.print("DIAG-CLEAR-ERR:" ++ tostring(e3));
+}
+
+f.close();
+io.print("PROBE-OK");

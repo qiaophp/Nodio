@@ -1,0 +1,133 @@
+// tests/editor_comp_probe.aardio — 代码补全浮层的行为回归（不依赖 LSP）。
+//
+// 验证：
+//   1. 光标处的单词前缀算对（含 UTF-8 中文行里的英文标识符）
+//   2. 浮层能弹出来、位置跟着光标
+//   3. ↑↓ 移动选择
+//   4. Enter 插入：把前缀替换成候选
+//   5. Esc 关闭
+//   6. 候选超过可见行数 → 浮层滚动，选中项留在可见区
+//   7. 真实按键路径：Ctrl+Space（真发 WM_KEYDOWN 给 richedit）
+import win.ui;
+import raw;
+import nodio.ui.editor;
+
+var f = win.form(text="comp probe";right=1000;bottom=600);
+f.add({
+	ed={cls="richedit";left=80;top=40;right=900;bottom=540;multiline=true;vscroll=true}
+});
+f.show();
+..win.delay(300);
+
+var ed = nodio.ui.editor(f, {
+	ctrl = f.ed;
+	fontSize = 11;
+});
+ed.layout(80, 40, 900, 540);
+..win.delay(300);
+
+var src = 'var alpha = 1\r\n'
+	++ 'var beta = 2\r\n'
+	++ 'print(al\r\n';
+ed.setText(src);
+..win.delay(700);
+
+// 候选表（假数据，模拟 LSP 返回）
+var items = {
+	{label="alpha"; kind=6; detail="var"};
+	{label="alphabet"; kind=3; detail="function"};
+	{label="alpine"; kind=6; detail="var"};
+	{label="also"; kind=14; detail="keyword"};
+};
+
+// 1) 前缀计算：光标放在 "al" 后面
+//    lineToChar 是 1-based 行首；setSel(x) 单参是 0-based 插入点
+var l3 = f.ed.lineToChar(3);
+f.ed.setSel(l3 + 7);            // "print(al" 的 'l' 之后
+..win.delay(200);
+var w = ed.__wordAtCursor();
+io.print("PREFIX:[" ++ tostring(w.word) ++ "] LINE:" ++ tostring(w.line)
+	++ " COL:" ++ tostring(w.col) ++ " START:" ++ tostring(w.start));
+
+// 2) 真实按键路径：模拟 Ctrl+Space
+//    Nodio 里没有键盘输入链路 → 直接给 richedit 发一个 WM_KEYDOWN，
+//    并用 SetKeyboardState 把**本线程**的 Ctrl 状态置成「按下」
+//    （GetKeyState 读的就是本线程状态）—— 不走系统输入队列，
+//    所以中文输入法不会抢走 Ctrl+Space、也不会往控件里塞空格。
+var u32 = ..raw.loadDll("user32.dll");
+var setKb = u32.api("SetKeyboardState", "bool(addr state)");
+var gotLine = 0;
+var gotCol = 0;
+ed.onComplete = function(line, col){
+	gotLine = line;
+	gotCol = col;
+	ed.showCompletion(items);
+};
+var kb = ..string.rep('\0', 256);
+// ⚠ 键盘状态数组是 256 字节，第 0x11 字节（1 基第 17 个）放 VK_CONTROL 的状态。
+//   拼串必须正好 256 字节：前 16 字节 + 0x80 + 后 239 字节。
+//   之前写成 sub(kb,1,0x11) 是 17+1+239 = **257 字节**，
+//   raw.write 写进 256 字节的 buffer → 堆溢出（x86 上随机崩，x64 上侥幸没炸）。
+kb = ..string.sub(kb, 1, 0x10) ++ '\x80' ++ ..string.sub(kb, 0x12, 256);
+var kbBuf = ..raw.buffer(256);
+..raw.write(kbBuf, kb);
+var kbOk = setKb(kbBuf);
+io.print("KB-STATE:" ++ tostring(kbOk));
+::PostMessage(f.ed.hwnd, 0x100/*WM_KEYDOWN*/, 0x20/*VK_SPACE*/, 0);
+..win.delay(600);
+// 复位（把 Ctrl 放开）
+kb = ..string.rep('\0', 256);
+..raw.write(kbBuf, kb);
+setKb(kbBuf);
+io.print("KEY-CB-LINE:" ++ tostring(gotLine) ++ " COL:" ++ tostring(gotCol));
+io.print("KEY-VISIBLE:" ++ tostring(ed.completionVisible()));
+ed.hideCompletion();
+
+// 3) 弹浮层（用假数据）
+var n = ed.showCompletion(items);
+io.print("SHOW:" ++ tostring(n));
+io.print("VISIBLE:" ++ tostring(ed.completionVisible()));
+..win.delay(400);
+
+// 4) ↓ 移动
+ed.completionMove(1);
+io.print("MOVE1-IDX:" ++ tostring(ed.compIndex));
+ed.completionMove(1);
+io.print("MOVE2-IDX:" ++ tostring(ed.compIndex));
+ed.completionMove(-1);
+io.print("MOVE3-IDX:" ++ tostring(ed.compIndex));
+
+// 5) Esc 关闭
+ed.hideCompletion();
+io.print("HIDDEN:" ++ tostring(ed.completionVisible()));
+
+// 6) 候选超过可见行数 → 浮层滚动，选中项必须留在可见区
+var many = {};
+for(i=1;15;1){
+	..table.push(many, {label="item" ++ i; kind=6; detail="var"});
+}
+ed.showCompletion(many);
+io.print("MANY-N:" ++ tostring(#ed.compItems) ++ " SCROLL:" ++ tostring(ed.compScroll));
+for(i=1;8;1) ed.completionMove(1);
+io.print("MANY-IDX:" ++ tostring(ed.compIndex) ++ " SCROLL:" ++ tostring(ed.compScroll));
+ed.hideCompletion();
+
+// 7) 重新弹出并插入（选第 2 项 alphabet）
+f.ed.setSel(l3 + 7);
+ed.requestComplete();          // 会算前缀（onComplete 已设 → 会弹浮层）
+ed.showCompletion(items);
+ed.completionMove(1);         // 选中第 2 项
+ed.completionAccept();
+..win.delay(500);
+io.print("AFTER-INSERT-LINE3:[" ++ tostring(f.ed.lineText(3)) ++ "]");
+io.print("AFTER-INSERT-VISIBLE:" ++ tostring(ed.completionVisible()));
+
+// 留着浮层给截图
+f.ed.setSel(l3 + 7);
+ed.requestComplete();
+ed.showCompletion(items);
+..win.delay(800);
+
+..win.delay(5000);
+f.close();
+io.print("PROBE-OK");

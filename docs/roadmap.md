@@ -1727,3 +1727,28 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 > ② EOF 哨兵取最后内容行：单行文件语法错误报 行 1（原 行 2）。
 > ③ 回归锁 t98；vm 96/0/0；双架构 18/18。并行会话的 sysapi 剪贴板
 >    注册不随行。
+
+> **第四十七轮（以 RTF / HTML 格式复制——编辑菜单彩色复制两条）**。
+>    （详见 `docs/capability-gap.md` §1.52）
+> ① 缺口清单 §5.1「以 RTF / HTML 格式复制 ❌」收掉。语义=复制**整篇**
+>    （带色贴进 Word/邮件/博客），复制后选区还原。RTF 走 richedit 原生
+>    copy（真 CHARFORMAT 序列化），复制前强制全文着色补偿（平时只着色
+>    可见范围；显式命令可接受数秒，copyHtml 无此代价）；HTML 由本地
+>    词法器 token 流直出（<pre> 包裹 + token 级 span，颜色同 self.colors
+>    主题跟随；&<> 转义；MAX_TOKENS 截断降级纯文本），CF_HTML +
+>    CF_UNICODETEXT 同会话写入兜底。
+> ② 字节保真配方（探针 2b/2c/2d 钉死）：raw.buffer 落字节 +
+>    RtlMoveMemory void(addr,addr,int) 纯指针拷贝 + GMEM_ZEROINIT 兜
+>    终止符；CloseClipboard 后 Sleep(30)（win.clip.write 同款）——缺这拍
+>    本机剪贴板管理器在 Close 瞬间清板。
+> ③ 坑：string.unpack 走 BStr 对 bRawBytes 非 ASCII 双重编码 → 中文断言
+>    用「同管线重建期望字节 + 全量 ==」（== 走 StrByteForm，同通道可靠）；
+>    __buildHtml 转义实体曾写成无操作 + <pre> 漏实现（ASCII 断言查不出，
+>    全量比对抓出）；CF_HTML pad=1 终止符计入期望字节。
+> ④ 回归锁：editor_clip_probe 挂进 run_editor_tests（RTF 头 + 文本一致；
+>    HTML 期望字节全量相等 + 文本一致；整写验循环重试抗清板）。编辑器
+>    4 探针 ×2 全绿；全量 **x64 18/18**（vm 首轮假红）、**x86 18/18**。
+>    附带修 ide_nav 硬编码 NAV-JUMP-LINE:44 → 动态取 NAV-DEF-LINE
+>    （门面插行实测假红）；修 .gitignore 误盖四个编辑器回归锁探针
+>    （前三个官方用例从未入库）。⑤ sysapi 剪贴板 API 注册（§1.50/1.51
+>    挂账 WIP）随本轮落账。

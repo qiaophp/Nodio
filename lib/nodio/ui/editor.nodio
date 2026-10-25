@@ -174,6 +174,69 @@ var __shade = function(argb, d){
 	return (argb & 0xFF000000) | (r << 16) | (g << 8) | b;
 }
 
+// ── 剪贴板原始写入（copyHtml 用；链路照 tests/_probe_cfhtml2c/2d 探针逐字节验证）──
+// ⚠ 三条字节保真铁律（全部实测踩过，别走回头路）：
+//   1. 字节落地走 ..raw.buffer(size, data)：文本按 CP_UTF8 编码、bRawBytes
+//      字节串（toUtf16 产物）逐元素 1:1（builtins.cpp:7157-7177 直接索引，
+//      不过 BStr/代码页）。
+//   2. 拷贝用 RtlMoveMemory 声明成 void(addr,addr,int)（纯指针参数，无 str
+//      封送）。api 的 str 参数不能用：普通串按 CP_ACP 转换（中文变 GBK），
+//      bRawBytes 串又会被 BStr/ToString 重解释（探针 2b P1 实测）。
+//   3. 终止符靠 GMEM_ZEROINIT(0x42) 零初始化兜底，不做任何 NUL 拼接
+//      （拼接再封送会花，探针 2b P2 实测）。
+//   验证读回时：raw.read 产物要与「同通道产物」比对，fromUtf16 在 NUL 处
+//   截断（应与不带终止符的原文比对）；本机剪贴板管理器会在 Close/Reopen
+//   窗口清板——断言必须与写入同一个 Open 会话内完成。
+var __rtlMove = ::Kernel32.api("RtlMoveMemory", "void(addr,addr,int)");
+var __apiSleep = ::Kernel32.api("Sleep", "void(int)");
+// items = { {fmt=格式号; data=内容串; pad=终止符字节数(CF_UNICODETEXT=2,CF_HTML=1)}; ... }
+// 一次 OpenClipboard 会话内连续写入（win.clip.write 内部会 EmptyClipboard，
+// 多格式必须自己开会话）。OpenClipboard 失败重试（内置 win.clip 同款：10×10ms）。
+var __clipWriteRaw = function(items){
+	var opened = false;
+	for(t=1;10;1){
+		if(::OpenClipboard(0)){ opened = true; break }
+		__apiSleep(10);
+	}
+	if(!opened) return false;
+	::EmptyClipboard();
+	var ok = true;
+	for(i=1;#items;1){
+		var it = items[i];
+		var n = #it.data;
+		var pad = it.pad : 1;
+		var src = ..raw.buffer(n + pad, it.data);
+		var h = 0;
+		var p = 0;
+		if(src){
+			h = ::GlobalAlloc(0x42/*GMEM_MOVEABLE|GMEM_ZEROINIT*/, n + pad);
+			if(h) p = ::GlobalLock(h);
+		}
+		if(p){
+			__rtlMove(p, src, n);
+			::GlobalUnlock(h);
+		}
+		if(src){ ..raw.free(src) }
+		if(p){
+			var r = ::SetClipboardData(it.fmt, h);
+			if(r === null || r == 0){
+				::GlobalFree(h);   // 只有失败才归还；成功后 h 归系统
+				ok = false;
+			}
+		}
+		else{
+			if(h) ::GlobalFree(h);
+			ok = false;
+		}
+	}
+	::CloseClipboard();
+	// 写后 Sleep(30) 再返回：给剪贴板链监听者（含本机剪贴板管理器）处理窗口，
+	// 否则管理器会在 Close 瞬间快照到空板并清板（editor_clip_probe 实测）。
+	// 与内置 win.clip.write 的收尾同款（builtins.cpp:5717）。
+	__apiSleep(30);
+	return ok;
+}
+
 // 诊断集合的指纹（诊断没变就不用重刷槽内标记）
 var __diagSig = function(list){
 	if(!list || !#list) return "";
@@ -257,6 +320,7 @@ editor = function(winform, opt){
 		onChange = null;     // function(text) —— 文档内容变了
 		onDirty = null;      // function(dirty)
 		onGotoLine = null;   // function() —— Ctrl+G（由 IDE 弹输入框）
+		onHotkey = null;     // function(vk) —— Ctrl+1..9（IDE 侧接外部工具），返回 1 = 已处理
 		// ---------- 断点 ----------
 		// 点行号打/消断点（VS 的基本操作，调试功能的前提）。
 		// 断点集合放在编辑器组件里（按**文档行号**，1 基），
@@ -330,14 +394,27 @@ editor = function(winform, opt){
 	// 官方 stripPoint + richEdit 会按当前 DPI 计算物理高度，
 	// 11pt 在 150% 下为 22px 物理高度，行高 25px，与周边 18px UI 完美协调。
 	// 严禁在此处乘 dpiScale（否则产生二次放大，字号膨胀到 33-40px）。
+	//
+	// ⚠⚠ 键名必须是 **name**，不是 faceName！
+	//   官方 LOGFONT 类的字体名字段就叫 `name`（WORD name[32]），
+	//   构造函数是 `for(k,v in arg){ this[k] = v; }` —— **逐键原样拷贝**，
+	//   认不得的键会被塞进结构体当垃圾，不报错。
+	//   传 faceName 的后果（实测）：name 保持默认值 → LOGFONT 构造函数里的
+	//   「Tahoma → Segoe UI」兜底生效 → 字体变成 **Segoe UI**（比例字体），
+	//   代码既不等宽、汉字又走回退字体显得更大 —— 整片「时大时小」。
+	//   实测对照：::LOGFONT({faceName="Consolas";point=11}).name == "Segoe UI"
+	//             ::LOGFONT({name="Consolas";point=11}).name    == "Consolas"
 	try{
-		ctrl.setFont({faceName=self.fontName; point=self.fontSize});
+		ctrl.setFont({name=self.fontName; point=self.fontSize});
 	}catch(e3){}
 
 	// ---------- 行号栏 ----------
 	self.gutter = nodio.ui.board(winform, {
 		left = 0; top = 0; right = 60; bottom = 400;
-		fontSize = self.fontSize;
+		// ⚠ 画板字号单位是**逻辑像素**，而 self.fontSize 是 **pt** →
+		//   必须用 uiFontSize（pt × 4/3），否则这块板面的字体比别处小一圈。
+		//   （行号数字本身用 __updateGutterFont 另建的字体画，这里是兜底。）
+		fontSize = self.uiFontSize;
 		z = 50;
 	});
 	self.gutter.onDraw = function(graphics, rc, bd){
@@ -846,6 +923,174 @@ editor = function(winform, opt){
 		try{ ctrl.setSel(1, ctrl.getLength()) }catch(e){}
 		self.updateCursor();
 	}
+
+	// ---------- 以 RTF / HTML 格式复制 ----------
+	// 共同语义：复制**整个文档**（不是当前选区）——这两条命令的用途是
+	// 「把这份代码带颜色地贴进 Word / 邮件 / 博客」，整篇才是预期。
+	// 复制后选区/光标保持原样。
+	//
+	// 以 RTF 格式复制：richedit 原生 copy 自带 RTF（着色是真 CHARFORMAT，
+	// 复制时按控件里存的字符格式序列化）——不自建 RTF 生成器。
+	// ⚠ 平时只给「可见范围」着色（__color，性能取舍，见其注释），
+	//   视口外是正文色——直接复制的话 RTF 里视口外代码没有颜色。
+	//   所以复制前先全文着色一遍（tokenize 逐字节扫，85KB ≈ 数秒——
+	//   显式菜单命令，可接受；「以 HTML 格式复制」无此代价）。
+	self.copyRtf = function(){
+		var t = self.text;
+		if(!t || !#t) return false;
+		// 记下选区（全文着色和全选都会动它，完了还原）
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		if(mn === null || mn === undefined) mn = 0;
+		self.__syncLineTable();
+		self.__colorRange(t, 1, self.__lineCount());
+		var ok = false;
+		try{
+			ctrl.setSel(1, ctrl.getLength());
+			ctrl.copy();
+			ok = true;
+		}catch(e2){}
+		// 还原：无选区是 0-based 插入点（单参），有选区是 1-based 闭区间（双参）
+		if(mx === null || mx === undefined){
+			try{ ctrl.setSel(mn) }catch(e3){}
+		}
+		else{
+			try{ ctrl.setSel(mn, mx) }catch(e4){}
+		}
+		self.updateCursor();
+		return ok;
+	}
+	// 以 HTML 格式复制：本地词法器生成带色 HTML，按 CF_HTML（"HTML Format"）
+	// 规范（Version:0.9 + 4 个 10 位定宽字节偏移 + StartFragment/EndFragment
+	// 标记）连同 CF_UNICODETEXT 兜底一次会话写入——贴到不认 HTML 的目标不丢文本。
+	// 颜色与编辑器着色同一映射（self.colors），主题跟随；不需要先全文着色
+	//（HTML 直接从 token 流生成，不经过 richedit 格式）。
+	self.copyHtml = function(){
+		var t = self.text;
+		if(!t || !#t) return false;
+		self.__syncLineTable();
+		var frag = self.__buildHtml(t);
+		if(frag === null || frag === undefined) return false;
+		// CF_HTML 头：4 个偏移各占 10 位（前导 0 定宽），从数据第 0 字节起算；
+		// 头是定长的（13 + 4×22 = 101 字节），先用 0 占位量出长度再回填。
+		var tail1 = '<html><body>\r\n<!--StartFragment-->';
+		var tail2 = '<!--EndFragment-->\r\n</body></html>';
+		var hdr0 = ..string.format('Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\nStartFragment:%010d\r\nEndFragment:%010d\r\n', 0, 0, 0, 0);
+		var hdrLen = #hdr0;
+		var startFrag = hdrLen + #tail1;
+		var endFrag = startFrag + #frag;          // frag 是 UTF-8 字节长度（# 即字节）
+		var endHtml = endFrag + #tail2;
+		var hdr = ..string.format('Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\nStartFragment:%010d\r\nEndFragment:%010d\r\n',
+			hdrLen, endHtml, startFrag, endFrag);
+		var html = hdr ++ tail1 ++ frag ++ tail2;
+		return __clipWriteRaw({
+			{ fmt = 13/*CF_UNICODETEXT*/; data = ..string.toUtf16(t); pad = 2 };
+			{ fmt = ::RegisterClipboardFormat("HTML Format"); data = html; pad = 1 };
+		});
+	}
+	// token 流 → 带色 HTML 片段（<pre> + 逐 token <span style="color:#xxxxxx">）。
+	// ⚠ token 位置是 richedit 码元（CRLF 只占 1 格，__buildLineStarts 同口径），
+	//   所以**逐行**处理：行内用 __cu/__cb 做「UTF-8 字节 ↔ UTF-16 码元」
+	//   双游标推进，行间直接补 '\n'（<pre> 里就是换行）。
+	//   普通文本不套 span（贴进 Word/网页取默认色）；&<> 三字符转义。
+	//   MAX_TOKENS（6000）截断后，多出的行按纯文本输出——超大文件的合理降级。
+	self.__buildHtml = function(t){
+		var toks = self.__tokenize(t);
+		var colCache = {};
+		var spanOf = function(kind){
+			var sp = colCache[kind];
+			if(sp === null || sp === undefined){
+				var cr = self.colors[kind];
+				if(cr === null || cr === undefined){
+					sp = false;    // 该 kind 无色：原样输出
+				}
+				else{
+					sp = '<span style="color:#' ++ ..string.format("%06X", cr & 0xFFFFFF) ++ '">';
+				}
+				colCache[kind] = sp;
+			}
+			return sp;
+		}
+		var out = {};
+		var m = 0;
+		var ti = 1;
+		var nt = #toks;
+		var lines = ..string.split(t, '\n');
+		for(ln=1;#lines;1){
+			var line = self.__lineText(lines, ln);
+			var blen = #line;
+			if(blen > 0){
+				var bytes = ..string.unpack(line);
+				var base = self.__lineStart(ln);
+				var bi = 1;          // 字节游标（1 基）
+				var u = 0;           // 行内已消耗的 UTF-16 码元
+				while(bi <= blen){
+					var isTok = false;
+					if(ti <= nt){
+						var off = toks[ti].pos - base;    // 行内 0 基码元偏移
+						if(off == u) isTok = true;
+						elseif(off < u) ti = ti + 1;      // 防御：错位就丢掉这个 token
+					}
+					if(isTok){
+						// 收集 token 覆盖的字节区间（码元 [u, u+len) → 字节）
+						var want = u + toks[ti].len;
+						var b0 = bi;
+						while(bi <= blen && u < want){
+							var bb = bytes[bi];
+							u = u + __cu(bb);
+							bi = bi + __cb(bb);
+						}
+						var s = ..string.sub(line, b0, bi - 1);
+						var sp = spanOf(toks[ti].kind);
+						m = m + 1;
+						if(sp){
+							// ⚠ & 必须最先转义（先换 &amp; 才不会吃掉后面的实体）
+							s = ..string.replaceLiteral(s, "&", "&amp;");
+							s = ..string.replaceLiteral(s, "<", "&lt;");
+							s = ..string.replaceLiteral(s, ">", "&gt;");
+							out[m] = sp ++ s ++ "</span>";
+						}
+						else{
+							out[m] = s;
+						}
+						ti = ti + 1;
+						continue;
+					}
+					// 普通文本：批量吃到 token 边界 / 转义字符 / 行尾
+					var b0 = bi;
+					while(bi <= blen){
+						var bb = bytes[bi];
+						if(bb == 38 || bb == 60 || bb == 62) break;   // & < >
+						if(ti <= nt && (toks[ti].pos - base) == u) break;
+						u = u + __cu(bb);
+						bi = bi + __cb(bb);
+					}
+					if(bi > b0){
+						m = m + 1;
+						out[m] = ..string.sub(line, b0, bi - 1);   // 无 &<>，免转义
+					}
+					if(bi <= blen){
+						var eb = bytes[bi];
+						if(eb == 38 || eb == 60 || eb == 62){
+							m = m + 1;
+							out[m] = (eb == 38) ? "&amp;" : ((eb == 60) ? "&lt;" : "&gt;");
+							u = u + 1;
+							bi = bi + 1;
+						}
+						// 否则是 token 边界 → 交给外层下一轮
+					}
+				}
+			}
+			if(ln < #lines){
+				m = m + 1;
+				out[m] = '\n';
+			}
+		}
+		// 数组 + join 一次拼成（逐段 ++ 是 O(n²)，大文件会卡死）
+		// <pre> 包裹：贴入 HTML 目标时保留换行/缩进（代码等宽呈现也是预期）。
+		return '<pre>' ++ ..string.join(out, "") ++ '</pre>';
+	}
 	// 程序改完控件内容后同步快照（避免轮询把「程序改动」当成「用户编辑」）
 	self.__syncFromCtrl = function(){
 		var t = null;
@@ -1287,23 +1532,21 @@ editor = function(winform, opt){
 		if(last > total) last = total;
 		return first, last;
 	}
-	self.__color = function(){
-		var t = self.text;
-		if(!t) return;
-		var __t0 = ..time.tick();
-		// 记下当前选区，着色过程会动选区，最后要还原
-		var mn = 0;
-		var mx = null;
-		try{ mn,mx = ctrl.getSel() }catch(e){}
-		if(mn === null || mn === undefined) mn = 0;
-		// ⚠⚠ **只着色可见的那几行**：
-		//   全文着色是 O(全文) 的活（tokenize 逐字节扫 2.2s
-		//   + 每个 token 两次 FFI 共 4.8s），85KB 的文件实测 **7 秒** ——
-		//   这一秒多的冻结就是用户说的「刷新不及时」的真凶。
-		//   改成「只着色当前可见的行 + 6 行余量」，
-		//   滚动时（WM_VSCROLL / WM_MOUSEWHEEL）再补着色新出现的那一段，
-		//   和 VS Code / CodeMirror 的做法一样。
-		var from, to = self.__visibleRange();
+	// 按「行段」着色：from..to 行（1 基，含）。返回 token 数组。
+	// ① 这一段先刷成正文色（清掉上一次留在上面的着色）
+	// ② tokenize 出这一段的 token，逐个上色
+	// 选区还原 / 诊断重刷 / gutter 是调用方的事（__color 与 copyRtf 各自处理）。
+	//
+	// ⚠⚠ **平时只给「可见的那几行」着色**（__color 的性能取舍）：
+	//   全文着色是 O(全文) 的活（tokenize 逐字节扫 2.2s
+	//   + 每个 token 两次 FFI 共 4.8s），85KB 的文件实测 **7 秒** ——
+	//   这一秒多的冻结就是用户说的「刷新不及时」的真凶。
+	//   改成「只着色当前可见的行 + 6 行余量」，
+	//   滚动时（WM_VSCROLL / WM_MOUSEWHEEL）再补着色新出现的那一段，
+	//   和 VS Code / CodeMirror 的做法一样。
+	//   copyRtf（以 RTF 格式复制）是唯一例外——复制前强制全文着色，
+	//   显式菜单命令，可接受数秒顿挫。
+	self.__colorRange = function(t, from, to){
 		// ① 先把这一段刷成正文色（清掉上一次留在上面的着色）
 		var a = self.__lineStart(from);
 		var b = self.__lineEnd(to);
@@ -1330,6 +1573,20 @@ editor = function(winform, opt){
 				self.__applyColor(cc);
 			}catch(e3){}
 		}
+		return toks;
+	}
+	self.__color = function(){
+		var t = self.text;
+		if(!t) return;
+		var __t0 = ..time.tick();
+		// 记下当前选区，着色过程会动选区，最后要还原
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e){}
+		if(mn === null || mn === undefined) mn = 0;
+		// 只着色可见范围（性能取舍见 __colorRange 注释；copyRtf 是唯一例外）
+		var from, to = self.__visibleRange();
+		var toks = self.__colorRange(t, from, to);
 		if( ..string.getenv("NODIO_IDE_DIAG") ){
 			io.print("DIAG editor color cost=" ++ tostring(..time.tick() - __t0)
 				++ "ms lines=" ++ tostring(from) ++ "-" ++ tostring(to)
@@ -3834,6 +4091,17 @@ editor = function(winform, opt){
 				if(self.onGotoLine) self.onGotoLine();
 				return 1;
 			}
+			// Ctrl+1..9 → 交给 IDE（官方 IDE 的「外部工具」快捷键）。
+			// 编辑器组件不认识外部工具，只声明 onHotkey(vk) 钩子，
+			// IDE 那边把「工具 N」接进来。返回 1 表示已处理（吃掉按键）。
+			if(ctrlDown() && vk >= 0x31 && vk <= 0x39){
+				self.__eatChar = 0;
+				if(self.onHotkey){
+					try{
+						if(self.onHotkey(vk) == 1) return 1;
+					}catch(eHot){}
+				}
+			}
 			if(vk == 0x7B){            // F12：转到定义；Shift+F12：查找引用
 				self.__eatChar = 0;
 				if(shiftDown()) self.__scheduleNav(2);
@@ -3977,6 +4245,40 @@ editor = function(winform, opt){
 		if(self.gutter) self.gutter.show(self.gutterVisible);
 		self.layout();
 		return self.gutterVisible;
+	}
+
+	// ---------- 运行时改字号（设置面板用）----------
+	// 行高是**量出来的**（EM_POSFROMCHAR，见 __measureLineHeight），
+	// 所以改字号必须走完整链条，缺一步行号栏就会飘：
+	//   ① 重设 richedit 字体
+	//   ② 重新量行高（行号栏字体是行高的 0.72 倍，跟着走）
+	//   ③ 浮层画板字号（uiFontSize = pt × 4/3 逻辑像素）
+	//   ④ 重新布局
+	// board 每次重绘都会重取字体（board.nodio 的 onDrawBackground），
+	// 所以改 board.fontSize 再触发重绘就生效，不需要重建控件。
+	self.setFontSize = function(pt){
+		pt = tonumber(pt);
+		if(!pt || pt < 6 || pt > 48) return false;
+		self.fontSize = pt;
+		self.uiFontSize = pt * 4 / 3;
+		try{
+			// ⚠ 键名是 name（官方 LOGFONT 的字体名字段），不是 faceName ——
+			//   详见上面首次设字体处的大段注释。
+			ctrl.setFont({name=self.fontName; point=pt});
+		}catch(e){ return false }
+		self.__measureLineHeight();
+		if(self.gutter) self.gutter.fontSize = self.uiFontSize;
+		if(self.navBar) self.navBar.fontSize = self.uiFontSize;
+		if(self.compBoard) self.compBoard.fontSize = self.uiFontSize;
+		if(self.hoverBoard) self.hoverBoard.fontSize = self.uiFontSize;
+		if(self.sigHelpBoard) self.sigHelpBoard.fontSize = self.uiFontSize;
+		self.layout();
+		self.__updateGutter();
+		return true;
+	}
+	// 当前字号（设置面板回显用）
+	self.getFontSize = function(){
+		return self.fontSize;
 	}
 	self.wordWrap = false;
 	self.toggleWordWrap = function(){

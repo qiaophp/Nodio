@@ -1874,7 +1874,7 @@ server 自己则随父进程退出变成孤儿。两者互相喂养：下一次 
 | 全屏模式（Shift+F11） | ✅ 已通（记录窗口几何，二次触发无损恢复） | `shell.nodio:1211` |
 | 快速打开文件（Ctrl+P） | ✅ 已通（工程文件模糊匹配 + 定位载入页签） | `shell.nodio:1064` |
 | **打印 / 打印预览 / 快速打印 / 打印设置** | ❌ **未做** —— 菜单无任何打印入口，`lib/nodio/` 全库无打印管线 | — |
-| **以 RTF / HTML 格式复制文档** | ❌ **未做** | — |
+| 以 RTF / HTML 格式复制文档 | ✅ 已通（RTF=整篇 richedit 原生 copy + 全文着色补偿；HTML=token 流直出 CF_HTML + CF_UNICODETEXT 兜底；复制后选区还原） | `shell.nodio:1146-1152`；`app/editor.nodio:21-22`；`editor.nodio:195-239, 938-1095`；§1.52 |
 | **官方 intellisense 词库**（`config/intellisense/kernel.txt` 150KB + `winform.txt` 58KB） | ❌ **未接入** —— 补全靠 LSP 自产 | — |
 
 ### 5.2 工程 / 窗口面
@@ -5292,3 +5292,106 @@ conv 双 0；重建零改动 worktree 后真原样版 x86 收益 2.2×+ 复现�
 干净后经用户确认合入。patch 交付物（.perf-fix-round35-callframe-pool.patch
 /.md，含完整归因与踩坑）保留于仓库根作审计底稿。engine/sysapi.cpp
 剪贴板 API（IDE 线 WIP）未随本提交。
+
+## 1.52 第四十七轮：以 RTF / HTML 格式复制（编辑菜单彩色复制两条）
+
+### 1.52.1 目标与方案
+
+缺口清单 §5.1「以 RTF / HTML 格式复制文档 ❌」（挂账自缺口普查轮）。
+两条命令语义 = **复制整个文档**（不是当前选区）——用途是「把这份代码
+带颜色贴进 Word / 邮件 / 博客」，整篇才是预期；复制后选区/光标还原。
+- RTF：richedit 原生 copy 自带 RTF（着色是真 CHARFORMAT，复制时按控件
+  存储的字符格式序列化），不自建 RTF 生成器。平时只着色可见范围
+  （§1.36 性能取舍，85KB 全文 7 秒），视口外是正文色——复制前**强制
+  全文着色**补偿；显式菜单命令可接受数秒顿挫（copyHtml 无此代价）。
+- HTML：本地词法器从 token 流直出带色 HTML，按 CF_HTML（"HTML Format"，
+  Version:0.9 + 4 个 10 位定宽字节偏移 + StartFragment/EndFragment 标记）
+  规范连同 CF_UNICODETEXT 兜底在**一次 OpenClipboard 会话**写入——贴到
+  不认 HTML 的目标不丢文本。颜色复用 self.colors（主题跟随）、`<pre>`
+  包裹（换行/缩进保留）、普通文本不套 span（贴入目标取默认色）、
+  `&<>` 转义（& 先行）、行间 `\n`、MAX_TOKENS（6000）截断后多余行
+  降级纯文本。
+
+### 1.52.2 实现（四层）
+
+- `lib/nodio/ui/editor.nodio`：
+  - `__colorRange(t, from, to)`（`__color` 拆分重构）：行段清底 + 逐
+    token 上色，返回 token 数组；`__color` 变包装器（可见范围 + 选区
+    还原 + hlLine/诊断/gutter 收尾，性能注释随迁）；copyRtf 是**唯一**
+    全文着色例外（注释明示）。
+  - `__clipWriteRaw(items)`：一次会话写多格式。字节保真配方（探针
+    2b/2c/2d 逐字节钉死）：`raw.buffer(size,data)` 落字节（文本
+    CP_UTF8 / bRawBytes 1:1，builtins.cpp:7157-7177 直写不过 BStr）→
+    `RtlMoveMemory` 声明 `void(addr,addr,int)` 纯指针拷贝（api 的 str
+    参数按 CP_ACP 中文必花、bRawBytes 过 BStr 重解释，两条路都禁）→
+    GMEM_ZEROINIT(0x42) 兜终止符，不做 NUL 拼接 → SetClipboardData
+    失败 `GlobalFree`、成功后 h 归系统（`r === null || r == 0` 判失败，
+    0 是真值坑）→ CloseClipboard 后 **Sleep(30)**（内置 win.clip.write
+    同款，builtins.cpp:5717——实测缺这拍本机剪贴板管理器会在 Close
+    瞬间快照到空板并清板）。
+  - `copyRtf`：存选区 → `__syncLineTable` → `__colorRange(1, 行数)`
+    全文着色 → 全选 → `ctrl.copy()` → 按 getSel 语义还原选区。
+  - `copyHtml` / `__buildHtml`：**逐行**处理（token 位置是 richedit
+    码元，CRLF 占 1 格，与 `__buildLineStarts` 同口径），行内 `__cu`/
+    `__cb` 做「UTF-8 字节 ↔ UTF-16 码元」双游标推进，token 边界
+    `toks[ti].pos - base == u` 对齐；span 颜色 `%06X` 缓存；
+    `..string.join(out,"")` 一次拼装（逐段 `++` 是 O(n²)）。
+- `ide/nodio/app/editor.nodio:21-22`：门面 `copyRtf`/`copyHtml` 转发。
+- `ide/nodio/app/shell.nodio:1146-1152`：编辑菜单「全选」后两条 +
+  `setStatus` 成功提示。
+- `tests/editor_clip_probe.aardio`：回归锁（见 1.52.4）。
+
+### 1.52.3 坑（全部实测）
+
+1. **本机剪贴板管理器在 Close/Reopen 窗口清板**：探针 2d 已见 reopen
+   丢格式；本轮 `__clipWriteRaw` 无 Sleep 版四轮「写成功但读回空板」
+   （board=[] 枚举为空）。补 Sleep(30) 后稳定。断言不可能与写入同
+   会话（写完必然 Close）→ 探针整「写+验」循环重试 4 次吸收。
+2. **bRawBytes 断言口径**（本轮回归钉死）：`==` 比较走规范化字节形态
+   （common.h:309 StrByteForm——比较/拼接/输出统一过它），**同通道
+   产物全量相等判定可靠**；`string.unpack` 走 BStr（builtins.cpp:2842），
+   对 bRawBytes 的非 ASCII 段**双重编码**（ASCII 段恰好 1:1 存活）——
+   中文包含判定不能用字节码扫描，改「同管线重建期望字节 + 全量 ==」。
+3. **`__buildHtml` 两处实体转义曾被写成无操作**（`"&"→"&"`、
+   `"<"→"<"`，应为 `&amp;`/`&lt;`/`&gt;`）且 `<pre>` 包裹漏实现——
+   纯 ASCII 结构断言（marker/span）查不出来，全量字节比对抓出。
+4. **CF_HTML 写入侧带 1 字节 NUL 终止符**（pad=1，规范要求）——期望
+   字节必须同款，否则全量 `==` 恒差 1（先误判为「板上多一字节」，
+   转储逐字节后定案）。
+
+### 1.52.4 回归锁与回归
+
+`tests/editor_clip_probe.aardio` 挂进 `run_editor_tests.ps1`（第 4 探针，
+须打出 PROBE-OK）。断言全部与写入同一 OpenClipboard 会话 + 整循环
+4 次重试：
+- RTF：`{\rtf` 头（字节码判定，unpack 对 ASCII 忠实）+ CF_UNICODETEXT
+  读回 `fromUtf16 == 控件文本`（fromUtf16 在 NUL 截断，与不带终止符的
+  原文比对，探针 2d P3 口径）。
+- HTML：探针用**同一条管线**重建期望 CF_HTML（`ed.__buildHtml(cur)` +
+  同款信封组装）→ 板上读回**全量字节 ==**（Version 头/4 偏移/
+  StartFragment/`<pre>`/颜色 span/中文/NUL 终止符一次全覆盖）+
+  CF_UNICODETEXT 同上。
+
+编辑器回归 4 探针两轮全绿。x64 全量 18/18（vm 首轮假红重跑绿，
+§1.45.6 在案环境项）；x86 全量 18/18 一次过。
+
+### 1.52.5 附带修两处（均为回归基建，非功能代码）
+
+1. `ide_nav_smoke.ps1` 硬编码 `NAV-JUMP-LINE:44`（`app/editor.nodio` 的
+   contextMenu 定义行）。门面插 3 行后定义行移至 47——导航功能本身
+   正常（NAV-DEF-LINE=NAV-JUMP-LINE=47，跨文件打开正确），断言过时
+   即假红。改为**动态取 NAV-DEF-LINE** 断言相等，此后 app/editor.nodio
+   增删行不再假红。
+2. `.gitignore:29` 的 `tests/editor_*.aardio`（意图：一次性探针 scratch）
+   把**全部四个编辑器回归锁探针**都盖住了——`git ls-files` 证实
+   editor_probe/fold/comp 三个官方用例从未入库，新鲜克隆的
+   run_editor_tests.ps1 会引用四个缺失文件。加四条例外
+   （`!tests/editor_*.aardio` 逐个点名），四探针恢复可跟踪。
+
+### 1.52.6 会话协调
+
+本轮编号顺延 §1.51（第四十六轮，性能线会话）。engine/sysapi.cpp 剪贴板
+6 API + GlobalAlloc 族注册（§1.50.4/§1.51.6 挂账的「IDE 线 WIP」）随
+本轮一起落账；§1.49/1.50/1.51 三节（并行会话）与 AI 面板等代码在本轮
+落账时仍为工作树未提交状态，按 HEAD 拉仓库会拿到「文档说有、代码没有」
+的树。

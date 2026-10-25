@@ -17,6 +17,9 @@ setText = function(ed,s){ ed.setText(s) }
 cut = function(ed){ ed.cut() }
 copy = function(ed){ ed.copy() }
 paste = function(ed){ ed.paste() }
+// 以 RTF / HTML 格式复制（整篇带色，复制后选区还原）
+copyRtf = function(ed){ return ed.copyRtf() }
+copyHtml = function(ed){ return ed.copyHtml() }
 selectAll = function(ed){ ed.selectAll() }
 undo = function(ed){ ed.undo() }
 redo = function(ed){ ed.redo() }

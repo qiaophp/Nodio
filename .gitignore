@@ -31,5 +31,11 @@ tests/ide_diag_sample.nodio
 tests/m7/proj/probe2.aardio
 pelican-bike.html
 
+# 例外：编辑器回归锁是正式用例（run_editor_tests.ps1 引用），保持可跟踪
+!tests/editor_probe.aardio
+!tests/editor_fold_probe.aardio
+!tests/editor_comp_probe.aardio
+!tests/editor_clip_probe.aardio
+
 # 发布回归自产的可执行产物（回归锁每次重新发布）
 tests/fixtures_dist/*.exe

@@ -1,0 +1,211 @@
+// tests/editor_clip_probe.aardio — 「以 RTF / HTML 格式复制」回归锁（缺口清单 §5.1）。
+//
+// copyRtf：剪贴板要有 "Rich Text Format"（{\rtf 开头）+ CF_UNICODETEXT 与控件文本一致。
+// copyHtml：剪贴板要有 "HTML Format"（Version:0.9 头 + StartFragment/EndFragment
+//           标记 + <pre + 颜色 span + 中文）+ CF_UNICODETEXT 与控件文本一致。
+//
+// ⚠ 断言必须在写入后的一个 OpenClipboard 会话内读回（本机剪贴板管理器会在
+//   Close/Reopen 窗口清板，探针 _probe_cfhtml2d 实测）——copy 与 verify 之间
+//   必然隔着一次 Close→Reopen，所以整个「写+验」循环重试 4 次。
+// ⚠ aardio 语法：双引号=原样串（"{\rtf" 的反斜杠不转义），单引号=转义串。
+import win.ui;
+import nodio.ui.editor;
+
+var f = win.form(text="editor clip probe";right=800;bottom=520);
+f.add({
+	ed={cls="richedit";left=20;top=20;right=640;bottom=480;multiline=true;vscroll=true}
+});
+f.show();
+..win.delay(300);
+
+var ed = nodio.ui.editor(f, {
+	ctrl = f.ed;
+	fontSize = 11;
+});
+ed.layout(20, 20, 640, 480);
+..win.delay(300);
+
+var src = '// 中文注释\n';
+src = src ++ 'var x = 1;\n';
+src = src ++ 'var s = "hello 世界";\n';
+src = src ++ 'function demo(a,b){\n';
+src = src ++ '\treturn a + b;\n';
+src = src ++ '}\n';
+
+ed.setText(src);
+..win.delay(600);
+// 断言以控件文本为准（getText 内部就是 self.text，即复制命令用的同一份文本）
+var cur = ed.getText();
+if(!cur || !#cur){
+	f.close();
+	io.print("PROBE-FAIL empty control text");
+	return;
+}
+
+var cfHtml = ::RegisterClipboardFormat("HTML Format");
+var cfRtf  = ::RegisterClipboardFormat("Rich Text Format");
+
+// 诊断：OpenClipboard 失败时拿错误码（5=ERROR_ACCESS_DENIED，多半是剪贴板管理器抓板）
+var getLastErr = ::Kernel32.api("GetLastError","int()");
+// 开板带重试（照内置 win.clip.write 的重试哲学；40ms×10=400ms 窗口）
+var openBoard = function(){
+	for(t=1;10;1){
+		if(::OpenClipboard(0)) return true;
+		..win.delay(40);
+	}
+	return false;
+}
+// 枚举当前板上全部格式（诊断：管理器会不会把注册格式洗掉）
+var enumFormats = ::User32.api("EnumClipboardFormats", "int(int)");
+var enumList = function(){
+	var list = "";
+	var f = enumFormats(0);
+	while(f){
+		list = list ++ tostring(f) ++ " ";
+		f = enumFormats(f);
+	}
+	return list;
+}
+// 前 n 个字节码转储（诊断：板上数据头到底长啥样）
+var headDump = function(data, n){
+	var bytes = ..string.unpack(..string.sub(data, 1, n));
+	var s = "";
+	for(i=1;#bytes;1){ s = s ++ tostring(bytes[i]) ++ "," }
+	return s;
+}
+// ⚠ bRawBytes 断言口径（实测钉死）：
+//   · == 比较走规范化字节形态（common.h StrByteForm），同通道产物相等判定可靠；
+//   · string.unpack 走 BStr，对 bRawBytes 的非 ASCII 段双重编码（ASCII 段 1:1），
+//     所以字节码扫描只能用于 ASCII 针；
+//   · 中文等非 ASCII 内容一律走「同管线重建期望字节 + 全量 ==」。
+var startsWithBytes = function(data, s){
+	var nb = #s;
+	if(#data < nb) return false;
+	var bd = ..string.unpack(..string.sub(data, 1, nb));
+	var bs = ..string.unpack(s);
+	for(i=1;nb;1){ if(bd[i] != bs[i]) return false }
+	return true;
+}
+// 探针启动时的板子状态（外部持有者诊断）
+var openAtStart = ::OpenClipboard(0);
+if(openAtStart) ::CloseClipboard();
+io.print("BOARD-START:" ++ tostring(openAtStart));
+
+// 同一个 Open 会话内读一个格式 → 字节串；失败返回 null
+var readFmt = function(fmt){
+	var h = ::GetClipboardData(fmt);
+	if(!h) return null;
+	var sz = ::GlobalSize(h);
+	if(!sz) return null;
+	var p = ::GlobalLock(h);
+	if(!p) return null;
+	var data = ..raw.read(p, sz);
+	::GlobalUnlock(h);
+	if(!data || !#data) return null;
+	return data;
+}
+// （内容包含判定统一走上面的 containsBytes，indexOf 对 bRawBytes 不可靠）
+// CF_UNICODETEXT 读回 → fromUtf16（在 NUL 处截断，与不带终止符的原文比对）
+var clipTextEq = function(){
+	var data = readFmt(13);
+	if(!data) return false, "no CF_UNICODETEXT";
+	var dec = ..string.fromUtf16(data);
+	if(dec != cur) return false, "text mismatch: #dec=" ++ tostring(#dec) ++ " #cur=" ++ tostring(#cur);
+	return true, "";
+}
+
+var verifyRtf = function(){
+	if(!openBoard()) return false, "OpenClipboard failed err=" ++ tostring(getLastErr());
+	var diag = "";
+	var data = readFmt(cfRtf);
+	if(!data) diag = "no RTF format data";
+	elseif(!startsWithBytes(data, "{\rtf")) diag = "RTF header missing; head=[" ++ headDump(data, 12) ++ "]";
+	if(diag == ""){
+		var ok2, d2 = clipTextEq();
+		if(!ok2) diag = d2;
+	}
+	::CloseClipboard();
+	var okPass = (diag == "");
+	return okPass, diag;
+}
+
+// 复刻 copyHtml 的 CF_HTML 信封（信封格式就是回归锁的一部分，改了必须同步改这里）
+var buildCfHtml = function(frag){
+	var tail1 = '<html><body>\r\n<!--StartFragment-->';
+	var tail2 = '<!--EndFragment-->\r\n</body></html>';
+	var hdr0 = ..string.format('Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\nStartFragment:%010d\r\nEndFragment:%010d\r\n', 0, 0, 0, 0);
+	var hdrLen = #hdr0;
+	var startFrag = hdrLen + #tail1;
+	var endFrag = startFrag + #frag;
+	var endHtml = endFrag + #tail2;
+	var hdr = ..string.format('Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\nStartFragment:%010d\r\nEndFragment:%010d\r\n',
+		hdrLen, endHtml, startFrag, endFrag);
+	return hdr ++ tail1 ++ frag ++ tail2;
+}
+
+var verifyHtml = function(){
+	if(!openBoard()) return false, "OpenClipboard failed err=" ++ tostring(getLastErr());
+	var diag = "";
+	var data = readFmt(cfHtml);
+	if(!data){
+		diag = "no HTML Format data; board=[" ++ enumList() ++ "]";
+	}
+	else{
+		// 期望字节：用同一条管线重建（__buildHtml + 同款信封），与板上读回
+		// 做同通道 bRawBytes 全量 == —— 头/偏移/标记/<pre/span/中文一次全覆盖。
+		ed.__syncLineTable();
+		var frag = ed.__buildHtml(cur);
+		var eh = buildCfHtml(frag);
+		// 写入侧带 1 字节 NUL 终止符（pad=1，CF_HTML 规范），期望字节同款
+		var ebytes = ..raw.read(..raw.buffer(#eh + 1, eh), #eh + 1);
+		if(data != ebytes){
+			diag = "board != expected bytes; len=" ++ tostring(#data)
+				++ "/" ++ tostring(#ebytes)
+				++ " head=[" ++ headDump(data, 24) ++ "]";
+		}
+	}
+	if(diag == ""){
+		var ok2, d2 = clipTextEq();
+		if(!ok2) diag = d2;
+	}
+	::CloseClipboard();
+	var okPass = (diag == "");
+	return okPass, diag;
+}
+
+// 整轮「写+验」重试（抗剪贴板管理器在 Close/Reopen 窗口清板）
+var runMode = function(who, doCopy, verify){
+	var diag = "";
+	var ok = false;
+	for(attempt=1;4;1){
+		diag = "";
+		var w = false;
+		try{ w = doCopy() }catch(e){ diag = "copy EXC: " ++ tostring(e) }
+		if(w){
+			try{
+				ok, diag = verify();
+				if(ok){
+					io.print("CLIP-" ++ who ++ ":PASS (attempt " ++ attempt ++ ")");
+					return true;
+				}
+			}catch(e2){ diag = "verify EXC: " ++ tostring(e2) }
+		}
+		elseif(diag == ""){ diag = "copy returned false" }
+		io.print("CLIP-" ++ who ++ " attempt " ++ attempt ++ ": " ++ diag);
+		..win.delay(200);
+	}
+	io.print("CLIP-" ++ who ++ ":FAIL " ++ diag);
+	return false;
+}
+
+var passRtf = runMode("RTF", function(){ return ed.copyRtf() }, verifyRtf);
+..win.delay(100);
+var passHtml = runMode("HTML", function(){ return ed.copyHtml() }, verifyHtml);
+
+f.close();
+if(passRtf && passHtml){
+	io.print("PROBE-OK");
+}
+else{
+	io.print("PROBE-FAIL");
+}

@@ -1,0 +1,111 @@
+// tests/editor_fold_probe.aardio — 代码折叠的行为回归。
+//
+// 要验的：
+//   1. 折叠区识别：带 '{' 的行 + 配对的 '}'
+//   2. 折叠后**正文真的收起**（控件行数变少），但**文本没丢**
+//   3. 展开后恢复
+//   4. 行号栏画的是**文档行号**（折叠后不能错位）
+//   5. 折叠状态下定位/缩进仍然按文档行算
+import win.ui;
+import nodio.ui.editor;
+
+var f = win.form(text="fold probe";right=1000;bottom=600);
+f.add({
+	ed={cls="richedit";left=80;top=40;right=900;bottom=540;multiline=true;vscroll=true}
+});
+f.show();
+..win.delay(300);
+
+var ed = nodio.ui.editor(f, {
+	ctrl = f.ed;
+	fontSize = 11;
+});
+ed.layout(80, 40, 900, 540);
+..win.delay(300);
+
+var src = '// 折叠回归\r\n'
+	++ 'var a = 1\r\n'
+	++ 'function demo(x){\r\n'
+	++ '\tvar s = "hello 世界"\r\n'
+	++ '\tif(x){\r\n'
+	++ '\t\tprint(s)\r\n'
+	++ '\t}\r\n'
+	++ '\treturn s\r\n'
+	++ '}\r\n'
+	++ 'var b = 2\r\n';
+
+ed.setText(src);
+..win.delay(800);
+
+io.print("LINES:" ++ tostring(#..string.split(ed.getText(), '\n')));
+io.print("CTRL-LINES:" ++ tostring(f.ed.lineCount));
+io.print("FOLDABLE-3:" ++ tostring(ed.isFoldable(3)));
+io.print("FOLDABLE-5:" ++ tostring(ed.isFoldable(5)));
+io.print("FOLDABLE-9:" ++ tostring(ed.isFoldable(9)));
+io.print("FOLDABLE-1:" ++ tostring(ed.isFoldable(1)));
+
+// 折叠第 3 行（function demo 的正文 4..9）
+var ok = ed.toggleFold(3);
+..win.delay(500);
+io.print("TOGGLE-OK:" ++ tostring(ok));
+io.print("FOLDED-3:" ++ tostring(ed.isFolded(3)));
+io.print("CTRL-LINES-FOLDED:" ++ tostring(f.ed.lineCount));
+io.print("TEXT-KEEP-L4:" ++ tostring(..string.indexOf(ed.getText(), 'hello 世界') ? 1 : 0));
+io.print("TEXT-KEEP-L6:" ++ tostring(..string.indexOf(ed.getText(), 'print(s)') ? 1 : 0));
+io.print("CTRL-TEXT-LEN:" ++ tostring(#f.ed.text));
+
+// 折叠后定位到第 9 行（折叠区内部）—— 位置按文档行算
+ed.gotoLine(9);
+..win.delay(200);
+var ln,col = ed.updateCursor();
+io.print("GOTO-9:" ++ tostring(ln) ++ "," ++ tostring(col));
+
+// 展开
+ed.toggleFold(3);
+..win.delay(500);
+io.print("FOLDED-3-B:" ++ tostring(ed.isFolded(3)));
+io.print("CTRL-LINES-UNFOLD:" ++ tostring(f.ed.lineCount));
+
+// 全部折叠
+var n = ed.foldAll();
+..win.delay(500);
+io.print("FOLDALL:" ++ tostring(n));
+io.print("CTRL-LINES-ALL:" ++ tostring(f.ed.lineCount));
+io.print("TEXT-ALL-KEEP:" ++ tostring(..string.indexOf(ed.getText(), 'return s') ? 1 : 0));
+ed.unfoldAll();
+..win.delay(500);
+io.print("CTRL-LINES-RESET:" ++ tostring(f.ed.lineCount));
+
+// 点行号栏的折叠标记 → 应该折叠
+// ⚠ 行号栏是 plus 画板：鼠标坐标是**画板本地坐标**（0 基），
+//   行号栏和 richedit 顶边对齐，纵坐标可以直接用 richedit 的 y。
+var gr = ed.gutter.rect;
+var gw = gr.right - gr.left;
+var mx = gw - ..nodio.ui.px(20) + ..nodio.ui.px(7);
+var my = ed.__posY(ed.__lineStart(3) - 1) + ed.lineHeight / 2;
+::SendMessage(ed.gutter.ctrl.hwnd, 0x201/*_WM_LBUTTONDOWN*/, 1,
+	(my << 16) | (mx & 0xFFFF));
+..win.delay(400);
+io.print("CLICK-FOLDED:" ++ tostring(ed.isFolded(3)));
+io.print("CLICK-LINES:" ++ tostring(f.ed.lineCount));
+io.print("CLICK-MX:" ++ tostring(mx) ++ " MY:" ++ tostring(my));
+
+// 折叠一半，留给截图看
+ed.toggleFold(3);
+..win.delay(800);
+
+// ⚠ 打字后折叠还在不在？
+//   打字会触发全文重着色（SCF_ALL + CFM_COLOR）—— 如果它把 hidden 位冲掉，
+//   折叠就散了。这一条专门盯这个。
+f.ed.setFocus();
+f.ed.setSel(f.ed.lineToChar(2), f.ed.lineToChar(2) + 3);
+::SendMessage(f.ed.hwnd, 0x102/*_WM_CHAR*/, 88/*'X'*/, 0);
+..win.delay(900);
+io.print("AFTER-TYPE-LINES:" ++ tostring(f.ed.lineCount));
+io.print("AFTER-TYPE-FOLDED:" ++ tostring(ed.isFolded(3)));
+io.print("AFTER-TYPE-TEXT:" ++ tostring(..string.indexOf(ed.getText(), 'X') ? 1 : 0));
+io.print("AFTER-TYPE-KEPT:" ++ tostring(..string.indexOf(ed.getText(), 'return s') ? 1 : 0));
+
+..win.delay(4000);
+f.close();
+io.print("PROBE-OK");

@@ -135,6 +135,20 @@ namespace NodioVM
         { L"GlobalSize", L"kernel32.dll", L"GlobalSize", L"int(addr hmem)" },
         { L"GlobalReAlloc", L"kernel32.dll", L"GlobalReAlloc",
           L"addr(addr hmem,int size,int flags)" },
+        // clipboard (CF_HTML / colored-copy support for the IDE). Registered
+        // with explicit signatures because the dynamic bare-call path
+        // truncates HANDLE returns to 32 bits (capability-gap §1.38.2):
+        // GetClipboardData must return addr or the HGLOBAL is unusable.
+        { L"OpenClipboard", L"user32.dll", L"OpenClipboard",
+          L"int(addr hwnd)" },
+        { L"CloseClipboard", L"user32.dll", L"CloseClipboard", L"int()" },
+        { L"EmptyClipboard", L"user32.dll", L"EmptyClipboard", L"int()" },
+        { L"SetClipboardData", L"user32.dll", L"SetClipboardData",
+          L"addr(int format,addr hmem)" },
+        { L"GetClipboardData", L"user32.dll", L"GetClipboardData",
+          L"addr(int format)" },
+        { L"RegisterClipboardFormat", L"user32.dll", L"RegisterClipboardFormatW",
+          L"int(str name)" },
     };
 
     // gdi32 — drawing

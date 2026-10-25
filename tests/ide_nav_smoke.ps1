@@ -113,11 +113,15 @@ if ($out -notmatch 'NAV-SYM-COUNT:[1-9]\d*')       { Write-Output 'FAIL: workspa
 if ($out -notmatch 'NAV-REF-ROWS:[1-9]\d*')       { Write-Output 'FAIL: references panel was not filled'; exit 1 }
 
 # 完整链路：F12 回调 → 跨文件打开 → 光标落到定义行
+# 期望行动态取 NAV-DEF-LINE（1 基，两者实测同口径）：app/editor.nodio 一旦
+# 增删行，硬编码行号就会假红（第四十四轮 copyRtf/copyHtml 插行实测）。
 if ($out -notmatch 'NAV-JUMP-PATH:.*app\\editor\.nodio') {
     Write-Output 'FAIL: go to definition did not open the defining file'
     exit 1
 }
-if ($out -notmatch 'NAV-JUMP-LINE:44') {
+$defLine = ''
+if ($out -match 'NAV-DEF-LINE:(\d+)') { $defLine = $Matches[1] }
+if (-not $defLine -or $out -notmatch ('NAV-JUMP-LINE:' + $defLine)) {
     Write-Output 'FAIL: cursor did not land on the definition line'
     exit 1
 }
