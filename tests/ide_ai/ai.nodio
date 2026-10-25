@@ -1,0 +1,251 @@
+// tests/ide_ai/ai.nodio — AI 面板的无头回归锁。
+//
+// 覆盖三层：
+//   1) nodio.ai.chat —— 纯逻辑（URL / 端点 / 请求体 / 响应解析 / 会话）
+//   2) nodio.ai.cred —— Windows 凭据管理器写读删往返
+//   3) nodio.ai.http —— WinINet FFI 实发（自定义头 / 状态码 / UTF-8 正文）
+//
+// ⚠ 第 3 层要联网。没网时打印 SKIP 而不是 FAIL（网络不是回归项），
+//   有网时是真的断言（自定义头被回显、正文里的中文一字不差）。
+//
+// ⚠ 凭据测试会真的往 Windows 凭据管理器写一条，结尾删掉。
+import nodio.ai.chat;
+import nodio.ai.cred;
+import nodio.ai.http;
+
+var fail = 0;
+var skip = 0;
+function chk(name, got, want){
+	if(got === want){ io.print("PASS ", name); return; }
+	fail++;
+	io.print("FAIL ", name, " got=", tostring(got), " want=", tostring(want));
+}
+function chkTrue(name, v){
+	if(v){ io.print("PASS ", name); return; }
+	fail++;
+	io.print("FAIL ", name, " got=", tostring(v));
+}
+function skp(name, why){
+	skip++;
+	io.print("SKIP ", name, " (", why, ")");
+}
+
+// ============================================================
+// 1) URL 解析
+// ============================================================
+var u1 = nodio.ai.http.parseUrl("https://api.openai.com/v1/chat/completions");
+chk("url/https-secure", u1.secure, true);
+chk("url/https-host", u1.host, "api.openai.com");
+chk("url/https-port", u1.port, 443);
+chk("url/https-path", u1.path, "/v1/chat/completions");
+
+var u2 = nodio.ai.http.parseUrl("http://127.0.0.1:11434/v1/chat/completions");
+chk("url/http-secure", u2.secure, false);
+chk("url/http-port", u2.port, 11434);
+chk("url/http-host", u2.host, "127.0.0.1");
+chk("url/http-path", u2.path, "/v1/chat/completions");
+
+var u3 = nodio.ai.http.parseUrl("https://example.com");
+chk("url/no-path", u3.path, "/");
+
+var u4 = nodio.ai.http.parseUrl("ftp://example.com/x");
+chkTrue("url/bad-scheme", !!u4.err);
+
+var u5 = nodio.ai.http.parseUrl("");
+chkTrue("url/empty", !!u5.err);
+
+var u6 = nodio.ai.http.parseUrl("https://");
+chkTrue("url/no-host", !!u6.err);
+
+// ============================================================
+// 2) 端点
+// ============================================================
+chk("ep/default", nodio.ai.chat.endpoint("", "/chat/completions"),
+	"https://api.openai.com/v1/chat/completions");
+chk("ep/trailing-slash", nodio.ai.chat.endpoint("http://127.0.0.1:11434/v1/", "/chat/completions"),
+	"http://127.0.0.1:11434/v1/chat/completions");
+chk("ep/ollama", nodio.ai.chat.endpoint("http://localhost:11434/v1", "/chat/completions"),
+	"http://localhost:11434/v1/chat/completions");
+chk("ep/no-slash-in-path", nodio.ai.chat.endpoint("http://a.com/v1", "chat/completions"),
+	"http://a.com/v1/chat/completions");
+
+// ============================================================
+// 3) 请求体
+// ============================================================
+var body1 = nodio.ai.chat.buildBody({ {role="user";content="你好"} }, {model="gpt-4o-mini"});
+var j1 = json.parse(body1);
+chk("body/model", j1.model, "gpt-4o-mini");
+chk("body/msg-count", #j1.messages, 1);
+chk("body/role", j1.messages[1].role, "user");
+chk("body/content", j1.messages[1].content, "你好");
+
+// 引号 / 反斜杠 / 换行必须被正确转义
+// ⚠ 双引号串是**原样串**（不处理转义），要带转义必须用单引号串
+var body2 = nodio.ai.chat.buildBody({ {role="user";content='a"b\\c\nd'} }, {});
+var j2 = json.parse(body2);
+chk("body/escape", j2.messages[1].content, 'a"b\\c\nd');
+
+// 多条消息
+var body3 = nodio.ai.chat.buildBody({ {role="system";content="s"};{role="user";content="u"} }, {});
+var j3 = json.parse(body3);
+chk("body/two-msgs", #j3.messages, 2);
+chk("body/roles", j3.messages[2].role, "user");
+
+// 空消息列表
+var body4 = nodio.ai.chat.buildBody({}, {model="m"});
+var j4 = json.parse(body4);
+chk("body/empty-msgs", #j4.messages, 0);
+
+// ============================================================
+// 4) 响应解析
+// ============================================================
+var p1 = nodio.ai.chat.parseResponse(
+	'{"id":"x","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"你好，世界"},"finish_reason":"stop"}],"usage":{"total_tokens":9}}');
+chk("parse/ok", p1.ok, true);
+chk("parse/content", p1.content, "你好，世界");
+chk("parse/model", p1.model, "gpt-4o-mini");
+chk("parse/finish", p1.finish, "stop");
+chk("parse/usage", p1.usage.total_tokens, 9);
+
+var p2 = nodio.ai.chat.parseResponse('{"error":{"message":"invalid api key","type":"auth"}}');
+chk("parse/error-ok", p2.ok, false);
+chk("parse/error-msg", p2.err, "invalid api key");
+
+var p3 = nodio.ai.chat.parseResponse("not json at all");
+chk("parse/bad-json", p3.ok, false);
+chkTrue("parse/bad-json-err", !!p3.err);
+
+var p4 = nodio.ai.chat.parseResponse("");
+chk("parse/empty", p4.ok, false);
+
+var p5 = nodio.ai.chat.parseResponse('{"choices":[]}');
+chk("parse/no-choices", p5.ok, false);
+
+// ============================================================
+// 5) 会话
+// ============================================================
+var s = nodio.ai.chat.newSession();
+chk("sess/baseUrl", s.baseUrl, "https://api.openai.com/v1");
+chk("sess/model", s.model, "gpt-4o-mini");
+chk("sess/empty", #s.messages, 0);
+chkTrue("sess/add", nodio.ai.chat.addMessage(s, "user", "第一句"));
+chkTrue("sess/add2", nodio.ai.chat.addMessage(s, "assistant", "第二句"));
+chk("sess/count", #s.messages, 2);
+chk("sess/role1", s.messages[1].role, "user");
+chk("sess/content2", s.messages[2].content, "第二句");
+chk("sess/add-empty", nodio.ai.chat.addMessage(s, "user", ""), false);
+chk("sess/count-after-empty", #s.messages, 2);
+chk("sess/trim", nodio.ai.chat.trim(s, 1), 1);
+chk("sess/trim-keep-last", s.messages[1].content, "第二句");
+nodio.ai.chat.addMessage(s, "user", "第三句");
+chk("sess/clear", nodio.ai.chat.clear(s), true);
+chk("sess/cleared", #s.messages, 0);
+chk("sess/clear-keeps-model", s.model, "gpt-4o-mini");
+
+// 没有 key 时 send 要给出明确错误（不能真发请求）
+var sr = nodio.ai.chat.send(s, {});
+chk("send/no-key", sr.ok, false);
+chk("send/no-key-err", sr.err, "没有配置 API Key");
+
+// ============================================================
+// 6) Windows 凭据管理器
+// ============================================================
+var CTARGET = "NodioIDE/test/ide_ai_check";
+var CSECRET = "sk-test-秘密-🔑-123";
+nodio.ai.cred.remove(CTARGET);
+chk("cred/read-missing", nodio.ai.cred.read(CTARGET), null);
+chk("cred/write", nodio.ai.cred.write(CTARGET, CSECRET, "nodio-test"), true);
+chk("cred/read", nodio.ai.cred.read(CTARGET), CSECRET);
+chk("cred/overwrite", nodio.ai.cred.write(CTARGET, "第二个密钥", "nodio-test"), true);
+chk("cred/read-overwrite", nodio.ai.cred.read(CTARGET), "第二个密钥");
+chk("cred/remove", nodio.ai.cred.remove(CTARGET), true);
+chk("cred/read-after-remove", nodio.ai.cred.read(CTARGET), null);
+chk("cred/write-empty-target", nodio.ai.cred.write("", "x"), false);
+chk("cred/write-empty-secret", nodio.ai.cred.write(CTARGET, ""), false);
+chk("cred/read-empty-target", nodio.ai.cred.read(""), null);
+chk("cred/remove-empty-target", nodio.ai.cred.remove(""), false);
+
+// API Key：存凭据管理器（**不进 ide.cfg**）
+chk("cred/target-name", nodio.ai.cred.TARGET_APIKEY, "NodioIDE/ai/apiKey");
+// ⚠ 当前生效的凭据名：回归锁必须用**隔离名**（ide_ai_check.ps1 设的
+//   NODIO_AI_CRED_TARGET），否则 apiKeyRemove() 会抹掉用户自己配的那条。
+chk("cred/apikey-target-isolated", nodio.ai.cred.apiKeyTarget(), "NodioIDE/test/ide_ai_check");
+nodio.ai.cred.apiKeyRemove();
+chk("cred/apikey-missing", nodio.ai.cred.apiKeyGet(), null);
+chk("cred/apikey-set", nodio.ai.cred.apiKeySet("sk-unit-test-密钥"), true);
+chk("cred/apikey-get", nodio.ai.cred.apiKeyGet(), "sk-unit-test-密钥");
+chk("cred/apikey-overwrite", nodio.ai.cred.apiKeySet("sk-unit-test-2"), true);
+chk("cred/apikey-get2", nodio.ai.cred.apiKeyGet(), "sk-unit-test-2");
+chk("cred/apikey-remove", nodio.ai.cred.apiKeyRemove(), true);
+chk("cred/apikey-gone", nodio.ai.cred.apiKeyGet(), null);
+// 隔离名之外的默认名不受影响（常量本身没改）
+chk("cred/apikey-target-default", nodio.ai.cred.TARGET_APIKEY, "NodioIDE/ai/apiKey");
+
+// ============================================================
+// 7) WinINet 实发（要联网；没网就 SKIP）
+// ============================================================
+var g1 = nodio.ai.http.request({
+	method = "GET";
+	url = "https://httpbin.org/headers";
+	headers = {["X-Nodio-Probe"] = "nodio-ai-panel"; ["Authorization"] = "Bearer sk-probe-xyz"};
+	timeout = 30;
+});
+if(!g1.status && g1.err){
+	skp("http/get", g1.err);
+}
+else{
+	chk("http/get-status", g1.status, 200);
+	chkTrue("http/get-custom-header", !!string.indexOf(g1.text, "nodio-ai-panel"));
+	chkTrue("http/get-auth-header", !!string.indexOf(g1.text, "sk-probe-xyz"));
+}
+
+var g2 = nodio.ai.http.request({
+	method = "GET";
+	url = "https://httpbin.org/status/404";
+	timeout = 30;
+});
+if(!g2.status && g2.err){
+	skp("http/status404", g2.err);
+}
+else{
+	chk("http/status404", g2.status, 404);
+	chk("http/status404-not-ok", g2.ok, false);
+}
+
+// POST：正文按 UTF-8 发，中文必须一字不差
+var g3 = nodio.ai.http.request({
+	method = "POST";
+	url = "https://httpbin.org/post";
+	headers = {["Content-Type"] = "application/json"};
+	body = '{"text":"你好，Nodio 🔑","n":42}';
+	timeout = 30;
+});
+if(!g3.status && g3.err){
+	skp("http/post", g3.err);
+}
+else{
+	chk("http/post-status", g3.status, 200);
+	// ⚠ httpbin 用 Python 的 json.dumps（ensure_ascii 默认 True），
+	//   非 ASCII 会被转义成 \uXXXX —— 所以不能在整个响应文本里直接找中文，
+	//   要先解析 JSON 再看它回显的 json 字段。
+	var pj = json.parse(g3.text);
+	if(type(pj) == "table" && pj.json && type(pj.json) == "table"){
+		chk("http/post-chinese", pj.json.text, "你好，Nodio 🔑");
+		chk("http/post-number", pj.json.n, 42);
+	}
+	else{
+		chkTrue("http/post-chinese", !!string.indexOf(g3.text, "你好，Nodio"));
+		chkTrue("http/post-emoji", !!string.indexOf(g3.text, "🔑"));
+		chkTrue("http/post-number", !!string.indexOf(g3.text, "42"));
+	}
+}
+
+// 非法 URL：必须返回错误而不是崩
+var g4 = nodio.ai.http.request({method="GET"; url="gopher://x/y";});
+chk("http/bad-url-ok", g4.ok, false);
+chkTrue("http/bad-url-err", !!g4.err);
+
+// ============================================================
+io.print("== AI SUMMARY pass/fail=", fail, " skip=", skip, " ==");
+if(fail){ io.print("== IDE AI FAILED: ", fail); return 1; }
+io.print("== IDE AI OK ==");

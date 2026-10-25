@@ -1,0 +1,503 @@
+// app/ai.nodio — 右栏「AI」页：AI 聊天面板（OpenAI 兼容接口）。
+//
+// ── 分层 ────────────────────────────────────────────────────
+//   nodio.ai.chat —— 纯逻辑：会话 / 请求体 / 响应解析（无头可测）
+//   nodio.ai.http —— WinINet 带头 HTTP 客户端（无头可测）
+//   nodio.ai.cred —— Windows 凭据管理器（API Key 存这里，无头可测）
+//   本文件 —— 只管**界面**：摆控件、画按钮、收发消息
+//
+// ── 配置分工 ────────────────────────────────────────────────
+//   base_url / model → ide.cfg（app.settings，与官方命令面共用同一个文件）
+//   API Key          → Windows 凭据管理器（**不进明文配置文件**）
+//
+// ── 请求为什么放 worker 线程 ────────────────────────────────
+//   WinINet 是阻塞调用，放主线程 IDE 会整个卡住（鼠标不响应、窗口不重绘）。
+//   实测：worker 线程里可以 import nodio.ai.* 并跑 WinINet FFI，
+//   结果用 thread.set / thread.get 回传（引擎的线程安全共享表）。
+//
+// ── 坐标 ────────────────────────────────────────────────────
+//   自绘板（board）一律**物理像素**；设计常量按逻辑像素写，用 px() 换算
+//   （与 nodio.ui.board / searchPanel 的约定一致）。
+import nodio.ui.board;
+import nodio.ui.theme;
+import nodio.ui.dpi;
+import nodio.ui.rect;
+import nodio.ui.richedit;
+import nodio.ui.subclass;
+import nodio.ai.chat;
+import nodio.ai.cred;
+import app.settings;
+import thread;
+import gdip;
+
+var __aiSeq = 0;
+
+// 面板：app.ai.panel(winform, {rect={left;top;right;bottom}})
+//   opt.setStatus = function(text)  可选：把状态同步到 IDE 状态栏
+panel = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+
+	// 设计常量（逻辑像素）
+	var HEAD_H  = 26;    // 顶部状态条
+	var IN_H    = 76;    // 输入框
+	var BTN_W   = 46;    // 顶部按钮宽
+	var BTN_H   = 20;
+	var PAD     = 6;
+	var ROW_H   = 28;    // 配置项行高
+	var LBL_W   = 46;    // 配置项标签宽
+	var ED_H    = 22;    // 配置项输入框高
+
+	var self = {
+		winform = winform;
+		rect = opt.rect;
+		session = null;      // nodio.ai.chat 的会话
+		mode = "chat";       // "chat" | "config"
+		busy = false;        // 有请求在飞
+		status = "就绪";
+		hover = 0;           // 顶部按钮悬停（0=无，1=发送 2=清空 3=设置）
+		hoverCfg = 0;        // 配置区按钮悬停（1=保存 2=返回）
+		timer = null;        // 轮询定时器
+		threadHandle = null;
+		onStatus = null;     // function(text)
+	};
+
+	__aiSeq = __aiSeq + 1;
+	var seq = __aiSeq;
+
+	// ---------- 控件 ----------
+	// 顺序有讲究：画板要盖在它下面的控件**之上**，所以 richedit 先建、
+	// 画板后建（配置区的三个输入框反过来：画板先建、输入框后建）。
+	self.log = ..nodio.ui.addCtrl(winform, "aiLog" ++ seq, {
+		cls="richedit"; left=0; top=0; right=200; bottom=200;
+		multiline=true; vscroll=true; readonly=true;
+	});
+	self.input = ..nodio.ui.addCtrl(winform, "aiInput" ++ seq, {
+		cls="richedit"; left=0; top=0; right=200; bottom=200;
+		multiline=true; vscroll=true;
+	});
+	self.head = nodio.ui.board(winform, {
+		left = 0; top = 0; right = 200; bottom = ..nodio.ui.px(HEAD_H);
+		fontSize = 12;
+	});
+	self.cfg = nodio.ui.board(winform, {
+		left = 0; top = 0; right = 200; bottom = 200;
+		fontSize = 12;
+	});
+	self.edUrl = ..nodio.ui.addCtrl(winform, "aiUrl" ++ seq, {
+		cls="edit"; left=0; top=0; right=200; bottom=20;
+	});
+	self.edModel = ..nodio.ui.addCtrl(winform, "aiModel" ++ seq, {
+		cls="edit"; left=0; top=0; right=200; bottom=20;
+	});
+	self.edKey = ..nodio.ui.addCtrl(winform, "aiKey" ++ seq, {
+		cls="edit"; left=0; top=0; right=200; bottom=20;
+		password = true;
+	});
+
+	// ---------- 深色化 ----------
+	// 原生控件不吃自绘配色，靠 nodio.ui.richedit 的三招（见该模块的说明）
+	..nodio.ui.richedit.darken(self.log, th);
+	..nodio.ui.richedit.darken(self.input, th);
+	..nodio.ui.richedit.darkenEdit(self.edUrl, th);
+	..nodio.ui.richedit.darkenEdit(self.edModel, th);
+	..nodio.ui.richedit.darkenEdit(self.edKey, th);
+
+	// ---------- 会话 ----------
+	self.session = nodio.ai.chat.newSession({
+		baseUrl = app.settings.aiBaseUrlGet();
+		model = app.settings.aiModelGet();
+	});
+
+	// ---------- 顶栏按钮 ----------
+	// 1=发送 2=清空 3=设置（从右往左排：设置最右）
+	var BTN_NAMES = {"发送"; "清空"; "设置"};
+	self.__btnRect = function(idx){
+		var w = self.head.rect.right - self.head.rect.left;
+		var h = self.head.rect.bottom - self.head.rect.top;
+		var bw = ..nodio.ui.px(BTN_W);
+		var bh = ..nodio.ui.px(BTN_H);
+		var gap = ..nodio.ui.px(4);
+		var pad = ..nodio.ui.px(PAD);
+		var x = w - pad - bw * (4 - idx) - gap * (3 - idx);
+		var y = math.floor((h - bh) / 2);
+		return {left = x; top = y; right = x + bw; bottom = y + bh};
+	}
+	self.__hitBtn = function(x, y){
+		for(i=1; #BTN_NAMES; 1){
+			var b = self.__btnRect(i);
+			if(x >= b.left && x < b.right && y >= b.top && y < b.bottom) return i;
+		}
+		return 0;
+	}
+
+	// ---------- 配置区 ----------
+	// 配置区画在一块自绘板上，三个输入框摆��它上面。
+	self.__cfgRows = function(){
+		var top = self.cfg.rect.top;
+		var h = self.cfg.rect.bottom - self.cfg.rect.top;
+		var pad = ..nodio.ui.px(PAD);
+		var rh = ..nodio.ui.px(ROW_H);
+		var eh = ..nodio.ui.px(ED_H);
+		var bh = ..nodio.ui.px(BTN_H);
+		var l = self.cfg.rect.left;
+		var r = self.cfg.rect.right;
+		var rows = {};
+		// 三行配置项
+		for(i=1; i<=3; 1){
+			var y = top + pad + (i - 1) * rh;
+			..table.push(rows, {top = y; bottom = y + eh});
+		}
+		// 底部两个按钮
+		var by = top + h - pad - bh;
+		return {
+			rows = rows;
+			edLeft = l + pad + ..nodio.ui.px(LBL_W);
+			edRight = r - pad;
+			btnTop = by;
+			btnBottom = by + bh;
+			btnW = ..nodio.ui.px(BTN_W);
+			saveLeft = r - pad - ..nodio.ui.px(BTN_W) * 2 - ..nodio.ui.px(4);
+			saveRight = r - pad - ..nodio.ui.px(BTN_W) - ..nodio.ui.px(4);
+			backLeft = r - pad - ..nodio.ui.px(BTN_W);
+			backRight = r - pad;
+		};
+	}
+
+	// ---------- 绘制 ----------
+	self.head.onDraw = function(graphics, rc, bd){
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+		bg.delete();
+		var pen = ..gdip.pen(th.border, 1);
+		graphics.drawLine(pen, rc.left, rc.bottom - 1, rc.right, rc.bottom - 1);
+		pen.delete();
+		// 状态文字（模型 + 状态）
+		var fmt = ..nodio.ui.boardFormat();
+		var brush = ..gdip.solidBrush(self.busy ? th.accent : th.text);
+		graphics.drawString(self.status, bd.font,
+			::RECTF(rc.left + ..nodio.ui.px(PAD), rc.top,
+				rc.right - rc.left - ..nodio.ui.px(PAD) * 2, rc.bottom),
+			fmt, brush);
+		brush.delete();
+		// 按钮
+		for(i=1; #BTN_NAMES; 1){
+			var b = self.__btnRect(i);
+			if(self.hover == i){
+				var hb = ..gdip.solidBrush(th.hoverBg);
+				graphics.fillRect(hb, b.left, b.top, b.right - b.left, b.bottom - b.top);
+				hb.delete();
+			}
+			var bb = ..gdip.solidBrush(th.text);
+			graphics.drawString(BTN_NAMES[i], bd.font,
+				::RECTF(b.left, b.top, b.right - b.left, b.bottom - b.top),
+				fmt, bb);
+			bb.delete();
+		}
+	}
+
+	self.cfg.onDraw = function(graphics, rc, bd){
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+		bg.delete();
+		var fmt = ..nodio.ui.boardFormat();
+		var geo = self.__cfgRows();
+		var labels = {"接口"; "模型"; "密钥"};
+		var lblBrush = ..gdip.solidBrush(th.textDim);
+		for(i=1; #labels; 1){
+			var row = geo.rows[i];
+			graphics.drawString(labels[i], bd.font,
+				::RECTF(rc.left + ..nodio.ui.px(PAD), row.top,
+					..nodio.ui.px(LBL_W), row.bottom - row.top),
+				fmt, lblBrush);
+		}
+		lblBrush.delete();
+		// 按钮：保存 / 返回
+		var btns = {"保存"; "返回"};
+		var rects = {};
+		..table.push(rects, {left=geo.saveLeft; top=geo.btnTop; right=geo.saveRight; bottom=geo.btnBottom});
+		..table.push(rects, {left=geo.backLeft; top=geo.btnTop; right=geo.backRight; bottom=geo.btnBottom});
+		for(i=1; #btns; 1){
+			var b = rects[i];
+			if(self.hoverCfg == i){
+				var hb = ..gdip.solidBrush(th.hoverBg);
+				graphics.fillRect(hb, b.left, b.top, b.right - b.left, b.bottom - b.top);
+				hb.delete();
+			}
+			var bb = ..gdip.solidBrush(th.text);
+			graphics.drawString(btns[i], bd.font,
+				::RECTF(b.left, b.top, b.right - b.left, b.bottom - b.top), fmt, bb);
+			bb.delete();
+		}
+	}
+
+	// ---------- 鼠标 ----------
+	self.head.onMouseMove = function(x,y,bd){
+		var h = self.__hitBtn(x,y);
+		if(h != self.hover){
+			self.hover = h;
+			self.head.invalidate();
+		}
+	}
+	self.head.onMouseLeave = function(bd){
+		if(self.hover){
+			self.hover = 0;
+			self.head.invalidate();
+		}
+	}
+	self.head.onMouseDown = function(x,y,bd){
+		var h = self.__hitBtn(x,y);
+		if(h == 1) self.__send();
+		elseif(h == 2) self.__clear();
+		elseif(h == 3) self.__setMode("config");
+	}
+
+	self.cfg.onMouseMove = function(x,y,bd){
+		var geo = self.__cfgRows();
+		var h = 0;
+		if(x >= geo.saveLeft && x < geo.saveRight
+			&& y >= geo.btnTop && y < geo.btnBottom) h = 1;
+		elseif(x >= geo.backLeft && x < geo.backRight
+			&& y >= geo.btnTop && y < geo.btnBottom) h = 2;
+		if(h != self.hoverCfg){
+			self.hoverCfg = h;
+			self.cfg.invalidate();
+		}
+	}
+	self.cfg.onMouseLeave = function(bd){
+		if(self.hoverCfg){
+			self.hoverCfg = 0;
+			self.cfg.invalidate();
+		}
+	}
+	self.cfg.onMouseDown = function(x,y,bd){
+		var geo = self.__cfgRows();
+		if(x >= geo.saveLeft && x < geo.saveRight
+			&& y >= geo.btnTop && y < geo.btnBottom){
+			self.__saveConfig();
+		}
+		elseif(x >= geo.backLeft && x < geo.backRight
+			&& y >= geo.btnTop && y < geo.btnBottom){
+			self.__setMode("chat");
+		}
+	}
+
+	// ---------- 回车发送 ----------
+	// 普通 Enter = 发送；Ctrl+Enter = 换行（多行输入框里能换行是刚需）
+	self.sub = ..nodio.ui.subclass(self.input.hwnd, function(hwnd,msg,wp,lp){
+		if(msg == 0x100 && tonumber(wp) == 0x0D){
+			var ctrl = 0;
+			try{ ctrl = ::GetKeyState(0x11/*VK_CONTROL*/) }catch(e){}
+			if(!(ctrl < 0)){
+				self.__send();
+				return 1;   // 吞掉回车
+			}
+		}
+		return null;
+	});
+
+	// ---------- 日志 ----------
+	// ⚠⚠ 官方 richedit 控件**没有** append 方法（只有 appendText）——
+	//   早先这里写的是 self.log.append(text)，异常被下面的 try/catch 吞掉，
+	//   结果**聊天记录永远是空白**（实测：type(ctrl.append) == null，
+	//   而 type(ctrl.appendText) == "function"）。
+	//   这里跟 app.output 一样：自己留一份 buffer 当真相，控件只负责显示。
+	self.__logBuf = "";
+	self.__log = function(text){
+		self.__logBuf = self.__logBuf ++ (text : "");
+		..nodio.ui.setCtrlText(self.log, self.__logBuf);
+		// 光标推到末尾，滚动条跟着走（appendText 的效果，这里自己补）
+		try{ self.log.caretPos = -1 }catch(e1){}
+		try{ ::SendMessage(self.log.hwnd, 0x00B7/*_EM_SCROLLCARET*/, 0, 0) }catch(e2){}
+	}
+	// 供自动化测试读日志（不依赖控件回读）
+	self.getLog = function(){ return self.__logBuf }
+
+	self.__setStatus = function(s){
+		self.status = s;
+		self.head.invalidate();
+		if(self.onStatus) self.onStatus(s);
+	}
+
+	// ---------- 模式（对话 / 设置）----------
+	self.__setMode = function(mode){
+		self.mode = mode;
+		if(mode == "config"){
+			// 进设置页时把当前配置读出来
+			..nodio.ui.setCtrlText(self.edUrl, app.settings.aiBaseUrlGet());
+			..nodio.ui.setCtrlText(self.edModel, app.settings.aiModelGet());
+			var k = nodio.ai.cred.apiKeyGet();
+			..nodio.ui.setCtrlText(self.edKey, (k : ""));
+		}
+		self.__applyMode();
+		self.layout();
+	}
+
+	self.__applyMode = function(){
+		var isChat = (self.mode == "chat");
+		self.log.show(isChat && self.visible);
+		self.input.show(isChat && self.visible);
+		self.cfg.show(!isChat && self.visible);
+		self.edUrl.show(!isChat && self.visible);
+		self.edModel.show(!isChat && self.visible);
+		self.edKey.show(!isChat && self.visible);
+		self.cfg.invalidate();
+		self.head.invalidate();
+	}
+
+	// ---------- 保存配置 ----------
+	self.__saveConfig = function(){
+		var url = ..string.trim(..nodio.ui.getCtrlText(self.edUrl));
+		var model = ..string.trim(..nodio.ui.getCtrlText(self.edModel));
+		var key = ..string.trim(..nodio.ui.getCtrlText(self.edKey));
+		var ok = true;
+		if(!app.settings.aiBaseUrlSet(url)){
+			self.__log("[错误] 接口地址必须是 http / https 开头的地址\r\n");
+			ok = false;
+		}
+		if(!app.settings.aiModelSet(model)){
+			self.__log("[错误] 模型名不能为空\r\n");
+			ok = false;
+		}
+		// Key 存凭据管理器：空串 = 删除
+		if(!nodio.ai.cred.apiKeySet(key)){
+			self.__log("[错误] API Key 写入凭据管理器失败\r\n");
+			ok = false;
+		}
+		if(ok){
+			self.session.baseUrl = app.settings.aiBaseUrlGet();
+			self.session.model = app.settings.aiModelGet();
+			self.__setStatus("配置已保存");
+			self.__setMode("chat");
+		}
+	}
+
+	// ---------- 清空 ----------
+	self.__clear = function(){
+		nodio.ai.chat.clear(self.session);
+		self.__logBuf = "";
+		..nodio.ui.setCtrlText(self.log, "");
+		self.__setStatus("已清空");
+	}
+
+	// ---------- 发送 ----------
+	self.__send = function(){
+		if(self.busy) return;
+		var text = ..string.trim(..nodio.ui.getCtrlText(self.input));
+		if(!text || !#text) return;
+		// 先把用户消息记进会话并显示出来 —— 请求失败时这句话也该留在面板里
+		nodio.ai.chat.addMessage(self.session, "user", text);
+		..nodio.ui.setCtrlText(self.input, "");
+		self.__log("我: " ++ text ++ "\r\n");
+		var apiKey = nodio.ai.cred.apiKeyGet();
+		if(!apiKey || !#apiKey){
+			self.__log("[未配置 API Key —— 点右上角「设置」填写]\r\n");
+			self.__setMode("config");
+			return;
+		}
+		// 发给 worker 的消息列表必须是**副本**：
+		// thread.create 的实参是深拷贝，会话随后还会继续变。
+		var msgs = {};
+		for(i=1; #self.session.messages; 1){
+			..table.push(msgs, self.session.messages[i]);
+		}
+		self.busy = true;
+		self.__setStatus("请求中…");
+		thread.set("nodio.ai.result", null);
+		self.threadHandle = thread.create(function(baseUrl, model, apiKey, messages){
+			import nodio.ai.chat;
+			import json;
+			var sess = nodio.ai.chat.newSession({baseUrl = baseUrl; model = model});
+			sess.messages = messages;
+			var r = nodio.ai.chat.send(sess, {apiKey = apiKey; timeout = 120});
+			// ⚠ 结果必须序列化成**字符串**再回传，不能直接把表丢进
+			//   thread.set 的共享表：那张表不是 GC 的根，GC 跑起来会把
+			//   表内容清空（表对象本身还在，于是读回来是空表）。
+			//   字符串不是堆对象，GC 碰不到它。
+			thread.set("nodio.ai.result", json.stringify(r));
+		}, self.session.baseUrl, self.session.model, apiKey, msgs);
+		self.timer = winform.setInterval(self.__poll, 200);
+	}
+	// 对外：发一条（菜单 / 自动化测试用）
+	self.send = function(){ self.__send() }
+
+	// ---------- 轮询结果 ----------
+	self.__stopTimer = function(){
+		if(self.timer){
+			try{ winform.clearInterval(self.timer) }catch(e){}
+			self.timer = null;
+		}
+	}
+	self.__poll = function(){
+		var raw = thread.get("nodio.ai.result");
+		if(type(raw) == "string" && #raw){
+			thread.set("nodio.ai.result", null);
+			self.__stopTimer();
+			self.busy = false;
+			var r = null;
+			try{ r = ..json.parse(raw) }catch(e){}
+			if(r && r.ok){
+				nodio.ai.chat.addMessage(self.session, "assistant", (r.content : ""));
+				self.__log("AI: " ++ (r.content : "") ++ "\r\n");
+				self.__setStatus("就绪");
+			}
+			else{
+				self.__log("[错误] " ++ ((r && r.err) ? r.err : "未知错误") ++ "\r\n");
+				self.__setStatus("出错");
+			}
+			return null;
+		}
+		// 线程结束却没回结果 → worker 里抛异常了
+		if(self.threadHandle && thread.status(self.threadHandle) !== "active"){
+			self.__stopTimer();
+			self.busy = false;
+			self.__log("[错误] 请求线程异常退出\r\n");
+			self.__setStatus("出错");
+		}
+		return null;
+	}
+
+	// ---------- 布局 ----------
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		var hh = ..nodio.ui.px(HEAD_H);
+		var ih = ..nodio.ui.px(IN_H);
+		self.head.layout(l, t, r, t + hh);
+		// 对话区：日志占中间，输入框贴底
+		..nodio.ui.setRect(self.log, l, t + hh, r, b - ih);
+		..nodio.ui.setRect(self.input, l, b - ih, r, b);
+		// 配置区：整块画板 + 三个输入框
+		self.cfg.layout(l, t + hh, r, b);
+		var geo = self.__cfgRows();
+		for(i=1; i<=3; 1){
+			var row = geo.rows[i];
+			..nodio.ui.setRect(self.edUrl, geo.edLeft, row.top, geo.edRight, row.bottom);
+		}
+		..nodio.ui.setRect(self.edModel, geo.edLeft, geo.rows[2].top, geo.edRight, geo.rows[2].bottom);
+		..nodio.ui.setRect(self.edKey, geo.edLeft, geo.rows[3].top, geo.edRight, geo.rows[3].bottom);
+	}
+
+	// ---------- 显隐 ----------
+	self.visible = false;
+	self.show = function(flag){
+		self.visible = flag ? true : false;
+		self.head.show(flag);
+		self.__applyMode();
+	}
+
+	// dock 只认一个 ctrl；这里给一个「可见性代理」，
+	// 让页签切换时 顶栏 / 日志 / 输入框 / 配置区 一起显隐
+	// （与 nodio.ui.searchPanel 同一个套路）。
+	self.ctrl = {
+		show = function(flag){ self.show(flag) }
+	};
+
+	self.layout();
+	self.show(false);
+	return self;
+}

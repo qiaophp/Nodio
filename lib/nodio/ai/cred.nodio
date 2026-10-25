@@ -1,0 +1,205 @@
+// nodio.ai.cred — Windows 凭据管理器（Credential Manager）读写。
+//
+// ── 为什么自己手写结构体 ────────────────────────────────
+// 官方 aardio 没有凭据管理器模块；Nodio 的 :: 系统 API 表
+// （engine/sysapi.cpp）也只有 User32/Gdi32/Comdlg32 这些固定项，
+// 没有 advapi32 的凭据函数 —— 所以这里 raw.loadDll("advapi32.dll")
+// + FFI 自己调。
+//
+// ── CREDENTIALW 的布局必须自己对齐 ──────────────────────
+// Windows 的 CREDENTIALW（x64 80 字节 / x86 52 字节）字段顺序：
+//   Flags 0 / Type 4 / TargetName 8 / Comment 8+P / LastWritten(8 字节)
+//   / CredentialBlobSize / CredentialBlob / Persist / AttributeCount
+//   / Attributes / TargetAlias / UserName
+// 指针字段的宽度跟着 sizeof(void*) 走，所以**同一份声明 x64/x86 都对**：
+//   x64(P=8)：BlobSize 32 / Blob 40 / UserName 72
+//   x86(P=4)：BlobSize 24 / Blob 28 / UserName 48
+//
+// ⚠⚠ **LastWritten 是 FILETIME（8 字节），不是 SYSTEMTIME（16 字节）**
+// 这一条是 CredWriteW 一直返回 ERROR_INVALID_PARAMETER(87) 的根因：
+// 之前把 LastWritten 声明成 4 个 INT（16 字节），后面所有字段的偏移
+// 整体后移了 8 字节 —— Windows 读到的是
+//   BlobSize=0 / Blob=NULL / Persist=12（非法值）/ Attributes=乱指针
+// 直接被参数校验打回。改成 2 个 INT（8 字节）后，
+// 实测 sizeof(CREDENTIAL)=80（与 Windows 一致）、CredWriteW 返回 TRUE。
+//
+// ── ⚠ 写用 ustring 字段，读用 pointer 字段 ──────────────
+// 写：把 ustring 字段直接赋普通文本 —— 序列化器
+// （engine/ffi.cpp StructSerialize）会写该字符串自身的 UTF-16 缓冲区地址，
+// 正好就是 CredentialBlob 要的「一段 UTF-16 字节」。
+// 读：CredentialBlob 是 BYTE*，**不是 C 串**（没有结尾 NUL），
+// 所以读回时要用 pointer 字段拿到指针 + CredentialBlobSize 拿长度，
+// 再按宽字符读固定长度。引擎的 StructDeserialize 会把 pointer 字段
+// 解成 Pointer 值、把 ustring 字段解成文本，用 raw.structFrom 一次搞定。
+//
+// ── ⚠ 读回的结构体要按偏移取字段 ────────────────────────
+// CredReadW 分配的那份 CREDENTIALW 的偏移同上（公式写在本文件里）。
+//   而**读 32 位整数不能用 raw.uint** —— 官方 lib/builtin/raw.aardio
+//   把它覆盖成了「数值包装器」，根本不读内存。这里用 raw.read 取 4 个字节
+//   自己拼（见 __readU32）。
+namespace nodio.ai.cred{
+import raw;
+
+var CRED_TYPE_GENERIC = 1;
+var CRED_PERSIST_LOCAL_MACHINE = 2;
+var CRED_MAX_BLOB = 2560;   // _CRED_MAX_CREDENTIAL_BLOB_SIZE
+
+// IDE 自己的凭据名约定：一律带 "NodioIDE/" 前缀，
+// 免得和别的程序（浏览器、git、SSH…）的凭据混在一起。
+// API Key 存这里，**不进 ide.cfg**（配置文件是明文的，会被同步/备份带走）。
+var TARGET_APIKEY = "NodioIDE/ai/apiKey";
+
+var __dll = null;
+var __api = function(){
+	if(__dll) return __dll;
+	var dll = raw.loadDll("advapi32.dll");
+	__dll = {
+		dll = dll,
+		write = dll.api("CredWriteW", "bool(struct credential,INT flags)"),
+		read = dll.api("CredReadW",
+			"bool(ustring target,INT type,INT flags,POINTER &credential)"),
+		del = dll.api("CredDeleteW", "bool(ustring target,INT type,INT flags)"),
+		free = dll.api("CredFree", "void(POINTER buffer)"),
+	};
+	return __dll;
+}
+
+// CREDENTIALW 的声明（字段顺序 = Windows 的真实布局）
+// 写路径：字符串指针用 ustring —— 见文件头的说明。
+var CREDENTIAL = class{
+	INT Flags;              // 0
+	INT Type;               // 4
+	ustring TargetName;     // 8
+	ustring Comment;        // 8+P
+	INT _ft0; INT _ft1;     // FILETIME（8 字节！） 8+2P
+	INT CredentialBlobSize; // 16+2P
+	ustring CredentialBlob; // 20+2P 按指针宽度对齐
+	INT Persist;
+	INT AttributeCount;
+	ustring Attributes;
+	ustring TargetAlias;
+	ustring UserName;       // 64+6P
+};
+
+// 读路径：CredentialBlob / Attributes 是指针，要原样拿到地址
+// （blob 是二进制，不是结尾带 NUL 的 C 串）
+var CREDENTIAL_R = class{
+	INT Flags;
+	INT Type;
+	ustring TargetName;
+	ustring Comment;
+	INT _ft0; INT _ft1;
+	INT CredentialBlobSize;
+	pointer CredentialBlob;
+	INT Persist;
+	INT AttributeCount;
+	pointer Attributes;
+	ustring TargetAlias;
+	ustring UserName;
+};
+
+// 一段文本的 UTF-16 字节数
+// ⚠ 要按**字节**算：string.toUtf16 的产物是「一个字节一个 wchar」的字节串，
+//   它的**字符数**才是字节数。
+//   string.len(s,false) 是「按 UTF-8 重新编码后的长度」，对字节串是错的
+//   （实测 "🔑" → 4 字节，算出来 6）。
+var __u16bytes = function(s){
+	var b = ..string.toUtf16((s : ""));
+	return ..string.len(b, true);
+}
+
+// 写一个凭据（覆盖同名凭据）
+//   target = 凭据名（建议 "NodioIDE/xxx" 这种带前缀的）
+//   secret = 明文（按 UTF-16 存进 CredentialBlob）
+//   user   = 用户名（可省略）
+write = function(target, secret, user){
+	// ⚠ aardio 里空串是真值，判空要同时看 !#xxx
+	if(!target || !#target || !secret || !#secret) return false;
+	var api = __api();
+	var blobSize = __u16bytes(secret);
+	if(blobSize <= 0 || blobSize > CRED_MAX_BLOB) return false;
+	var cred = CREDENTIAL();
+	cred.Flags = 0;
+	cred.Type = CRED_TYPE_GENERIC;
+	cred.TargetName = target;
+	cred.Comment = "";
+	cred.CredentialBlobSize = blobSize;
+	// ⚠ 直接赋普通文本：序列化器写的是该字符串自身的 UTF-16 缓冲区地址，
+	//   正是 CredentialBlob 要的「一段 UTF-16 字节」
+	cred.CredentialBlob = secret;
+	cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
+	cred.AttributeCount = 0;
+	cred.Attributes = "";
+	cred.TargetAlias = "";
+	cred.UserName = (user : "");
+	return api.write(cred, 0) ? true : false;
+}
+
+// 读一个凭据 → 明文；没有 / 读失败返回 null
+read = function(target){
+	if(!target || !#target) return null;
+	var api = __api();
+	var ok, credPtr = api.read(target, CRED_TYPE_GENERIC, 0, 0);
+	if(!ok || credPtr === null) return null;
+	var secret = null;
+	// 用「读路径」结构体解回字段：
+	//   CredentialBlobSize → 数字（字节数）
+	//   CredentialBlob     → Pointer（blob 地址，二进制，不是 C 串）
+	var cred = CREDENTIAL_R();
+	raw.structFrom(cred, credPtr);
+	var blobSize = tonumber(cred.CredentialBlobSize);
+	if(blobSize > 0 && blobSize <= CRED_MAX_BLOB && blobSize % 2 == 0
+		&& cred.CredentialBlob !== null){
+		secret = raw.readW(cred.CredentialBlob, ..math.floor(blobSize / 2));
+	}
+	api.free(credPtr);
+	return secret;
+}
+
+// 删一个凭据
+remove = function(target){
+	if(!target || !#target) return false;
+	var api = __api();
+	return api.del(target, CRED_TYPE_GENERIC, 0) ? true : false;
+}
+
+// 凭据是否存在
+exists = function(target){
+	if(!target || !#target) return false;
+	return read(target) !== null;
+}
+
+// ---------- IDE 用的 API Key ----------
+//
+// ⚠ 当前生效的凭据名可以被环境变量 NODIO_AI_CRED_TARGET 覆盖。
+//   **回归锁 / IDE 冒烟必须用它**：
+//   apiKeyRemove() 是真删凭据，测试要是直接打真实的
+//   "NodioIDE/ai/apiKey"，用户配好的 Key 会被抹掉。
+//   （隔离名一律带 "NodioIDE/test/" 前缀，方便事后清理。）
+apiKeyTarget = function(){
+	var t = ..string.getenv("NODIO_AI_CRED_TARGET");
+	// ⚠ aardio 里空串是真值，判空要同时看 !#t
+	if(t && #t) return t;
+	return TARGET_APIKEY;
+}
+
+// 读不到 / 没配过 → null（调用方要自己给「未配置」的提示）
+apiKeyGet = function(){
+	return read(apiKeyTarget());
+}
+
+// 写 API Key（空串 = 删掉）
+apiKeySet = function(key, user){
+	if(key === null || key === undefined){
+		return remove(apiKeyTarget());
+	}
+	key = tostring(key);
+	if(!#key) return remove(apiKeyTarget());
+	return write(apiKeyTarget(), key, user);
+}
+
+apiKeyRemove = function(){
+	return remove(apiKeyTarget());
+}
+
+}

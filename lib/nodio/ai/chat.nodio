@@ -1,0 +1,188 @@
+// nodio.ai.chat — OpenAI 兼容接口的会话 / 请求构造 / 响应解析。
+//
+// 这一层是**纯逻辑**（不碰窗口、不碰注册表），所以能无头跑：
+// 回归锁 tests/ide_ai/ai.nodio 直接 import 它，逐条断言。
+//
+// 兼容的是「OpenAI /v1/chat/completions」这一类接口，
+// 官方文档：https://platform.openai.com/docs/api-reference/chat
+// 任何兼容实现（Ollama / llama.cpp server / vLLM / DeepSeek / 通义 …）
+// 都吃同一套请求体，所以 base_url + model 可配就能连。
+namespace nodio.ai.chat{
+import nodio.ai.http;
+
+var DEFAULT_BASE_URL = "https://api.openai.com/v1";
+var DEFAULT_MODEL = "gpt-4o-mini";
+var DEFAULT_PATH = "/chat/completions";
+
+// ---------- 端点 ----------
+// base_url 末尾的 "/" 去掉；path 不以 "/" 开头就补一个
+endpoint = function(baseUrl, path){
+	var b = ..string.trim((baseUrl : ""));
+	// ⚠ aardio 里**空串是真值**（只有 null / false 为假），
+	//   判空必须写成 !b || !#b
+	if(!b || !#b) b = DEFAULT_BASE_URL;
+	b = ..string.trimRight(b, "/");
+	if(!path || !#path) return b;
+	if(path == "/") return b ++ "/";
+	if(..string.indexOf(path, "/") == 1) return b ++ path;
+	return b ++ "/" ++ path;
+}
+
+// ---------- 请求体 ----------
+// messages = { {role="user";content="..."}; ... }
+buildBody = function(messages, opt){
+	opt = opt : {};
+	var msgs = {};
+	if(messages){
+		for(i=1; #messages; 1){
+			var m = messages[i];
+			if(!m) continue;
+			var role = m.role;
+			if(!role) role = "user";
+			..table.push(msgs, {role = role; content = (m.content : "")});
+		}
+	}
+	var req = {
+		model = (opt.model : DEFAULT_MODEL);
+		messages = msgs;
+	};
+	if(opt.temperature !== null) req.temperature = opt.temperature;
+	if(opt.max_tokens) req.max_tokens = opt.max_tokens;
+	if(opt.top_p) req.top_p = opt.top_p;
+	return ..json.stringify(req);
+}
+
+// ---------- 响应解析 ----------
+// 返回 {ok; content; err; model; finish; usage}
+parseResponse = function(text){
+	var r = {ok=false; content=""; err=""; model=""; finish=""; usage=null};
+	if(!text || !#text){
+		r.err = "服务端没有返回内容";
+		return r;
+	}
+	var j = ..json.parse(text);
+	if(!j || type(j) != "table"){
+		r.err = "响应不是合法的 JSON";
+		return r;
+	}
+	// OpenAI 的错误格式：{"error":{"message":"...","type":"..."}}
+	if(j.error){
+		var e = j.error;
+		if(type(e) == "table"){
+			r.err = e.message ? e.message : "服务端返回错误";
+		}else{
+			r.err = tostring(e);
+		}
+		return r;
+	}
+	var choices = j.choices;
+	if(!choices || type(choices) != "table" || !#choices){
+		r.err = "响应里没有 choices";
+		return r;
+	}
+	var c0 = choices[1];
+	if(!c0 || type(c0) != "table"){
+		r.err = "choices 为空";
+		return r;
+	}
+	var msg = c0.message;
+	if(msg && type(msg) == "table"){
+		r.content = (msg.content : "");
+	}
+	r.finish = c0.finish_reason ? c0.finish_reason : "";
+	r.model = j.model ? j.model : "";
+	r.usage = j.usage;
+	r.ok = true;
+	return r;
+}
+
+// ---------- 会话 ----------
+newSession = function(opt){
+	opt = opt : {};
+	return {
+		messages = {};
+		baseUrl = (opt.baseUrl : DEFAULT_BASE_URL);
+		model = (opt.model : DEFAULT_MODEL);
+	};
+}
+
+// 加一条消息（content 为空串时忽略）
+addMessage = function(session, role, content){
+	if(!session) return false;
+	content = (content : "");
+	// ⚠ aardio 里空串是真值，判空必须同时看 !#content
+	if(!content || !#content) return false;
+	..table.push(session.messages, {role = (role : "user"); content = content});
+	return true;
+}
+
+// 只留最近 maxMessages 条（0 = 全留）
+trim = function(session, maxMessages){
+	if(!session) return 0;
+	var n = #session.messages;
+	maxMessages = tonumber(maxMessages);
+	if(!maxMessages || maxMessages <= 0 || n <= maxMessages) return n;
+	// 从尾部截取
+	var keep = {};
+	for(i = n - maxMessages + 1; i <= n; 1){
+		..table.push(keep, session.messages[i]);
+	}
+	session.messages = keep;
+	return #keep;
+}
+
+// 清空会话的消息（保留 base_url / model）
+clear = function(session){
+	if(!session) return false;
+	session.messages = {};
+	return true;
+}
+
+// ---------- 发一轮 ----------
+// send(session, opt) -> {ok; content; err; status}
+//   opt.apiKey  = API Key（明文，由调用方从凭据管理器取）
+//   opt.baseUrl / opt.model / opt.timeout 可覆盖会话里的设置
+send = function(session, opt){
+	opt = opt : {};
+	if(!session){
+		return {ok=false; content=""; err="没有会话"; status=0};
+	}
+	var apiKey = opt.apiKey;
+	if(!apiKey || !#apiKey){
+		return {ok=false; content=""; err="没有配置 API Key"; status=0};
+	}
+	var baseUrl = opt.baseUrl ? opt.baseUrl : session.baseUrl;
+	var model = opt.model ? opt.model : session.model;
+	var url = endpoint(baseUrl, DEFAULT_PATH);
+	var body = buildBody(session.messages, {model = model});
+	var headers = {
+		["Content-Type"] = "application/json";
+		["Authorization"] = "Bearer " ++ apiKey;
+	};
+	var res = nodio.ai.http.request({
+		method = "POST";
+		url = url;
+		headers = headers;
+		body = body;
+		timeout = opt.timeout;
+	});
+	if(!res.ok){
+		return {ok=false; content=""; err = res.err; status = res.status; raw = res.text};
+	}
+	var p = parseResponse(res.text);
+	if(!p.ok){
+		return {ok=false; content=""; err = p.err; status = res.status; raw = res.text};
+	}
+	// 回复也记进会话（下一轮就是多轮上下文）
+	..table.push(session.messages, {role = "assistant"; content = p.content});
+	return {
+		ok = true;
+		content = p.content;
+		err = "";
+		status = res.status;
+		model = p.model;
+		usage = p.usage;
+	};
+}
+
+}

@@ -1,0 +1,246 @@
+// nodio.ai.http — WinINet HTTP 客户端（**支持自定义请求头**）。
+//
+// ── 为什么不用引擎的 web.get / web.post ──────────────────────
+// engine/builtins.cpp:8795 的 web.get / web.post 底层是 util.cpp 的
+// HttpFetch，但它**只发 Content-Type，不支持自定义请求头** ——
+// OpenAI 兼容接口必须带 "Authorization: Bearer <key>"，所以这里直接
+// 用 WinINet 的 FFI 自己发请求（engine/sysapi.cpp 的固定系统 API 表里
+// 没有 wininet，只能 raw.loadDll）。
+//
+// ── 三个必须记住的坑（都是实测踩出来的）────────────────────
+// 1) **出参必须用 by-ref 约定**（签名里写 "INT &length"），
+//    不要用 raw.uint 读内存：
+//    官方 lib/builtin/raw.aardio 把 raw.uint 覆盖成了「数值包装器」
+//    （raw.uint = lambda(v,ref) number("INT",...)），它**根本不读内存**。
+//    拿它读 DWORD 只会拿到指针值本身 → 拿这个长度去分配缓冲区 =
+//    申请 2.5TB → 分配失败返回 null → WinINet 往空指针写 → 0xC0000005。
+//    （这是本模块第一版真崩过的原因。）
+// 2) 出参缓冲区用 raw.buffer() 分配（引擎会登记大小），别用数字地址。
+// 3) 正文按 **UTF-8** 发：raw.buffer(文本) 出来的就是 UTF-8 字节，
+//    字节数用 string.len(文本, false) 拿（false = 按字节，不是码点）。
+//    解码回来用 string.fromto(字节串, 65001)。
+// 4) **HttpQueryInfoW 返回的是 UTF-16**（状态码、原始响应头都是宽串），
+//    按宽字符读；只有响应正文是原始字节流（按 UTF-8 解）。
+//
+// ── FFI 签名的类型词表（engine/ffi.cpp ApiTypeOf）────────────
+//   int / long / dword / uint  → 32 位整数
+//   int64 / qword              → 64 位整数
+//   word / ushort              → 16 位
+//   byte / uchar               → 8 位
+//   ptr / pointer / lpvoid     → 指针（指针宽 8/4 随架构）
+//   addr / handle / hwnd       → 句柄（当数值传）
+//   str                        → ANSI 串（CP_ACP）
+//   ustring / wstr / lpwstr    → UTF-16 串
+//   struct                     → 结构体（按声明序列化）
+//   "类型 &"                   → by-ref 出参（多返回一个值）
+namespace nodio.ai.http{
+import raw;
+
+// ---------- FFI 绑定（进程内只加载一次）----------
+var __dll = null;
+var __api = function(){
+	if(__dll) return __dll;
+	var dll = raw.loadDll("wininet.dll");
+	__dll = {
+		dll = dll,   // 留住 dll 表，别让它被回收（否则句柄失效）
+		open = dll.api("InternetOpenW",
+			"pointer(ustring agent,INT accessType,ustring proxy,ustring proxyBypass,INT flags)"),
+		connect = dll.api("InternetConnectW",
+			"pointer(POINTER hInet,ustring serverName,INT serverPort,ustring userName,ustring password,INT service,INT flags,INT context)"),
+		openRequest = dll.api("HttpOpenRequestW",
+			"pointer(POINTER hConnect,ustring verb,ustring objectName,ustring version,ustring referrer,POINTER acceptTypes,INT flags,INT context)"),
+		// ⚠⚠ HttpSendRequestW 在本机 SDK 里是 **5 参数**原型
+		//   （hRequest, lpszHeaders, dwHeadersLength, lpOptional, dwOptionalLength）——
+		//   引擎自己的 util.cpp:140 也只传 5 个。
+		//   多传 dwFlags/dwContext 两个参数在 x64 上看不出问题（多出来的只是
+		//   寄存器里的垃圾值），但 x86 是 stdcall：被调方按自己的原型弹栈，
+		//   多压的 8 字节会把调用方的栈冲歪 → 返回地址变成 0 → 0xC0000005
+		//   （EIP=00000000）。实测：7 参声明在 x86 上必崩，5 参正常。
+		send = dll.api("HttpSendRequestW",
+			"bool(POINTER hRequest,ustring headers,INT headersLength,POINTER optional,INT optionalLength)"),
+		query = dll.api("HttpQueryInfoW",
+			"bool(POINTER hRequest,INT level,POINTER buffer,INT &length,INT &index)"),
+		read = dll.api("InternetReadFile",
+			"bool(POINTER hFile,POINTER buffer,INT bytesToRead,INT &bytesRead)"),
+		close = dll.api("InternetCloseHandle", "bool(POINTER hInet)"),
+		setOption = dll.api("InternetSetOptionW",
+			"bool(POINTER h,INT option,INT &value,INT len)"),
+	};
+	return __dll;
+}
+
+// ---------- URL 解析 ----------
+// 返回 {secure; host; port; path; err}
+parseUrl = function(url){
+	url = ..string.trim((url : ""));
+	var r = {secure=false; host=""; port=0; path="/"; err=""};
+	if(!url || !#url){
+		r.err = "URL 为空";
+		return r;
+	}
+	var s = url;
+	if(..string.indexOf(s, "https://") == 1){
+		r.secure = true;
+		s = ..string.slice(s, 9);
+	}
+	elseif(..string.indexOf(s, "http://") == 1){
+		s = ..string.slice(s, 8);
+	}
+	elseif(..string.indexOf(s, "://") != null){
+		r.err = "只支持 http / https 协议";
+		return r;
+	}
+	// 路径（含查询串）
+	var q = ..string.indexOf(s, "/");
+	if(q){
+		r.path = ..string.slice(s, q);
+		s = ..string.left(s, q - 1);
+	}
+	// 端口
+	r.port = r.secure ? 443 : 80;
+	var c = ..string.indexOf(s, ":");
+	if(c){
+		var pv = tonumber(..string.slice(s, c + 1));
+		s = ..string.left(s, c - 1);
+		if(!pv || pv < 1 || pv > 65535){
+			r.err = "端口号非法";
+			return r;
+		}
+		r.port = pv;
+	}
+	r.host = s;
+	if(!r.host){
+		r.err = "缺少主机名";
+		return r;
+	}
+	return r;
+}
+
+// 本机地址直连，别绕系统代理（localhost 走代理是很常见的坑）
+var __isLocal = function(host){
+	if(!host) return false;
+	var h = ..string.lower(host);
+	return (h == "localhost" || h == "127.0.0.1" || h == "::1" ||
+		h == "0.0.0.0" || h == "[::1]");
+}
+
+// ---------- 响应正文上限（防止响应体失控把内存吃满）----------
+var MAX_BODY = 8 * 1024 * 1024;
+
+// request(opt) -> {ok; status; text; headers; err}
+//   opt.method  = "GET" / "POST"（默认 GET）
+//   opt.url     = 完整 URL
+//   opt.headers = 表 {名 = 值}（值 null 的跳过）
+//   opt.body    = 请求正文（文本，按 UTF-8 发出）
+//   opt.timeout = 超时秒数（默认 60）
+request = function(opt){
+	opt = opt : {};
+	var r = {ok=false; status=0; text=""; headers=""; err=""};
+	var u = parseUrl(opt.url : "");
+	// ⚠ aardio 里**空串是真值** —— 判「有错误」必须看长度，
+	//   写成 if(u.err) 会在正常路径上直接 return（状态码恒为 0）。
+	if(#u.err){
+		r.err = u.err;
+		return r;
+	}
+	var api = __api();
+
+	// 请求头：每行 "名: 值\r\n"
+	var hdr = "";
+	if(opt.headers){
+		for(k,v in opt.headers){
+			if(v === null || v === undefined) continue;
+			hdr = hdr ++ k ++ ": " ++ tostring(v) ++ '\r\n';
+		}
+	}
+
+	var h = api.open("NodioIDE/1.0",
+		__isLocal(u.host) ? 1/*_INTERNET_OPEN_TYPE_DIRECT*/ : 0/*_PRECONFIG*/,
+		0, 0, 0);
+	if(!h){
+		r.err = "InternetOpenW 失败";
+		return r;
+	}
+	// 超时（秒 → 毫秒）：2 = CONNECT_TIMEOUT，6 = RECEIVE_TIMEOUT
+	var to = tonumber(opt.timeout : 60);
+	if(to && to > 0){
+		api.setOption(h, 2, to * 1000, 4);
+		api.setOption(h, 6, to * 1000, 4);
+	}
+	var c = api.connect(h, u.host, u.port, 0, 0, 3/*_INTERNET_SERVICE_HTTP*/, 0, 0);
+	if(!c){
+		r.err = "无法连接 " ++ u.host ++ ":" ++ (u.port : "");
+		api.close(h);
+		return r;
+	}
+	// 0x00800000 = _INTERNET_FLAG_SECURE（https 必需，否则 443 端口走明文）
+	var flags = u.secure ? 0x00800000 : 0;
+	var rq = api.openRequest(c, (opt.method : "GET"), u.path, "HTTP/1.1", 0, 0, flags, 0);
+	if(!rq){
+		r.err = "HttpOpenRequestW 失败";
+		api.close(c);
+		api.close(h);
+		return r;
+	}
+	// 正文：raw.buffer(文本) 出来就是 UTF-8 字节
+	var bodyPtr = 0;
+	var bodyLen = 0;
+	if(opt.body){
+		bodyPtr = raw.buffer(opt.body);
+		bodyLen = ..string.len(opt.body, false);
+	}
+	if(!api.send(rq, hdr, -1, bodyPtr, bodyLen)){
+		r.err = "发送请求失败";
+		api.close(rq);
+		api.close(c);
+		api.close(h);
+		return r;
+	}
+	// 状态码：先问需要多少字节，再取内容（0x13 = _HTTP_QUERY_STATUS_CODE）
+	// ⚠⚠ HttpQueryInfoW 返回的是 **UTF-16 串**（W 版 API 的通例）：
+	//   实测缓冲区内容是 "32 00 30 00 30 00"（"200" 的 UTF-16LE），
+	//   当成 UTF-8 解会得到乱码（之前只取到首字符 "2" 就是这么来的）。
+	//   必须按宽字符读：字节数 / 2。
+	var okQ, need = api.query(rq, 0x13, 0, 0, 0);
+	if(need && need > 0){
+		var pStatus = raw.buffer(need + 2);
+		var ok2, n2 = api.query(rq, 0x13, pStatus, need + 2, 0);
+		if(n2 > 0){
+			r.status = tonumber(..string.trim(raw.readW(pStatus, ..math.floor(n2 / 2))));
+		}
+	}
+	// 原始响应头（0x15 = _HTTP_QUERY_RAW_HEADERS），出错时排障用
+	// ⚠ 同样是 UTF-16
+	var okH, needH = api.query(rq, 0x15, 0, 0, 0);
+	if(needH && needH > 0){
+		var pHdr = raw.buffer(needH + 2);
+		var ok3, n3 = api.query(rq, 0x15, pHdr, needH + 2, 0);
+		if(n3 > 0){
+			r.headers = raw.readW(pHdr, ..math.floor(n3 / 2));
+		}
+	}
+	// 正文
+	// ⚠ 不要写 for(;;)：Nodio 的 aardio 解析器对空的 for 三个槽处理不对
+	//   （实测：循环体不执行 / 直接崩）。这里用有界循环 + break。
+	var acc = "";
+	var total = 0;
+	var pBuf = raw.buffer(65536);
+	for(i=1; i<=256; 1){
+		var okR, got = api.read(rq, pBuf, 65536, 0);
+		if(!got) break;
+		acc = acc ++ raw.tostring(pBuf, 1, got);
+		total = total + got;
+		if(total > MAX_BODY) break;
+	}
+	r.text = ..string.fromto(acc, 65001);
+	r.ok = (r.status >= 200 && r.status < 300);
+	if(!r.ok && (!r.err || !#r.err)){
+		r.err = "HTTP " ++ (r.status : 0);
+	}
+	api.close(rq);
+	api.close(c);
+	api.close(h);
+	return r;
+}
+
+}
