@@ -1,0 +1,35 @@
+// 第四十八轮回归锁：设计器 DSG 往返保真 + 窗体表面。
+// 旧行为：bgcolor 丢、未登记属性（edge 等）丢、edit 空文本被填成类名。
+import nodio.designer.registry;
+import nodio.designer.canvas;
+import nodio.designer.dsg;
+nodio.designer.registry.defaults();
+var frm = win.form(text="t99";right=699;bottom=599);
+var cv = nodio.designer.canvas(frm, {left=0;top=0;right=700;bottom=600});
+var dsgSrc = `/*DSG{{*/
+winform = win.form(text="窗A";right=599;bottom=449;bgcolor=0xF0F0F0)
+winform.add(
+btnOk={cls="button";text="确定";left=10;top=10;right=110;bottom=40;z=1};
+edX={cls="edit";left=10;top=50;right=200;bottom=76;edge=1;z=2}
+)
+/*}}*/`;
+var n = cv.fromDSG(dsgSrc);
+io.print("N=" ++ n);
+io.print("FORM=" ++ cv.form.text ++ "/" ++ cv.form.w ++ "/" ++ cv.form.h ++ "/" ++ cv.form.bgcolor);
+// 空文本不填类名（edit 是内容类）
+var ed = null;
+for(i=1;#cv.items;1){ if(cv.items[i].name == "edX") ed = cv.items[i] }
+var edText = "";
+var edEdge = "";
+for(i=1;#ed.props;1){
+	if(ed.props[i].key == "text") edText = ed.props[i].value;
+	if(ed.props[i].key == "edge") edEdge = tostring(ed.props[i].value);
+}
+io.print("EDTEXT-EMPTY=" ++ tostring(edText == ""));
+io.print("EDGE-KEPT=" ++ edEdge);
+// toDSG 往返：bgcolor 进头、edge 不丢、中文文本不丢
+var d2 = cv.toDSG();
+io.print("BG=" ++ tostring(..string.match(d2, `;bgcolor=(0x[0-9A-Fa-f]+)`)));
+io.print("EDGE2=" ++ tostring(..string.match(d2, `edge=1`) != null));
+io.print("TXT2=" ++ tostring(..string.match(d2, `text="确定"`) != null));
+io.print("T99-OK");

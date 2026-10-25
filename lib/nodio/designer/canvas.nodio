@@ -55,7 +55,10 @@ canvas = function(winform, opt){
 		onDoubleClick = null;   // function(item) —— 双击组件（官方 IDE 用它生成事件代码）
 		// 窗体设置（DSG 头 win.form 的 标题/宽度/高度，设计坐标=逻辑像素）
 		// ⚠ 改它走 applyFormProps()，别直接赋值 —— 要连带重画。
-		form    = { text = "窗体"; w = 759; h = 469 };
+		// bgcolor：窗体底色（DSG 头 bgcolor=），透明系控件（static/分组框/
+		// checkbox/radio）的底色跟着它走 —— 不给底色的话透明控件透出的是
+		// IDE 深色壳（实测灰/黑条的根因）。
+		form    = { text = "窗体"; w = 759; h = 469; bgcolor = 0xF0F0F0 };
 		// 对齐网格：拖动/缩放时把坐标吸附到 GRID_SIZE 的整数倍
 		// （官方 USR.CFG 的 dlg_restraint；属性格改的精确值不吸附）
 		snap    = true;
@@ -87,6 +90,14 @@ canvas = function(winform, opt){
 		handleColor = opt.handleColor : 0xFF1F6FB2;
 		gridColor = opt.gridColor : 0xFFE0E0E0;
 		bgColor   = opt.bgColor : 0xFFFFFFFF;
+		// 第四十八轮：工作区 + 窗体铬件配色。工作区明显深一档（衬出表面）；
+		// 标题栏浅灰、深字；窗体边框中灰。bgColor 保留为旧选项兼容（不再使用）。
+		// ⚠ 三档灰必须有可见台阶：C9C9C9 工作区 vs F0F0F0 客户区实测糊成
+		// 一片（截图核过）—— 工作区取 B4。
+		wsColor      = opt.wsColor : 0xFFB4B4B4;
+		capColor     = opt.capColor : 0xFFDCDCE0;
+		capTextColor = opt.capTextColor : 0xFF202020;
+		fsBorderColor = opt.fsBorderColor : 0xFF6E6E6E;
 	};
 
 	self.zoomScale = function(){
@@ -103,6 +114,29 @@ canvas = function(winform, opt){
 			self.__place(self.items[i]);
 		}
 		self.__refresh();
+	};
+
+	// ---------- 窗体表面 ----------
+	// 官方设计器：工作区中央摆着一张**真的像窗**的表面（标题栏 + 边框 +
+	// 客户底色），控件摆在表面里 —— 而不是控件直接漂在整片网格上。
+	// 返回表面在**底板坐标系**里的矩形（物理像素）：x/y = 表面（含标题栏）
+	// 左上角，w/h = 客户区宽高，capH = 标题栏高。窗体比工作区大时靠左上
+	//（clamp 到边距）。
+	var CAPTION_H = 26;   // 标题栏高（逻辑像素，随缩放）
+	self.__fs = function(){
+		var zs = self.zoomScale ? self.zoomScale() : 1.0;
+		var fw = math.round(..nodio.ui.px(self.form.w) * zs);
+		var fh = math.round(..nodio.ui.px(self.form.h) * zs);
+		var capH = math.round(..nodio.ui.px(CAPTION_H) * zs);
+		if(!self.rect) return {x=0; y=0; w=fw; h=fh; capH=capH};
+		var cw = self.rect.right - self.rect.left;
+		var ch = self.rect.bottom - self.rect.top;
+		var margin = ..nodio.ui.px(12);
+		var fx = math.floor((cw - fw) / 2);
+		var fy = math.floor((ch - fh - capH) / 2);
+		if(fx < margin) fx = margin;
+		if(fy < margin) fy = margin;
+		return {x=fx; y=fy; w=fw; h=fh; capH=capH};
 	};
 
 	__cvSeq = __cvSeq + 1;
@@ -154,7 +188,8 @@ canvas = function(winform, opt){
 	self.__handlePos = function(index, it){
 		var zs = self.zoomScale ? self.zoomScale() : 1.0;
 		var s = ..nodio.ui.px(HANDLE_SIZE);
-		var x = math.round(..nodio.ui.px(it.x) * zs), y = math.round(..nodio.ui.px(it.y) * zs);
+		var fs = self.__fs();
+		var x = fs.x + math.round(..nodio.ui.px(it.x) * zs), y = fs.y + fs.capH + math.round(..nodio.ui.px(it.y) * zs);
 		var w = math.round(..nodio.ui.px(it.w) * zs), h = math.round(..nodio.ui.px(it.h) * zs);
 		if(index == 0) return {x = x - s - 1; y = y - s - 1};
 		if(index == 1) return {x = x + (w - s) / 2; y = y - s - 1};
@@ -247,8 +282,9 @@ canvas = function(winform, opt){
 	self.__place = function(item){
 		if(!item || !item.ctrl) return;
 		var zs = self.zoomScale ? self.zoomScale() : 1.0;
-		var l = self.origin.left + math.round(..nodio.ui.px(item.x) * zs);
-		var t = self.origin.top + math.round(..nodio.ui.px(item.y) * zs);
+		var fs = self.__fs();
+		var l = self.origin.left + fs.x + math.round(..nodio.ui.px(item.x) * zs);
+		var t = self.origin.top + fs.y + fs.capH + math.round(..nodio.ui.px(item.y) * zs);
 		var r = l + math.round(..nodio.ui.px(item.w) * zs);
 		var b = t + math.round(..nodio.ui.px(item.h) * zs);
 		..nodio.ui.setRect(item.ctrl, l, t, r, b);
@@ -275,7 +311,9 @@ canvas = function(winform, opt){
 
 	// ---------- 组件 ----------
 	// 加一个组件（保留 DSG 原生变量名或自动递增）
-	self.add = function(spec, rect, name){
+	// rawAttrs 可选：DSG 里该控件的**全部原生属性**（edge/bgcolor/color…），
+	// 要在**创建时**传给 form.add 才有原生语义（后补 setCtrlProp 亡羊补牢）。
+	self.add = function(spec, rect, name, rawAttrs){
 		if(!spec) return null;
 		rect = rect : {x=0; y=0; w=120; h=30};
 		var n = #self.items + 1;
@@ -299,18 +337,39 @@ canvas = function(winform, opt){
 		// 创建矩形给**逻辑坐标**（官方 win.ui 的 add 会按 DPI 缩放），
 		// 建完立刻用 __place 摆到物理位置，两条路径都对得上。
 		var sc = ..nodio.ui.dpiScale();
-		var ox = self.origin.left / sc, oy = self.origin.top / sc;
+		var fs0 = self.__fs();
+		var ox = (self.origin.left + fs0.x) / sc, oy = (self.origin.top + fs0.y + fs0.capH) / sc;
 		var tParam = {
 			cls = spec.drawAs : (spec.cls : "static");
 			left = ox + rect.x; top = oy + rect.y;
 			right = ox + rect.x + rect.w;
 			bottom = oy + rect.y + rect.h;
 		};
+		// 透明系控件的底色 = 窗体底色：控件是挂**主窗体**上的，透明底透出
+		// 的是 IDE 深色壳（实测 static 灰条 / checkbox 黑条的根因）。
+		// 内容类控件（edit/listbox…）保持原生白底；DSG 显式写了 bgcolor 的
+		// 在下面 rawAttrs 覆盖。
+		var transBg = { static=true; groupbox=true; checkbox=true; radio=true };
+		if(transBg[spec.cls]) tParam.bgcolor = self.form.bgcolor;
+		// DSG 原生属性进创建参数（几何/文本/锚点除外 —— 各有专门通道）
+		if(rawAttrs){
+			var geoK = {left=true; top=true; right=true; bottom=true; width=true;
+				height=true; text=true; z=true; cls=true; anchors=true; name=true; autoResize=true};
+			for(k3 in rawAttrs){
+				if(geoK[k3]) continue;
+				var v3 = rawAttrs[k3];
+				if(v3 === null || v3 === "") continue;
+				tParam[k3] = v3;
+			}
+		}
 		for(i=1;#props;1){
 			var pk = props[i].key;
 			if(pk == "text"){
-				// 标题类属性默认取组件名（VS 里 Button 的 Text 默认就是控件名）
-				if(type(props[i].value) == "string" && #props[i].value == 0){
+				// 标题类属性默认取组件名 —— 只对**标签类**控件（官方 Button
+				// 默认文本就是变量名）。内容类（edit/richedit/combobox…）
+				// 空文本保持空：画布上 edit 里填着「编辑框」不是官方行为。
+				var labelLike = { button=true; checkbox=true; radio=true; static=true; groupbox=true };
+				if(type(props[i].value) == "string" && #props[i].value == 0 && labelLike[spec.cls]){
 					props[i].value = spec.name;
 				}
 				tParam.text = props[i].value;
@@ -332,10 +391,10 @@ canvas = function(winform, opt){
 		var ctrl = null;
 		if(spec.ctor){
 			var pt = {
-				left = self.origin.left + ..nodio.ui.px(rect.x);
-				top = self.origin.top + ..nodio.ui.px(rect.y);
-				right = self.origin.left + ..nodio.ui.px(rect.x + rect.w);
-				bottom = self.origin.top + ..nodio.ui.px(rect.y + rect.h);
+				left = self.origin.left + fs0.x + ..nodio.ui.px(rect.x);
+				top = self.origin.top + fs0.y + fs0.capH + ..nodio.ui.px(rect.y);
+				right = self.origin.left + fs0.x + ..nodio.ui.px(rect.x + rect.w);
+				bottom = self.origin.top + fs0.y + fs0.capH + ..nodio.ui.px(rect.y + rect.h);
 				text = tParam.text;
 			};
 			face = spec.ctor(self.winform, pt);
@@ -360,6 +419,10 @@ canvas = function(winform, opt){
 			name = name; spec = spec; face = face;
 			x = rect.x; y = rect.y; w = rect.w; h = rect.h;
 			props = props; ctrl = ctrl;
+			// 底色旗标：transBg = 底色跟着窗体走的透明系控件；
+			// explicitBg = DSG 里显式写过 bgcolor（窗体换底色时不被覆盖）
+			transBg = transBg[spec.cls] ? true : false;
+			explicitBg = (rawAttrs && rawAttrs.bgcolor !== null && rawAttrs.bgcolor !== undefined) ? true : false;
 		};
 		..table.push(self.items, item);
 		ctrl.show(self.visible);
@@ -828,6 +891,20 @@ canvas = function(winform, opt){
 					elseif(p.key == "height" && nv != self.form.h){ self.form.h = nv; n = n + 1 }
 				}
 			}
+			elseif(p.key == "bgcolor"){
+				// 窗体底色变了 → 没显式写过 bgcolor 的透明系控件跟着换底
+				var nb = tonumber(p.value);
+				if(nb !== null && nb != self.form.bgcolor){
+					self.form.bgcolor = nb; n = n + 1;
+					// 只有「底色跟着窗体走」的透明系控件要换底；
+					// DSG 里显式写过 bgcolor 的保持自己的底色
+					for(j=1;#self.items;1){
+						var it2 = self.items[j];
+						if(!it2.ctrl || !it2.transBg || it2.explicitBg) continue;
+						try{ ..nodio.ui.setCtrlProp(it2.ctrl, "bgcolor", nb) }catch(e2){}
+					}
+				}
+			}
 		}
 		self.__refresh();
 		return n;
@@ -998,21 +1075,23 @@ canvas = function(winform, opt){
 			});
 		}
 		return ..nodio.designer.dsg.generate(arr,
-			self.form.text, self.form.w, self.form.h);
+			self.form.text, self.form.w, self.form.h, self.form.bgcolor);
 	}
 
 	// 从 DSG 载入（窗体头一并解析 —— 设计视图里改窗体设置，关设计器写回）
 	self.fromDSG = function(text){
 		self.clear();
-		// win.form(text="..";right=..;bottom=..)：属性顺序不保证，
+		// win.form(text="..";right=..;bottom=..;bgcolor=..)：属性顺序不保证，
 		// 各自独立匹配；匹配不到保持默认（空画布/普通脚本不受影响）
 		var ft = ..string.match(text, 'win\.form\(text="([^"]*)"');
 		var fr = tonumber(..string.match(text, ';right=(\d+)'));
 		var fb = tonumber(..string.match(text, ';bottom=(\d+)'));
+		var fbg = tonumber(..string.match(text, ';bgcolor=(0x[0-9A-Fa-f]+)'));
 		self.form = {
 			text = ft : self.form.text;
 			w = fr : self.form.w;
 			h = fb : self.form.h;
+			bgcolor = fbg : self.form.bgcolor;
 		};
 		var items = ..nodio.designer.dsg.parse(text);
 		for(i=1;#items;1){
@@ -1023,7 +1102,7 @@ canvas = function(winform, opt){
 			var y = tonumber(props.top) : 0;
 			var w = (tonumber(props.right) : 100) - x;
 			var h = (tonumber(props.bottom) : 30) - y;
-			var item = self.add(spec, {x=x; y=y; w=w; h=h}, it.name);
+			var item = self.add(spec, {x=x; y=y; w=w; h=h}, it.name, props);
 			if(item){
 				for(k=1;#item.props;1){
 					var key = item.props[k].key;
@@ -1034,6 +1113,21 @@ canvas = function(winform, opt){
 					elseif(key == "height") item.props[k].value = h;
 					elseif(props[key] !== null) item.props[k].value = props[key];
 				}
+				// 注册表没登记的 DSG 属性（edge/border/font/…）并入属性表：
+				// 属性格能看到、toDSG 原样写回 —— 往返不再丢属性。
+				var known = {};
+				for(k2=1;#item.props;1){ known[item.props[k2].key] = true }
+				var skip = {left=true; top=true; right=true; bottom=true; width=true;
+					height=true; text=true; z=true; cls=true; anchors=true; name=true; autoResize=true};
+				for(k4 in props){
+					if(known[k4] || skip[k4]) continue;
+					var v4 = props[k4];
+					if(v4 === null || v4 === "") continue;
+					var t4 = "string";
+					if(type(v4) == "number") t4 = "number";
+					elseif(type(v4) == "boolean") t4 = "bool";
+					..table.push(item.props, {key=k4; name=k4; value=v4; type=t4; cat="其他"});
+				}
 				self.applyProps(item);
 			}
 		}
@@ -1041,24 +1135,63 @@ canvas = function(winform, opt){
 	}
 
 	// ---------- 绘制 ----------
-	// 画布底色 + 网格 + 边距线 + 吸附参考线 + 选中框 + 8 个手柄
+	// 工作区 + 窗体表面（标题栏/边框/客户底色）+ 客户区网格 + 边距线 +
+	// 吸附参考线 + 选中框 + 8 个手柄。
+	// 第四十八轮：画布不再是「整片网格当窗体」，而是工作区中央摆一张
+	// **真的像窗**的表面 —— 控件在表面里，所见即所得对齐官方设计器。
 	self.__draw = function(graphics, rc, bd){
 		var w = rc.right - rc.left;
 		var h = rc.bottom - rc.top;
-		var bg = ..gdip.solidBrush(self.bgColor);
-		graphics.fillRect(bg, rc.left, rc.top, w, h);
-		bg.delete();
-		// 网格（官方 USR.CFG 的 dlg_grid：可开关，间距按 DPI 和设计器缩放计算）
+		var fs = self.__fs();
+		var cOffX = fs.x, cOffY = fs.y + fs.capH;   // 客户区原点（底板坐标）
+		// 工作区（窗体周围的中性灰，衬出表面）
+		var ws = ..gdip.solidBrush(self.wsColor);
+		graphics.fillRect(ws, rc.left, rc.top, w, h);
+		ws.delete();
+		// 窗体客户区底色（DSG 头 bgcolor）。⚠ DSG 的 0xRRGGBB 没有 alpha 位，
+		// GDI+ 把 0x00F0F0F0 当全透明 —— 实测客户区透出工作区的根因，
+		// 画 GDI+ 前强制补不透明位。
+		var fb = ..gdip.solidBrush(0xFF000000 | self.form.bgcolor);
+		graphics.fillRect(fb, fs.x, cOffY, fs.w, fs.h);
+		fb.delete();
+		// 标题栏
+		var cap = ..gdip.solidBrush(self.capColor);
+		graphics.fillRect(cap, fs.x, fs.y, fs.w, fs.capH);
+		cap.delete();
+		// 标题文字（DSG 头 win.form 的 text）。中文字体名 —— Segoe UI 没有
+		// 中文字形；format 必须给 stringFormat（实测 null 静默不渲染）。
+		// boardFont/boardFormat 挂在 nodio.ui 名下（board.nodio 的 namespace
+		// 是 nodio.ui，不是 nodio.ui.board —— 写错拼写实测「调用非函数值」）。
+		var capFont = ..nodio.ui.boardFont(9, "Microsoft YaHei UI");
+		var capBrush = ..gdip.solidBrush(self.capTextColor);
+		graphics.drawString(self.form.text, capFont,
+			::RECTF(fs.x + ..nodio.ui.px(8), fs.y, fs.w - ..nodio.ui.px(30), fs.capH),
+			..nodio.ui.boardFormat(), capBrush);
+		capBrush.delete();
+		// 关闭钮（示意 ✕）
+		var xpen = ..gdip.pen(self.capTextColor, 1);
+		var cs = ..nodio.ui.px(7);
+		var cx = fs.x + fs.w - ..nodio.ui.px(18), cy = fs.y + math.floor(fs.capH / 2);
+		var ch2 = math.floor(cs / 2);
+		graphics.drawLine(xpen, cx, cy - ch2, cx + cs, cy + ch2);
+		graphics.drawLine(xpen, cx + cs, cy - ch2, cx, cy + ch2);
+		xpen.delete();
+		// 窗体边框（含标题栏的整框）
+		var bpen = ..gdip.pen(self.fsBorderColor, 1);
+		graphics.drawRectangle(bpen, fs.x, fs.y, fs.w, fs.h + fs.capH);
+		bpen.delete();
+		// 网格（官方 USR.CFG 的 dlg_grid：只画在窗体客户区，工作区不画；
+		// 间距按 DPI 和设计器缩放计算）
 		if(self.showGrid){
 			var zs = self.zoomScale ? self.zoomScale() : 1.0;
 			var step = math.round(..nodio.ui.px(GRID_SIZE) * zs);
 			if(step >= 4){
 				var pen = ..gdip.pen(self.gridColor, 1);
-				for(x=rc.left;x<rc.right;x+=step){
-					graphics.drawLine(pen, x, rc.top, x, rc.bottom);
+				for(x=cOffX;x<cOffX + fs.w;x+=step){
+					graphics.drawLine(pen, x, cOffY, x, cOffY + fs.h);
 				}
-				for(y=rc.top;y<rc.bottom;y+=step){
-					graphics.drawLine(pen, rc.left, y, rc.right, y);
+				for(y=cOffY;y<cOffY + fs.h;y+=step){
+					graphics.drawLine(pen, cOffX, y, cOffX + fs.w, y);
 				}
 				pen.delete();
 			}
@@ -1069,14 +1202,14 @@ canvas = function(winform, opt){
 			var mpen = ..gdip.pen(self.frameColor, 1);
 			var ml = ..nodio.ui.px(m.left : 0), mt = ..nodio.ui.px(m.top : 0);
 			var mr = ..nodio.ui.px(m.right : 0), mb = ..nodio.ui.px(m.bottom : 0);
-			graphics.drawLine(mpen, rc.left + ml, rc.top + mt,
-				rc.right - mr, rc.top + mt);            // 上
-			graphics.drawLine(mpen, rc.left + ml, rc.bottom - mb,
-				rc.right - mr, rc.bottom - mb);         // 下
-			graphics.drawLine(mpen, rc.left + ml, rc.top + mt,
-				rc.left + ml, rc.bottom - mb);          // 左
-			graphics.drawLine(mpen, rc.right - mr, rc.top + mt,
-				rc.right - mr, rc.bottom - mb);         // 右
+			graphics.drawLine(mpen, cOffX + ml, cOffY + mt,
+				cOffX + fs.w - mr, cOffY + mt);            // 上
+			graphics.drawLine(mpen, cOffX + ml, cOffY + fs.h - mb,
+				cOffX + fs.w - mr, cOffY + fs.h - mb);     // 下
+			graphics.drawLine(mpen, cOffX + ml, cOffY + mt,
+				cOffX + ml, cOffY + fs.h - mb);            // 左
+			graphics.drawLine(mpen, cOffX + fs.w - mr, cOffY + mt,
+				cOffX + fs.w - mr, cOffY + fs.h - mb);     // 右
 			mpen.delete();
 		}
 		// 动态吸附对齐参考线（拖拽时生成，松手消失）
@@ -1086,20 +1219,20 @@ canvas = function(winform, opt){
 			for(i=1;#self.__guideLines;1){
 				var g = self.__guideLines[i];
 				if(g.type == "v"){
-					var gx = rc.left + math.round(..nodio.ui.px(g.pos) * zs);
-					graphics.drawLine(gpen, gx, rc.top, gx, rc.bottom);
+					var gx = cOffX + math.round(..nodio.ui.px(g.pos) * zs);
+					graphics.drawLine(gpen, gx, cOffY, gx, cOffY + fs.h);
 				}
 				elseif(g.type == "h"){
-					var gy = rc.top + math.round(..nodio.ui.px(g.pos) * zs);
-					graphics.drawLine(gpen, rc.left, gy, rc.right, gy);
+					var gy = cOffY + math.round(..nodio.ui.px(g.pos) * zs);
+					graphics.drawLine(gpen, cOffX, gy, cOffX + fs.w, gy);
 				}
 			}
 			gpen.delete();
 		}
-		// 选中「窗体本身」：画布四周一圈框（没有手柄 —— 尺寸在属性格改）
+		// 选中「窗体本身」：表面整框（含标题栏；尺寸在属性格改）
 		if(self.__formSel){
 			var fpen2 = ..gdip.pen(self.frameColor, 1);
-			graphics.drawRectangle(fpen2, 0, 0, w - 1, h - 1);
+			graphics.drawRectangle(fpen2, fs.x - 1, fs.y - 1, fs.w + 2, fs.h + fs.capH + 2);
 			fpen2.delete();
 			return;
 		}
@@ -1109,8 +1242,8 @@ canvas = function(winform, opt){
 		if(!#selItems) return;
 		for(k=1;#selItems;1){
 			var curIt = selItems[k];
-			var sx = math.round(..nodio.ui.px(curIt.x) * zs);
-			var sy = math.round(..nodio.ui.px(curIt.y) * zs);
+			var sx = cOffX + math.round(..nodio.ui.px(curIt.x) * zs);
+			var sy = cOffY + math.round(..nodio.ui.px(curIt.y) * zs);
 			var sw = math.round(..nodio.ui.px(curIt.w) * zs);
 			var sh = math.round(..nodio.ui.px(curIt.h) * zs);
 			var isPrimary = (curIt == self.selected);

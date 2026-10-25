@@ -127,12 +127,17 @@ dsg = {
 		return out;
 	}
 
-	// item 数组 → DSG 文本
-	generate = function(items, formText, formW, formH){
+	// item 数组 → DSG 文本（formBg 可选：明确知道窗体底色时写进头部，
+	// 老调用方不传就不写 —— DSG 往返保持对称）
+	generate = function(items, formText, formW, formH, formBg){
 		items = items : {};
 		var sb = '/*DSG{{*/\r\n';
 		sb = sb ++ 'winform = win.form(text="' ++ (formText : '窗体')
-			++ '";right=' ++ (formW : 759) ++ ';bottom=' ++ (formH : 469) ++ ')\r\n';
+			++ '";right=' ++ (formW : 759) ++ ';bottom=' ++ (formH : 469);
+		if(formBg !== null && formBg !== undefined){
+			sb = sb ++ ';bgcolor=' ++ string.format('0x%X', formBg);
+		}
+		sb = sb ++ ')\r\n';
 		sb = sb ++ 'winform.add(\r\n';
 		for(i=1;#items;1){
 			var it = items[i];

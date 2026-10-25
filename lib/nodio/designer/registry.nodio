@@ -176,6 +176,41 @@ registry = {
 			{name="进度条";cls="progress";props={{"value";"进度";"number";"数据"};{"left";"左边";"number";"位置"};{"top";"上边";"number";"位置"};{"width";"宽度";"number";"位置"};{"height";"高度";"number";"位置"}}};
 		};
 		for(i=1;#defs;1){
+			// 第四十八轮：通用属性统一补齐（官方属性格这些每类都有）。
+			// 已登记的键跳过（static 自带 align）；颜色用 number（0xRRGGBB
+			// 文本可录）；属性格按 cat 分组带展示，追加在尾部不影响分组。
+			var commonByCls = {
+				static   = {"color";"bgcolor";"disabled"};
+				button   = {"color";"bgcolor";"disabled"};
+				checkbox = {"color";"bgcolor";"disabled"};
+				radio    = {"color";"bgcolor";"disabled"};
+				edit     = {"color";"bgcolor";"edge";"align";"disabled";"autohscroll"};
+				richedit = {"color";"bgcolor";"edge";"align";"disabled"};
+				groupbox = {"color";"bgcolor";"disabled"};
+				listbox  = {"color";"bgcolor";"edge";"disabled"};
+				combobox = {"color";"bgcolor";"edge";"disabled"};
+				listview = {"color";"bgcolor";"edge";"disabled"};
+				treeview = {"color";"bgcolor";"edge";"disabled"};
+				tab      = {"color";"bgcolor";"disabled"};
+				progress = {"bgcolor";"disabled"};
+			};
+			var defMap = {
+				color    = {"color";"文字色";"number";"外观"};
+				bgcolor  = {"bgcolor";"底色";"number";"外观"};
+				align    = {"align";"对齐";"string";"外观"};
+				edge     = {"edge";"凹陷边框";"bool";"样式"};
+				disabled = {"disabled";"禁用";"bool";"行为"};
+				autohscroll = {"autohscroll";"自动水平滚动";"bool";"样式"};
+			};
+			var keys2 = commonByCls[defs[i].cls];
+			if(keys2){
+				var known2 = {};
+				for(j=1;#defs[i].props;1){ known2[defs[i].props[j][1]] = true }
+				for(j=1;#keys2;1){
+					var d2 = defMap[keys2[j]];
+					if(d2 && !known2[keys2[j]]) ..table.push(defs[i].props, d2);
+				}
+			}
 			registry.register(defs[i]);
 		}
 		return #defs;
