@@ -90,4 +90,103 @@ else {
     "--- publisher output ---"
     $stdout
 }
+if ($fail -gt 0) { exit $fail }
+
+# ---- 2) Nodio-native manifest: default.nproj auto-probe --------------------
+# The publisher must treat .nproj (same <file> XML shape as .aproj) as a
+# project manifest when there is no default.aproj next to the entry.
+$proj2 = Join-Path $dir 'm7\proj_nproj'
+$entry2 = Join-Path $proj2 'main.aardio'
+$out2f = Join-Path $proj2 'dist\main.exe'
+if (-not (Test-Path $entry2)) { "FIXTURE MISSING: $entry2"; exit 2 }
+New-Item -ItemType Directory -Force -Path (Join-Path $proj2 'dist') | Out-Null
+
+$psi2 = New-Object System.Diagnostics.ProcessStartInfo
+$psi2.FileName = $Exe
+$psi2.UseShellExecute = $false
+$psi2.RedirectStandardOutput = $true
+$psi2.RedirectStandardError = $true
+$psi2.StandardOutputEncoding = [Text.Encoding]::UTF8
+$psi2.StandardErrorEncoding = [Text.Encoding]::UTF8
+$psi2.EnvironmentVariables['NODIO_PUBLISH'] = $entry2
+$psi2.EnvironmentVariables['NODIO_PUBOUT'] = $out2f
+$psi2.EnvironmentVariables['NODIO_LIBDIR'] = 'D:\aardio\lib'
+$psi2.EnvironmentVariables['NODIO_PAUSE'] = '0'
+
+$p2 = [System.Diagnostics.Process]::Start($psi2)
+$pubTask2 = $p2.StandardOutput.ReadToEndAsync()
+$pubErrTask2 = $p2.StandardError.ReadToEndAsync()
+$p2.WaitForExit()
+$pubOut2 = $pubTask2.Result + $pubErrTask2.Result
+
+if (-not (Test-Path $out2f)) {
+    "FAIL publish(nproj): output exe not created"
+    "--- publisher output ---"
+    $pubOut2
+    exit 1
+}
+
+$run2i = New-Object System.Diagnostics.ProcessStartInfo
+$run2i.FileName = $out2f
+$run2i.UseShellExecute = $false
+$run2i.RedirectStandardOutput = $true
+$run2i.RedirectStandardError = $true
+$run2i.StandardOutputEncoding = [Text.Encoding]::UTF8
+$run2i.StandardErrorEncoding = [Text.Encoding]::UTF8
+$r2 = [System.Diagnostics.Process]::Start($run2i)
+$runTask2 = $r2.StandardOutput.ReadToEndAsync()
+$runErrTask2 = $r2.StandardError.ReadToEndAsync()
+$r2.WaitForExit()
+$runOut2 = $runTask2.Result + $runErrTask2.Result
+
+if ($runOut2 -match 'nproj-entry=main') { "PASS nproj-manifest-auto (entry runs)" }
+else { "FAIL nproj-manifest-auto: payload did not run"; $runOut2; $fail++ }
+if ($runOut2 -match 'nproj-res:note-from-nproj-manifest') { "PASS nproj-embed-res" }
+else { "FAIL nproj-embed-res: manifest embed=true resource missing from payload"; $runOut2; $fail++ }
+
+# ---- 3) explicit manifest via NODIO_PUBPROJ --------------------------------
+$out3f = Join-Path $proj2 'dist\custom.exe'
+$psi3 = New-Object System.Diagnostics.ProcessStartInfo
+$psi3.FileName = $Exe
+$psi3.UseShellExecute = $false
+$psi3.RedirectStandardOutput = $true
+$psi3.RedirectStandardError = $true
+$psi3.StandardOutputEncoding = [Text.Encoding]::UTF8
+$psi3.StandardErrorEncoding = [Text.Encoding]::UTF8
+$psi3.EnvironmentVariables['NODIO_PUBLISH'] = $entry2
+$psi3.EnvironmentVariables['NODIO_PUBOUT'] = $out3f
+$psi3.EnvironmentVariables['NODIO_PUBPROJ'] = Join-Path $proj2 'custom.nproj'
+$psi3.EnvironmentVariables['NODIO_LIBDIR'] = 'D:\aardio\lib'
+$psi3.EnvironmentVariables['NODIO_PAUSE'] = '0'
+
+$p3 = [System.Diagnostics.Process]::Start($psi3)
+$pubTask3 = $p3.StandardOutput.ReadToEndAsync()
+$pubErrTask3 = $p3.StandardError.ReadToEndAsync()
+$p3.WaitForExit()
+$pubOut3 = $pubTask3.Result + $pubErrTask3.Result
+
+if (-not (Test-Path $out3f)) {
+    "FAIL publish(--proj): output exe not created"
+    "--- publisher output ---"
+    $pubOut3
+    exit 1
+}
+
+$run3i = New-Object System.Diagnostics.ProcessStartInfo
+$run3i.FileName = $out3f
+$run3i.UseShellExecute = $false
+$run3i.RedirectStandardOutput = $true
+$run3i.RedirectStandardError = $true
+$run3i.StandardOutputEncoding = [Text.Encoding]::UTF8
+$run3i.StandardErrorEncoding = [Text.Encoding]::UTF8
+$r3 = [System.Diagnostics.Process]::Start($run3i)
+$runTask3 = $r3.StandardOutput.ReadToEndAsync()
+$runErrTask3 = $r3.StandardError.ReadToEndAsync()
+$r3.WaitForExit()
+$runOut3 = $runTask3.Result + $runErrTask3.Result
+
+if ($runOut3 -match 'nproj-res:note-from-nproj-manifest') { "PASS proj-explicit-manifest" }
+else { "FAIL proj-explicit-manifest: --proj manifest resource missing"; $runOut3; $fail++ }
+
+if ($fail -eq 0) { "== publish regression green (nproj + --proj) ==" }
 exit $fail

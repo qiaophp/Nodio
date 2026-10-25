@@ -737,12 +737,27 @@ namespace NodioPublish
         }
         std::wstring strProjDir = DirOf(opt.strEntry);
 
-        // 1) .aproj
+        // 1) project manifest. Precedence: explicit --proj, then
+        //    default.aproj (official layout), then default.nproj
+        //    (Nodio-native layout, same <file> XML shape).
         std::vector<ProjFile> projFiles;
         {
-            std::wstring aproj = JoinPath(strProjDir, L"default.aproj");
-            if (GetFileAttributesW(aproj.c_str()) != INVALID_FILE_ATTRIBUTES)
-                ParseAproj(ReadTextUtf8(aproj), projFiles);
+            std::wstring manifest = opt.strProj;
+            if (!manifest.empty() &&
+                GetFileAttributesW(manifest.c_str()) == INVALID_FILE_ATTRIBUTES)
+            {
+                strErr = L"找不到工程清单: " + manifest;
+                return false;
+            }
+            if (manifest.empty())
+            {
+                manifest = JoinPath(strProjDir, L"default.aproj");
+                if (GetFileAttributesW(manifest.c_str()) == INVALID_FILE_ATTRIBUTES)
+                    manifest = JoinPath(strProjDir, L"default.nproj");
+            }
+            if (!manifest.empty() &&
+                GetFileAttributesW(manifest.c_str()) != INVALID_FILE_ATTRIBUTES)
+                ParseAproj(ReadTextUtf8(manifest), projFiles);
         }
 
         // 2) syntax gate: entry + every embedded script

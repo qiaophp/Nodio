@@ -9,6 +9,9 @@ import process.popen;
 create = function(winform, exe, outCtl, setStatus){
 	var proc = null;
 	var wid = null;
+	// 结束标记：run() 是 [运行结束]；runArgs() 按任务名生成（如 [发布结束]）。
+	// 冒烟锁靠 outCtl.contains() 等这个标记判断「子进程跑完了」。
+	var endTag = "[运行结束]";
 
 	var stop = function(){
 		if(wid){ winform.clearInterval(wid); wid = null }
@@ -25,7 +28,7 @@ create = function(winform, exe, outCtl, setStatus){
 			var o2,e2 = proc.peek(0);
 			if(o2 && #o2) outCtl.append(o2);
 			if(e2 && #e2) outCtl.append(e2);
-			outCtl.append("\r\n[运行结束]\r\n");
+			outCtl.append("\r\n" ++ endTag ++ "\r\n");
 			proc.close();
 			proc = null;
 			stop();
@@ -57,12 +60,33 @@ create = function(winform, exe, outCtl, setStatus){
 				if(pi && pi.dir) workDir = pi.dir;
 				else workDir = ..io.fullpath(".");
 			}
+			endTag = "[运行结束]";
 			var cmd = """" ++ exe ++ """ """ ++ filePath ++ """";
 			proc = process.popen(cmd, , {workDir = workDir; showWindow = 1/*_SW_NORMAL*/});
 			if(!proc){ outCtl.append("[启动失败: " ++ exe ++ "]\r\n"); return };
 			outCtl.clear();
 			outCtl.append("[运行] " ++ filePath ++ "\r\n[工作目录] " ++ workDir ++ "\r\n");
 			setStatus("运行中...");
+			wid = winform.setInterval(poll,100);
+		};
+		// 完整参数行版（参数行**不含** exe 本身，路径自带引号）：
+		// 发布等「同一个 exe 的另一条命令行」复用同一套流式轮询。
+		// title 只影响输出头/结束标记/状态栏文案（如「发布中...」）。
+		runArgs = function(argLine, workDir, title){
+			if(proc){ outCtl.append("\r\n[运行中——先等待当前任务结束]\r\n"); return };
+			var t = title : "运行";
+			endTag = "[" ++ t ++ "结束]";
+			// 单引号串里可以直接写双引号字符（比 """" 转义堆叠可读）
+			var cmd = '"' ++ exe ++ '" ' ++ argLine;
+			proc = process.popen(cmd, , {workDir = workDir; showWindow = 1/*_SW_NORMAL*/});
+			if(!proc){
+				outCtl.append("[启动失败: " ++ cmd ++ "]\r\n");
+				endTag = "[运行结束]";
+				return;
+			}
+			outCtl.clear();
+			outCtl.append("[" ++ t ++ "] " ++ cmd ++ "\r\n[工作目录] " ++ workDir ++ "\r\n");
+			setStatus(t ++ "中...");
 			wid = winform.setInterval(poll,100);
 		};
 	};

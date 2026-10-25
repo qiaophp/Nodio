@@ -14,6 +14,10 @@ namespace NodioPublish
         bool bConsole = true;       // console subsystem in the output exe
         std::wstring strIcon;       // optional .ico to stamp
 
+        // Explicit project manifest (.aproj/.nproj). When empty the pipeline
+        // auto-probes <entry dir>\default.aproj, then default.nproj.
+        std::wstring strProj;
+
         // PE version resource (FileVersion/ProductVersion + strings).
         // Empty fields fall back to the entry file name / "1.0".
         std::wstring strVersion;            // "1.2.3.4"

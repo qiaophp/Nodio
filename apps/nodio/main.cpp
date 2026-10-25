@@ -382,7 +382,7 @@ int wmain(int argc, wchar_t** argv)
         EnsureConsole(false);
         if (argc < 3)
         {
-            WriteStderrUtf8(L"用法: nodio [--publish|-p|publish] <entry_script> [-o <out.exe>] [--gui] [--icon <icon.ico>]");
+            WriteStderrUtf8(L"用法: nodio [--publish|-p|publish] <entry_script> [-o <out.exe>] [--gui] [--icon <icon.ico>] [--proj <manifest.aproj|.nproj>] [--ver <v>] [--lib <dir>]");
             return 1;
         }
 
@@ -411,6 +411,10 @@ int wmain(int argc, wchar_t** argv)
             else if (wcscmp(argv[i], L"--lib") == 0 && i + 1 < argc)
             {
                 opt.strLibDir = argv[++i];
+            }
+            else if (wcscmp(argv[i], L"--proj") == 0 && i + 1 < argc)
+            {
+                opt.strProj = argv[++i];
             }
         }
 
@@ -547,6 +551,7 @@ int wmain(int argc, wchar_t** argv)
             opt.strDescription = Rd(L"NODIO_PUBDESC", b, MAX_PATH);
             opt.strCopyright   = Rd(L"NODIO_PUBCOPYRIGHT", b, MAX_PATH);
             opt.strUacLevel    = Rd(L"NODIO_PUBUAC", b, MAX_PATH);
+            opt.strProj        = Rd(L"NODIO_PUBPROJ", b, MAX_PATH);
             wchar_t szNoDpi[8];
             opt.bDpiAware = !(GetEnvironmentVariableW(L"NODIO_PUBNODPI",
                                                       szNoDpi, 8) > 0 &&

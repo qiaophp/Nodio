@@ -1,0 +1,5 @@
+// .nproj 清单发布夹具：清单里的 embed 资源必须被打进独立 exe。
+// res\note.txt 由 default.nproj（自动探测）声明 embed="true"。
+import raw;
+io.print("nproj-entry=main");
+io.print("nproj-res:", ..io.readFile("~\res\note.txt"));
