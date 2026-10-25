@@ -5405,3 +5405,64 @@ GUI 用例，因 IDE 线测量会话活跃（同晚 python mock/probe 特征）�
 本轮一起落账；§1.49/1.50/1.51 三节（并行会话）与 AI 面板等代码在本轮
 落账时仍为工作树未提交状态，按 HEAD 拉仓库会拿到「文档说有、代码没有」
 的树。
+
+## 1.53 第四十八轮：设计器保真度——「工作区中央一张真窗」
+
+### 1.53.1 缘起（用户的「完全不对」）
+
+用户反馈设计器观感「完全不对」。实机取证（ideCommand 总线驱动 IDE 进
+设计视图 + PrintWindow 截图）证实：功能清单（8 手柄/DSG 往返/属性回
+写）虽全通，但画布是「控件直接漂在整片网格上」——edit 里填着类名
+「编辑框」、groupbox 没有边框、static/checkbox 透出 IDE 深色壳成灰/黑
+条、treeview 不见、窗体本身没有表面（无标题栏/边框/底色）。
+
+### 1.53.2 根因（三层）
+
+1. **无窗体表面**：画布底板即「窗体」，没有铬件，控件坐标以画布为原点。
+2. **透明控件透底**：控件真挂在 IDE 主窗体上，static/checkbox 透明底
+   透出深色壳；tParam 不给 bgcolor。
+3. **属性丢失**：applyProps 只写注册表登记过的键，DSG 的
+   edge/bgcolor/color 在往返时全丢；空 text 又被填成类显示名。
+
+### 1.53.3 改造（canvas/registry/dsg 三文件）
+
+1. **窗体表面**：工作区（B4B4B4）中央按窗体真实尺寸铺一张「真窗」——
+   标题栏（文字 + 示意关闭钮）+ 边框 + 客户底色（DSG bgcolor）；网格
+   只画在客户区；边距线/吸附线/选中框/8 手柄全部切到表面坐标系；
+   「选中窗体」框在整面上。缩放/改窗体尺寸联动（__fs()）。
+2. **控件保真**：透明系（static/groupbox/checkbox/radio）创建时给
+   bgcolor=窗体底色（DSG 显式 bgcolor 优先，applyFormProps 改底色联动）；
+   空文本只对标签类默认类名，内容类（edit/richedit/combobox…）保持空；
+   DSG 原生属性**创建时**传进 form.add（edge/bgcolor/color 有原生语义），
+   注册表未登记的属性并入属性表原样往返（不再丢）。
+3. **属性集扩充**：每类补 文字色/底色/对齐/凹陷边框/禁用（edit 另加
+   自动水平滚动），属性格按分组带展示。
+4. **DSG 头**：generate/fromDSG 支持 `;bgcolor=`（可选，老调用对称）。
+
+### 1.53.4 途中踩掉的四个坑（截图驱动逐个实锤）
+
+1. `nodio.ui.board.boardFont` 拼写——board.nodio 的 namespace 是
+   `nodio.ui`，正解 `nodio.ui.boardFont`；写错即 chrome 画一半静默中断。
+2. 标题字体用 Segoe UI 没有中文字形 → 标题空白；换 Microsoft YaHei UI。
+3. `graphics.drawString` 的 format 参数传 null 静默不渲染，必须给
+   `boardFormat()`。
+4. DSG 的 `bgcolor=0xF0F0F0` 没有 alpha 位，GDI+ 当全透明 → 客户区透出
+   工作区；画 GDI+ 前强制 `0xFF000000 |`。
+另：三档灰（工作区/客户区/标题栏）必须拉开可见台阶，C9C9C9 vs F0F0F0
+实测糊成一片（截图核过）。
+
+### 1.53.5 验证
+
+组件级截图验收（独立画布探针，IDE 总线路径被并行会话在飞的
+shell.nodio 编译失败暂时堵死）：工作区中央真窗 + 中文标题 + 网格 +
+真实控件全部就位；edit 选中框/手柄正常。回归锁 **t99**（DSG 往返保真：
+bgcolor 进头、未登记 edge 不丢、edit 空文本不填类名、中文文本往返），
+VM 套件 97/0/0（x64+x86）。全量回归 11/18——7 个失败全部为 IDE 族，
+归因并行会话在飞的 shell.nodio「字符串未终止」编译失败（第 45 轮末
+同套件 18/18 全绿可证非本轮引入）；其恢复后需复跑 IDE 族确认。
+
+### 1.53.6 会话协调
+
+本轮只动 lib/nodio/designer/（canvas/registry/dsg）三个文件，均在并行
+会话在飞清单之外；ide_smoke 等失败与其 shell.nodio/editor.nodio 中间态
+相关，未触碰。

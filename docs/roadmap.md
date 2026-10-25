@@ -1752,3 +1752,13 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 >    （门面插行实测假红）；修 .gitignore 误盖四个编辑器回归锁探针
 >    （前三个官方用例从未入库）。⑤ sysapi 剪贴板 API 注册（§1.50/1.51
 >    挂账 WIP）随本轮落账。
+
+> **第四十八轮（设计器保真度——「工作区中央一张真窗」）**。
+> ① 实机取证用户「完全不对」：画布无窗体表面、透明控件透深色壳、
+>    DSG 属性往返丢失、edit 填类名。② canvas/registry/dsg 三文件改造：
+>    窗体表面（标题栏+边框+底色+客户区网格，坐标系全面切换）；透明系
+>    控件给 bgcolor；DSG 原生属性创建时下发+未登记属性并入往返；
+>    属性集每类补五件套；DSG 头 bgcolor。③ 四坑实锤：boardFont 命名
+>    空间、中文字体、drawString format 空静默、bgcolor 无 alpha。
+> ④ t99 锁 + VM 97/0/0 双架构；全量 11/18（7 失败归因并行会话在飞的
+>    shell.nodio 编译失败，恢复后复跑）。
