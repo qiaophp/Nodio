@@ -38,6 +38,9 @@ import nodio.ui.titlebar;
 import nodio.ui.editor;
 import nodio.ui.filedlg;
 import nodio.ui.prompt;
+import nodio.ui.richedit;
+import app.settings;   // 主题 / 编辑器字号 / 外部工具（持久化在 %APPDATA%\Nodio\ide.cfg）
+import app.ai;        // 右栏「AI」页：AI 聊天面板（app.ai.panel）
 import nodio.gui.designerExt;   // nodio.gui 控件 → 设计器工具箱组件（不是展厅）
 import gdip;
 
@@ -137,6 +140,7 @@ var titlebar = nodio.ui.titlebar(winform, {
 // EM_SETBKGNDCOLOR(0x443) 用引擎 sysapi 表里的 ::SendMessage ——
 // 它有**显式签名**（"int64(addr hwnd,int msg,addr wparam,addr lparam)"），
 // 安全；不要用 ::User32.SendMessageW（动态绑定，签名靠猜会传错）。
+// 控件本身的染色在 nodio.ui.richedit.darken（AI 面板等新面板也用同一份）。
 var darkenRichEdit = function(ctrl){
 	if(!ctrl) return;
 	try{
@@ -149,17 +153,7 @@ var darkenRichEdit = function(ctrl){
 			setTheme(ctrl.hwnd, "DarkMode_Explorer", null);
 		}
 	}catch(eUx){}
-	try{
-		ctrl.setCharformat({
-			textColor = ..nodio.ui.themeRef(theme.text);
-			backColor = ..nodio.ui.themeRef(theme.bg);
-		}, 1);
-	}catch(e){};
-	try{ ctrl.bgcolor = ..nodio.ui.themeRef(theme.bg) }catch(e){};
-	try{
-		::SendMessage(ctrl.hwnd, 0x443/*_EM_SETBKGNDCOLOR*/, 0,
-			..nodio.ui.themeRef(theme.bg));
-	}catch(e){};
+	..nodio.ui.richedit.darken(ctrl, theme);
 }
 darkenRichEdit(winform.ed);
 
@@ -170,7 +164,9 @@ darkenRichEdit(winform.ed);
 // shell 只负责摆放它、把它的回调接到状态栏/页签上。
 var editor = nodio.ui.editor(winform, {
 	ctrl = winform.ed;
-	fontSize = 11;
+	// 字号取设置（app.settings）：用户改过就按用户要的来，
+	// 没改过就是官方默认 11pt Consolas。
+	fontSize = app.settings.fontSizeGet();
 	fontName = "Consolas";
 });
 
@@ -181,7 +177,9 @@ editor2 = null;
 getEditor2 = function(){
 	if(!editor2){
 		editor2 = nodio.ui.editor(winform, {
-			fontSize = 11;
+			// 字号跟着设置走 —— 硬编码 11 会让「分栏对比」的右半边
+			// 跟左半边（以及设置里的字号）对不上。
+			fontSize = app.settings.fontSizeGet();
 			fontName = "Consolas";
 		});
 		editor2.show(false);
@@ -249,6 +247,16 @@ gotoLinePrompt = function(){
 	});
 }
 editor.onGotoLine = function(){ gotoLinePrompt() };
+
+// Ctrl+1..9 → 外部工具（官方 IDE 的约定：第 N 个外部工具）。
+// 编辑器组件只声明 onHotkey(vk) 钩子，不认识「外部工具」是什么。
+editor.onHotkey = function(vk){
+	if(!hooks.onRunExternalTool) return 0;
+	var idx = tonumber(vk) - 0x30;    // '1'..'9' → 1..9
+	if(!idx || idx < 1 || idx > 9) return 0;
+	if(hooks.onRunExternalTool(idx) == 1) return 1;
+	return 0;
+};
 
 // 项目符号搜索（Ctrl+Shift+T）：问一个名字，结果进「引用」面板
 showSymbolPrompt = function(){
@@ -390,7 +398,16 @@ var exTree = nodio.ui.tree(winform, {left=0;top=0;right=300;bottom=600});
 rightDock.addTab("范例", exTree);
 var toolTree = nodio.ui.tree(winform, {left=0;top=0;right=300;bottom=600});
 rightDock.addTab("工具", toolTree);
-rightDock.addTab("AI", "richedit", {multiline=true;vscroll=true});
+// 「AI」页 = AI 聊天面板（app.ai.panel）：
+//   顶栏（模型 / 状态 + 发送 / 清空 / 设置）+ 对话日志 + 输入框，
+//   设置页里填接口地址 / 模型 / API Key（Key 存 Windows 凭据管理器）。
+//   面板自己管显隐（dock 只认一个 ctrl → 面板给的是「可见性代理」），
+//   跟 nodio.ui.searchPanel 同一个套路。
+var aiPanel = app.ai.panel(winform, {
+	rect = {left=1040; top=S(TOP0); right=1280; bottom=400};
+});
+aiPanel.onStatus = function(s){ setStatus(s) };
+rightDock.addTab("AI", aiPanel, {});
 // 原生 treeview / listview 的深色暂时做不了：comctl32 的配色消息在本机会崩
 // （见 nodio.ui.theme 的注释）。这两类面板已经改成自绘（nodio.ui.list / tree）。
 // 「控件」页留给设计器的工具箱（main.nodio 接入）
@@ -415,7 +432,7 @@ var refLv = bottomDock.addTab("引用", refList, {icon="search"});
 darkenRichEdit(outEd);
 darkenRichEdit(dbgEd);
 darkenRichEdit(termEd);
-darkenRichEdit(rightDock.content(5));   // AI 页（右栏已无「组件」页）
+// 「AI」页不是原生 richedit 了（是 app.ai 面板），染色由面板自己做
 // 问题列表已改成自绘（nodio.ui.list），不再受原生 listview 的配色限制
 
 // ---------- toolbar ----------
@@ -1057,35 +1074,67 @@ install = function(){
 
 	// 菜单：自绘标题栏的一行（不再是原生系统菜单栏）。
 	// 表结构：{ {"标题"; { {"菜单项"; 函数}; {"-"; null} }} }
-	titlebar.setMenus({
-		{ "文件";{
+	// 主题当前值在**建菜单时**读一次：主题是构造期配色，改主题要重启 IDE
+	// （见 app/settings.nodio 的说明），所以菜单上的「（当前）」不会中途变。
+	var __curTheme = app.settings.themeGet();
+	var __themeDark = (__curTheme == "dark") ? "深色（当前）" : "深色";
+	var __themeLight = (__curTheme == "light") ? "浅色（当前）" : "浅色";
+	// 「文件」菜单条目**每次重建**：最近文件列表会变（打开任何文档就置顶入队，
+	// 见 app/settings.nodio 的 recentGet/recentPush）。自绘菜单
+	// （nodio.ui.titlebar）打开下拉时**现读** items 表，重建后 setMenus
+	// 一次即生效 —— 不需要二级子菜单机制，也不需要菜单句柄级 API。
+	//
+	// ⚠ mkOpen 闭包工厂：循环里直接写 function(){...p...} 的话，所有条目
+	//   可能共享同一个循环变量（点哪条都打开最后一条）。mkOpen 把路径绑进
+	//   **参数**，每次调用是独立的新局部变量，与循环变量无关，无条件安全。
+	var mkOpen = function(p){
+		return function(id){ if(hooks.onOpenFile) hooks.onOpenFile(p) };
+	}
+	var buildFileMenuItems = function(){
+		var items = {
 			{ "新建  Ctrl+N"; function(id){ if(hooks.onNewFile) hooks.onNewFile() } };
 			{ "打开文件...  Ctrl+O"; function(id){ if(hooks.onOpenFile) hooks.onOpenFile("") } };
 			{ "快速打开文件...  Ctrl+P"; function(id){ quickOpenFilePrompt() } };
 			{ "打开工程..."; function(id){ if(hooks.onOpenProject) hooks.onOpenProject() } };
-			{ "-"; null };
-			{ "保存  Ctrl+S"; function(id){ if(hooks.onSave) hooks.onSave() } };
-			{ "另存为..."; function(id){ if(hooks.onSaveAs) hooks.onSaveAs() } };
-			{ "全部保存"; function(id){ if(hooks.onSaveAll) hooks.onSaveAll() } };
-			{ "-"; null };
-			{ "关闭标签页  Ctrl+W"; function(id){ if(hooks.onCloseTab) hooks.onCloseTab(curTab) } };
-			{ "关闭其他标签页"; function(id){ if(hooks.onCloseOtherTabs) hooks.onCloseOtherTabs(curTab); else closeOtherTabs(curTab); } };
-			{ "关闭全部标签页"; function(id){ if(hooks.onCloseAllTabs) hooks.onCloseAllTabs(); else closeAllTabs(); } };
-			{ "-"; null };
-			{ "下一个文档  Ctrl+Tab"; function(id){ tabNext(1) } };
-			{ "上一个文档  Ctrl+Shift+Tab"; function(id){ tabNext(-1) } };
-			{ "-"; null };
-			{ "退出"; function(id){ winform.close() } };
-		} };
+		};
+		var rf = app.settings.recentGet();
+		if(#rf){
+			..table.push(items, { "-"; null });
+			for(i=1;#rf;1){
+				..table.push(items, { (tostring(i) ++ ".  " ++ rf[i]); mkOpen(rf[i]) });
+			}
+			..table.push(items, { "-"; null });
+		}
+		..table.push(items, { "保存  Ctrl+S"; function(id){ if(hooks.onSave) hooks.onSave() } });
+		..table.push(items, { "另存为..."; function(id){ if(hooks.onSaveAs) hooks.onSaveAs() } });
+		..table.push(items, { "全部保存"; function(id){ if(hooks.onSaveAll) hooks.onSaveAll() } });
+		..table.push(items, { "-"; null });
+		..table.push(items, { "关闭标签页  Ctrl+W"; function(id){ if(hooks.onCloseTab) hooks.onCloseTab(curTab) } });
+		..table.push(items, { "关闭其他标签页"; function(id){ if(hooks.onCloseOtherTabs) hooks.onCloseOtherTabs(curTab); else closeOtherTabs(curTab); } });
+		..table.push(items, { "关闭全部标签页"; function(id){ if(hooks.onCloseAllTabs) hooks.onCloseAllTabs(); else closeAllTabs(); } });
+		..table.push(items, { "-"; null });
+		..table.push(items, { "下一个文档  Ctrl+Tab"; function(id){ tabNext(1) } });
+		..table.push(items, { "上一个文档  Ctrl+Shift+Tab"; function(id){ tabNext(-1) } });
+		..table.push(items, { "-"; null });
+		..table.push(items, { "退出"; function(id){ winform.close() } });
+		return items;
+	}
+	// 菜单表持有为局部变量：refreshRecentMenu 重建「文件」条目后用
+	// setMenus 原表重挂（titlebar 打开下拉时现读，重建即生效）。
+	var menusDef = {
+		{ "文件"; buildFileMenuItems() };
 		{ "工程";{
 			{ "打开工程..."; function(id){ if(hooks.onOpenProject) hooks.onOpenProject() } };
 			{ "新建文件..."; function(id){ if(hooks.onProjNewFile) hooks.onProjNewFile(null) } };
 			{ "新建目录..."; function(id){ if(hooks.onProjNewDir) hooks.onProjNewDir(null) } };
-			{ "工程属性"; function(id){ setStatus("工程属性") } };
+			{ "工程属性"; function(id){ if(hooks.onProjProperties) hooks.onProjProperties() } };
 			{ "-"; null };
 			{ "在资源管理器中定位"; function(id){ if(hooks.onRevealInExplorer) hooks.onRevealInExplorer() } };
 			{ "在终端中打开"; function(id){ if(hooks.onOpenTerminal) hooks.onOpenTerminal() } };
 			{ "工程代码行统计"; function(id){ if(hooks.onProjectStats) hooks.onProjectStats() } };
+			{ "-"; null };
+			{ "发布为独立 exe（控制台）..."; function(id){ if(hooks.onPublishConsole) hooks.onPublishConsole() } };
+			{ "发布为独立 exe（界面程序）..."; function(id){ if(hooks.onPublishGui) hooks.onPublishGui() } };
 			{ "-"; null };
 			{ "打开设计器"; function(id){ if(hooks.onDesigner) hooks.onDesigner() } };
 		} };
@@ -1094,6 +1143,12 @@ install = function(){
 			{ "复制  Ctrl+C"; function(id){ app.editor.copy(editor) } };
 			{ "粘贴  Ctrl+V"; function(id){ app.editor.paste(editor) } };
 			{ "全选  Ctrl+A"; function(id){ app.editor.selectAll(editor) } };
+			{ "以 RTF 格式复制"; function(id){
+				if(app.editor.copyRtf(editor)) setStatus("已复制 RTF（整篇带色，可贴入 Word）");
+			} };
+			{ "以 HTML 格式复制"; function(id){
+				if(app.editor.copyHtml(editor)) setStatus("已复制 HTML（整篇带色，可贴入邮件/网页）");
+			} };
 			{ "-"; null };
 			{ "复制文件完整路径"; function(id){
 				var cur = tabCurPath();
@@ -1242,12 +1297,40 @@ install = function(){
 			{ "打开 .dsg 文件"; function(id){ if(hooks.onDesignerOpen) hooks.onDesignerOpen() } };
 		} };
 		{ "设置";{
-			{ "编辑器设置"; function(id){ setStatus("编辑器设置") } };
+			{ "主题（重启后生效）";{
+				{ __themeDark; function(id){ if(hooks.onSetTheme) hooks.onSetTheme("dark") } };
+				{ __themeLight; function(id){ if(hooks.onSetTheme) hooks.onSetTheme("light") } };
+			} };
+			{ "编辑器字体大小...  (6-24 pt)"; function(id){ if(hooks.onEditorFontSize) hooks.onEditorFontSize() } };
+			{ "-"; null };
+			{ "添加外部工具..."; function(id){ if(hooks.onAddExternalTool) hooks.onAddExternalTool() } };
+			{ "删除外部工具..."; function(id){ if(hooks.onDelExternalTool) hooks.onDelExternalTool() } };
+			{ "-"; null };
+			{ "打开配置文件..."; function(id){ if(hooks.onOpenConfigFile) hooks.onOpenConfigFile() } };
 		} };
 		{ "帮助";{
 			{ "关于"; function(id){ ..win.msgbox("Nodio IDE\n自托管 aardio 风格 IDE","Nodio") } };
 		} };
-	});
+	};
+	titlebar.setMenus(menusDef);
+
+	// 最近文件变化后重建「文件」菜单（openFile 成功后由 main.nodio 调）
+	refreshRecentMenu = function(){
+		if(!menusDef || !#menusDef) return;
+		menusDef[1] = { "文件"; buildFileMenuItems() };
+		titlebar.setMenus(menusDef);
+	}
+	// 供回归：当前「文件」菜单里的条目文本（含最近文件动态段）
+	fileMenuLabels = function(){
+		var out = {};
+		if(!menusDef || !menusDef[1] || !menusDef[1][2]) return out;
+		for(i=1;#menusDef[1][2];1){
+			..table.push(out, tostring(menusDef[1][2][i][1] : ""));
+		}
+		return out;
+	}
+	// 启动时把 cfg 里已有的最近文件落进「文件」菜单
+	refreshRecentMenu();
 
 	// 钩子自检（诊断模式）：钩子必须**真的**被 main.nodio 灌上了。
 	//

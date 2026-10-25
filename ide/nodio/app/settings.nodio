@@ -1,0 +1,307 @@
+// app/settings.nodio — IDE 设置：主题 / 编辑器字号 / 外部工具。
+//
+// 持久化在 %APPDATA%\Nodio\ide.cfg（key=value，一行一个键）。
+// 与官方命令面的 getConfig/setConfig **共用同一个文件** ——
+// 外部工具/插件用 ide.command.getConfig("theme") 就能读到 IDE 的设置。
+//
+// 为什么分两档：
+//   · **编辑器字号** —— 即时生效（editor.setFontSize 走完整链条：
+//     重设 richedit 字体 → 重新量行高 → 行号栏字体跟着行高走 → 重新布局）。
+//   · **主题** —— 「重启后生效」。因为 nodio.ui.list / tree / tabstrip /
+//     toolbar / statusbar / titlebar 都是**构造期**调一次 theme() 把配色
+//     存进自己的字段（见 nodio/ui/theme.nodio 的说明），运行期再切主题
+//     要重建整排 chrome。官方 aardio 同样是换主题后重开编辑器才生效。
+//     这里存偏好、启动时应用，菜单里也明说，不假装能热切。
+import nodio.ui.theme;
+import process.popen;
+
+// ---------- 配置存取（%APPDATA%\Nodio\ide.cfg）----------
+// NODIO_IDE_CFG 可覆盖路径（无头回归测试用，避免动用户的真实配置）；
+// 不设就是 %APPDATA%\Nodio\ide.cfg。
+var CFG_PATH = function(){
+	var p = ..string.getenv("NODIO_IDE_CFG");
+	if(p) return p;
+	return ..string.getenv("APPDATA") ++ "\Nodio\ide.cfg";
+}
+
+cfgRead = function(key){
+	if(!key) return null;
+	var text = ..string.load(CFG_PATH());
+	if(!text) return null;
+	for(line in ..string.lines(text)){
+		var s = ..string.trim(line);
+		if(!s) continue;
+		var p = ..string.indexOf(s, "=");
+		if(!p) continue;
+		var k = ..string.trim(..string.left(s, p - 1));
+		var v = ..string.trim(..string.slice(s, p + 1));
+		if(k == key) return v;
+	}
+	return null;
+}
+
+cfgWrite = function(key, val){
+	if(!key) return false;
+	var path = CFG_PATH();
+	var dir = ..io.splitpath(path).dir;
+	if(dir && !..io.exist(dir)) ..io.createDir(dir);
+	// val === null → **删除**这个键（不写回）。
+	// 写空串不算删除：空串在 aardio 里是真值，读回来还会挡住
+	// 「这个槽位有没有配过」的判断。
+	var bDel = (val === null);
+	var text = "";
+	var old = ..string.load(path);
+	if(old){
+		for(line in ..string.lines(old)){
+			var s = ..string.trim(line);
+			if(!s) continue;
+			var p = ..string.indexOf(s, "=");
+			if(p){
+				var k = ..string.trim(..string.left(s, p - 1));
+				if(k == key) continue;
+			}
+			text = text ++ s ++ '\r\n';
+		}
+	}
+	if(!bDel){
+		text = text ++ key ++ "=" ++ (val : "") ++ '\r\n';
+	}
+	..string.save(path, text);
+	return true;
+}
+
+// ---------- 主题 ----------
+// 合法值只有 "dark" / "light"，其余一律当 dark（配置被手改过也不炸）。
+themeGet = function(){
+	var t = cfgRead("theme");
+	if(t == "light") return "light";
+	return "dark";
+}
+
+// 只存偏好 —— 真正的应用在 IDE 启动时（main.nodio：app.settings.themeApply()
+// 必须在 import app.shell **之前**调，因为各 chrome 组件是构造期读配色）
+themeSet = function(name){
+	if(name != "light" && name != "dark") return false;
+	return cfgWrite("theme", name);
+}
+
+// 启动时调用：把偏好落到主题系统
+themeApply = function(){
+	var t = themeGet();
+	try{ nodio.ui.themeSet(t) }catch(e){}
+	return t;
+}
+
+// ---------- 编辑器字号 ----------
+// 合法区间 6..48 pt；越界回落到 11（官方 IDE 默认 11pt Consolas）
+fontSizeGet = function(){
+	var v = tonumber(cfgRead("editor.fontSize"));
+	if(!v || v < 6 || v > 48) return 11;
+	return v;
+}
+
+fontSizeSet = function(pt){
+	pt = tonumber(pt);
+	if(!pt || pt < 6 || pt > 48) return false;
+	return cfgWrite("editor.fontSize", tostring(pt : ""));
+}
+
+// ---------- AI（接口地址 / 模型）----------
+//
+// ⚠ **API Key 不存这里**：ide.cfg 是明文文件（会被同步盘 / 备份带走），
+//   Key 走 Windows 凭据管理器（nodio.ai.cred）。
+//   这里只放「不敏感」的两项：接口地址与模型名。
+var AI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
+var AI_DEFAULT_MODEL = "gpt-4o-mini";
+
+aiBaseUrlGet = function(){
+	var v = cfgRead("ai.baseUrl");
+	if(!v || !#v) return AI_DEFAULT_BASE_URL;
+	return v;
+}
+
+aiBaseUrlSet = function(url){
+	url = ..string.trim((url : ""));
+	if(!url || !#url) return false;
+	// 只认 http / https（别的协议没有意义，也容易配错）
+	if(..string.indexOf(url, "http://") != 1 && ..string.indexOf(url, "https://") != 1){
+		return false;
+	}
+	return cfgWrite("ai.baseUrl", url);
+}
+
+aiModelGet = function(){
+	var v = cfgRead("ai.model");
+	if(!v || !#v) return AI_DEFAULT_MODEL;
+	return v;
+}
+
+aiModelSet = function(model){
+	model = ..string.trim((model : ""));
+	if(!model || !#model) return false;
+	return cfgWrite("ai.model", model);
+}
+
+// ---------- 外部工具 ----------
+// 官方 IDE 的「外部工具」：名称 / 命令 / 参数，Ctrl+1..9 触发。
+// 存成 exttool.<N>.name / .cmd / .args，N = 1..9（官方也是 9 个上限）。
+var TOOL_MAX = 9;
+
+toolGet = function(idx){
+	idx = tonumber(idx);
+	if(!idx || idx < 1 || idx > TOOL_MAX) return null;
+	var pre = "exttool." ++ (idx : "") ++ ".";
+	var name = cfgRead(pre ++ "name");
+	// 空名 = 这个槽位没配过（aardio 里空串是真值，不能只判 !name）
+	if(!name || !#name) return null;
+	return {
+		idx = idx;
+		name = name;
+		cmd = cfgRead(pre ++ "cmd") : "";
+		args = cfgRead(pre ++ "args") : "";
+	};
+}
+
+// 已配置的工具列表（按序号升序）
+toolsGet = function(){
+	var out = {};
+	for(i=1;i<=TOOL_MAX;1){
+		var t = toolGet(i);
+		if(t) ..table.push(out, t);
+	}
+	return out;
+}
+
+// 写一个工具（idx 必须是 1..9）
+toolSave = function(idx, name, cmd, args){
+	idx = tonumber(idx);
+	if(!idx || idx < 1 || idx > TOOL_MAX) return false;
+	// 名称/命令都不能是空串（空串在 aardio 里是真值）
+	if(!name || !#name) return false;
+	if(!cmd || !#cmd) return false;
+	var pre = "exttool." ++ (idx : "") ++ ".";
+	if(!cfgWrite(pre ++ "name", name)) return false;
+	cfgWrite(pre ++ "cmd", cmd);
+	cfgWrite(pre ++ "args", args : "");
+	return true;
+}
+
+// 删一个工具（把 3 个键**真删掉**，不是写空值）
+toolRemove = function(idx){
+	idx = tonumber(idx);
+	if(!idx || idx < 1 || idx > TOOL_MAX) return false;
+	var pre = "exttool." ++ (idx : "") ++ ".";
+	cfgWrite(pre ++ "name", null);
+	cfgWrite(pre ++ "cmd", null);
+	cfgWrite(pre ++ "args", null);
+	return true;
+}
+
+// 找一个空位（给「添加外部工具」用）：优先用已删掉的槽，否则往后找
+toolFreeSlot = function(){
+	for(i=1;i<=TOOL_MAX;1){
+		if(!toolGet(i)) return i;
+	}
+	return null;
+}
+
+// ---------- 外部工具执行 ----------
+// %f = 当前文档路径（官方 IDE 的外部工具约定），%p = 当前工程目录。
+// 输出流进「输出」面板，状态栏显示运行状态 —— 与 app/runner.nodio 同一套。
+toolRun = function(idx, winform, outCtl, setStatus, curFile, workDir){
+	var t = toolGet(idx);
+	if(!t) return false;
+	var args = t.args : "";
+	if(curFile){
+		args = ..string.replace(args, "%f", curFile);
+	}
+	if(workDir){
+		args = ..string.replace(args, "%p", workDir);
+	}
+	var cmd = t.cmd;
+	if(args) cmd = cmd ++ " " ++ args;
+	if(!workDir) workDir = ..io.fullpath(".");
+
+	outCtl.append("[工具" ++ (t.idx : "") ++ "] " ++ cmd ++ "\r\n");
+	var proc = null;
+	try{
+		proc = process.popen(cmd, , {workDir = workDir; showWindow = 1/*_SW_NORMAL*/});
+	}catch(e){
+		outCtl.append("[启动失败: " ++ tostring(e) ++ "]\r\n");
+		return false;
+	}
+	if(!proc){
+		outCtl.append("[启动失败]\r\n");
+		return false;
+	}
+	setStatus("外部工具 " ++ t.name ++ " 运行中...");
+	var wid = winform.setInterval(function(){
+		var p = proc;
+		if(!p) return null;
+		var o,e = p.peek(0);
+		if(o !== null && o !== false && #o) outCtl.append(o);
+		if(e !== null && e !== false && #e) outCtl.append(e);
+		if(p.process && p.process.waitOne(0)){
+			var o2,e2 = proc.peek(0);
+			if(o2 && #o2) outCtl.append(o2);
+			if(e2 && #e2) outCtl.append(e2);
+			outCtl.append("\r\n[运行结束]\r\n");
+			proc.close();
+			proc = null;
+			winform.clearInterval(wid);
+			setStatus("就绪");
+		}
+		// 必须显式返回 null：官方 WM_TIMER 会把「返回值既不是 null 也不是 true」
+		// 的定时器移除（win/ui/_.aardio:342）—— 与 app/runner.nodio 同理。
+		return null;
+	},100);
+	return true;
+}
+
+// ---------- 最近文件 ----------
+// 「文件」菜单的最近文件列表（官方 IDE 的「最近使用的文档」，缺口清单 §5.2）。
+// cfg 一行：recent.files=路径1|路径2|... —— Windows 文件名不允许出现 |，
+// 拿它当分隔符安全；cfgRead 是单行 key=value，路径里也不可能有换行。
+var RECENT_MAX = 10;
+
+// 读最近文件（最常用在前；去空、去重、截 RECENT_MAX）
+recentGet = function(){
+	var v = cfgRead("recent.files");
+	var out = {};
+	if(!v || !#v) return out;
+	// ⚠ split 结果用计数循环 + 下标访问（仓库惯例，见 main.nodio navShortPath）——
+	//   单变量 for in 对数组拿到的不是元素值
+	var segs = ..string.split(v, "|");
+	for(i=1;#segs;1){
+		var p = ..string.trim(segs[i]);
+		if(!p || !#p) continue;
+		var dup = false;
+		for(j=1;#out;1){
+			if(out[j] == p){ dup = true; break }
+		}
+		if(dup) continue;
+		..table.push(out, p);
+		if(#out >= RECENT_MAX) break;
+	}
+	return out;
+}
+
+// 置顶入队：已存在 → 挪到最前；超 RECENT_MAX → 裁掉最旧的。
+// （同一路径反复打开不会把列表撑满。）
+recentPush = function(path){
+	path = ..string.trim((path : ""));
+	if(!path || !#path) return false;
+	var list = recentGet();
+	var out = { path };
+	for(i=1;#list;1){
+		if(list[i] == path) continue;
+		if(#out >= RECENT_MAX) break;
+		..table.push(out, list[i]);
+	}
+	var s = "";
+	for(i=1;#out;1){
+		if(i > 1) s = s ++ "|";
+		s = s ++ out[i];
+	}
+	return cfgWrite("recent.files", s);
+}

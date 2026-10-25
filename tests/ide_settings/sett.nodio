@@ -1,0 +1,85 @@
+// tests/ide_settings/sett.nodio — IDE 设置模块的无头回归锁。
+//
+// 覆盖 app.settings（ide/nodio/app/settings.nodio）的四件事：
+//   1) 配置读写往返（key=value，一行一个键）
+//   2) 主题：合法值只有 dark / light，其它一律当 dark
+//   3) 编辑器字号：越界回落 11
+//   4) 外部工具：存 / 取 / 删 / 找空槽（Ctrl+1..9 的槽位）
+//
+// ⚠ 配置路径由 NODIO_IDE_CFG 指定（临时文件），不碰用户的真实 ide.cfg。
+global.import("D:/Nodio/ide/nodio/app/settings.nodio");
+
+var fail = 0;
+function chk(name, got, want){
+	if(got === want){ io.print("PASS ", name); return; }
+	fail++;
+	io.print("FAIL ", name, " got=", tostring(got), " want=", tostring(want));
+}
+
+// ---------- 1) 配置往返 ----------
+chk("cfg/read-missing", settings.cfgRead("no.such.key"), null);
+chk("cfg/write", settings.cfgWrite("probe.key", "v1"), true);
+chk("cfg/read", settings.cfgRead("probe.key"), "v1");
+settings.cfgWrite("probe.key", "v2");
+chk("cfg/overwrite", settings.cfgRead("probe.key"), "v2");
+chk("cfg/other-key-intact", settings.cfgRead("probe.key2"), null);
+settings.cfgWrite("probe.key2", "keep");
+settings.cfgWrite("probe.key", "v3");
+chk("cfg/no-dup", settings.cfgRead("probe.key2"), "keep");
+
+// ---------- 2) 主题 ----------
+chk("theme/default", settings.themeGet(), "dark");
+chk("theme/set-light", settings.themeSet("light"), true);
+chk("theme/light", settings.themeGet(), "light");
+chk("theme/set-bogus", settings.themeSet("rainbow"), false);
+chk("theme/bogus-ignored", settings.themeGet(), "light");
+chk("theme/set-dark", settings.themeSet("dark"), true);
+chk("theme/dark", settings.themeGet(), "dark");
+
+// ---------- 3) 编辑器字号 ----------
+chk("font/default", settings.fontSizeGet(), 11);
+chk("font/set", settings.fontSizeSet(14), true);
+chk("font/get", settings.fontSizeGet(), 14);
+chk("font/too-small", settings.fontSizeSet(2), false);
+chk("font/too-big", settings.fontSizeSet(99), false);
+chk("font/unchanged", settings.fontSizeGet(), 14);
+chk("font/restore", settings.fontSizeSet(11), true);
+
+// ---------- 4) 外部工具 ----------
+chk("tool/none", #settings.toolsGet(), 0);
+chk("tool/slot-1", settings.toolFreeSlot(), 1);
+chk("tool/save", settings.toolSave(1, "Echo", "cmd.exe", "/c echo %f"), true);
+chk("tool/count", #settings.toolsGet(), 1);
+var t1 = settings.toolGet(1);
+chk("tool/name", t1 ? t1.name : null, "Echo");
+chk("tool/cmd", t1 ? t1.cmd : null, "cmd.exe");
+chk("tool/args", t1 ? t1.args : null, "/c echo %f");
+chk("tool/slot-next", settings.toolFreeSlot(), 2);
+settings.toolSave(2, "Two", "cmd.exe", "/c echo two");
+chk("tool/count2", #settings.toolsGet(), 2);
+chk("tool/save-bad-slot", settings.toolSave(99, "X", "y", ""), false);
+chk("tool/save-no-name", settings.toolSave(3, "", "y", ""), false);
+chk("tool/remove", settings.toolRemove(1), true);
+chk("tool/count-after-remove", #settings.toolsGet(), 1);
+chk("tool/gone", settings.toolGet(1), null);
+chk("tool/slot-reuse", settings.toolFreeSlot(), 1);
+settings.toolRemove(2);
+chk("tool/empty", #settings.toolsGet(), 0);
+
+// ---------- 5) AI 配置（接口地址 / 模型）----------
+// ⚠ API Key **不在这里**（明文配置文件）：它走 Windows 凭据管理器，
+//   见 tests/ide_ai/ai.nodio。
+chk("ai/base-default", settings.aiBaseUrlGet(), "https://api.openai.com/v1");
+chk("ai/model-default", settings.aiModelGet(), "gpt-4o-mini");
+chk("ai/base-set", settings.aiBaseUrlSet("http://127.0.0.1:11434/v1"), true);
+chk("ai/base-get", settings.aiBaseUrlGet(), "http://127.0.0.1:11434/v1");
+chk("ai/base-bad-scheme", settings.aiBaseUrlSet("ftp://x/y"), false);
+chk("ai/base-empty", settings.aiBaseUrlSet(""), false);
+chk("ai/base-unchanged", settings.aiBaseUrlGet(), "http://127.0.0.1:11434/v1");
+chk("ai/model-set", settings.aiModelSet("qwen2.5:7b"), true);
+chk("ai/model-get", settings.aiModelGet(), "qwen2.5:7b");
+chk("ai/model-empty", settings.aiModelSet(""), false);
+chk("ai/model-unchanged", settings.aiModelGet(), "qwen2.5:7b");
+
+if(fail){ io.print("== SETTINGS FAILED: ", fail); return 1; }
+io.print("== IDE SETTINGS OK ==");

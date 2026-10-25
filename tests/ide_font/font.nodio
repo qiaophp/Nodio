@@ -1,0 +1,179 @@
+// tests/ide_font/font.nodio — 编辑器字体的无头回归锁。
+//
+// ── 这条锁在防什么 ────────────────────────────────────────────
+// 官方 LOGFONT 类的字体名字段叫 **name**（WORD name[32]），构造函数是
+// `for(k,v in arg){ this[k] = v; }` —— **逐键原样拷贝**，认不得的键会被
+// 当垃圾塞进结构体，**不报错**。
+//
+// 于是 `ctrl.setFont({faceName="Consolas"; point=11})` 会得到：
+//   name 保持默认值 → 构造函数里「Tahoma → Segoe UI」的兜底生效
+//   → 字体变成 **Segoe UI（比例字体）**。
+// 后果：代码不等宽（列对不齐），汉字又走回退字体、字面更大，
+//       同一行里中英文「时大时小」。
+//
+// 官方 API 文档也写死了键名：
+//   D:\aardio\lib\win\ui\ctrl\edit.aardio:802
+//     !edit.setFont(混入字体属性) = @.setFont(h=-12;name="Tahoma");
+//   D:\aardio\lib\win\ui\ctrl\richedit.aardio:799
+//     setFont = function(f,own = true ){ ... f = ::LOGFONT(f) ... }
+//
+// ── 怎么断言「字体对不对」────────────────────────────────────
+// 不去读 HFONT（我们引擎的 ::SendMessage 回不了指针型返回值，实测
+// WM_GETFONT 恒为 0），改用**可观测的排版特征**：
+//   ① 等宽性：等宽字体（Consolas）"iiiiiiiiii" 与 "WWWWWWWWWW" 宽度相同；
+//             比例字体（Segoe UI）两者差一大截。
+//   ② **字号真的生效**：改了 point，**字宽和行高必须跟着变**。
+// 宽度/行高用 EM_POSFROMCHAR(0x426) 量：低 16 位 = x，高 16 位 = y。
+//
+// ── ② 这一段为什么必须有（上一轮锁的盲区）──────────────────────
+// 旧锁只断言「等宽」+「setFontSize 返回 true」+「getFontSize 回显 14」。
+// 如果 setFont **静默失败**（point 没传进字体 / 键名又写错 / 被 catch 吞掉），
+// 这三条**照样全过** → 假绿：用户改字号没反应，测试却是绿的。
+// 所以必须有「排版跟着变」这条判据，它不依赖任何返回值。
+//
+// ── 末尾两条**反证**───────────────────────────────────────────
+// 故意用错键名再设一次，断言字体/字号确实变了 ——
+// 保证前面几条不是「测不出差别」的假绿。
+//
+// ⚠ aardio 铁律：**双引号串是原样字面量**，"\r\n" 是 4 个字符（\ r \ n），
+//   换行必须用单引号 '\r\n'。（踩过：双引号写出来的文本是一行 24 字符，
+//   行高量出来恒为 0，差点误判成「行高测不了」。）
+import win.ui;
+import gdi;
+import nodio.ui.editor;
+
+var fail = 0;
+function chk(name, got, want){
+	if(got === want){ io.print("PASS ", name); return; }
+	fail++;
+	io.print("FAIL ", name, " got=", tostring(got), " want=", tostring(want));
+}
+function chkTrue(name, got, detail){
+	if(got){ io.print("PASS ", name); return; }
+	fail++;
+	io.print("FAIL ", name, "  ", tostring(detail));
+}
+
+var f = win.form(text="ide-font";right=900;bottom=600);
+f.add({
+	ed={cls="richedit";left=0;top=0;right=600;bottom=300;multiline=true}
+});
+// 控件要等窗体 show 之后才真的建出来
+f.show();
+win.delay(500);
+
+var ed = nodio.ui.editor(f, {ctrl=f.ed; fontSize=11; fontName="Consolas"});
+win.delay(300);
+var ctrl = ed.control();
+
+// ---------- 测量工具 ----------
+// 文本 'iiiiiiiiii\r\nWWWWWWWWWW'（单引号才是真换行）：
+//   控件内 0..9 = i，10 = 行尾 \r，11..20 = W，21 = 末尾 \r
+//   → x(10)  = 第 1 行 10 个 i 的宽度
+//   → x(21)  = 第 2 行 10 个 W 的宽度
+//   → y(11) - y(0) = 行高（行 2 首字符与行 1 首字符的纵坐标差）
+ed.setText('iiiiiiiiii\r\nWWWWWWWWWW');
+win.delay(300);
+
+var posOf = function(idx){
+	var r = ::SendMessage(ctrl.hwnd, 0x426/*_EM_POSFROMCHAR*/, idx, 0);
+	if(r < 0) return -1;
+	return r;
+}
+var xAt = function(idx){
+	var r = posOf(idx);
+	return (r < 0) ? -1 : (r & 0xFFFF);
+}
+var yAt = function(idx){
+	var r = posOf(idx);
+	return (r < 0) ? -1 : ((r >> 16) & 0xFFFF);
+}
+var wW = function(){ return xAt(21) }        // 10 个 W 的宽度
+var iW = function(){ return xAt(10) }        // 10 个 i 的宽度
+var lh = function(){ return yAt(11) - yAt(0) } // 行高
+
+// ---------- 1) 官方 LOGFONT 的契约（键名）----------
+var lfOk = ::LOGFONT({name="Consolas"; point=11});
+chk("logfont/name-key", lfOk.name, "Consolas");
+chk("logfont/point-kept", lfOk.point, 11);
+// 错键名：不被当成字体名（aardio 官方库里落回 Segoe UI）
+var lfBad = ::LOGFONT({faceName="Consolas"; point=11});
+chkTrue("logfont/faceName-not-a-key", lfBad.name != "Consolas", lfBad.name);
+
+// ---------- 2) 编辑器实际用上的字体必须等宽 ----------
+// 先把基准钉死在 11pt（构造时就是 11pt，这里再显式设一次保证确定性）
+ed.setFontSize(11);
+win.delay(300);
+var w11 = wW();
+var i11 = iW();
+var lh11 = lh();
+chkTrue("editor/mono", i11 == w11 && w11 > 0,
+	"i=" ++ tostring(i11) ++ " w=" ++ tostring(w11));
+
+// ---------- 3) 运行时改字号那条路径（setFontSize）也要等宽 ----------
+chkTrue("editor/setFontSize-accepts", ed.setFontSize(14), "setFontSize(14)");
+chk("editor/fontSize-echo", ed.getFontSize(), 14);
+// pt → 逻辑像素（画板字号用的是逻辑像素，口径必须一致）
+chkTrue("editor/uiFontSize-pt-to-px",
+	math.floor(ed.uiFontSize * 10) == math.floor(14 * 4 / 3 * 10), ed.uiFontSize);
+win.delay(300);
+var w14 = wW();
+var i14 = iW();
+var lh14 = lh();
+chkTrue("editor/mono-after-setFontSize", i14 == w14 && w14 > 0,
+	"i=" ++ tostring(i14) ++ " w=" ++ tostring(w14));
+
+// ---------- 4) 字号**真的**生效了（这一段是旧锁的盲区）----------
+// 判据：改了 point，排版必须跟着变 —— 横向（字宽）与纵向（行高）都要变。
+// 用**比值**而不是绝对像素：比值与 DPI 无关，换机器/换缩放仍然成立。
+// 阈值 115/100：等宽字体 11pt→14pt 的字宽实测 81→101（比值 1.247），
+// 理论下限约 1.23，留了余量；而「point 没生效」的比值是 1.00，必挂。
+chkTrue("editor/width-grows-with-size", w14 * 100 > w11 * 115,
+	"w11=" ++ tostring(w11) ++ " w14=" ++ tostring(w14));
+chkTrue("editor/lineheight-grows-with-size", lh14 > lh11,
+	"lh11=" ++ tostring(lh11) ++ " lh14=" ++ tostring(lh14));
+// 编辑器自己算的 lineHeight 必须和实测一致（行号栏靠它对齐）
+chkTrue("editor/lineHeight-field-matches", ed.lineHeight == lh14,
+	"field=" ++ tostring(ed.lineHeight) ++ " measured=" ++ tostring(lh14));
+
+ed.setFontSize(18);
+win.delay(300);
+var w18 = wW();
+var lh18 = lh();
+chkTrue("editor/width-grows-again", w18 * 100 > w14 * 115,
+	"w14=" ++ tostring(w14) ++ " w18=" ++ tostring(w18));
+chkTrue("editor/lineheight-grows-again", lh18 > lh14,
+	"lh14=" ++ tostring(lh14) ++ " lh18=" ++ tostring(lh18));
+
+// 调回 11pt：宽度和行高必须**精确**回到基准
+// （证明测量是字号的确定函数，不是噪声/随机波动）
+ed.setFontSize(11);
+win.delay(300);
+chkTrue("editor/width-restores", wW() == w11,
+	"w11=" ++ tostring(w11) ++ " back=" ++ tostring(wW()));
+chkTrue("editor/lineheight-restores", lh() == lh11,
+	"lh11=" ++ tostring(lh11) ++ " back=" ++ tostring(lh()));
+
+// ---------- 5) 反证 A：point 键名写错 → 字号根本进不去 ----------
+// point 被丢掉 → LOGFONT 退回默认 h=-12（≈9pt）→ 宽度既不是 11pt 的
+// 也不是 14pt 的。这条证明第 4 段的「变大」断言**有判别力**：
+// 如果哪天 point 没传进字体，宽度会停在这，断言立刻变红。
+ctrl.setFont({name="Consolas"; fontPoint=14});
+win.delay(300);
+var wBadPoint = wW();
+chkTrue("counter/wrong-point-key-not-11pt-not-14pt",
+	wBadPoint != w11 && wBadPoint != w14,
+	"w11=" ++ tostring(w11) ++ " w14=" ++ tostring(w14) ++ " bad=" ++ tostring(wBadPoint));
+
+// ---------- 6) 反证 B：字体名键名写错 → 字体确实变回比例 ----------
+// 这条保证 2) / 3) 不是「怎么测都过」的假绿。
+ctrl.setFont({faceName="Consolas"; point=14});
+win.delay(300);
+var iBad = iW();
+var wBad = wW();
+chkTrue("editor/wrong-key-becomes-proportional", iBad != wBad,
+	"i=" ++ tostring(iBad) ++ " w=" ++ tostring(wBad));
+
+f.close();
+if(fail){ io.print("== FONT FAILED: ", fail); return 1; }
+io.print("== IDE FONT OK ==");

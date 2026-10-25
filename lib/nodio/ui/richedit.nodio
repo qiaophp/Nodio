@@ -1,0 +1,68 @@
+// nodio.ui.richedit — 原生 richedit / edit 的深色化。
+//
+// 原生控件不吃自绘配色，只能靠这几招：
+//   · richedit：setCharformat（文字色 + 文字背景色）+ EM_SETBKGNDCOLOR
+//     （整个控件背景）+ uxtheme 的 DarkMode_Explorer（边框/滚动条）
+//   · edit：不吃 setCharformat，只有 EM_SETBKGNDCOLOR + ctrl.color（文字色）
+//
+// ⚠ EM_SETBKGNDCOLOR(0x443) 必须用引擎 sysapi 表里的 ::SendMessage ——
+//   它有**显式签名**（"int64(addr hwnd,int msg,addr wparam,addr lparam)"），
+//   安全；不要用 ::User32.SendMessageW（动态绑定，签名靠猜会传错）。
+//
+// ⚠ 命名空间必须写**完整路径**（nodio.ui.richedit）：
+//   多函数模块的成员要落在「导入路径」这张表里 ——
+//   写成 namespace nodio.ui{ ... } 的话，成员会跑到 nodio.ui 下面，
+//   nodio.ui.richedit 反而是张空表（单函数模块才用
+//   namespace nodio.ui{ richedit = function... } 那种写法）。
+namespace nodio.ui.richedit{
+import nodio.ui.theme;
+import nodio.ui.rect;
+
+// richedit 深色化
+//   theme 可传（省一次取色），不传就用当前主题
+darken = function(ctrl, theme){
+	if(!ctrl) return;
+	theme = theme : nodio.ui.theme();
+	try{
+		var uxtheme = ..raw.loadDll("uxtheme.dll");
+		var setAppMode = uxtheme.api(135, "int(int mode)");
+		if(setAppMode) setAppMode(2/*ForceDark*/);
+		var setTheme = uxtheme.api("SetWindowTheme",
+			"int(addr hwnd,ustring subAppName,ustring subIdList)");
+		if(setTheme) setTheme(ctrl.hwnd, "DarkMode_Explorer", null);
+	}catch(eUx){}
+	try{
+		ctrl.setCharformat({
+			textColor = ..nodio.ui.themeRef(theme.text);
+			backColor = ..nodio.ui.themeRef(theme.bg);
+		}, 1);
+	}catch(e){};
+	try{ ctrl.bgcolor = ..nodio.ui.themeRef(theme.bg) }catch(e){};
+	try{
+		::SendMessage(ctrl.hwnd, 0x443/*_EM_SETBKGNDCOLOR*/, 0,
+			..nodio.ui.themeRef(theme.bg));
+	}catch(e){};
+}
+
+// edit 输入框深色化
+darkenEdit = function(ctrl, theme){
+	if(!ctrl) return;
+	theme = theme : nodio.ui.theme();
+	try{ ctrl.color = ..nodio.ui.themeRef(theme.text) }catch(e){}
+	try{
+		::SendMessage(ctrl.hwnd, 0x443/*_EM_SETBKGNDCOLOR*/, 0,
+			..nodio.ui.themeRef(theme.bgSecondary));
+	}catch(e){}
+}
+
+// 读文本（官方控件 text 是属性，引擎原生控件 text 是函数）
+text = function(ctrl){
+	return nodio.ui.getCtrlText(ctrl);
+}
+
+// 写文本
+setText = function(ctrl, s){
+	return nodio.ui.setCtrlText(ctrl, s);
+}
+
+}

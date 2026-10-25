@@ -49,9 +49,85 @@ if ($bad.Count -gt 0) {
 
 $env:NODIO_LIBDIR    = $LibDir
 $env:NODIO_OVERLAY_LIBDIR = 'D:\Nodio\lib'
+# 冒烟不许写用户的真实配置（%APPDATA%\Nodio\ide.cfg）—— 用临时文件隔离
+$env:NODIO_IDE_CFG  = Join-Path $env:TEMP 'nodio_ide_smoke_cfg.nodie'
+if (Test-Path $env:NODIO_IDE_CFG) { Remove-Item $env:NODIO_IDE_CFG -Force }
 $env:NODIO_EXE       = $Exe
 $env:NODIO_RUN       = $Ide
 $env:NODIO_IDE_SMOKE = '1'
+# AI 面板冒烟要写一条 API Key —— 必须用**隔离的凭据名**，
+# 否则 apiKeyRemove() 会把用户自己配的那条凭据抹掉。
+$env:NODIO_AI_CRED_TARGET = 'NodioIDE/test/ide_smoke'
+
+# ---- 本地 mock OpenAI 服务器（AI 面板的「成功回包」路径）----
+#
+# 面板的成功分支（AI 的回答进日志 + 进会话）以前从没被断言过 ——
+# 只有失败分支。用一个只依赖标准库的 mock 把这条路径也变成无头断言：
+#   · 不依赖外网、不依赖用户真实 Key
+#   · 回包内容固定（"MOCK-OK …"），断言不会飘
+#
+# ⚠ **Python 是硬依赖**：没有它就起不来 mock → AI 成功路径根本没法断言 →
+#   这条回归就只剩失败路径，等于白跑。所以这里**明确报错**，不做静默降级
+#   （静默降级 = 锁不住东西，却看起来是绿的）。
+#   Python 的找法与 tests/run_vm_tests.ps1 一致：先找 PATH，再找固定路径。
+$mockProc = $null
+$mockLog  = Join-Path $env:TEMP ("nodio_ai_mock_{0}.out" -f $PID)
+$mockErr  = "$mockLog.err"
+$mockScript = Join-Path $PSScriptRoot 'ai_mock_server.py'
+if (-not (Test-Path $mockScript)) {
+    Write-Output "FAIL: AI mock server script not found: $mockScript"
+    exit 1
+}
+$pyCmd = Get-Command 'python' -ErrorAction SilentlyContinue
+$py = ''
+if ($pyCmd) {
+    # ApplicationInfo → 取完整路径；命中别名/函数就退回命令名（Start-Process 自己解析 PATH）
+    if ($pyCmd -is [System.Management.Automation.ApplicationInfo]) { $py = $pyCmd.Path }
+    else { $py = 'python' }
+}
+if (-not $py -and (Test-Path 'C:\Python311\python.exe')) { $py = 'C:\Python311\python.exe' }
+if (-not $py) {
+    Write-Output 'FAIL: python not found (neither PATH nor C:\Python311\python.exe) - the IDE smoke needs it to run the local AI mock server'
+    exit 1
+}
+# 别让外层环境里残留的端口号混进来
+$env:NODIO_IDE_AI_MOCK_PORT = ''
+
+# ---- 主体全包在 try 里 ----
+# 下面有十几条 exit 1 的断言失败路径，任何一条都得先把 mock 收掉，
+# 否则它会变成孤儿进程留着（还会占着调用方的输出管道）。
+# PowerShell 的 exit 在 try 内也会走 finally，所以这里统一在 finally 收尾。
+try {
+
+# 起 mock。--parent-pid 让它「父进程一死就自己退出」：
+# 不给这个参数的话，mock 的 stdin 在 Start-Process 下**立刻 EOF**
+# → 它会自己 shutdown 掉 → 端口拿到了但一连就 Connection refused。
+try {
+    $mockProc = Start-Process -FilePath $py -ArgumentList @($mockScript, '--parent-pid', "$PID") `
+        -PassThru -NoNewWindow -RedirectStandardOutput $mockLog -RedirectStandardError $mockErr
+    for ($i = 0; $i -lt 60; $i++) {
+        Start-Sleep -Milliseconds 200
+        if (Test-Path $mockLog) {
+            $line = Get-Content $mockLog -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($line -and $line -match 'READY (\d+)') {
+                $env:NODIO_IDE_AI_MOCK_PORT = $Matches[1]
+                break
+            }
+        }
+    }
+} catch {
+    $mockProc = $null
+}
+if (-not $env:NODIO_IDE_AI_MOCK_PORT) {
+    Write-Output 'FAIL: local AI mock server did not become ready'
+    try {
+        if (Test-Path $mockErr) {
+            $e = [IO.File]::ReadAllText($mockErr, [Text.Encoding]::UTF8)
+            if ($e.Trim()) { Write-Output ('   stderr: ' + $e.Trim()) }
+        }
+    } catch {}
+    exit 1
+}
 
 # the IDE's own project file drives the project-model check
 $proj = Join-Path (Split-Path -Parent $Ide) 'ide.nproj'
@@ -218,11 +294,72 @@ if ($out -notmatch 'DOC-CURSOR:')          { Write-Output 'FAIL: cursor position
 if ($out -notmatch 'DOC-INDENT-LEN:\d+')    { Write-Output 'FAIL: indent command did not change the text'; exit 1 }
 if ($out -notmatch 'DOC-COMMENT-LEN:\d+')   { Write-Output 'FAIL: comment toggle did not change the text'; exit 1 }
 if ($out -notmatch 'DOC-UNDO-LEN:30')       { Write-Output 'FAIL: editor undo did not revert the last edit'; exit 1 }
+# 编辑器字号：主编辑器 / 设置里的值 / 分栏对比编辑器 三处必须一致
+if ($out -notmatch 'DOC-FONT:(\d+)/(\d+)') {
+    Write-Output 'FAIL: editor font size was not reported'; exit 1
+}
+$fontEditor = [int]$Matches[1]
+$fontCfg    = [int]$Matches[2]
+if ($out -notmatch 'DOC-FONT-DIFF:(\d+)') {
+    Write-Output 'FAIL: split-diff editor font size was not reported'; exit 1
+}
+$fontDiff = [int]$Matches[1]
+if ($fontEditor -ne $fontCfg) { Write-Output "FAIL: editor font ($fontEditor) != settings font ($fontCfg)"; exit 1 }
+if ($fontDiff -ne $fontCfg)  { Write-Output "FAIL: split-diff editor font ($fontDiff) != settings font ($fontCfg)"; exit 1 }
 
 # every dock / editor must be visible once the window is shown
 foreach ($v in @('VIS-LEFT','VIS-RIGHT','VIS-BOTTOM','VIS-DOC','VIS-ED','VIS-TOOLBOX')) {
     if ($out -notmatch ($v + ':true')) { Write-Output "FAIL: $v is not visible"; exit 1 }
 }
+
+# AI 面板（app.ai）：页签切过去要显示、切回来要隐藏；控件与会话都在
+if ($out -notmatch 'AI-TAB:true/false') { Write-Output 'FAIL: AI panel tab visibility is wrong'; exit 1 }
+if ($out -notmatch 'AI-CTRLS:1/1')      { Write-Output 'FAIL: AI panel controls are missing'; exit 1 }
+
+# AI 面板发送链路（端到端，两段）：
+#   ① 成功 —— base_url 指向本地 mock 服务器（tests/ai_mock_server.py）：
+#      必须看到「用户消息进了日志」+「**AI 的回答进了日志**」+「会话多了一条
+#      assistant 消息」+「状态回到空闲」。
+#   ② 失败 —— base_url 指向 127.0.0.1:1（没人监听）→ 请求必然失败，
+#      必须看到「用户消息进了日志」+「有一条 [错误]」，且用户消息仍留在会话里。
+#   （凭据名不是隔离的测试名时整段跳过 —— 见 main.nodio 的 aiIsolated 判断）
+if ($out -notmatch 'AI-SEND-SKIP:1') {
+    if ($out -notmatch 'AI-SESSION-INIT:0')  { Write-Output 'FAIL: AI session is not empty on startup'; exit 1 }
+    if ($out -notmatch 'AI-SEND-START:1')    { Write-Output 'FAIL: AI panel send could not be started'; exit 1 }
+    # 成功回包（对本地 mock 服务器）：AI 的回答要进日志 + 进会话
+    if ($out -notmatch 'AI-SEND-MOCK:1') {
+        Write-Output 'FAIL: local AI mock server was not used'
+        exit 1
+    }
+    if ($out -notmatch 'AI-SEND-USER:1')     { Write-Output 'FAIL: user message did not reach the AI log'; exit 1 }
+    if ($out -notmatch 'AI-SEND-REPLY:1')    { Write-Output 'FAIL: AI reply did not reach the AI log'; exit 1 }
+    if ($out -notmatch 'AI-SEND-BUSY:false') { Write-Output 'FAIL: AI panel stayed busy after the request finished'; exit 1 }
+    if ($out -notmatch 'AI-SEND-MSGS:2')     { Write-Output 'FAIL: AI reply did not enter the AI session'; exit 1 }
+    # 失败回包（对没人监听的端口）：要报错 + 用户消息仍留在会话里
+    if ($out -notmatch 'AI-SEND-ERRUSER:1')  { Write-Output 'FAIL: failed request did not log the user message'; exit 1 }
+    if ($out -notmatch 'AI-SEND-ERR:1')      { Write-Output 'FAIL: failed request did not report an error in the AI log'; exit 1 }
+    if ($out -notmatch 'AI-SEND-ERRMSGS:3')  { Write-Output 'FAIL: failed request left the session in a wrong state'; exit 1 }
+}
+
+# 发布链路（端到端）：IDE 入口 → 发布器 → 独立 exe 跑起来。
+# 菜单「工程 → 发布为独立 exe」与冒烟走同一条 publishRun 链路（capability-gap §1.46）：
+#   PUB-START:1  发布子进程起来了（runner 单槽已被占用）
+#   PUB-EXE:1    发布产物落盘
+#   PUB-RUN:1    发布产物**真的**跑了自己的 payload（内容带每次不同的 token，
+#                旧的产物混进来也骗不过 —— 断绝「拿上次结果假绿」）
+if ($out -notmatch 'PUB-START:1') { Write-Output 'FAIL: publish was not started from the IDE'; exit 1 }
+if ($out -notmatch 'PUB-EXE:1')   { Write-Output 'FAIL: published exe was not created'; exit 1 }
+if ($out -notmatch 'PUB-RUN:1')   { Write-Output 'FAIL: published exe did not run its payload'; exit 1 }
+
+# 最近文件（capability-gap §5.2「最近使用的文档」→ §1.47 落地）：
+#   RECENT-AUTO:1     openFile 链路自动入队（钩子打开 hookTarget 后 cfg 里就有）
+#   RECENT-TOP-OK:1   再 push 后置顶
+#   RECENT-DUP-OK:1   同一路径反复 push 不翻倍（去重置顶）
+#   RECENT-MENU-HIT:1 「文件」菜单重建后含 "1.  <路径>" 动态条目
+if ($out -notmatch 'RECENT-AUTO:1')     { Write-Output 'FAIL: openFile did not record recent file'; exit 1 }
+if ($out -notmatch 'RECENT-TOP-OK:1')   { Write-Output 'FAIL: recent file is not on top'; exit 1 }
+if ($out -notmatch 'RECENT-DUP-OK:1')   { Write-Output 'FAIL: recent push duplicated entry'; exit 1 }
+if ($out -notmatch 'RECENT-MENU-HIT:1') { Write-Output 'FAIL: file menu missing recent entry'; exit 1 }
 
 # 属性格分组带（VS WinForms 属性窗口的「分类」）：
 # 分类映射 / 显示行表 / 折叠 / 就地编辑框落位 —— 见 capability-gap §1.22
@@ -246,3 +383,19 @@ if (Test-Path $probe) {
 
 Write-Output 'SMOKE OK'
 exit 0
+
+}
+finally {
+    # ---- mock 收尾 ----
+    # ① 杀掉自己起的那个（连进程树一起杀：mock 自己也可能派生子进程）
+    if ($mockProc) {
+        try { if (-not $mockProc.HasExited) { & taskkill /PID $mockProc.Id /T /F 2>$null | Out-Null } } catch {}
+        try { [void]$mockProc.WaitForExit(3000) } catch {}
+    }
+    # ② 按命令行扫一遍，把**上一次被中断**（Ctrl+C / 崩了）留下的孤儿也回收掉。
+    #    与 tests/run_vm_tests.ps1 同一套做法：按**脚本路径**匹配，不按 "python"。
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -match 'ai_mock_server\.py' } |
+        ForEach-Object { & taskkill /PID $_.ProcessId /T /F 2>$null | Out-Null }
+    Remove-Item $mockLog, $mockErr -Force -ErrorAction SilentlyContinue
+}

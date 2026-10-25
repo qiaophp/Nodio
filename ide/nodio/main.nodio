@@ -4,6 +4,12 @@
 // live in app/*.nodio; this file only wires them together and enters the
 // message loop. The IDE is its own project: ide.nproj.
 import win.ui;
+import app.settings;
+// ⚠ 主题必须在 app.shell **之前**应用：各 chrome 组件都是**构造期**读一次
+// theme() 把配色存进自己的字段（nodio.ui.list / tree / tabstrip / toolbar /
+// statusbar / titlebar …），构造完再切主题就得重建整排 chrome。
+// 官方 aardio 同样是「换主题重开 IDE」。
+app.settings.themeApply();
 import app.shell;
 import app.output;
 import app.editor;
@@ -16,6 +22,8 @@ import app.dapClient;
 import nodio.designer.registry;
 import nodio.ui.dpi;
 import nodio.ui.board;   // nodio.ui.redrawAll（窗口显示后统一强制重画）
+import nodio.ui.rect;    // nodio.ui.setCtrlText（AI 面板冒烟要往输入框写字）
+import nodio.ai.cred;    // AI 面板冒烟：隔离凭据名 + 写/删测试 Key
 import app.ideCommand;   // 官方 ide.command 37 命令外部命令面
 import raw;
 
@@ -749,6 +757,25 @@ fillTools = function(){
 			n.cmd = defs[i][2];
 		}
 	}
+	// 外部工具（官方 IDE 的「工具」面板同样列在这里）：分组父节点 + 子节点。
+	// 闭包用工厂函数造 —— 循环里直接闭包捕获循环变量，取到的可能是最后一次的值。
+	var mkToolCmd = function(idx){
+		return function(){ shell.hooks.onRunExternalTool(idx) };
+	};
+	var tools = app.settings.toolsGet();
+	if(#tools){
+		var grp = shell.toolTree.addNode("外部工具", null, null);
+		if(grp){
+			grp.icon = "wrench";
+			for(i=1;#tools;1){
+				var tn = shell.toolTree.addNode(tools[i].name, null, grp);
+				if(tn){
+					tn.icon = "wrench";
+					tn.cmd = mkToolCmd(tools[i].idx);
+				}
+			}
+		}
+	}
 	shell.toolTree.onSelect = function(node){
 		if(node && node.cmd) node.cmd();
 	};
@@ -909,6 +936,10 @@ openFile = function(path){
 	}
 	if(!..io.exist(path)) return false;
 	openTab(path);
+	// 最近文件：打开成功就置顶入队 + 重建「文件」菜单（最近使用的文档，
+	// 工程、搜索跳转、钩子打开的文档都走这里，一处收口）
+	app.settings.recentPush(path);
+	shell.refreshRecentMenu();
 	return true;
 }
 
@@ -1075,6 +1106,24 @@ var projSetStart = function(path){
 	proj.start = path;
 	if(app.project.save(proj)) shell.setStatus("启动文件: " ++ path);
 	else shell.setStatus("已设为启动文件（工程文件未更新）");
+}
+
+// 工程属性（真对话框，替代旧的 setStatus 占位）：
+// 文件清单就是发布规则 —— 这里把发布要用的四个事实一次说清。
+var projProperties = function(){
+	if(!proj){
+		..win.msgbox("当前没有打开的工程。\r\n用「工程 → 打开工程...」或「文件 → 打开工程...」。"
+			, "Nodio IDE - 工程属性");
+		return;
+	}
+	var pub = proj.root ++ "default.aproj";
+	if(!..io.exist(pub)) pub = proj.root ++ "default.nproj";
+	var msg = "工程文件: " ++ tostring(proj.path)
+		++ "\r\n根目录: " ++ tostring(proj.root)
+		++ "\r\n启动文件: " ++ tostring(proj.start : "(未设置)")
+		++ "\r\n清单文件数: " ++ tostring(proj.count)
+		++ "\r\n发布清单: " ++ (..io.exist(pub) ? pub : "(无 — 发布时只打 import 闭包)");
+	..win.msgbox(msg, "Nodio IDE - 工程属性");
 }
 
 // 新建文档（未命名）
@@ -1272,6 +1321,51 @@ runScript = function(){
 	runner.run(f);
 }
 
+// ---------- 发布为独立 exe（工程 → 发布）----------
+//
+// 发布器（publish/publish.cpp）一直在、CLI 契约也早有回归锁
+// （tests/run_publish_tests.ps1），但 IDE 一直**没有发布入口** ——
+// 能写、能跑、能调试，就是出不了货。这里把链路接上：
+//
+//   工程打开时     entry = 工程启动文件，清单 = 工程文件（--proj 显式传入）
+//   没有工程时     entry = 当前文档（先存盘），清单 = 入口旁的 default.aproj/.nproj
+//
+// 输出走「输出」面板（runner.runArgs 流式刷新），结束标记 [发布结束]。
+publishRun = function(entry, outExe, manifest, bGui){
+	if(!entry || !..io.exist(entry)){ shell.setStatus("启动文件不存在: " ++ tostring(entry)); return false }
+	if(!outExe){ shell.setStatus("没有输出路径"); return false }
+	// 参数行不含 exe 本身；路径自带引号（单引号串里直接写双引号字符）
+	var args = '--publish "' ++ entry ++ '" -o "' ++ outExe ++ '"';
+	if(manifest && #manifest) args = args ++ ' --proj "' ++ manifest ++ '"';
+	if(bGui) args = args ++ " --gui";
+	var pi = ..io.splitpath(entry);
+	if(shell.bottomDock) shell.bottomDock.setSelIndex(2);   // 切到「输出」页
+	runner.runArgs(args, pi.dir, "发布");
+	return true;
+}
+
+publishExe = function(bGui){
+	var f = proj ? proj.start : curFile;
+	if(!f){ shell.setStatus("没有工程/启动文件"); return }
+	if(!..io.exist(f)){
+		// 草稿文档：先落盘（与 F5 的临时运行文件同一份），再发布
+		var text = shell.tabTextForSave(curFile);
+		f = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_scratch_run.aardio");
+		..string.save(f, text);
+	}
+	else{
+		saveFile();
+	}
+	var pi = ..io.splitpath(f);
+	var out = shell.fileDlg.save('可执行文件|*.exe|所有文件|*.*|',
+		bGui ? "发布为独立 exe（界面程序）" : "发布为独立 exe（控制台）",
+		pi.dir, pi.name ++ ".exe");
+	if(!out) return;   // 用户取消
+	// 清单：工程打开时显式传工程文件；散文件靠发布器自动探测 default.aproj/.nproj
+	publishRun(f, out, proj ? proj.path : null, bGui);
+}
+
+
 // ---------- debugging (F10) ----------
 //
 // dapClient 是**模块式 API**（跟 lspClient 一样），不是对象实例：
@@ -1448,6 +1542,7 @@ shell.hooks.onProjNewDir  = projNewDir;
 shell.hooks.onProjRename  = projRename;
 shell.hooks.onProjDelete  = projDelete;
 shell.hooks.onProjSetStart = projSetStart;
+shell.hooks.onProjProperties = projProperties;
 // 左栏「搜索」页：双击结果 → 打开文件并跳到那一行
 shell.searchPanel.onStatus = function(text){
 	shell.setStatus(text);
@@ -1464,6 +1559,9 @@ shell.hooks.onDocChange   = function(path, text){
 	symTreeDirty = true;
 };
 shell.hooks.onRun         = runScript;
+// 发布为独立 exe（工程 → 发布）：控制台 / 界面程序两条入口
+shell.hooks.onPublishConsole = function(){ publishExe(false) };
+shell.hooks.onPublishGui     = function(){ publishExe(true) };
 // F10 = 调试：没有会话 → 开始调试；已经停住了 → **继续**（resume）
 //
 // ⚠ 以前这里停住之后走的是 next()（单步跳过），resume() 从来没被调用过 ——
@@ -1730,6 +1828,103 @@ shell.hooks.onClearWatch = function(){
 	watchList = {};
 	shell.setStatus("已清空监视列表");
 	refreshWatchList();
+};
+
+// ---------- 设置（主题 / 编辑器字号 / 外部工具）----------
+//
+// 三件事的生效方式不一样，菜单里也标清楚了：
+//   · 主题 —— **重启后生效**（各 chrome 组件构造期读一次配色）
+//   · 编辑器字号 —— **即时生效**（editor.setFontSize 走完整链条）
+//   · 外部工具 —— 加完立刻能用，Ctrl+1..9 触发
+shell.hooks.onSetTheme = function(name){
+	if(!app.settings.themeSet(name)) return;
+	shell.setStatus("主题已设为「" ++ name ++ "」，重启 IDE 后生效");
+};
+
+shell.hooks.onEditorFontSize = function(){
+	var cur = app.settings.fontSizeGet();
+	shell.showPrompt("编辑器字体大小 (6-24 pt)", tostring(cur : ""), function(t){
+		var n = tonumber(t);
+		if(!n || n < 6 || n > 24) return false;
+		if(!shell.editor.setFontSize(n)) return false;
+		// 分栏对比的第二个编辑器（如果已经开过）也要跟着变，
+		// 否则左右两半字号对不上。
+		if(shell.editor2 && shell.editor2.setFontSize(n)){}
+		app.settings.fontSizeSet(n);
+		shell.setStatus("编辑器字号已设为 " ++ n ++ " pt");
+		return true;
+	});
+};
+
+// 外部工具：名称 → 命令 → 参数（%f = 当前文档，%p = 工程目录）
+shell.hooks.onAddExternalTool = function(){
+	shell.showPrompt("外部工具名称", "", function(name){
+		name = ..string.trim(name);
+		if(!name) return false;
+		shell.showPrompt("命令（可执行文件路径）", "", function(cmd){
+			cmd = ..string.trim(cmd);
+			if(!cmd) return false;
+			shell.showPrompt("参数（%f=当前文件 %p=工程目录，可留空）", "", function(args){
+				var slot = app.settings.toolFreeSlot();
+				if(!slot){
+					shell.setStatus("外部工具已满（最多 9 个），先删一个");
+					return true;
+				}
+				if(!app.settings.toolSave(slot, name, cmd, ..string.trim(args : ""))){
+					shell.setStatus("外部工具保存失败");
+					return true;
+				}
+				fillTools();
+				shell.setStatus("已添加外部工具 " ++ slot ++ ": " ++ name ++ "（Ctrl+" ++ slot ++ " 触发）");
+				return true;
+			});
+			return true;   // 后一个 prompt 接管后本层不再关
+		});
+		return true;
+	});
+};
+
+shell.hooks.onDelExternalTool = function(){
+	var list = app.settings.toolsGet();
+	if(!#list){
+		shell.setStatus("还没有配置任何外部工具");
+		return;
+	}
+	var names = "";
+	for(i=1;#list;1){
+		names = names ++ (i : "") ++ ":" ++ list[i].name ++ "  ";
+	}
+	shell.showPrompt("删除哪个外部工具（" ++ names ++ "）", "", function(t){
+		var n = tonumber(t);
+		if(!n || n < 1 || n > 9){ return false }
+		if(!app.settings.toolRemove(n)){
+			shell.setStatus("删除失败");
+			return true;
+		}
+		fillTools();
+		shell.setStatus("已删除外部工具 " ++ n);
+		return true;
+	});
+};
+
+// Ctrl+1..9 / 「工具」面板 → 执行外部工具
+shell.hooks.onRunExternalTool = function(idx){
+	var t = app.settings.toolGet(idx);
+	if(!t) return 0;
+	var cur = shell.tabCurPath();
+	var wd = proj ? proj.root : null;
+	var ok = app.settings.toolRun(idx, shell.winform, outCtl, shell.setStatus, cur, wd);
+	return ok ? 1 : 0;
+};
+
+// 打开配置文件（%APPDATA%\Nodio\ide.cfg）—— 用户可以直接手改
+shell.hooks.onOpenConfigFile = function(){
+	var p = ..string.getenv("APPDATA") ++ "\Nodio\ide.cfg";
+	if(!..io.exist(p)){
+		shell.setStatus("配置文件还不存在: " ++ p);
+		return;
+	}
+	openFile(p);
 };
 
 // ---------- 外部工具与工程代码统计 ----------
@@ -2085,44 +2280,11 @@ shell.winform.setInterval(function(){
 // ---------- 配置持久化（%APPDATA%\Nodio\ide.cfg）----------
 // 极简 key=value，一行一个键。
 // 只存「上次打开的工程」这种跨会话要记住的东西。
-var CFG_PATH = ..string.getenv("APPDATA") ++ "\Nodio\ide.cfg";
-var cfgRead = function(key){
-	if(!key) return null;
-	var text = ..string.load(CFG_PATH);
-	if(!text) return null;
-	for(line in ..string.lines(text)){
-		var s = ..string.trim(line);
-		if(!s) continue;
-		var p = ..string.indexOf(s, "=");
-		if(!p) continue;
-		var k = ..string.trim(..string.left(s, p - 1));
-		var v = ..string.trim(..string.slice(s, p + 1));
-		if(k == key) return v;
-	}
-	return null;
-}
-var cfgWrite = function(key, val){
-	if(!key) return false;
-	var dir = ..io.splitpath(CFG_PATH).dir;
-	if(dir && !..io.exist(dir)) ..io.createDir(dir);
-	var text = "";
-	var old = ..string.load(CFG_PATH);
-	if(old){
-		for(line in ..string.lines(old)){
-			var s = ..string.trim(line);
-			if(!s) continue;
-			var p = ..string.indexOf(s, "=");
-			if(p){
-				var k = ..string.trim(..string.left(s, p - 1));
-				if(k == key) continue;
-			}
-			text = text ++ s ++ '\r\n';
-		}
-	}
-	text = text ++ key ++ "=" ++ (val : "") ++ '\r\n';
-	..string.save(CFG_PATH, text);
-	return true;
-}
+//
+// ⚠ 实现放在 app.settings（设置面板与外部工具共用同一份配置，也保证
+// 官方命令面 getConfig/setConfig 与设置面板看到的是同一个文件）。
+var cfgRead = function(key){ return app.settings.cfgRead(key) };
+var cfgWrite = function(key, val){ return app.settings.cfgWrite(key, val) };
 
 // ---------- 正常启动：加载工程 + 打开文档 ----------
 //
@@ -2360,6 +2522,12 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 	io.print("DOC-COMMENT-LEN:" ++ tostring(..string.len(shell.editor.getText())));
 	shell.editor.undo();
 	io.print("DOC-UNDO-LEN:" ++ tostring(..string.len(shell.editor.getText())));
+	// 编辑器字号：三处必须一致 —— 主编辑器 / 设置里的值 / 分栏对比编辑器。
+	// （分栏那个曾经硬编码 11，用户改字号时左右两半对不上。）
+	io.print("DOC-FONT:" ++ tostring(shell.editor.getFontSize())
+		++ "/" ++ tostring(app.settings.fontSizeGet()));
+	var ed2 = shell.getEditor2();
+	io.print("DOC-FONT-DIFF:" ++ tostring(ed2 ? ed2.getFontSize() : -1));
 
 	// layout + docks (only contract-documented members are asserted)
 	io.print("DOCK-LEFT-STRIP:" ++ tostring(shell.leftDock.strip ? 1 : 0));
@@ -2562,6 +2730,18 @@ win.loopMessage();`);
 	// 4) 网格吸附：30 → 32（1.875 逐进），33 → 32（2.0625 逐退）
 	io.print("SNAP:" ++ tostring(designer.canvas.__snap(30)) ++ "/" ++ tostring(designer.canvas.__snap(33)));
 
+	// 5) 设置面：编辑器字号**即时生效** + 配置往返（配置路径由 NODIO_IDE_CFG 隔离）
+	var __f0 = shell.editor.getFontSize();
+	var __fOk = shell.editor.setFontSize(13) ? 1 : 0;
+	io.print("SET-FONT:" ++ tostring(__fOk) ++ "/" ++ tostring(shell.editor.getFontSize()));
+	app.settings.fontSizeSet(13);
+	io.print("SET-FONT-CFG:" ++ tostring(app.settings.fontSizeGet()));
+	io.print("SET-THEME:" ++ app.settings.themeGet());
+	io.print("SET-TOOLS:" ++ #app.settings.toolsGet());
+	// 还原（别把冒烟跑出来的字号留给用户）
+	shell.editor.setFontSize(__f0);
+	app.settings.fontSizeSet(__f0);
+
 	// 钩子链路：shell.hooks.onOpenFile → main.nodio 的 openFile → 真的打开页签
 	// （以前这条链是**死的**：模块级的钩子被模块帧的局部副本遮蔽，
 	//   外部 app.shell.onX = f 灌不进来 —— 工具条/菜单/快捷键/工程树全废）
@@ -2570,6 +2750,23 @@ win.loopMessage();`);
 	..io.writeFile(hookTarget, `io.print("hook-open-ok")`);
 	shell.hooks.onOpenFile(hookTarget);
 	io.print("SMOKE-HOOK-OPEN:" ++ tostring(shell.tabCurPath()));
+	// 最近文件：openFile 链路应已自动入队；再 push 两次验证置顶/去重/菜单重建
+	var rc0 = app.settings.recentGet();
+	var autoIn = 0;
+	for(i=1;#rc0;1){ if(rc0[i] == hookTarget){ autoIn = 1; break } }
+	io.print("RECENT-AUTO:" ++ autoIn);
+	app.settings.recentPush(hookTarget);   // 置顶（后面 PROJOPS 段可能开过别的文档）
+	var rc1 = app.settings.recentGet();
+	io.print("RECENT-TOP-OK:" ++ tostring((#rc1 >= 1 && rc1[1] == hookTarget) ? 1 : 0));
+	var n1 = #rc1;
+	app.settings.recentPush(hookTarget);
+	var rc2 = app.settings.recentGet();
+	io.print("RECENT-DUP-OK:" ++ tostring((#rc2 == n1 && rc2[1] == hookTarget) ? 1 : 0));
+	shell.refreshRecentMenu();
+	var lbls = shell.fileMenuLabels();
+	var menuHit = 0;
+	for(i=1;#lbls;1){ if(lbls[i] == "1.  " ++ hookTarget) menuHit = 1 }
+	io.print("RECENT-MENU-HIT:" ++ menuHit);
 	// optional: prove the project model loads (NODIO_IDE_PROJECT=<*.nproj>)
 	var smokeProj = ..string.getenv("NODIO_IDE_PROJECT");
 	if(smokeProj){
@@ -2613,12 +2810,139 @@ win.loopMessage();`);
 		}
 	}
 
+	// ---------- AI 面板：端到端发两条（成功 + 失败）----------
+	//
+	// 目的：证明「填输入 → 发送 → 回包 → 落日志 → 记进会话」这条链在
+	// **面板层**是通的（库层由 tests/ide_ai 单独锁）。
+	//
+	// 两条路径：
+	//   ① **成功**：base_url 指向本地 mock 服务器（tests/ai_mock_server.py，
+	//      端口由 ide_smoke.ps1 起好后用 NODIO_IDE_AI_MOCK_PORT 传进来）
+	//      → 必须出现「AI: MOCK-OK …」，会话里多出一条 assistant 消息。
+	//      断言的是**面板的成功分支**（原来只测过失败分支）。
+	//   ② **失败**：base_url 指向 127.0.0.1:1（本机没人监听这个端口）
+	//      → 连接必然失败 → 必须出现一条「[错误]」。
+	//   两条都不依赖外网 ✅
+	//
+	// ⚠⚠ 只有在凭据名是**隔离的测试名**时才发：
+	//   这条链要写一条 API Key 凭据，冒烟结束时还会删掉它 ——
+	//   要是打的是用户自己配的那条 "NodioIDE/ai/apiKey"，就把它抹了。
+	//   tests/ide_smoke.ps1 设的 NODIO_AI_CRED_TARGET=NodioIDE/test/ide_smoke
+	//   才满足这个条件；不满足就整段跳过（AI-SEND-SKIP:1）。
+	var aiCredTarget = ..string.getenv("NODIO_AI_CRED_TARGET");
+	var aiIsolated = aiCredTarget && #aiCredTarget
+		&& ..string.indexOf(aiCredTarget, "/test/") ? 1 : 0;
+	// 关窗定时器要等 AI 断言跑完（见下面那段轮询）
+	var aiCheckDone = false;
+	// mock 服务器在不在（没有 Python / 没起 mock 时降级成「只测失败路径」）
+	var aiMockPort = ..string.getenv("NODIO_IDE_AI_MOCK_PORT");
+	var aiHasMock = aiMockPort && #aiMockPort ? 1 : 0;
+	if(aiIsolated){
+		try{
+			// 启动时对话必须是空的（这条要在发消息**之前**断言）
+			io.print("AI-SESSION-INIT:" ++ tostring(#shell.aiPanel.session.messages));
+			nodio.ai.cred.apiKeySet("sk-smoke-test");
+			if(aiHasMock){
+				shell.aiPanel.session.baseUrl = "http://127.0.0.1:" ++ aiMockPort ++ "/v1";
+				shell.aiPanel.session.model = "mock-model";
+				..nodio.ui.setCtrlText(shell.aiPanel.input, "冒烟-成功");
+				shell.aiPanel.send();
+				io.print("AI-SEND-START:1");
+				io.print("AI-SEND-MOCK:1");
+			}
+			else{
+				// 没有 mock：直接走失败路径（连没人监听的端口）
+				shell.aiPanel.session.baseUrl = "http://127.0.0.1:1/v1";
+				shell.aiPanel.session.model = "smoke-model";
+				..nodio.ui.setCtrlText(shell.aiPanel.input, "冒烟-失败");
+				shell.aiPanel.send();
+				io.print("AI-SEND-START:1");
+				io.print("AI-SEND-MOCK:0");
+			}
+		}
+		catch(eAi){
+			io.print("AI-SEND-START:0");
+			io.print("AI-SEND-EXC:" ++ tostring(eAi));
+		}
+	}
+	else{
+		io.print("AI-SEND-SKIP:1");
+	}
+
+	// ---------- 发布链路（端到端）：IDE 入口 → 发布器 → 独立 exe 跑起来 ----------
+	// runner 是单槽：先发布、后 F5 回声（下面那个 600ms 定时器等 pubDone）。
+	// 产物内容带**每次不同的 token** —— 旧的发布产物混进来也骗不过 PUB-RUN。
+	var pubExe = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_smoke_pub.exe");
+	var pubToken = "pubtok-" ++ tostring(..time.tick());
+	var pubSrc = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_smoke_pub.aardio");
+	..string.save(pubSrc, 'io.print("' ++ pubToken ++ '")');
+	var pubDone = false;
+	publishRun(pubSrc, pubExe, null, false);
+	io.print("PUB-START:" ++ tostring(runner.isRunning() ? 1 : 0));
+
+	var pubTicks = 0;
 	shell.winform.setInterval(function(){
+		pubTicks = pubTicks + 1;
+		if(pubDone) return null;
+		// 最多等 30s（75 × 400ms）；发布器正常 1~2s 就完
+		if(!outCtl.contains("[发布结束]") && pubTicks < 75) return null;
+		if(!outCtl.contains("[发布结束]")){
+			io.print("PUB-EXE:0");
+			io.print("PUB-RUN:0");
+			io.print("PUB-TIMEOUT:1");
+			pubDone = true;
+			return null;
+		}
+		io.print("PUB-EXE:" ++ tostring(..io.exist(pubExe) ? 1 : 0));
+		var runOk = 0;
+		// ⚠ IDE 进程带着 NODIO_RUN（跑 IDE 自己的脚本），子进程会继承 ——
+		//   main.cpp 里 NODIO_RUN harness（464 行）在 payload 模式（586 行）
+		//   **之前**，不清掉的话发布产物会去跑 IDE 脚本而不是自己的 payload。
+		//   popen 的 startInfo 塞 environment 表实测报错（popen.aardio:63 .indexOf），
+		//   改走「spawn 前后临时清父进程 env」：定时器回调同线程同步执行，无重入风险；
+		//   置空串 ≡ 删除变量 → main.cpp 的 `> 0` 判定等于未设置。
+		var envNames = {"NODIO_RUN";"NODIO_PUBLISH";"NODIO_PUBOUT";"NODIO_LIBDIR"};
+		var envOld = {};
+		for(i=1;#envNames;1){
+			envOld[i] = ..string.getenv(envNames[i]);
+			..string.setenv(envNames[i], "");
+		}
+		var p = null;
+		var pubExc = null;
+		try{ p = ..process.popen('"' ++ pubExe ++ '"') }catch(ePub){ pubExc = ePub }
+		for(i=1;#envNames;1){ ..string.setenv(envNames[i], envOld[i] : "") }
+		if(pubExc){ io.print("PUB-EXC:" ++ tostring(pubExc)) }
+		if(p){
+			try{
+				var acc = "";
+				for(i=1;50;1){
+					var o,e = p.peek(50);
+					if(o && #o) acc = acc ++ o;
+					if(e && #e) acc = acc ++ e;
+					if(p.process.waitOne(0)){
+						var o2,e2 = p.peek(0);
+						if(o2 && #o2) acc = acc ++ o2;
+						if(e2 && #e2) acc = acc ++ e2;
+						break;
+					}
+				}
+				p.close();
+				runOk = ..string.indexOf(acc, pubToken) ? 1 : 0;
+				if(!runOk) io.print("PUB-OUT:" ++ acc);
+			}catch(ePub){ io.print("PUB-EXC:" ++ tostring(ePub)) }
+		}
+		io.print("PUB-RUN:" ++ tostring(runOk));
+		pubDone = true;
+		return null;
+	},400);
+
+	shell.winform.setInterval(function(){
+		if(!pubDone) return null;   // 等发布链路走完（runner 单槽，别去抢）
 		try{ runner.run(target) }catch(e){ io.print("RUN-ERR:" ++ tostring(e)) };
 		return null;   // 官方 WM_TIMER 会按返回值决定是否移除定时器
 	},600);
 	shell.winform.setInterval(function(){
-		if(!runner.isRunning() && outCtl.contains("[运行结束]")){
+		if(!runner.isRunning() && outCtl.contains("[运行结束]") && pubDone && aiCheckDone){
 			var ok = outCtl.contains("ide-smoke-echo") ? "OK" : "NO-ECHO";
 			..string.setenv("NODIO_IDE_SMOKE_RESULT",ok);
 			io.print("IDE-SMOKE-" ++ ok);
@@ -2635,7 +2959,73 @@ win.loopMessage();`);
 		io.print("VIS-DOC:" ++ tostring(..win.isVisible(shell.docStrip.board.ctrl.hwnd)));
 		io.print("VIS-ED:" ++ tostring(..win.isVisible(shell.winform.ed.hwnd)));
 		io.print("VIS-TOOLBOX:" ++ tostring(..win.isVisible(shell.rightDock.pages[1].ctrl.hwnd)));
+		// AI 页签：切过去面板内容应当显示，切回来应当隐藏
+		// （面板给 dock 的是「可见性代理」，dock 只切这一个 ctrl）
+		shell.rightDock.setSelIndex(6);
+		var aiOn = ..win.isVisible(shell.aiPanel.head.ctrl.hwnd);
+		shell.rightDock.setSelIndex(1);
+		var aiOff = ..win.isVisible(shell.aiPanel.head.ctrl.hwnd);
+		io.print("AI-TAB:" ++ tostring(aiOn) ++ "/" ++ tostring(aiOff));
+		io.print("AI-CTRLS:" ++ tostring(shell.aiPanel.log ? 1 : 0) ++ "/"
+			++ tostring(shell.aiPanel.input ? 1 : 0));
 	},900);
+
+	// ---------- AI 发送链路：等结果出来再断言 ----------
+	//
+	// ⚠ 不能用固定时间点断言：worker 线程第一次跑时要**自己解析**
+	//   nodio.ai.chat / nodio.ai.http 两个模块（每个解释器各有一份模块缓存），
+	//   x86 上这一步比 900ms 检查点还慢 —— 固定点断言会在请求还没回来时
+	//   就打印「没有错误」，看着像通过，其实链路根本没跑完。
+	//   所以这里改成**轮询到请求结束**再打印，超时（20s）也打印（带 busy:true）。
+	//
+	// 关窗也要等它：上面的关窗定时器带 aiCheckDone 条件。
+	//
+	// 两段：阶段 0 = 成功（对 mock 服务器）→ 阶段 1 = 失败（对没人监听的端口）。
+	if(aiIsolated){
+		var aiTicks = 0;
+		var aiPhase = 0;      // 0=等成功 1=等失败 2=完事
+		var aiTimer = shell.winform.setInterval(function(){
+			aiTicks = aiTicks + 1;
+			if(aiTicks < 5) return null;          // 先给 worker 一点时间起跑
+			if(shell.aiPanel.busy && aiTicks < 200) return null;   // 还在请求 → 继续等
+
+			if(aiPhase == 0){
+				// ---- 阶段 0：成功回包 ----
+				var logOk = shell.aiPanel.getLog();
+				io.print("AI-SEND-USER:" ++ tostring(..string.indexOf(logOk, "我: 冒烟-成功") ? 1 : 0));
+				io.print("AI-SEND-REPLY:" ++ tostring(..string.indexOf(logOk, "AI: MOCK-OK") ? 1 : 0));
+				io.print("AI-SEND-MSGS:" ++ tostring(#shell.aiPanel.session.messages));
+				io.print("AI-SEND-BUSY:" ++ tostring(shell.aiPanel.busy));
+				// ---- 进入阶段 1：失败回包 ----
+				aiPhase = 1;
+				aiTicks = 0;
+				try{
+					shell.aiPanel.session.baseUrl = "http://127.0.0.1:1/v1";
+					..nodio.ui.setCtrlText(shell.aiPanel.input, "冒烟-失败");
+					shell.aiPanel.send();
+				}
+				catch(e3){}
+				return null;
+			}
+
+			// ---- 阶段 1：失败回包 ----
+			var logErr = shell.aiPanel.getLog();
+			io.print("AI-SEND-ERRUSER:" ++ tostring(..string.indexOf(logErr, "我: 冒烟-失败") ? 1 : 0));
+			io.print("AI-SEND-ERR:" ++ tostring(..string.indexOf(logErr, "[错误]") ? 1 : 0));
+			io.print("AI-SEND-ERRMSGS:" ++ tostring(#shell.aiPanel.session.messages));
+			io.print("AI-SEND-TICKS:" ++ tostring(aiTicks));
+			// 测试凭据用完就删（隔离名，不影响用户真实 Key）
+			try{ nodio.ai.cred.apiKeyRemove() }catch(e2){}
+			// ⚠ 定时器必须自己摘掉：官方 WM_TIMER 只按返回值决定留不留，
+			//   这里返回 null = 继续跑 → 每 100ms 重复打一遍断言。
+			try{ shell.winform.clearInterval(aiTimer) }catch(e4){}
+			aiCheckDone = true;
+			return null;
+		},100);
+	}
+	else{
+		aiCheckDone = true;
+	}
 }
 
 // ---------- 导航 smoke（NODIO_IDE_NAV_SMOKE=1）----------

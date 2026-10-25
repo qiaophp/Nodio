@@ -9,4 +9,6 @@
 	<file path="app\designer.nodio" />
 	<file path="app\lspClient.nodio" />
 	<file path="app\dapClient.nodio" />
+	<file path="app\settings.nodio" />
+	<file path="app\ai.nodio" />
 </project>
