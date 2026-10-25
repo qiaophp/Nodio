@@ -1579,7 +1579,26 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 >    GC 悬垂指针修复），两个架构都按当前工作树重建；
 >    **x64 17/17、x86 17/17 全绿**。
 
-> **第三十九轮（编辑器字体「时大时小」—— 一个键名写错，Consolas 静默变成了 Segoe UI）**。
+> **第三十九轮（import / 加载路径分配治理——普查驱动）**。
+> ① 普查工具（allocstat.cpp 常驻）：全局 new/delete override + 阶段归账
+>    + 尺寸直方图 + 阶段×尺寸交叉 + >64KB 大块栈位点（dbghelp 符号化），
+>    NODIO_ALLOC_TRACE=1 门控；定位不再靠调试堆放大倍数猜。
+> ② 优化五项：PNode 节点池（allocate_shared+自由链表，256B 桶 13.0万→6.5k）、
+>    Lex 预留 + Parser move（token 倍增 churn 消失）、VarAt 几何增长、
+>    **槽空间封顶 kSlotMax=512 + 整帧退化 map**（槽下标=全局 intern id 的
+>    尺度病：晚定义帧为几个局部撑 max-id×328B 槽向量；exec 字节 -74%）、
+>    BootTrace 计时器全门控（Ident 无条件 QPC 每语句白付 ~60ns）。
+> ③ 数字（同日同机 A/B，HEAD=8175aba）：import win.ui 家族 281→250ms(-11%)，
+>    exec 分配 105.7→27.3MB，总分配 358k→220k 次 / 185→61MB，callbench
+>    变参 -2.5~3×、其余打平，冷启动打平。
+> ④ 结构挂账：Value=328B（7 shared_ptr + std::function）→ FuncData 侧表
+>    重构挂下轮；round-35 台账 µs 表今日 HEAD 无法复现，以同日 A/B 为准。
+> ⑤ 回归：x64 17/17、x86 17/17（槽封顶后、门控后各一轮），gcstress ×4。
+>    并行 IDE 会话的第三十七轮引擎修复（thread.worker GC 悬垂）按 hunk
+>    拆分先行单独提交（694a399）。
+
+> **第四十轮（编辑器字体「时大时小」—— 一个键名写错，Consolas 静默变成了 Segoe UI）**。
+>    （详见 `docs/capability-gap.md` §1.45）
 > ① **现象**：代码编辑框里同一行的中文和英文**大小明显不一致**、风格也不同，
 >    整片代码看上去「时大时小」（截图 `build-x64/Release/shot_font_ide.png`，
 >    150% DPI 下第 8 行「主脚本必须在」明显大于同行的「app.shell」）。
@@ -1607,22 +1626,45 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 >    故意用错键名再设一次，断言字体确实变回比例 —— 保证不是假绿。
 >    冒烟另加 `DOC-FONT:主编辑器/设置` 与 `DOC-FONT-DIFF:分栏编辑器` 两条。
 > ⑤ 回归：**x64 18/18、x86 18/18 全绿**。
+>
+> ⑤′ **补盲区：给字体锁加「字号真的变了」的判据**（详见 §1.45.8）
+>    上一轮那条锁有洞：字号相关的三条断言**全都只读返回值**
+>    （`setFontSize` 返回 true / `getFontSize` 回显 14 / 仍然等宽），
+>    `setFont` 一旦**静默失败**，三条照样全过 → **假绿**。
+>    补法：字号变了，**排版必须跟着变** —— 字宽（`EM_POSFROMCHAR` 低 16 位）
+>    与行高（高 16 位作差）都从控件里直接量，**不依赖任何返回值**。
+>    实测（96 DPI）：11pt→81px/17px，14pt→101px/22px，18pt→131px/28px，
+>    调回 11pt 精确回到 81px/17px。断言用**比值**（与 DPI 无关，实测 1.247，
+>    失败点 1.00），阈值 `w14*100 > w11*115`。
+>    **变异测试证明判别力**：把 `setFontSize` 的 point 写死成 11 后，
+>    旧的 8 项**全 PASS**（假绿坐实），新增的 4 项**全 FAIL**。
+>    字体锁 9 项 → **17 项**，双架构 17/17；跑批仍 **18/18**。
+>
+> ⑥ **顺带修的回归夹具**：`ide_ctx` 在批量跑批里**间歇性假红**、单独跑恒绿
+>    —— 与字体无关，是**共享桌面的剪贴板争用**（本机剪贴板被别的进程**高频
+>    短暂占用**：`GetOpenClipboardWindow` 连采 5 次都看不到持有者，但 .NET 的
+>    `Clipboard::SetText` 稳定报「所请求的剪贴板操作失败」；仓库自己的
+>    `win_clip/clip.nopio` 也打印 `CLIP-OK 0`）。根因是夹具**复制后直接回读、
+>    不校验**：写失败时回读拿到的是**上一次遗留的内容** → 单独跑时遗留正好是
+>    `"hello"` → **碰巧通过**（假绿），跟着别的测试跑 → **间歇性假红**。
+>    改法沿用仓库既有思路（`win_clip/clip.nopio` 的「每步重新探测 + 按门选
+>    期望值」）：复制/剪切/写入/粘贴**每步都「操作 → 回读校验 → 不对就重试」**，
+>    任何一步对不上就整组退成 `EDIT-CLIP-SKIP`（右键链路的断言一条不放松）。
+>    两条分支都验过：成功语义用内存假剪贴板跑出**逐行对齐 `ctx.expect`**，
+>    失败语义用实机（剪贴板正被锁）验过。
 
 
-> **第三十九轮（import / 加载路径分配治理——普查驱动）**。
-> ① 普查工具（allocstat.cpp 常驻）：全局 new/delete override + 阶段归账
->    + 尺寸直方图 + 阶段×尺寸交叉 + >64KB 大块栈位点（dbghelp 符号化），
->    NODIO_ALLOC_TRACE=1 门控；定位不再靠调试堆放大倍数猜。
-> ② 优化五项：PNode 节点池（allocate_shared+自由链表，256B 桶 13.0万→6.5k）、
->    Lex 预留 + Parser move（token 倍增 churn 消失）、VarAt 几何增长、
->    **槽空间封顶 kSlotMax=512 + 整帧退化 map**（槽下标=全局 intern id 的
->    尺度病：晚定义帧为几个局部撑 max-id×328B 槽向量；exec 字节 -74%）、
->    BootTrace 计时器全门控（Ident 无条件 QPC 每语句白付 ~60ns）。
-> ③ 数字（同日同机 A/B，HEAD=8175aba）：import win.ui 家族 281→250ms(-11%)，
->    exec 分配 105.7→27.3MB，总分配 358k→220k 次 / 185→61MB，callbench
->    变参 -2.5~3×、其余打平，冷启动打平。
-> ④ 结构挂账：Value=328B（7 shared_ptr + std::function）→ FuncData 侧表
->    重构挂下轮；round-35 台账 µs 表今日 HEAD 无法复现，以同日 A/B 为准。
-> ⑤ 回归：x64 17/17、x86 17/17（槽封顶后、门控后各一轮），gcstress ×4。
->    并行 IDE 会话的第三十七轮引擎修复（thread.worker GC 悬垂）按 hunk
->    拆分先行单独提交（694a399）。
+
+> **第四十一轮（Value 侧表化——调用路径近乎腰斩）**。
+> ① FuncData 侧表：9 个函数专属字段收进 shared_ptr，sizeof(Value)
+>    328→136B（-58%），拷贝 7→3 次原子操作；232 处访问点编译错误驱动
+>    修补。② native 裸指针化：std::function(64B 内联) → 裸指针+可选
+>    上下文，407 个 NF 注册点零改动，无捕获 lambda 零分配。
+> ③ 三类真坑：创建点漏分配 fnData（builtin 注册期崩）、GcMarkValue
+>    无条件解引用（首次 GC 崩）、共享侧表写透（跨线程 DeepCopy 原地
+>    reset 清掉原函数闭包——t28/t29 抓获，先深拷贝再清）。
+> ④ 数字：全局 2 参调用 4µs→1.8µs(-55%)，方法 4µs，变参 2.7µs，
+>    native 0.14µs；import win.ui 250→172-188ms(-30%)；exec 分配字节
+>    27.3→11.6MB；uiprobe13 WS 增量 20-54→11.7-14.9MB。
+> ⑤ 回归：x64 18/18、x86 18/18，gcstress ×2。第四十轮（编辑器字体，
+>    并行 IDE 会话）未提交内容经核对后随行落账。

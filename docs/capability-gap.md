@@ -4602,117 +4602,6 @@ mock 还活着 → 它一直占着控制台句柄 → **调用方的 stdout 管�
 
 ---
 
-## 1.44 第三十九轮：编辑器字体「时大时小」—— 一个键名写错，Consolas 静默变成了 Segoe UI
-
-### 1.44.1 现象
-
-IDE 的**代码编辑框**里，同一行的中文和英文**大小明显不一致**：英文小一号、
-中文大一号，中文还像是另一种字体（笔画更细、风格不同）。整片代码看上去
-「时大时小」。
-
-截图（`build-x64/Release/shot_font_ide.png`，150% DPI）里第 8 行：
-`// ⚠ 主脚本必须在 app.shell **之前**应用：各 chrome 组件都是…`
-—— 「主脚本必须在」明显比「app.shell」大，且风格不同。
-
-### 1.44.2 根因：`ctrl.setFont` 的键名写错了（`faceName` ≠ `name`）
-
-`lib/nodio/ui/editor.nodio` 设编辑器字体时写的是：
-
-```aardio
-ctrl.setFont({faceName=self.fontName; point=self.fontSize});   // ← 错
-```
-
-但官方 `LOGFONT` 类的字体名字段就叫 **`name`**（`WORD name[32]`），
-而它的构造函数是**逐键原样拷贝**：
-
-```aardio
-// D:\aardio\lib\gdi\_.aardio:7
-class ::LOGFONT{
-  ctor(arg,point){
-    this.name = "Tahoma";
-    ...
-    for(k,v in arg){ if( k!="_struct" ) this[k] = v; }   // ← 认不得的键被当垃圾塞进去，不报错
-    if(this.name =="Tahoma"){ ... elseif(!_WINXP){ this.name = "Segoe UI"; } }   // ← 兜底
-  }
-  WORD name[32];   // ← 字体名
-}
-```
-
-于是 `faceName` 被当成一个**无关的结构体字段**扔掉，`name` 保持默认值
-→ 触发「Tahoma → **Segoe UI**」兜底 → **Consolas 从来没生效过**。
-实际渲染的是 **Segoe UI**（比例字体）→
-
-1. 代码**不等宽**，列对不齐；
-2. Segoe UI 没有汉字字形 → 汉字走 GDI 字体回退（另一套字体）→
-   字面更大、风格也不同 → 「时大时小」。
-
-**为什么能活这么久**：这一行包在 `try{ … }catch(e3){}` 里，**异常被吞掉**；
-而错键名**根本不抛异常**（只是被忽略），所以既没有报错、也没有日志，
-只剩下「看起来怪」。
-
-**实测对照**（`tests/ide_font/font.nodio` 的前三条断言）：
-
-```
-::LOGFONT({faceName="Consolas"; point=11}).name  ==  "Segoe UI"   ← 错键名
-::LOGFONT({name="Consolas";      point=11}).name  ==  "Consolas"   ← 对键名
-```
-
-官方 API 文档也写死了键名：
-
-- `D:\aardio\lib\win\ui\ctrl\edit.aardio:802`
-  `!edit.setFont(混入字体属性) = @.setFont(h=-12;name="Tahoma");`
-- `D:\aardio\lib\win\ui\ctrl\richedit.aardio:799`
-  `setFont = function(f,own = true ){ … f = ::LOGFONT(f) … }`
-
-### 1.44.3 修复
-
-`lib/nodio/ui/editor.nodio` 两处（首次设字体 + `setFontSize`）改成：
-
-```aardio
-ctrl.setFont({name=self.fontName; point=self.fontSize});   // ← name
-```
-
-`point`（pt）仍然是对的：官方 `setFont` 会 `stripPoint` 把它换算成
-像素高度，再除以 DPI 缩放（richedit 自己会缩放，避免二次放大），
-所以**不能**自己再乘 `dpiScale`。
-
-### 1.44.4 顺带修的三处「口径不一致」
-
-| 位置 | 问题 | 改法 |
-|---|---|---|
-| `lib/nodio/ui/editor.nodio`（行号栏画板） | 画板字号单位是**逻辑像素**，却直接塞了 **pt**（`fontSize = self.fontSize`）→ 这块板面的字体比别处小 1/4 | 改用 `self.uiFontSize`（pt × 4/3） |
-| `lib/nodio/ui/editor.nodio`（`setFontSize`） | 同上，改字号后行号栏画板字号跟着错 | 同上，改用 `self.uiFontSize` |
-| `ide/nodio/app/shell.nodio`（分栏对比编辑器） | **硬编码 `fontSize = 11`**，不跟设置走 → 用户改了字号，左右两半对不上 | 改成 `app.settings.fontSizeGet()` |
-| `ide/nodio/main.nodio`（`onEditorFontSize`） | 改字号只通知了主编辑器，分栏那个不动 | 同时 `shell.editor2.setFontSize(n)` |
-
-### 1.44.5 回归锁：`tests/ide_font/` + `tests/ide_font_check.ps1`（9 项）
-
-**怎么断言「字体对不对」**：不去读 HFONT —— 我们引擎的 `::SendMessage`
-回不了指针型返回值（实测 `WM_GETFONT` 恒为 0），改用**等宽性**这个
-可观测特征：等宽字体里 `"iiiiiiiiii"` 与 `"WWWWWWWWWW"` 宽度相同，
-比例字体里差一大截。宽度用 `EM_POSFROMCHAR(0x426)` 量（低 16 位 = x）。
-
-实测灵敏度（同一二进制，只改键名）：
-
-| 设置方式 | `iiiiiiiiii` | `WWWWWWWWWW` | 等宽 |
-|---|---|---|---|
-| `name=`（修好） | 81 px | 81 px | ✅ |
-| `faceName=`（原 bug） | 31 px | 131 px | ❌ |
-
-最后一条是**反证**：故意用错键名再设一次，断言字体确实变回比例 ——
-保证前几条不是「怎么测都过」的假绿。
-
-冒烟里另加两条（`ide/nodio/main.nodio` + `tests/ide_smoke.ps1`）：
-
-```
-DOC-FONT:11/11      ← 主编辑器字号 / 设置里的字号
-DOC-FONT-DIFF:11    ← 分栏对比编辑器的字号
-```
-
-三者必须相等（`tests/ide_smoke.ps1` 逐条比）。
-
-
-
 ## 1.44 第三十九轮：import / 加载路径分配治理（普查驱动）
 
 ### 1.44.1 工具：全局分配普查（engine/allocstat.cpp，常驻诊断）
@@ -4795,3 +4684,314 @@ x64 17/17、x86 17/17 全绿（run_regression.ps1，槽封顶后与计时器门�
 仍在工作树未提交，其完整性经核对后与本节一起落账）；其第三十七轮的
 引擎修复（thread.worker 解释器生命周期）已按 hunk 拆分单独提交
 （694a399），归属其轮次。
+
+
+## 1.45 第四十轮：编辑器字体「时大时小」—— 一个键名写错，Consolas 静默变成了 Segoe UI
+
+### 1.45.1 现象
+
+IDE 的**代码编辑框**里，同一行的中文和英文**大小明显不一致**：英文小一号、
+中文大一号，中文还像是另一种字体（笔画更细、风格不同）。整片代码看上去
+「时大时小」。
+
+截图（`build-x64/Release/shot_font_ide.png`，150% DPI）里第 8 行：
+`// ⚠ 主脚本必须在 app.shell **之前**应用：各 chrome 组件都是…`
+—— 「主脚本必须在」明显比「app.shell」大，且风格不同。
+
+### 1.45.2 根因：`ctrl.setFont` 的键名写错了（`faceName` ≠ `name`）
+
+`lib/nodio/ui/editor.nodio` 设编辑器字体时写的是：
+
+```aardio
+ctrl.setFont({faceName=self.fontName; point=self.fontSize});   // ← 错
+```
+
+但官方 `LOGFONT` 类的字体名字段就叫 **`name`**（`WORD name[32]`），
+而它的构造函数是**逐键原样拷贝**：
+
+```aardio
+// D:\aardio\lib\gdi\_.aardio:7
+class ::LOGFONT{
+  ctor(arg,point){
+    this.name = "Tahoma";
+    ...
+    for(k,v in arg){ if( k!="_struct" ) this[k] = v; }   // ← 认不得的键被当垃圾塞进去，不报错
+    if(this.name =="Tahoma"){ ... elseif(!_WINXP){ this.name = "Segoe UI"; } }   // ← 兜底
+  }
+  WORD name[32];   // ← 字体名
+}
+```
+
+于是 `faceName` 被当成一个**无关的结构体字段**扔掉，`name` 保持默认值
+→ 触发「Tahoma → **Segoe UI**」兜底 → **Consolas 从来没生效过**。
+实际渲染的是 **Segoe UI**（比例字体）→
+
+1. 代码**不等宽**，列对不齐；
+2. Segoe UI 没有汉字字形 → 汉字走 GDI 字体回退（另一套字体）→
+   字面更大、风格也不同 → 「时大时小」。
+
+**为什么能活这么久**：这一行包在 `try{ … }catch(e3){}` 里，**异常被吞掉**；
+而错键名**根本不抛异常**（只是被忽略），所以既没有报错、也没有日志，
+只剩下「看起来怪」。
+
+**实测对照**（`tests/ide_font/font.nodio` 的前三条断言）：
+
+```
+::LOGFONT({faceName="Consolas"; point=11}).name  ==  "Segoe UI"   ← 错键名
+::LOGFONT({name="Consolas";      point=11}).name  ==  "Consolas"   ← 对键名
+```
+
+官方 API 文档也写死了键名：
+
+- `D:\aardio\lib\win\ui\ctrl\edit.aardio:802`
+  `!edit.setFont(混入字体属性) = @.setFont(h=-12;name="Tahoma");`
+- `D:\aardio\lib\win\ui\ctrl\richedit.aardio:799`
+  `setFont = function(f,own = true ){ … f = ::LOGFONT(f) … }`
+
+### 1.45.3 修复
+
+`lib/nodio/ui/editor.nodio` 两处（首次设字体 + `setFontSize`）改成：
+
+```aardio
+ctrl.setFont({name=self.fontName; point=self.fontSize});   // ← name
+```
+
+`point`（pt）仍然是对的：官方 `setFont` 会 `stripPoint` 把它换算成
+像素高度，再除以 DPI 缩放（richedit 自己会缩放，避免二次放大），
+所以**不能**自己再乘 `dpiScale`。
+
+### 1.45.4 顺带修的三处「口径不一致」
+
+| 位置 | 问题 | 改法 |
+|---|---|---|
+| `lib/nodio/ui/editor.nodio`（行号栏画板） | 画板字号单位是**逻辑像素**，却直接塞了 **pt**（`fontSize = self.fontSize`）→ 这块板面的字体比别处小 1/4 | 改用 `self.uiFontSize`（pt × 4/3） |
+| `lib/nodio/ui/editor.nodio`（`setFontSize`） | 同上，改字号后行号栏画板字号跟着错 | 同上，改用 `self.uiFontSize` |
+| `ide/nodio/app/shell.nodio`（分栏对比编辑器） | **硬编码 `fontSize = 11`**，不跟设置走 → 用户改了字号，左右两半对不上 | 改成 `app.settings.fontSizeGet()` |
+| `ide/nodio/main.nodio`（`onEditorFontSize`） | 改字号只通知了主编辑器，分栏那个不动 | 同时 `shell.editor2.setFontSize(n)` |
+
+### 1.45.5 回归锁：`tests/ide_font/` + `tests/ide_font_check.ps1`（9 项）
+
+**怎么断言「字体对不对」**：不去读 HFONT —— 我们引擎的 `::SendMessage`
+回不了指针型返回值（实测 `WM_GETFONT` 恒为 0），改用**等宽性**这个
+可观测特征：等宽字体里 `"iiiiiiiiii"` 与 `"WWWWWWWWWW"` 宽度相同，
+比例字体里差一大截。宽度用 `EM_POSFROMCHAR(0x426)` 量（低 16 位 = x）。
+
+实测灵敏度（同一二进制，只改键名）：
+
+| 设置方式 | `iiiiiiiiii` | `WWWWWWWWWW` | 等宽 |
+|---|---|---|---|
+| `name=`（修好） | 81 px | 81 px | ✅ |
+| `faceName=`（原 bug） | 31 px | 131 px | ❌ |
+
+最后一条是**反证**：故意用错键名再设一次，断言字体确实变回比例 ——
+保证前几条不是「怎么测都过」的假绿。
+
+冒烟里另加两条（`ide/nodio/main.nodio` + `tests/ide_smoke.ps1`）：
+
+```
+DOC-FONT:11/11      ← 主编辑器字号 / 设置里的字号
+DOC-FONT-DIFF:11    ← 分栏对比编辑器的字号
+```
+
+三者必须相等（`tests/ide_smoke.ps1` 逐条比）。
+
+### 1.45.6 顺带修的回归夹具：`ide_ctx` 的剪贴板**间歇性假红**
+
+字体改完跑全量回归时，`ide_ctx` 在**批量**里时红时绿、**单独跑**恒绿。
+查下来与字体无关，是**共享桌面环境的剪贴板争用**：
+
+- 本机剪贴板被别的进程**高频短暂占用**（远端会话 / IM / 剪贴板管理器）：
+  `GetOpenClipboardWindow` 连续采样 5 次都**看不到持有者**（持有窗口太短），
+  但 `.NET` 的 `Clipboard::SetText` 稳定报「所请求的剪贴板操作失败」
+  = `CLIPBRD_E_CANT_OPEN`；仓库自己的 `tests/win_clip/clip.nopio` 开头
+  也打印 `CLIP-OK 0`。
+- `tests/ide_ctx/ctx.nodio` 的剪贴板段是**复制后直接回读、不校验**：
+  写失败时回读拿到的是**上一次遗留的内容**，于是打印出一个「说不清对错」
+  的值 → 跟 `ctx.expect` 逐行比对就红：
+  - 单独跑：上一轮遗留的正好是 `"hello"` → **碰巧通过**（假绿）
+  - 跟着别的测试跑：遗留的是别的东西 → **间歇性假红**
+
+**改法**（沿用仓库既有的思路，见 `tests/win_clip/clip.nopio`：剪贴板是全局
+资源，**每步都要重新探测**，按「成功语义 / 官方静默失败语义」分开处理）：
+
+- 复制 / 剪切 / 写入 / 粘贴**每一步都「操作 → 回读校验 → 不对就重试」**
+  （各 8 次，带 40ms 让出）；
+- 任何一步对不上 → 整组退成 `EDIT-CLIP-SKIP`（`ide_ctx_smoke.ps1` 已有
+  这个分支：它会同时从 got / want 里去掉那 4 行剪贴板断言）；
+- 右键链路相关的断言**一条都不放松**。
+
+**两条分支都验过**：
+
+| 分支 | 验证方式 | 结果 |
+|---|---|---|
+| 成功语义（剪贴板可用） | 临时副本把 `win.clip` 换成内存假实现（编辑器的文本效果照常） | 逐行对齐 `ctx.expect` → `CTX-SMOKE OK` |
+| 静默失败语义（剪贴板被占） | 实机（当前剪贴板就是被锁的） | 打印 `EDIT-CLIP-SKIP` → `CTX-SMOKE OK` |
+
+> 真正的剪贴板信号仍由 `tests/win_clip_check.ps1` 那条专门锁负责 ——
+> 它每步带 `CLIP0/CLIP1` 门、按门选择期望值（roadmap 第 27 轮挂账项）。
+
+### 1.45.7 回归（本轮最终态）
+
+| 架构 | ide_smoke | ide_font | ide_ai | ide_settings | ide_ctx | ide_threadgc | 其余 12 项 | 合计 |
+|---|---|---|---|---|---|---|---|---|
+| x64 | ✅ | ✅ 17 项 | ✅ 83 项 | ✅ 47 项 | ✅ | ✅ | ✅ | **18/18** |
+| x86 | ✅ | ✅ 17 项 | ✅ 83 项 | ✅ 47 项 | ✅ | ✅ | ✅ | **18/18** |
+
+> `ide_font` 的项数：§1.45.3 落锁时 9 项，§1.45.8 补完「字号真的生效」
+> 的盲区后为 **17 项**（含 5 条变异/反证）。
+
+本轮**未改引擎**，两个架构沿用上一轮的构建产物；改动全在
+`lib/nodio/ui/editor.nodio`（脚本层）、`ide/nodio/app/shell.nodio`、
+`ide/nodio/main.nodio`、`tests/ide_ctx/ctx.nodio` 与新增的
+`tests/ide_font/`、`tests/ide_font_check.ps1`。
+
+### 1.45.8 给字体锁补盲区：「字号真的变了」必须有判据
+
+**上一轮锁的盲区**
+
+`tests/ide_font/font.nodio` 原来的 9 项断言里，字号相关的只有三条，
+而这三条**全都只读返回值**：
+
+```
+chkTrue("editor/setFontSize-accepts", ed.setFontSize(14), ...)   ← 返回 true
+chk("editor/fontSize-echo", ed.getFontSize(), 14)                ← 回显 14
+chkTrue("editor/mono-after-setFontSize", ...)                    ← 仍然等宽
+```
+
+如果哪天 `setFont` **静默失败**（`point` 没传进字体 / 键名又写错 /
+异常被 `catch` 吞掉），`setFontSize` 照样返回 true、`getFontSize` 照样回显 14、
+字体照样等宽 —— **三条断言全过，但用户改字号一点反应都没有**。
+这就是假绿，也是这轮要补的洞。
+
+**判据：字号变了，排版必须跟着变**
+
+point 落到字体上，一定会影响**字宽**和**行高** —— 这两个量都能**直接从控件
+里量出来**，不依赖任何返回值：
+
+- 字宽：`EM_POSFROMCHAR(0x426)` 的低 16 位 = x
+- 行高：同一消息的高 16 位 = y，取「行 2 首字符的 y − 行 1 首字符的 y」
+
+实测（x64 / x86 同值；本机 96 DPI）：
+
+| point | 10 个 W 的宽度 | 行高 | `ed.lineHeight` |
+|---|---|---|---|
+| 11 | 81 px | 17 px | 17 |
+| 14 | 101 px | 22 px | 22 |
+| 18 | 131 px | 28 px | 28 |
+| 调回 11 | 81 px | 17 px | 17 |
+
+断言用**比值**而不是绝对像素：字宽正比于字体高度、字体高度正比于 DPI，
+所以比值与 DPI 无关（本机 96 DPI 实测 14pt/11pt = 101/81 = **1.247**；
+而「point 没生效」的比值是 **1.00**）。阈值取 `w14 * 100 > w11 * 115`，
+在实测 1.247 与失败点 1.00 之间留足了余量。
+
+「调回 11pt 后宽度**精确**回到 81、行高回到 17」这条也在锁里 ——
+它证明测量是字号的确定函数，不是噪声。
+
+**顺带踩到并绕开的坑：aardio 双引号串是原样字面量**
+
+第一版探针里文本写成双引号 `"WWWWWWWWWW\r\nWWWWWWWWWW"`，
+而 aardio 的**双引号串不转义** → `\r\n` 是 4 个字符 `\ r \ n` →
+文本成了**一行 24 个字符**（`EM_GETLINECOUNT` 返回 1），
+行高量出来恒为 0，差点误判成「这引擎量不出行高」。
+换行必须用**单引号** `'\r\n'`（`editor.nodio` 的 `__detectEOL` /
+`__toCRLF` 用的正是单引号，那两处没问题）。
+
+**变异测试：证明新断言真有判别力**
+
+把 `lib/nodio/ui/editor.nodio` 的 `setFontSize` 改成
+`ctrl.setFont({name=self.fontName; point=11})`（模拟「point 没生效」），
+**不重新构建**（`.nodio` 脚本运行时从 `NODIO_OVERLAY_LIBDIR` 加载），
+重跑字体锁：
+
+| 断言组 | 结果 |
+|---|---|
+| 旧的 8 项（含 `setFontSize-accepts` / `fontSize-echo` / `mono`） | **全 PASS** ← 旧锁确实是假绿 |
+| 新增 4 项（字宽 / 行高各两组「变大」） | **全 FAIL** ← 新锁抓住了 |
+
+```
+PASS editor/setFontSize-accepts
+PASS editor/fontSize-echo
+PASS editor/mono-after-setFontSize
+FAIL editor/width-grows-with-size  w11=81 w14=81
+FAIL editor/lineheight-grows-with-size  lh11=17 lh14=17
+PASS editor/lineHeight-field-matches
+FAIL editor/width-grows-again  w14=81 w18=81
+FAIL editor/lineheight-grows-again  lh14=17 lh18=17
+== FONT FAILED: 4
+```
+
+改回后 x64 / x86 恢复 17/17。
+
+**反证也补了一条**
+
+- `counter/wrong-point-key-not-11pt-not-14pt`：故意把 point 键名写错
+  （`fontPoint=`）→ point 被丢掉 → `LOGFONT` 退回默认 `h = -12`（≈9pt）
+  → 宽度 71 px，**既不是 11pt 的 81、也不是 14pt 的 101**。
+  这条证明「宽度随字号变」不是恒真的假绿。
+- `editor/wrong-key-becomes-proportional`（原有的字体名键名反证）保留。
+
+**规模**：字体锁 9 项 → **17 项**（`tests/ide_font_check.ps1` 统计 `^PASS `）。
+
+
+
+
+## 1.46 第四十一轮：Value 侧表化（FuncData）+ native 裸指针化——调用路径近乎腰斩
+
+### 1.46.1 动机（上一轮的挂账）
+
+`sizeof(Value)` 曾为 **328B**：7 个 shared_ptr（112B，每次拷贝 7 次原子
+引用计数）+ std::function（64B）+ 两个 wstring + params vector，而其中
+~200B 只有 Func/Class 值用得上。每个 Value 拷贝 = 328B memcpy + 7 次
+原子操作——这是调用路径、exec 分配量与 GC 压力的公共下限。
+
+### 1.46.2 两项结构手术
+
+1. **FuncData 侧表**：9 个函数专属字段（fn/classBody/params/fname/
+   nsClosure/envUp/pdefaults/thisVal/ownerVal）收进
+   `shared_ptr<FuncData>`，仅在创建 Func/Class 值时分配一次。
+   `sizeof(Value)` 328 → **136B**（-58%），拷贝 7 → 3 次原子操作。
+   全部 232 处字段访问点改为 `.fnData->`（编译错误驱动逐点修补）。
+2. **native 裸指针化**：64B 内联的 `std::function` 换成裸函数指针 +
+   `shared_ptr<void> nativeCtx`。`NF`/`Native_` 模板化后 407 个注册点
+   **零改动**：无捕获 lambda 经类型级 trampoline + 静态空对象（别名
+   指针不拥有）实现零分配；有捕获 lambda 一次 make_shared。30 个调用
+   点改传 `nativeCtx.get()`；等价判据从 `target_type()` 改为跳板地址
+   （同一 lambda 类型同一跳板，类型级判等语义不变）。
+
+### 1.46.3 途中踩出并修复的三类真坑
+
+1. **创建点漏分配 fnData**：`Native_` 模板化时漏加
+   `x.fnData = make_shared<FuncData>()`（脚本断言中断导致半截写入）——
+   builtin 注册期读 `fname` 直接空指针崩溃。规则固定为：**t ∈ {Func,
+   Class} 当且仅当 fnData 非空**，全部 6 个直接创建点 + NF/Native_ 落实。
+2. **GcMarkValue 无条件解引用**：非函数值在第一次 GC 即崩。侧表访问
+   必须以 `if (v.fnData)` 门控。
+3. **共享侧表的写透**：util.cpp 跨线程 DeepCopy 尾路对 `nsClosure`
+   原地 reset——fnData 共享后会把**原函数**的闭包一起清掉，必须先
+   `make_shared<FuncData>(*v.fnData)` 深拷贝再清；标量（Null/Num/Str）
+   与 native 函数也走这条尾路，fnData 为空时跳过（旧代码等价于对 null
+   shared_ptr reset，重构后成了空指针解引用，t28/t29 线程用例当场抓获）。
+
+### 1.46.4 数字（同日同机，与第三十九轮终态对比）
+
+| 项 | 第三十九轮终态 | 本轮 | 变化 |
+|---|---|---|---|
+| sizeof(Value) | 328B | **136B** | -58% |
+| callbench 全局 2 参 | 3.9-4.4µs | **1.8-2.1µs** | **-55%** |
+| callbench 方法调用 | 8.5-13.5µs | **3.9-4.0µs** | **-55%** |
+| callbench 变参 | 8.6-12.3µs | **2.6-2.8µs** | -60% |
+| callbench 内建 tostring | 234-376ms | **140-155ms** | -45% |
+| import win.ui 家族 | 250ms | **172-188ms** | -30% |
+| exec 阶段分配 | 91k 次 / 27.3MB | **75.9k 次 / 11.6MB** | -58% 字节 |
+| uiprobe13 WS 增量 | 20-54MB | **11.7-14.9MB** | GC 压力大降 |
+
+### 1.46.5 回归（本轮最终态）
+
+x64 18/18、x86 18/18 全绿（run_regression.ps1，含线程/IDE 全套）；
+gcstress uiprobe13 ×2 通过；字节码/记录 VM/官方样例全绿。
+
+### 1.46.6 会话协调
+
+文档第四十轮/§1.45（编辑器字体）为并行 IDE 会话所写，本轮提交时仍在
+工作树未提交，完整性经核对后与本节一起落账；第四十一轮编号顺延其后者。
