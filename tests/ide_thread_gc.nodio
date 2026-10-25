@@ -1,0 +1,37 @@
+// tests/ide_thread_gc.nodio — 引擎回归锁：worker 线程退出后主线程再分配。
+//
+// ⚠ 这条用例锁的是 **引擎 GC 的一个硬 bug**（2026-10-24 实测）：
+//
+//   thread.create 起一个 worker 线程；worker 一退出，线程栈就被释放，
+//   但主线程的 GC 仍可能顺着 Value::envUp / Env::parent 摸到
+//   **这个 worker 的解释器拥有的 env**（Interp::globals 是解释器对象的
+//   **成员**，就住在那个已释放的栈上）→ 访问违规 0xC0000005。
+//
+//   最小复现（就是本文件）：
+//     import thread;
+//     thread.create(function(a){ return a; }, "x");
+//     for(i=1; 300000; 1){ var junk = {a=i; b="str" ++ i; c={d=i}}; }
+//   → worker 退出后主线程的第一次 GC 就崩（exit=0xC0000005）；
+//     设 NODIO_GC_THRESHOLD=0（关掉自动 GC）同一个脚本 exit=0。
+//
+//   修法（engine/builtins.cpp ThreadWorkerProc）：
+//     解释器改成堆分配，并挂在 ThreadState 上随线程状态一起保活 ——
+//     线程栈可以释放，解释器不能。
+//
+// 断言靠**进程退出码**：崩了就是非 0（0xC0000005 → exit=-1073741819）。
+import thread;
+
+io.print("TG-START");
+
+// worker 立刻退出（这是触发条件：退出后主线程再分配）
+var handle = thread.create(function(a){
+	io.print("TG-WORKER:" ++ a);
+	return a;
+}, "x");
+
+// 主线程继续分配：跨过 GC 的阈值，逼主线程的收集器跑起来
+for(i=1; 300000; 1){
+	var junk = {a=i; b="str" ++ i; c={d=i; e={f=i}}};
+}
+
+io.print("TG-MAIN-DONE");

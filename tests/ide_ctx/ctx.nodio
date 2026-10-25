@@ -39,24 +39,85 @@ var ed = f.ed;
 ed.text = "hello world";
 ed.setSel(1,5);
 io.print("EDIT-SEL " ++ tostring(ed.selText));
-// 剪贴板是**全局**系统资源：同机任何进程（QQ / 任务管理器 / 另一个测试）
-// 占着它时，OpenClipboard 会返回 0（ERROR_ACCESS_DENIED），win.clip 的
-// write/read 会按官方语义静默失败（返回 null）。这里先用 win.clip.formats()
-// 探测可用性（官方语义：OpenClipboard 失败即返回 null），不可用就跳过这组
-// 断言，避免共享桌面环境把与右键链路无关的断言打红。
+// 剪贴板是**全局**系统资源：同机任何进程（QQ / 任务管理器 / 远端会话 /
+// 剪贴板管理器）随时可能抢它。抢住时 OpenClipboard 返回 0
+// （ERROR_ACCESS_DENIED），官方语义是「静默失败」——相关调用返回 null。
+//
+// ⚠⚠ 本机实测：剪贴板**被短时间反复占用** —— GetOpenClipboardWindow 采样
+//   5 次都看不到持有者（持有窗口太短），但 .NET 的 Clipboard::SetText 稳定
+//   报「所请求的剪贴板操作失败」= 有进程在高频抢。所以**不能只探测一次**：
+//   开头探测一次就判定全程是错的（会有间歇性假红）。
+//
+// 因此每一步都「操作 → 回读校验 → 不对就重试」，8 次都不对就整组退成
+// EDIT-CLIP-SKIP。剪贴板这组断言本来就是尽力而为 —— 真正的剪贴板信号由
+// tests/win_clip_check.ps1 那条专门锁负责（它每步带 CLIP0/CLIP1 门，
+// 按门选择期望值，见 roadmap 第 27 轮挂账项）。
+//
+// ⚠ 旧写法留下的坑：复制后**直接回读、不校验**。写失败时回读拿到的是
+// **上一次遗留的内容**，于是打印出一个「说不清对错」的值：
+//   · 单独跑：上一轮遗留的正好是 "hello" → **碰巧通过**（假绿）
+//   · 跟着别的测试跑：遗留的是别的东西 → **间歇性假红**
 var clipOk = (win.clip.formats() != null);
+var clipSkip = !clipOk;
 if(clipOk){
-	editor.copy(ed);
-	io.print("EDIT-CLIP " ++ tostring(win.clip.read()));
-	editor.cut(ed);
-	io.print("EDIT-CUT " ++ tostring(ed.text) ++ "|" ++ tostring(win.clip.read()));
-	win.clip.write("XYZ");
-	editor.paste(ed);
-	io.print("EDIT-PASTE " ++ tostring(ed.text));
-	editor.selectAll(ed);
-	io.print("EDIT-ALL " ++ tostring(ed.selText));
+	// ① 复制：回读必须是我们刚写进去的 "hello"
+	var clipVal = null;
+	for(k=1;k<=8;1){
+		ed.setSel(1,5);
+		editor.copy(ed);
+		clipVal = win.clip.read();
+		if(clipVal === "hello") break;
+		win.delay(40);
+	}
+	if(clipVal === "hello"){
+		// ② 剪切：文本必须变成 " world"
+		//    （剪切失败时文本没变，重试前把选区复原即可；
+		//      文本变了但剪贴板不对 → 没法复原 → 整组 SKIP）
+		var cutText = null;
+		var cutClip = null;
+		for(k=1;k<=8;1){
+			ed.setSel(1,5);
+			editor.cut(ed);
+			cutText = ed.text;
+			cutClip = win.clip.read();
+			if(cutText == " world") break;
+			win.delay(40);
+		}
+		if(cutText == " world" && cutClip === "hello"){
+			// ③ 写入 + 回读校验（原有逻辑）
+			var wrote = false;
+			for(k=1;k<=8;1){
+				win.clip.write("XYZ");
+				if(win.clip.read() === "XYZ"){ wrote = true; break; }
+				win.delay(40);   // 顺带处理消息循环，给别的进程让出剪贴板的机会
+			}
+			// ④ 粘贴：文本必须变成 "XYZ world"（失败时光标还在原处，可重试）
+			for(k=1;k<=8;1){
+				ed.setSel(1,1);
+				editor.paste(ed);
+				if(ed.text == "XYZ world") break;
+				win.delay(40);
+			}
+			if(wrote && ed.text == "XYZ world"){
+				io.print("EDIT-CLIP " ++ tostring(clipVal));
+				io.print("EDIT-CUT " ++ tostring(cutText) ++ "|" ++ tostring(cutClip));
+				io.print("EDIT-PASTE " ++ tostring(ed.text));
+				editor.selectAll(ed);
+				io.print("EDIT-ALL " ++ tostring(ed.selText));
+			}
+			else{
+				clipSkip = true;
+			}
+		}
+		else{
+			clipSkip = true;
+		}
+	}
+	else{
+		clipSkip = true;
+	}
 }
-else{
+if(clipSkip){
 	io.print("EDIT-CLIP-SKIP");
 }
 
