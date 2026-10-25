@@ -351,11 +351,18 @@ canvas = function(winform, opt){
 		// 在下面 rawAttrs 覆盖。
 		var transBg = { static=true; groupbox=true; checkbox=true; radio=true };
 		if(transBg[spec.cls]) tParam.bgcolor = self.form.bgcolor;
-		// DSG 原生属性进创建参数（几何/文本/锚点除外 —— 各有专门通道）
+		// DSG 原生属性进创建参数（几何/文本除外 —— 各有专门通道）
 		if(rawAttrs){
 			var geoK = {left=true; top=true; right=true; bottom=true; width=true;
-				height=true; text=true; z=true; cls=true; anchors=true; name=true; autoResize=true};
+				height=true; text=true; z=true; cls=true; name=true; autoResize=true};
 			for(k3 in rawAttrs){
+				if(k3 == "anchors"){
+					// anchors 只做**往返保真**（原始串进属性表、toDSG 裸写回），
+					// 创建时**不下发**：官方锚定是父窗体尺寸变化时的重排语义，
+					// 创建参数里给表会跟画布 __place 打架（实测 edit 被锚成
+					// 巨块——第四十九轮截图复验撤掉）。
+					continue;
+				}
 				if(geoK[k3]) continue;
 				var v3 = rawAttrs[k3];
 				if(v3 === null || v3 === "") continue;
@@ -1027,6 +1034,13 @@ canvas = function(winform, opt){
 				n = n + 1;
 				continue;
 			}
+			// anchors：属性表里存裸串 {left=1;..}，只做往返（toDSG 裸写回），
+			// **不写画布控件** —— 官方锚定在 form.show 时就会重排一次，
+			// 实测把控件锚成巨块（第四十九轮截图复验）；锚定的真实生效
+			// 场景是生成应用的运行时，由 DSG 文本带走。
+			if(key == "anchors"){
+				continue;
+			}
 			if(v === null || v === "") continue;
 			// 按类型转换
 			if(p.type == "bool"){
@@ -1118,7 +1132,7 @@ canvas = function(winform, opt){
 				var known = {};
 				for(k2=1;#item.props;1){ known[item.props[k2].key] = true }
 				var skip = {left=true; top=true; right=true; bottom=true; width=true;
-					height=true; text=true; z=true; cls=true; anchors=true; name=true; autoResize=true};
+					height=true; text=true; z=true; cls=true; name=true; autoResize=true};
 				for(k4 in props){
 					if(known[k4] || skip[k4]) continue;
 					var v4 = props[k4];
@@ -1162,7 +1176,7 @@ canvas = function(winform, opt){
 		// 中文字形；format 必须给 stringFormat（实测 null 静默不渲染）。
 		// boardFont/boardFormat 挂在 nodio.ui 名下（board.nodio 的 namespace
 		// 是 nodio.ui，不是 nodio.ui.board —— 写错拼写实测「调用非函数值」）。
-		var capFont = ..nodio.ui.boardFont(9, "Microsoft YaHei UI");
+		var capFont = ..nodio.ui.boardFont(10, "Microsoft YaHei UI");
 		var capBrush = ..gdip.solidBrush(self.capTextColor);
 		graphics.drawString(self.form.text, capFont,
 			::RECTF(fs.x + ..nodio.ui.px(8), fs.y, fs.w - ..nodio.ui.px(30), fs.capH),

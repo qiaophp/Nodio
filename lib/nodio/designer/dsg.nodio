@@ -37,15 +37,30 @@ dsg = {
 		while(i <= n){
 			var s = segs[i];
 			var q = dsg.__countQuote(s);
-			while(q % 2 == 1 && i < n){
+			// 引号没闭合（text="a;b"）或**花括号没闭合**（anchors={left=1;top=1}）
+			// 都要把后续段并回来 —— 否则 top=1} 会当独立段覆盖真实几何
+			// （实测 edit 的设计矩形 y 变 0、高变 158，第四十九轮）。
+			var depth = dsg.__braceDepth(s);
+			while((q % 2 == 1 || depth > 0) && i < n){
 				i = i + 1;
 				s = s ++ ';' ++ segs[i];
 				q = dsg.__countQuote(s);
+				depth = dsg.__braceDepth(s);
 			}
 			..table.push(out, s);
 			i = i + 1;
 		}
 		return out;
+	}
+
+	// 花括号净深度（{ 计 +1、} 计 -1；引用串内的花括号不理会——DSG 里
+	// 引号串不会包含未配对花括号，粗算够用）
+	__braceDepth = function(s){
+		var depth = 0;
+		var opens = ..string.count(s, '\{');
+		var closes = ..string.count(s, '\}');
+		depth = (opens === null ? 0 : opens) - (closes === null ? 0 : closes);
+		return depth;
 	}
 
 	// 裸值 → 布尔 / 数字 / 字符串
@@ -153,6 +168,11 @@ dsg = {
 				var key = keys[k];
 				var val = it.props[key];
 				if(val === null) continue;
+				// anchors 是裸表字面量（官方 DSG 就这么写），不加引号
+				if(key == 'anchors' && type(val) == 'string'){
+					line = line ++ ';' ++ key ++ '=' ++ val;
+					continue;
+				}
 				line = line ++ ';' ++ key ++ '=' ++ dsg.__literal(val);
 			}
 			// 几何（官方是裸值）
