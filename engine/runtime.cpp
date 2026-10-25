@@ -844,6 +844,21 @@ bool Interp::MetaSetLayer(const Value& obj, const Value& mtv,
 
         // instance method shim: CallVmFunc with owner forced to obj
 
+// ---- call-depth guard (shared by every script-invocation entry) ----
+// 第四十二轮：原守卫只挂在 Call 节点路径。native→脚本重入
+// （CallThisOwner：COM 事件/FFI 回调/_call 元方法/finalizer；
+// CallVmFunc：定时器与工作线程等原生侧直接调用）不经过 Call 节点，
+// 自嵌套会绕过守卫直奔线程栈底。三处入口共用同一 thread_local 计数器：
+// 纯脚本递归每层只计 1 次（Call 节点不经过 CallThisOwner），重入混合
+// 周期每层 ≥1，总嵌套封顶不变。
+static thread_local int s_callDepth = 0;
+struct CallDepthScope
+{
+    CallDepthScope() { s_callDepth++; }
+    ~CallDepthScope() { s_callDepth--; }
+};
+static bool CallDepthExceeded() { return s_callDepth > 500; }
+
 // ---- CallOwner ----
 Value Interp::CallOwner(const Value& f, const Value& obj,
                         vector<Value>& args)
@@ -857,6 +872,16 @@ Value Interp::CallOwner(const Value& f, const Value& obj,
 Value Interp::CallThisOwner(const Value& f, const Value& ths,
                             const Value& owner, vector<Value>& args)
         {
+            CallDepthScope cdg;
+            if (CallDepthExceeded())
+            {
+                // 与 Call 节点守卫同一契约：可捕获的运行错误，不写位置
+                //（报告点统一追加文件与行）
+                wstring fnName = f.fnData ? f.fnData->fname : wstring();
+                if (fnName.empty() && f.native) fnName = L"(native)";
+                (*err) = L"运行错误: 栈溢出 (超过最大调用深度) 函数: " + fnName;
+                return Value();
+            }
             Value oldOwner = s_currentOwner;
             s_currentOwner = owner;
             if (f.native)
@@ -1809,13 +1834,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             }
             rs.add(f);
             rs.add(vThis);
-            static thread_local int s_callDepth = 0;
-            struct CallDepthGuard {
-                int& d;
-                CallDepthGuard(int& x) : d(x) { d++; }
-                ~CallDepthGuard() { d--; }
-            } cdg(s_callDepth);
-            if (s_callDepth > 500)
+            CallDepthScope cdg;
+            if (CallDepthExceeded())
             {
                 // depth-guard contract: runaway recursion surfaces a
                 // catchable 运行错误 (栈溢出) instead of an
@@ -4343,6 +4363,14 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
 // ---- CallVmFunc ----
 Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
         {
+            CallDepthScope cdg;
+            if (CallDepthExceeded())
+            {
+                wstring fnName = f.fnData ? f.fnData->fname : wstring();
+                if (fnName.empty() && f.native) fnName = L"(native)";
+                (*err) = L"运行错误: 栈溢出 (超过最大调用深度) 函数: " + fnName;
+                return Value();
+            }
             if (f.native)
                 return f.native(f.nativeCtx.get(), args);
             if (f.t != Value::Func || !f.fnData->fn)

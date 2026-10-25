@@ -1,0 +1,9 @@
+// 第四十二轮回归锁：调用深度守卫边界与可捕获性。
+// 共享计数器（Call 节点 + CallThisOwner + CallVmFunc）不得腰斩
+// 纯脚本递归上限：499 层必须照常工作，1000 层必须可捕获。
+var function f(n) { if (n <= 0) { return 0; } return 1 + f(n - 1); }
+io.print("d499=", f(499));
+var r = "no";
+try { r = f(1000); } catch (e) { r = "CAUGHT"; }
+io.print("catch=", r);
+io.print("t97-ok");

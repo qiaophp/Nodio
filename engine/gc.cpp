@@ -302,50 +302,135 @@ namespace NodioVM
     // WHY an object is still reachable
     static GcMark s_lastMark;
 
+    // 第四十二轮：mark 迭代化。递归版会被深层嵌套表烧穿 16MB 主线程栈
+    // （20 万层嵌套 + 一次 GC 波 = 段错误，10 万层内安全）。显式工作栈，
+    // 可达性语义不变；Hop 边沿仍只在诊断模式记录。fromIsEnv 随边沿真实
+    // 传递——旧版在表/环境两个入口分别写死 false/true，跨 env 边界的
+    // 路径诊断会查错表。
+    struct GcMarkItem
+    {
+        const Value* v = nullptr;
+        void* from = nullptr;
+        bool fromIsEnv = false;
+        const wstring* edge = nullptr; // 借用：map 键/静态串，mark 期间无突变
+        wstring owned;                 // 诊断模式才构造的拼接边名
+    };
+
+    static void GcMarkTableInto(Table* t, GcMark& m, void* from, bool fromIsEnv,
+                                const wstring& edge,
+                                std::vector<GcMarkItem>& stack);
+    static void GcMarkEnvInto(Env* e, GcMark& m, void* from, bool fromIsEnv,
+                              const wstring& edge,
+                              std::vector<GcMarkItem>& stack);
+
+    static void GcMarkTableInto(Table* t, GcMark& m, void* from, bool fromIsEnv,
+                                const wstring& edge,
+                                std::vector<GcMarkItem>& stack)
+    {
+        if (!t || m.tables.count(t)) return;
+        m.tables.insert(t);
+        if (m.bTrackPaths) m.tPath[t] = GcMark::Hop{ from, edge, fromIsEnv };
+        static const wstring s_arr = L"[]";
+        static const wstring s_com = L"~com";
+        for (auto& kv : t->map)
+            stack.push_back(GcMarkItem{ &kv.second, t, false, &kv.first, wstring() });
+        for (auto& e : t->arr)
+            stack.push_back(GcMarkItem{ &e, t, false, &s_arr, wstring() });
+        for (auto& kv : t->scopeVars)
+        {
+            if (m.bTrackPaths)
+                stack.push_back(GcMarkItem{ &kv.second, t, false, nullptr, L"$" + kv.first });
+            else
+                stack.push_back(GcMarkItem{ &kv.second, t, false, nullptr, wstring() });
+        }
+        if (t->comCache)
+            for (auto& kv : *t->comCache)
+                stack.push_back(GcMarkItem{ &kv.second.boundMethod, t, false, &s_com, wstring() });
+    }
+
+    static void GcMarkEnvInto(Env* e, GcMark& m, void* from, bool fromIsEnv,
+                              const wstring& edge,
+                              std::vector<GcMarkItem>& stack)
+    {
+        if (!e || m.envs.count(e)) return;
+        m.envs.insert(e);
+        if (m.bTrackPaths) m.ePath[e] = GcMark::Hop{ from, edge, fromIsEnv };
+        // Round 13: slot-aware — mainEnv (resident, slotted) reaches this
+        // through gcFrames; a bare vars loop would see an empty map and
+        // drop every main-script local from the mark set.
+        e->ForEachVar([&](uint32_t gid, Value& v)
+            {
+                if (m.bTrackPaths)
+                    stack.push_back(GcMarkItem{ &v, e, true, nullptr, L"$" + NameOf(gid) });
+                else
+                    stack.push_back(GcMarkItem{ &v, e, true, nullptr, wstring() });
+            });
+        static const wstring s_ns = L"@nsTable";
+        static const wstring s_mod = L"@modTable";
+        static const wstring s_par = L"@parent";
+        if (e->nsTable) GcMarkTableInto(e->nsTable.get(), m, e, true, s_ns, stack);
+        if (e->modTable) GcMarkTableInto(e->modTable.get(), m, e, true, s_mod, stack);
+        // env 父链由调用帧构成，深度被 500 层调用守卫封顶，递归安全
+        if (e->parent) GcMarkEnvInto(e->parent.get(), m, e, true, s_par, stack);
+    }
+
+    static void GcMarkDrain(std::vector<GcMarkItem>& stack, GcMark& m)
+    {
+        while (!stack.empty())
+        {
+            GcMarkItem it(std::move(stack.back()));
+            stack.pop_back();
+            const wstring& edge = it.edge ? *it.edge : it.owned;
+            auto pushV = [&](const Value* pv)
+            {
+                if (it.edge)
+                    stack.push_back(GcMarkItem{ pv, it.from, it.fromIsEnv, it.edge, wstring() });
+                else
+                    stack.push_back(GcMarkItem{ pv, it.from, it.fromIsEnv, nullptr, it.owned });
+            };
+            const Value& v = *it.v;
+            if (v.tab)
+                GcMarkTableInto(v.tab.get(), m, it.from, it.fromIsEnv, edge, stack);
+            if (v.fnData)   // 非 Func/Class 值没有侧表
+            {
+                if (v.fnData->nsClosure)
+                    GcMarkTableInto(v.fnData->nsClosure.get(), m, it.from, it.fromIsEnv, edge, stack);
+                if (v.fnData->envUp)
+                    GcMarkEnvInto(v.fnData->envUp.get(), m, it.from, it.fromIsEnv, edge, stack);
+                if (v.fnData->thisVal) pushV(v.fnData->thisVal.get());
+                if (v.fnData->ownerVal) pushV(v.fnData->ownerVal.get());
+            }
+            if (v.mrets)
+                for (auto& r : *v.mrets) pushV(&r);
+        }
+    }
+
     static void GcMarkValue(const Value& v, GcMark& m, void* from = nullptr,
                             const wstring& edge = L"")
     {
-        if (v.tab) GcMarkTable(v.tab.get(), m, from, edge);
-        if (v.fnData)   // 非 Func/Class 值没有侧表
-        {
-            if (v.fnData->nsClosure) GcMarkTable(v.fnData->nsClosure.get(), m, from, edge);
-            if (v.fnData->envUp) GcMarkEnv(v.fnData->envUp.get(), m, from, edge);
-            if (v.fnData->thisVal) GcMarkValue(*v.fnData->thisVal, m, from, edge);
-            if (v.fnData->ownerVal) GcMarkValue(*v.fnData->ownerVal, m, from, edge);
-        }
-        if (v.mrets)
-            for (auto& r : *v.mrets) GcMarkValue(r, m, from, edge);
+        static thread_local std::vector<GcMarkItem> stack;
+        stack.clear();
+        stack.push_back(GcMarkItem{ &v, from, false, nullptr,
+                                    m.bTrackPaths ? edge : wstring() });
+        GcMarkDrain(stack, m);
     }
 
     static void GcMarkTable(Table* t, GcMark& m, void* from,
                             const wstring& edge)
     {
-        if (!t || m.tables.count(t)) return;
-        m.tables.insert(t);
-        if (m.bTrackPaths) m.tPath[t] = GcMark::Hop{ from, edge, false };
-        static const wstring s_arr = L"[]";
-        for (auto& kv : t->map) GcMarkValue(kv.second, m, t, kv.first);
-        for (auto& e : t->arr) GcMarkValue(e, m, t, s_arr);
-        for (auto& kv : t->scopeVars) GcMarkValue(kv.second, m, t, L"$" + kv.first);
-        if (t->comCache)
-            for (auto& kv : *t->comCache)
-                GcMarkValue(kv.second.boundMethod, m, t, L"~com");
+        static thread_local std::vector<GcMarkItem> stack;
+        stack.clear();
+        GcMarkTableInto(t, m, from, false, edge, stack);
+        GcMarkDrain(stack, m);
     }
 
     static void GcMarkEnv(Env* e, GcMark& m, void* from,
                            const wstring& edge)
     {
-        if (!e || m.envs.count(e)) return;
-        m.envs.insert(e);
-        if (m.bTrackPaths) m.ePath[e] = GcMark::Hop{ from, edge, true };
-        // Round 13: slot-aware — mainEnv (resident, slotted) reaches this
-        // through gcFrames; a bare vars loop would see an empty map and
-        // drop every main-script local from the mark set.
-        e->ForEachVar([&](uint32_t gid, Value& v)
-            { GcMarkValue(v, m, e, L"$" + NameOf(gid)); });
-        if (e->nsTable) GcMarkTable(e->nsTable.get(), m, e, L"@nsTable");
-        if (e->modTable) GcMarkTable(e->modTable.get(), m, e, L"@modTable");
-        if (e->parent) GcMarkEnv(e->parent.get(), m, e, L"@parent");
+        static thread_local std::vector<GcMarkItem> stack;
+        stack.clear();
+        GcMarkEnvInto(e, m, from, false, edge, stack);
+        GcMarkDrain(stack, m);
     }
 
     // Print the chain of edges that made an object reachable.

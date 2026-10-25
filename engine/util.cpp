@@ -5,68 +5,94 @@ namespace NodioVM
 {
     static Value DeepCopyInternal(const Value& v, std::unordered_map<Table*, shared_ptr<Table>>& visited)
     {
-        if ((v.t == Value::TableT || v.t == Value::Class) && v.tab)
+        // 第四十二轮：拷贝迭代化。thread 序列化一个 5 万层嵌套表会把
+        // 递归版烧穿线程栈段错误（实测 exit 139 静默死亡）。显式工作栈，
+        // 语义逐路保持：visited 命中壳（Class 重建侧表）、新表先注册、
+        // "self" 回指新壳、Func 字面量早退、标量/native 尾路（fnData
+        // 深拷贝后清 nsClosure/fn）。同一张新表的全部目标槽位先落地再
+        // 填充，处理顺序 DFS→LIFO 不影响结果；新建对象受当前语句纪元
+        // 保护，拷贝途中 GC 不会扫走半成品。
+        struct DeepCopyItem
         {
-            auto it = visited.find(v.tab.get());
-            if (it != visited.end())
+            const Value* src;
+            Value* dst;
+        };
+        Value root;
+        std::vector<DeepCopyItem> stack;
+        stack.push_back(DeepCopyItem{ &v, &root });
+        while (!stack.empty())
+        {
+            DeepCopyItem it = stack.back();
+            stack.pop_back();
+            const Value& s = *it.src;
+            if ((s.t == Value::TableT || s.t == Value::Class) && s.tab)
             {
-                Value res = Value::Table_(it->second);
-                if (v.t == Value::Class)
+                auto hit = visited.find(s.tab.get());
+                if (hit != visited.end())
+                {
+                    Value res = Value::Table_(hit->second);
+                    if (s.t == Value::Class)
+                    {
+                        res.t = Value::Class;
+                        res.fnData = std::make_shared<FuncData>();
+                        res.fnData->fn = s.fnData->fn;
+                    }
+                    *it.dst = std::move(res);
+                    continue;
+                }
+
+                auto nt = std::make_shared<Table>();
+                visited[s.tab.get()] = nt;
+
+                for (auto& kv : s.tab->map)
+                {
+                    if (kv.first == L"self") continue;
+                    stack.push_back(DeepCopyItem{ &kv.second, &nt->map[kv.first] });
+                }
+                nt->arr.resize(s.tab->arr.size());
+                for (size_t i = 0; i < s.tab->arr.size(); i++)
+                    stack.push_back(DeepCopyItem{ &s.tab->arr[i], &nt->arr[i] });
+
+                Value res = Value::Table_(nt);
+                if (s.t == Value::Class)
                 {
                     res.t = Value::Class;
                     res.fnData = std::make_shared<FuncData>();
-                    res.fnData->fn = v.fnData->fn;
+                    res.fnData->fn = s.fnData->fn;
                 }
-                return res;
+                if (s.tab->map.count(L"self"))
+                    nt->map[L"self"] = res;
+                *it.dst = std::move(res);
+                continue;
             }
-
-            auto nt = std::make_shared<Table>();
-            visited[v.tab.get()] = nt;
-
-            for (auto& kv : v.tab->map)
+            // functions cross threads as a re-bindable literal: the AST
+            // (PNode) is immutable and shared, the worker VM re-resolves
+            // bare names against its own globals (multi-threading: thread
+            // functions get an independent global environment)
+            if (s.t == Value::Func && s.fnData->fn)
             {
-                if (kv.first == L"self") continue;
-                nt->map[kv.first] = DeepCopyInternal(kv.second, visited);
+                Value x = s;
+                x.tab.reset();
+                x.native = nullptr;
+                *it.dst = std::move(x);
+                continue;
             }
-            for (auto& x : v.tab->arr)
-                nt->arr.push_back(DeepCopyInternal(x, visited));
-
-            Value res = Value::Table_(nt);
-            if (v.t == Value::Class)
-            {
-                res.t = Value::Class;
-                res.fnData = std::make_shared<FuncData>();
-                res.fnData->fn = v.fnData->fn;
-            }
-            if (v.tab->map.count(L"self"))
-                nt->map[L"self"] = res;
-            return res;
-        }
-        // functions cross threads as a re-bindable literal: the AST
-        // (PNode) is immutable and shared, the worker VM re-resolves
-        // bare names against its own globals (multi-threading: thread
-        // functions get an independent global environment)
-        if (v.t == Value::Func && v.fnData->fn)
-        {
-            Value x = v;
+            Value x = s;
             x.tab.reset();
+            // 标量（Null/Num/Str）与 native 函数也走这条尾路：fnData 为空时
+            // 没有 函数数据可清（旧代码等价于对 null shared_ptr reset）
+            if (s.fnData)
+            {
+                // 深拷贝函数数据再清除 nsClosure：fnData 现在是共享侧表，
+                // 原地 reset 会把原函数的命名空间闭包一起清掉
+                x.fnData = std::make_shared<FuncData>(*s.fnData);
+                x.fnData->nsClosure.reset();
+                x.fnData->fn.reset();
+            }
             x.native = nullptr;
-            return x;
+            *it.dst = std::move(x);
         }
-        Value x = v;
-        x.tab.reset();
-        // 标量（Null/Num/Str）与 native 函数也走这条尾路：fnData 为空时
-        // 没有 函数数据可清（旧代码等价于对 null shared_ptr reset）
-        if (v.fnData)
-        {
-            // 深拷贝函数数据再清除 nsClosure：fnData 现在是共享侧表，
-            // 原地 reset 会把原函数的命名空间闭包一起清掉
-            x.fnData = std::make_shared<FuncData>(*v.fnData);
-            x.fnData->nsClosure.reset();
-            x.fnData->fn.reset();
-        }
-        x.native = nullptr;
-        return x;
+        return root;
     }
 
     Value DeepCopy(const Value& v)

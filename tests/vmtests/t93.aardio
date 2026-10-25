@@ -1,0 +1,8 @@
+// 第四十二轮回归锁：20 万层嵌套表 + GC 分配波。
+// 旧引擎：GcMark 递归烧穿 16MB 主线程栈，段错误无输出（exit 139）。
+// 迭代化 mark 后必须存活并走到最后。
+var t = {};
+var cur = t;
+for (i = 1; 200000; 1) { var nx = {}; cur[1] = nx; cur = nx; }
+for (j = 1; 50000; 1) { var junk = { a = j }; }
+io.print("t93-ok");

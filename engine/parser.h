@@ -10,6 +10,17 @@ namespace NodioVM
         vector<Tok> toks;
         size_t p = 0;
         wstring* err;
+        // 第四十二轮：解析深度守卫。3 万层嵌套括号的源文件会把递归下降
+        // 烧穿 16MB 主线程栈（x64 实测段错误；纯解析即触发——IDE 打开/
+        // LSP 解析深嵌套文件即杀宿主）。语句/表达式两个递归枢纽共用一
+        // 个计数器，阈值 1000：远高于真实代码的嵌套，远低于物理栈底。
+        inline static thread_local int s_nParseDepth = 0;
+        struct ParseDepthScope
+        {
+            Parser* ps;
+            explicit ParseDepthScope(Parser* p) : ps(p) { ++ps->s_nParseDepth; }
+            ~ParseDepthScope() { --ps->s_nParseDepth; }
+        };
         // compile-time file embedding ($"path"): resolution bases —
         // strEmbedBase = directory of the file being parsed,
         // strEmbedRoot = root (parent of NODIO_LIBDIR) for "~/"
@@ -92,6 +103,15 @@ namespace NodioVM
         PNode ParseStatement()
         {
             { static bool bT = GetEnvironmentVariableW(L"ATP", nullptr, 0) != 0; if (bT) fwprintf(stderr, L"%d ", Peek().line); }
+            // 深度守卫：与 ParseExpr 共用计数器（语句块也是递归入口）
+            ParseDepthScope dps(this);
+            if (s_nParseDepth > 1000 || !err->empty())
+            {
+                if (err->empty())
+                    (*err) = L"语法错误: 嵌套过深 (超过 1000 层) @ 行 " +
+                             std::to_wstring(Peek().line);
+                return nullptr;
+            }
             SkipNL();
             if (Peek().t == TEnd)
                 return nullptr;      // trailing newlines/comments at EOF
@@ -1365,7 +1385,19 @@ namespace NodioVM
             ~NcReset() { *f = old; }
         };
         bool bInAssignLhs = false;  // top-level statement assignment target
-        PNode ParseExpr() { return ParseTernary(); }
+        PNode ParseExpr()
+        {
+            // 深度守卫：与 ParseStatement 共用计数器；出错后快速退栈
+            ParseDepthScope dps(this);
+            if (s_nParseDepth > 1000 || !err->empty())
+            {
+                if (err->empty())
+                    (*err) = L"语法错误: 嵌套过深 (超过 1000 层) @ 行 " +
+                             std::to_wstring(Peek().line);
+                return nullptr;
+            }
+            return ParseTernary();
+        }
         PNode ParseTernary()
         {
             PNode l = ParseOr();

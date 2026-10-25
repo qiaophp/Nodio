@@ -1,0 +1,8 @@
+// 第四十二轮回归锁：6 万层嵌套表线程序列化。
+// 旧引擎：DeepCopy 递归烧穿线程栈，段错误静默死亡（exit 139）。
+import thread;
+var t = {};
+var cur = t;
+for (i = 1; 60000; 1) { var nx = {}; cur[1] = nx; cur = nx; }
+var h = thread.create(function(tt) { return 1; }, t);
+io.print("t94-ok", tostring(thread.waitOne(h, 20000)));

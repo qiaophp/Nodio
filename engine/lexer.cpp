@@ -166,6 +166,15 @@ namespace NodioVM
                         s += src[i++];
                     }
                 }
+                // 第四十二轮：EOF 不能当终止符——截断/损坏文件会静默执行
+                // 前缀（审计实测：未闭合引号 exit 0 无任何报告）
+                if (i >= n)
+                {
+                    if (strError && strError->empty())
+                        *strError = L"词法错误: 字符串未终止 @ 行 " +
+                                    std::to_wstring(line);
+                    return out;
+                }
                 i++;  // closing quote
                 if (i < n && src[i] == L'#')
                 {
@@ -326,6 +335,14 @@ namespace NodioVM
                         if (src[i] == L'\n') line++;
                         s += src[i++];
                     }
+                }
+                // 第四十二轮：同 raw 字符串——EOF 未终止要报错
+                if (i >= n)
+                {
+                    if (strError && strError->empty())
+                        *strError = L"词法错误: 字符串未终止 @ 行 " +
+                                    std::to_wstring(line);
+                    return out;
                 }
                 i++;  // closing quote
                 if (i < n && src[i] == L'#')
