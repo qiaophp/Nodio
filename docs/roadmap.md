@@ -1762,3 +1762,12 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 >    空间、中文字体、drawString format 空静默、bgcolor 无 alpha。
 > ④ t99 锁 + VM 97/0/0 双架构；全量 11/18（7 失败归因并行会话在飞的
 >    shell.nodio 编译失败，恢复后复跑）。
+
+> **第四十九轮（设计器打磨——anchors 往返 + 表内分号解析缺陷）**。
+> ① anchors 表属性：属性表留裸串、toDSG 不加引号裸写回；画布控件
+>    永不应用锚定（官方锚定 form.show 即重排，实测两次锚成巨块——
+>    创建参数与载入写控件两条路都封死）。② 真根因：__splitBody 朴素
+>    按 ; 切分把 anchors={left=1;top=1} 斩断，top=1} 覆盖真实 top=132
+>    ——切段跟踪花括号净深度。③ 标题字号 10；treeview 空态判定官方
+>    本态。④ t99 扩展两断言；VM 96/0/1；IDE 族仍被并行会话在飞
+>    shell.nodio 堵着（已代定位其 679/690 行）。
