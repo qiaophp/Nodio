@@ -1,0 +1,6 @@
+// 第四十五轮回归锁：投毒短路。递归守卫触发后的展开不得制造垃圾数字：
+// 打印的是 null（诚实透传），不是 500（1+null 凭空累加的错误占位值）。
+// 语句边界中止与 try 捕获照常。
+var function f(n) { if (n <= 0) { return 0; } return 1 + f(n - 1); }
+try { io.print("unwind=", f(1000)); } catch (e) { io.print("caught"); }
+io.print("t98-ok");

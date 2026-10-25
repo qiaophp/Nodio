@@ -252,6 +252,9 @@ Value Interp::Eval(const PNode& n, Env* env)
                 GcRootScope rs;
                 Value v = Eval(n->a, env);
                 rs.add(v);
+                // 第四十五轮：同 EvalBin——投毒后不再从 null 制造数字
+                if (!err->empty())
+                    return Value();
                 if (n->str == L"-") return Value::Num_(-ToNum(v));
                 if (n->str == L"!" || n->str == L"not") return Value::Bool_(!v.Truthy());
                 if (n->str == L"~")
@@ -2063,6 +2066,12 @@ Value Interp::EvalBin(const PNode& n, Env* env)
             rs.add(l);
             Value r = Eval(n->b, env);
             rs.add(r);
+            // 第四十五轮：投毒短路。err 非空 = 本语句已硬错、必在语句
+            // 边界中止（或被 try 捕获）。操作数之一是错误占位 null，继续
+            // 算术只会凭空制造垃圾数字（审计实测：递归守卫触发后
+            // f(1000) 的展开一路算出 500 被打印/赋值）。透传 null。
+            if (!err->empty())
+                return Value();
             if (l.t == Value::Num && r.t == Value::Num)
             {
                 if (op == L"+") return Value::Num_(l.n + r.n);

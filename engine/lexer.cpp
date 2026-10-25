@@ -482,6 +482,13 @@ namespace NodioVM
             i++;
         }
         tokStart = i;
+        // 第四十五轮：EOF 哨兵携带最后真实 token 的行号。line 此时已数过
+        // 尾部换行，报错点在 EOF 会报「文件尾后一行」（单行文件报行 2），
+        // 定位误导。回退跳过 TNL 取最后内容行。
+        for (size_t b = out.size(); b > 0; b--)
+        {
+            if (out[b - 1].t != TNL) { line = out[b - 1].line; break; }
+        }
         pushTok({ TEnd, L"", 0, line });
         return out;
     }
