@@ -306,10 +306,13 @@ namespace NodioVM
                             const wstring& edge = L"")
     {
         if (v.tab) GcMarkTable(v.tab.get(), m, from, edge);
-        if (v.nsClosure) GcMarkTable(v.nsClosure.get(), m, from, edge);
-        if (v.envUp) GcMarkEnv(v.envUp.get(), m, from, edge);
-        if (v.thisVal) GcMarkValue(*v.thisVal, m, from, edge);
-        if (v.ownerVal) GcMarkValue(*v.ownerVal, m, from, edge);
+        if (v.fnData)   // 非 Func/Class 值没有侧表
+        {
+            if (v.fnData->nsClosure) GcMarkTable(v.fnData->nsClosure.get(), m, from, edge);
+            if (v.fnData->envUp) GcMarkEnv(v.fnData->envUp.get(), m, from, edge);
+            if (v.fnData->thisVal) GcMarkValue(*v.fnData->thisVal, m, from, edge);
+            if (v.fnData->ownerVal) GcMarkValue(*v.fnData->ownerVal, m, from, edge);
+        }
         if (v.mrets)
             for (auto& r : *v.mrets) GcMarkValue(r, m, from, edge);
     }

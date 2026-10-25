@@ -14,7 +14,8 @@ namespace NodioVM
                 if (v.t == Value::Class)
                 {
                     res.t = Value::Class;
-                    res.fn = v.fn;
+                    res.fnData = std::make_shared<FuncData>();
+                    res.fnData->fn = v.fnData->fn;
                 }
                 return res;
             }
@@ -34,7 +35,8 @@ namespace NodioVM
             if (v.t == Value::Class)
             {
                 res.t = Value::Class;
-                res.fn = v.fn;
+                res.fnData = std::make_shared<FuncData>();
+                res.fnData->fn = v.fnData->fn;
             }
             if (v.tab->map.count(L"self"))
                 nt->map[L"self"] = res;
@@ -44,7 +46,7 @@ namespace NodioVM
         // (PNode) is immutable and shared, the worker VM re-resolves
         // bare names against its own globals (multi-threading: thread
         // functions get an independent global environment)
-        if (v.t == Value::Func && v.fn)
+        if (v.t == Value::Func && v.fnData->fn)
         {
             Value x = v;
             x.tab.reset();
@@ -53,9 +55,17 @@ namespace NodioVM
         }
         Value x = v;
         x.tab.reset();
-        x.nsClosure.reset();
+        // 标量（Null/Num/Str）与 native 函数也走这条尾路：fnData 为空时
+        // 没有 函数数据可清（旧代码等价于对 null shared_ptr reset）
+        if (v.fnData)
+        {
+            // 深拷贝函数数据再清除 nsClosure：fnData 现在是共享侧表，
+            // 原地 reset 会把原函数的命名空间闭包一起清掉
+            x.fnData = std::make_shared<FuncData>(*v.fnData);
+            x.fnData->nsClosure.reset();
+            x.fnData->fn.reset();
+        }
         x.native = nullptr;
-        x.fn.reset();
         return x;
     }
 

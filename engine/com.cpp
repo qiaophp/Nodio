@@ -255,7 +255,7 @@ namespace
                         inst->map[L"minute"] = Value::Num_(st.wMinute);
                         inst->map[L"second"] = Value::Num_(st.wSecond);
                         vector<Value> args = { Value::Table_(inst) };
-                        return icl->second.native(args);
+                        return icl->second.native(icl->second.nativeCtx.get(), args);
                     }
                 }
             }
@@ -5285,7 +5285,7 @@ void Interp::RegisterComKernel(Env& globalsEnv)
         if (itTI == com->map.end()) return Value::Str_(L"");
         Interp* it = g_interpCurrent;
         if (!it) return Value::Str_(L"");
-        Value tiVal = itTI->second.native ? itTI->second.native(a) : it->CallOwner(itTI->second, Value(), a);
+        Value tiVal = itTI->second.native ? itTI->second.native(itTI->second.nativeCtx.get(), a) : it->CallOwner(itTI->second, Value(), a);
         if (tiVal.t == Value::TableT && tiVal.tab)
         {
             auto idump = tiVal.tab->map.find(L"DumpTypeInfo");

@@ -4290,6 +4290,7 @@ void Interp::InitBuiltins()
                 fileCls->map[L"ctor"] = ioFileCtor;
                 Value vFileClass;
                 vFileClass.t = Value::Class;
+                vFileClass.fnData = std::make_shared<FuncData>();
                 vFileClass.tab = fileCls;
                 tb->map[L"file"] = vFileClass;
                 tb->map[L"open"] = vFileClass; // legacy alias, same class
@@ -4375,7 +4376,7 @@ void Interp::InitBuiltins()
                         vector<Value> ca;
                         ca.push_back(a[0]);
                         ca.push_back(Value::Str_(L"rb"));
-                        fileObj = ioFileCtor.native(ca);
+                        fileObj = ioFileCtor.native(ioFileCtor.nativeCtx.get(), ca);
                         if (fileObj.t != Value::TableT || !fileObj.tab)
                         {
                             Interp* it = g_interpCurrent;
@@ -5132,19 +5133,19 @@ void Interp::InitBuiltins()
                     vector<Value> na = a;
                     if (!na.empty() && na[0].t == Value::Num) na[0] = Value::Num_(BNum(na[0]) * 60);
                     else if (na.size() > 1 && na[1].t == Value::Num) na[1] = Value::Num_(BNum(na[1]) * 60);
-                    return addSecondsFunc.native(na);
+                    return addSecondsFunc.native(addSecondsFunc.nativeCtx.get(), na);
                 });
                 timeMeta->map[L"addHours"] = NF([addSecondsFunc](vector<Value>& a) -> Value {
                     vector<Value> na = a;
                     if (!na.empty() && na[0].t == Value::Num) na[0] = Value::Num_(BNum(na[0]) * 3600);
                     else if (na.size() > 1 && na[1].t == Value::Num) na[1] = Value::Num_(BNum(na[1]) * 3600);
-                    return addSecondsFunc.native(na);
+                    return addSecondsFunc.native(addSecondsFunc.nativeCtx.get(), na);
                 });
                 timeMeta->map[L"addDays"] = NF([addSecondsFunc](vector<Value>& a) -> Value {
                     vector<Value> na = a;
                     if (!na.empty() && na[0].t == Value::Num) na[0] = Value::Num_(BNum(na[0]) * 86400);
                     else if (na.size() > 1 && na[1].t == Value::Num) na[1] = Value::Num_(BNum(na[1]) * 86400);
-                    return addSecondsFunc.native(na);
+                    return addSecondsFunc.native(addSecondsFunc.nativeCtx.get(), na);
                 });
                 auto addMonthsFunc = NF([getSelf](vector<Value>& a) -> Value {
                     Value self = getSelf(a);
@@ -5218,19 +5219,19 @@ void Interp::InitBuiltins()
                     return Value::Num_((double)(toT(self.tab.get()) - toT(other.tab.get())));
                 });
                 timeMeta->map[L"diffMinutes"] = NF([timeMeta](vector<Value>& a) -> Value {
-                    Value v = timeMeta->map[L"diffSeconds"].native(a);
+                    Value v = timeMeta->map[L"diffSeconds"].native(timeMeta->map[L"diffSeconds"].nativeCtx.get(), a);
                     return Value::Num_((double)(long long)(BNum(v) / 60.0));
                 });
                 timeMeta->map[L"diffHours"] = NF([timeMeta](vector<Value>& a) -> Value {
-                    Value v = timeMeta->map[L"diffSeconds"].native(a);
+                    Value v = timeMeta->map[L"diffSeconds"].native(timeMeta->map[L"diffSeconds"].nativeCtx.get(), a);
                     return Value::Num_(BNum(v) / 3600.0);
                 });
                 timeMeta->map[L"diffDays"] = NF([timeMeta](vector<Value>& a) -> Value {
-                    Value v = timeMeta->map[L"diffSeconds"].native(a);
+                    Value v = timeMeta->map[L"diffSeconds"].native(timeMeta->map[L"diffSeconds"].nativeCtx.get(), a);
                     return Value::Num_(BNum(v) / 86400.0);
                 });
                 timeMeta->map[L"diffYears"] = NF([timeMeta](vector<Value>& a) -> Value {
-                    Value v = timeMeta->map[L"diffMonths"].native(a);
+                    Value v = timeMeta->map[L"diffMonths"].native(timeMeta->map[L"diffMonths"].nativeCtx.get(), a);
                     return Value::Num_(BNum(v) / 12.0);
                 });
                 timeMeta->map[L"diffday"] = timeMeta->map[L"diffDays"];
@@ -5308,7 +5309,7 @@ void Interp::InitBuiltins()
                         ctorArgs.push_back(a[i]);
                     auto ictor = timeMeta->map.find(L"_timeCtor");
                     if (ictor != timeMeta->map.end() && ictor->second.native)
-                        return ictor->second.native(ctorArgs);
+                        return ictor->second.native(ictor->second.nativeCtx.get(), ctorArgs);
                     return Value();
                 });
 
@@ -5488,7 +5489,7 @@ void Interp::InitBuiltins()
                     {
                         args.push_back(Value::Str_(L"%Y-%m-%d"));
                     }
-                    Value ret = timeCtor.native(args);
+                    Value ret = timeCtor.native(timeCtor.nativeCtx.get(), args);
                     if (ret.t == Value::TableT && ret.tab)
                     {
                         auto itFmt = ret.tab->map.find(L"format");
@@ -6639,7 +6640,7 @@ void Interp::InitBuiltins()
                                         {
                                             vector<Value> noArgs;
                                             Value r = vp.native
-                                                ? vp.native(noArgs)
+                                                ? vp.native(vp.nativeCtx.get(), noArgs)
                                                 : CallVmFuncStatic(
                                                       v, vp, noArgs, &bE,
                                                       &se);
@@ -7083,13 +7084,13 @@ void Interp::InitBuiltins()
                             sig += L")";
 
                             vector<Value> apiArgs{ Value::Str_(bareName), Value::Str_(sig) };
-                            Value boundApi = fnApi.native(apiArgs);
+                            Value boundApi = fnApi.native(fnApi.nativeCtx.get(), apiArgs);
                             if (boundApi.t != Value::Func)
                             {
                                 if (bareName != name)
                                 {
                                     vector<Value> apiArgs2{ Value::Str_(name), Value::Str_(sig) };
-                                    boundApi = fnApi.native(apiArgs2);
+                                    boundApi = fnApi.native(fnApi.nativeCtx.get(), apiArgs2);
                                 }
                             }
                             if (boundApi.t == Value::Func)
@@ -7860,7 +7861,7 @@ void Interp::InitBuiltins()
                     args.push_back(a[2]);
                     if (a.size() > 3) args.push_back(a[3]);
                     auto sFind = GetRoot(L"string").tab ? GetRoot(L"string").tab->map[L"find"] : Value();
-                    if (sFind.native) return sFind.native(args);
+                    if (sFind.native) return sFind.native(sFind.nativeCtx.get(), args);
                     return Value();
                 });
                 tb->map[L"match"] = NF([this](vector<Value>& a) -> Value {
@@ -7876,7 +7877,7 @@ void Interp::InitBuiltins()
                     args.push_back(a[2]);
                     if (a.size() > 3) args.push_back(a[3]);
                     auto sMatch = GetRoot(L"string").tab ? GetRoot(L"string").tab->map[L"match"] : Value();
-                    if (sMatch.native) return sMatch.native(args);
+                    if (sMatch.native) return sMatch.native(sMatch.nativeCtx.get(), args);
                     return Value();
                 });
                 // preloaded system DLLs (::User32 / ::Kernel32)
@@ -7885,13 +7886,13 @@ void Interp::InitBuiltins()
                     vector<Value> ua{ Value::Str_(L"User32.dll") };
                     if (uDll.native)
                     {
-                        globals.VarAt(NameId(L"User32")) = uDll.native(ua);
+                        globals.VarAt(NameId(L"User32")) = uDll.native(uDll.nativeCtx.get(), ua);
                         roots[L"User32"] = globals.VarAt(NameId(L"User32"));
                     }
                     vector<Value> ka{ Value::Str_(L"Kernel32.dll") };
                     if (uDll.native)
                     {
-                        globals.VarAt(NameId(L"Kernel32")) = uDll.native(ka);
+                        globals.VarAt(NameId(L"Kernel32")) = uDll.native(uDll.nativeCtx.get(), ka);
                         roots[L"Kernel32"] = globals.VarAt(NameId(L"Kernel32"));
                     }
                     // Preload common system library roots (::Shell32 / ::Gdi32 / ::Comctl32)
@@ -7903,7 +7904,7 @@ void Interp::InitBuiltins()
                     // ourselves so the reopen is a safe no-op.
                     {
                         vector<Value> da{ Value::Str_(L"msvcrt.dll"), Value::Str_(L"cdecl") };
-                        Value dv = uDll.native(da);
+                        Value dv = uDll.native(uDll.nativeCtx.get(), da);
                         if (dv.t == Value::TableT && dv.tab)
                         {
                             dv.tab->map[L"__iob_func"] = NF([](vector<Value>&) -> Value {
@@ -7928,7 +7929,7 @@ void Interp::InitBuiltins()
                     for (int di = 0; DLLS[di]; di++)
                     {
                         vector<Value> da{ Value::Str_(DLLS[di]) };
-                        Value dv = uDll.native(da);
+                        Value dv = uDll.native(uDll.nativeCtx.get(), da);
                         wstring nm(DLLS[di]);
                         nm = nm.substr(0, nm.size() - 4);
                         globals.VarAt(NameId(nm)) = dv;
@@ -9025,8 +9026,8 @@ void Interp::InitBuiltins()
                     for (size_t i = 2; i < a.size(); i++)
                         args.push_back(a[i]);
                     // Thread-shared functions execute in global namespace without enclosing lexical scopes
-                    fn.nsClosure = nullptr;
-                    fn.envUp = nullptr;
+                    fn.fnData->nsClosure = nullptr;
+                    fn.fnData->envUp = nullptr;
                     return this->CallOwner(fn, owner, args); });
                 tb->map[L"acquire"] = NF([](vector<Value>& a) -> Value {
                     if (a.empty()) return Value();
@@ -9320,10 +9321,10 @@ void Interp::InitBuiltins()
                     Value ownerVal;
                     wstring newBaseDir;
 
-                    if (a[0].t == Value::Func && a[0].fn)
+                    if (a[0].t == Value::Func && a[0].fnData->fn)
                     {
-                        fnBody = a[0].fn;
-                        params = a[0].params;
+                        fnBody = a[0].fnData->fn;
+                        params = a[0].fnData->params;
                         for (size_t i = 1; i < a.size(); i++)
                             args.push_back(DeepCopy(a[i]));
                     }
@@ -10777,9 +10778,10 @@ void Interp::InitBuiltins()
             auto MakeVmFunc = [](PNode fn) -> Value {
                 Value f;
                 f.t = Value::Func;
-                f.fn = fn->a;
-                f.params = fn->names;
-                f.pdefaults = std::make_shared<vector<PNode>>(fn->defaults);
+                f.fnData = std::make_shared<FuncData>();
+                f.fnData->fn = fn->a;
+                f.fnData->params = fn->names;
+                f.fnData->pdefaults = std::make_shared<vector<PNode>>(fn->defaults);
                 return f;
             };
             // print(...) — each argument through tostring, then io.print

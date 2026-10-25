@@ -341,9 +341,10 @@ Value Interp::Eval(const PNode& n, Env* env)
                     if (t0.QuadPart) { g_usFuncLit += UsSince(t0); g_nFuncLit++; } } } bt{ bt0 };
                 Value f;
                 f.t = Value::Func;
-                f.fn = n->a;
-                f.params = n->names;
-                f.pdefaults = std::make_shared<vector<PNode>>(
+                f.fnData = std::make_shared<FuncData>();
+                f.fnData->fn = n->a;
+                f.fnData->params = n->names;
+                f.fnData->pdefaults = std::make_shared<vector<PNode>>(
                     n->defaults);
                 // lexical upvalues: capture the defining frame chain. The
                 // closure's call frame parents into it (CallVmFunc/
@@ -351,7 +352,7 @@ Value Interp::Eval(const PNode& n, Env* env)
                 // `fib`/`result` stay visible and mutable.
                 if (env && env->self)
                 {
-                    f.envUp = env->self;
+                    f.fnData->envUp = env->self;
                     // the promotion weak->shared is what makes this frame
                     // able to take part in a reference cycle: register it
                     // with the collector exactly here (Round 34 lazy
@@ -360,28 +361,28 @@ Value Interp::Eval(const PNode& n, Env* env)
                 }
                 for (Env* e = env; e; e = e->parent.get())
                 {
-                    if (!f.thisVal)
+                    if (!f.fnData->thisVal)
                     {
                         Value* pvThis = e->FindInSelf(IdThis());
                         if (pvThis && pvThis->t != Value::Null)
-                            f.thisVal = std::make_shared<Value>(*pvThis);
+                            f.fnData->thisVal = std::make_shared<Value>(*pvThis);
                     }
-                    if (!f.ownerVal)
+                    if (!f.fnData->ownerVal)
                     {
                         Value* pvOwner = e->FindInSelf(IdOwner());
                         if (pvOwner && pvOwner->t != Value::Null)
-                            f.ownerVal = std::make_shared<Value>(*pvOwner);
+                            f.fnData->ownerVal = std::make_shared<Value>(*pvOwner);
                     }
-                    if (!f.nsClosure && e->nsTable && !e->bNsInst)
+                    if (!f.fnData->nsClosure && e->nsTable && !e->bNsInst)
                     {
-                        f.nsClosure = e->nsTable;
+                        f.fnData->nsClosure = e->nsTable;
                     }
                 }
-                if (!f.nsClosure)
+                if (!f.fnData->nsClosure)
                 {
                     for (Env* e = env; e; e = e->parent.get())
                     {
-                        if (e->modTable) { f.nsClosure = e->modTable; break; }
+                        if (e->modTable) { f.fnData->nsClosure = e->modTable; break; }
                     }
                 }
                 return f;
@@ -860,7 +861,7 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             s_currentOwner = owner;
             if (f.native)
             {
-                Value r = f.native(args);
+                Value r = f.native(f.nativeCtx.get(), args);
                 s_currentOwner = oldOwner;
                 return r;
             }
@@ -892,7 +893,7 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                 s_currentOwner = oldOwner;
                 return r;
             }
-            if (f.t != Value::Func || !f.fn)
+            if (f.t != Value::Func || !f.fnData->fn)
             {
                 (*err) = L"运行错误: 元表回调不是函数";
                 return Value();
@@ -902,8 +903,8 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             EnvUsePooledSlots(local.get());
             // lexical upvalues: the captured defining frame chain replaces
             // the bare globals jump
-            local->parent = f.envUp ? f.envUp : globals.self;
-            local->nsTable = f.nsClosure;
+            local->parent = f.fnData->envUp ? f.fnData->envUp : globals.self;
+            local->nsTable = f.fnData->nsClosure;
             local->VarAt(IdOwner()) = owner;
             // the callee frame, the receiver and the call arguments live
             // in C++ locals — the collector needs them as roots
@@ -913,33 +914,33 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             rs.add(owner);
             rs.add(ths);
             rs.addAll(args);
-            if (f.thisVal)
-                local->VarAt(IdThis()) = *f.thisVal;
+            if (f.fnData->thisVal)
+                local->VarAt(IdThis()) = *f.fnData->thisVal;
             else
                 local->VarAt(IdThis()) = ths;
-            for (size_t i = 0; i < f.params.size(); i++)
+            for (size_t i = 0; i < f.fnData->params.size(); i++)
             {
                 uint32_t pid = ParamIdAt(f, i);
                 if (i < args.size() && args[i].t != Value::Null)
                     local->VarAt(pid) = args[i];
-                else if (f.pdefaults && i < f.pdefaults->size() &&
-                         (*f.pdefaults)[i])
+                else if (f.fnData->pdefaults && i < f.fnData->pdefaults->size() &&
+                         (*f.fnData->pdefaults)[i])
                     local->VarAt(pid) =
-                        Eval((*f.pdefaults)[i], local.get());
+                        Eval((*f.fnData->pdefaults)[i], local.get());
                 else if (i < args.size())
                     local->VarAt(pid) = args[i];
                 else
                     local->VarAt(pid) = Value();
             }
-            if (f.params.size() && f.params.back() == L"..." && f.fn)
+            if (f.fnData->params.size() && f.fnData->params.back() == L"..." && f.fnData->fn)
             {
-                if (args.size() > f.params.size() - 1)
+                if (args.size() > f.fnData->params.size() - 1)
                 {
                     // keep the raw varargs in a shared vector so the bound
                     // `...` value can also carry mrets — `var a,b = ...`
                     // expands positionally while `var t = ...` still packs
                     auto tbV = std::make_shared<Table>();
-                    for (size_t k = f.params.size() - 1; k < args.size(); k++)
+                    for (size_t k = f.fnData->params.size() - 1; k < args.size(); k++)
                         tbV->arr.push_back(args[k]);
                     // scripts read varargs through `arg`, while the
                     // `...` spelling expands them at a call site — bind both
@@ -964,16 +965,16 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
                     local->VarAt(IdArg()) = vDots;
                     // an explicit `arg` parameter (gdip.bitmap's ctor) must
                     // win over the vararg alias — restore it
-                    for (size_t i = 0; i + 1 < f.params.size(); i++)
-                        if (f.params[i] == L"arg" && i < args.size())
+                    for (size_t i = 0; i + 1 < f.fnData->params.size(); i++)
+                        if (f.fnData->params[i] == L"arg" && i < args.size())
                             local->VarAt(IdArg()) = args[i];
                 }
                 else
                 {
                     local->VarAt(IdDots()) = Value();
                     local->VarAt(IdArg()) = Value();
-                    for (size_t i = 0; i < f.params.size(); i++)
-                        if (f.params[i] == L"arg" && i < args.size())
+                    for (size_t i = 0; i < f.fnData->params.size(); i++)
+                        if (f.fnData->params[i] == L"arg" && i < args.size())
                             local->VarAt(IdArg()) = args[i];
                 }
             }
@@ -981,7 +982,7 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;
             nReturn = nBreak = nContinue = 0;
             ret = Value();
-            ExecBlock(f.fn, local.get());
+            ExecBlock(f.fnData->fn, local.get());
             Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR; nBreak = oldB; nContinue = oldC;
             ret = old;
@@ -1283,7 +1284,7 @@ Value Interp::GetMember(const Value& obj, const Value& keyVal,
                             if (il != ir->second.tab->map.end() && il->second.native)
                             {
                                 vector<Value> da{ Value::Str_(dllName) };
-                                Value dv = il->second.native(da);
+                                Value dv = il->second.native(il->second.nativeCtx.get(), da);
                                 if (dv.t == Value::TableT && dv.tab)
                                 {
                                     roots[key] = dv;
@@ -1327,7 +1328,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 inst->map[L"_class"] = f;
             }
             Value vInst = Value::Table_(inst);
-            if (!f.classBody && !f.fn && f.tab)
+            if (!f.fnData->classBody && !f.fnData->fn && f.tab)
             {
                 auto itNC = f.tab->map.find(L"ctor");
                 if (itNC != f.tab->map.end() &&
@@ -1335,7 +1336,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 {
                     vector<Value> nargs = args;
                     nargs.push_back(vInst);
-                    Value rN = itNC->second.native(nargs);
+                    Value rN = itNC->second.native(itNC->second.nativeCtx.get(), nargs);
                     if (rN.t == Value::TableT && rN.tab)
                         return rN;
                     if (rN.t == Value::Null)
@@ -1352,11 +1353,11 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 classNsEnv->nsTable = f.tab;
                 classNsEnv->VarAt(IdSelf()) = f;
             }
-            shared_ptr<Env> lexicalParent = f.envUp ? f.envUp : globals.self;
-            if (f.nsClosure)
+            shared_ptr<Env> lexicalParent = f.fnData->envUp ? f.fnData->envUp : globals.self;
+            if (f.fnData->nsClosure)
             {
                 definingNsEnv->parent = lexicalParent;
-                definingNsEnv->nsTable = f.nsClosure;
+                definingNsEnv->nsTable = f.fnData->nsClosure;
                 classNsEnv->parent = definingNsEnv;
             }
             else
@@ -1365,7 +1366,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
             local->self = local;
             EnvUsePooledSlots(local.get());
             local->parent = f.tab ? classNsEnv
-                                  : (f.nsClosure ? definingNsEnv
+                                  : (f.fnData->nsClosure ? definingNsEnv
                                                  : lexicalParent);
             local->nsTable = inst;
             local->bNsInst = true;   // instance scope: never capture as nsClosure
@@ -1381,30 +1382,30 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
             rsInst.add(f);
             rsInst.addAll(args);
 
-            if (f.fn)
+            if (f.fnData->fn)
             {
                 local->VarAt(IdThis()) = vInst;
-                for (size_t i = 0; i < f.fn->names.size(); i++)
+                for (size_t i = 0; i < f.fnData->fn->names.size(); i++)
                 {
-                    uint32_t pid = NodeNameIdAt(f.fn, i);
+                    uint32_t pid = NodeNameIdAt(f.fnData->fn, i);
                     if (i < args.size() && args[i].t != Value::Null)
                         local->VarAt(pid) = args[i];
-                    else if (f.pdefaults &&
-                             i < f.pdefaults->size() &&
-                             (*f.pdefaults)[i])
+                    else if (f.fnData->pdefaults &&
+                             i < f.fnData->pdefaults->size() &&
+                             (*f.fnData->pdefaults)[i])
                         local->VarAt(pid) =
-                            Eval((*f.pdefaults)[i], local.get());
+                            Eval((*f.fnData->pdefaults)[i], local.get());
                     else if (i < args.size())
                         local->VarAt(pid) = args[i];
                     else
                         local->VarAt(pid) = Value();
                 }
-                if (f.fn->names.size() && f.fn->names.back() == L"...")
+                if (f.fnData->fn->names.size() && f.fnData->fn->names.back() == L"...")
                 {
-                    if (args.size() > f.fn->names.size() - 1)
+                    if (args.size() > f.fnData->fn->names.size() - 1)
                     {
                         auto tbV = std::make_shared<Table>();
-                        for (size_t k = f.fn->names.size() - 1; k < args.size(); k++)
+                        for (size_t k = f.fnData->fn->names.size() - 1; k < args.size(); k++)
                             tbV->arr.push_back(args[k]);
                         // 官方库的值位置 `...` 就是打包表(builtin/table.aardio
                         // 的 push 用 `#...` / `...[i]` / `...!==null`),展开只
@@ -1422,16 +1423,16 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 }
                         local->VarAt(IdDots()) = vDots;
                         local->VarAt(IdArg()) = vDots;
-                        for (size_t i = 0; i + 1 < f.fn->names.size(); i++)
-                            if (f.fn->names[i] == L"arg" && i < args.size())
+                        for (size_t i = 0; i + 1 < f.fnData->fn->names.size(); i++)
+                            if (f.fnData->fn->names[i] == L"arg" && i < args.size())
                                 local->VarAt(IdArg()) = args[i];
                     }
                     else
                     {
                         local->VarAt(IdDots()) = Value();
                         local->VarAt(IdArg()) = Value();
-                        for (size_t i = 0; i < f.fn->names.size(); i++)
-                            if (f.fn->names[i] == L"arg" && i < args.size())
+                        for (size_t i = 0; i < f.fnData->fn->names.size(); i++)
+                            if (f.fnData->fn->names[i] == L"arg" && i < args.size())
                                 local->VarAt(IdArg()) = args[i];
                     }
                 }
@@ -1439,7 +1440,7 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                 nReturn = nBreak = nContinue = 0;
                 ret = Value();
-                ExecBlock(f.fn->a, local.get());
+                ExecBlock(f.fnData->fn->a, local.get());
                 bool bCtorRet = (nReturn > 0);
                 Value ctorRet = ret;
                 nReturn = oldR; nBreak = oldB; nContinue = oldC;
@@ -1474,10 +1475,10 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                     if (pvThis->tab != vInst.tab && vInst.tab)
                     {
                         auto rebindVal = [&](Value& val) {
-                            if (val.t == Value::Func && val.thisVal &&
-                                val.thisVal->tab == vInst.tab)
+                            if (val.t == Value::Func && val.fnData->thisVal &&
+                                val.fnData->thisVal->tab == vInst.tab)
                             {
-                                *val.thisVal = *pvThis;
+                                *val.fnData->thisVal = *pvThis;
                             }
                         };
                         for (auto& kv : vInst.tab->map)
@@ -1541,14 +1542,14 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 }
             }
 
-            if (f.classBody)
+            if (f.fnData->classBody)
             {
                 local->VarAt(IdThis()) = vInst;
                 Value oldRet = ret;
                 int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                 nReturn = nBreak = nContinue = 0;
                 local->bClassBody = true;
-                ExecBlock(f.classBody, local.get());
+                ExecBlock(f.fnData->classBody, local.get());
                 local->bClassBody = false;
                 nReturn = oldR; nBreak = oldB; nContinue = oldC;
                 ret = oldRet;
@@ -1822,7 +1823,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 // frames fit the host's 16 MB reserve (~14 KB C++ stack
                 // per call); the guard must stay well below the
                 // physical crash point.
-                wstring fnName = f.fname;
+                wstring fnName = f.fnData->fname;
                 if (fnName.empty() && n->a->k == Node::Member) fnName = n->a->str;
                 else if (fnName.empty() && n->a->k == Node::Ident) fnName = n->a->str;
                 // S-2: no location here — the report point appends the
@@ -1835,7 +1836,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 if (bDbg && (n->line == 113 || n->line == 7))
                 {
                     fwprintf(stderr, L"[DEBUG CALL %d] f.t=%d bMethod=%d vThis.t=%d fn=%s\n",
-                             n->line, (int)f.t, bMethod, (int)vThis.t, f.fname.c_str());
+                             n->line, (int)f.t, bMethod, (int)vThis.t, f.fnData->fname.c_str());
                 }
             }
             if (f.t == Value::Class)
@@ -1852,7 +1853,7 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 vector<Value> args = evalCallArgs(n->list);
                 Value oldOwner = s_currentOwner;
                 s_currentOwner = bMethod ? vThis : Value();
-                Value r = f.native(args);
+                Value r = f.native(f.nativeCtx.get(), args);
                 s_currentOwner = oldOwner;
                 return r;
             }
@@ -1923,38 +1924,38 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             // functions see globals AND the defining frame chain
             // (upvalues). Plain functions capture only globals; nested
             // functions capture their enclosing frame via envUp.
-            local->parent = f.envUp ? f.envUp : globals.self;
-            local->nsTable = f.nsClosure;   // defining namespace stays in scope
+            local->parent = f.fnData->envUp ? f.fnData->envUp : globals.self;
+            local->nsTable = f.fnData->nsClosure;   // defining namespace stays in scope
             // the callee frame is a GC root while the body runs
             gcFrames.push_back(local);
             if (bMethod)
             {
-                if (f.thisVal)
-                    local->VarAt(IdThis()) = *f.thisVal;
+                if (f.fnData->thisVal)
+                    local->VarAt(IdThis()) = *f.fnData->thisVal;
                 else
-                    local->VarAt(IdThis()) = vThis;   // obj.fn() receiver as this
+                    local->VarAt(IdThis()) = vThis;   // obj.fnData->fn() receiver as this
                 // owner = the dot-left object of this call
                 local->VarAt(IdOwner()) = vThis;
             }
             else
             {
-                if (f.thisVal)
-                    local->VarAt(IdThis()) = *f.thisVal;
-                if (f.ownerVal)
-                    local->VarAt(IdOwner()) = *f.ownerVal;
+                if (f.fnData->thisVal)
+                    local->VarAt(IdThis()) = *f.fnData->thisVal;
+                if (f.fnData->ownerVal)
+                    local->VarAt(IdOwner()) = *f.fnData->ownerVal;
                 else
                     local->VarAt(IdOwner()) = Value();
             }
-            for (size_t i = 0; i < f.params.size(); i++)
+            for (size_t i = 0; i < f.fnData->params.size(); i++)
             {
                 uint32_t pid = ParamIdAt(f, i);
                 if (i < args.size() && args[i].t != Value::Null)
                     local->VarAt(pid) = args[i];
-                else if (f.pdefaults &&
-                         i < f.pdefaults->size() &&
-                         (*f.pdefaults)[i])
+                else if (f.fnData->pdefaults &&
+                         i < f.fnData->pdefaults->size() &&
+                         (*f.fnData->pdefaults)[i])
                     local->VarAt(pid) =
-                        Eval((*f.pdefaults)[i], local.get());
+                        Eval((*f.fnData->pdefaults)[i], local.get());
                 else if (i < args.size())
                     local->VarAt(pid) = args[i];
                 else
@@ -1963,11 +1964,11 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             // "..." varargs: leftover arguments as a 1-based table.
             // Spelled `arg` in scripts and `...` at call sites, so
             // bind both names.
-            if (f.params.size() && f.params.back() == L"..." &&
-                f.fn)
+            if (f.fnData->params.size() && f.fnData->params.back() == L"..." &&
+                f.fnData->fn)
             {
                 auto tbV = std::make_shared<Table>();
-                for (size_t k = f.params.size() - 1; k < args.size(); k++)
+                for (size_t k = f.fnData->params.size() - 1; k < args.size(); k++)
                     tbV->arr.push_back(args[k]);
                 // An EMPTY varargs table must read as null: library code
                 // guards recursion with `if(!...)`, and an empty table is
@@ -1985,15 +1986,15 @@ Value Interp::EvalCall(const PNode& n, Env* env)
                 }
                 local->VarAt(IdDots()) = vDots;
                 local->VarAt(IdArg()) = vDots;
-                for (size_t i = 0; i + 1 < f.params.size(); i++)
-                    if (f.params[i] == L"arg" && i < args.size())
+                for (size_t i = 0; i + 1 < f.fnData->params.size(); i++)
+                    if (f.fnData->params[i] == L"arg" && i < args.size())
                         local->VarAt(IdArg()) = args[i];
             }
             Value old = ret;
             int oldR = nReturn;
             nReturn = 0;
             ret = Value();
-            ExecBlock(f.fn, local.get());
+            ExecBlock(f.fnData->fn, local.get());
             Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR;
             ret = old;
@@ -2387,8 +2388,10 @@ bool Interp::ValuesEqual(const Value& l, const Value& r, bool strict)
                 }
                 return false;
             case Value::Func:
-                if (l.native && r.native) return l.native.target_type() == r.native.target_type();
-                return l.fn == r.fn;
+                // 裸 native 指针按跳板地址判等：同一 lambda 类型同一跳板，
+                // 与旧 std::function::target_type() 的类型级判等语义一致
+                if (l.native && r.native) return l.native == r.native;
+                return l.fnData->fn == r.fnData->fn;
             }
             return false;
         }
@@ -3174,19 +3177,20 @@ Value Interp::EvalClass(const PNode& n, Env* env)
             Value vClass;
             vClass.t = Value::Class;
             vClass.tab = tb;
-            vClass.fn = n->b;
-            vClass.pdefaults = std::make_shared<vector<PNode>>(
+            vClass.fnData = std::make_shared<FuncData>();
+            vClass.fnData->fn = n->b;
+            vClass.fnData->pdefaults = std::make_shared<vector<PNode>>(
                 n->b ? n->b->defaults : vector<PNode>());
-            vClass.classBody = n->a;
+            vClass.fnData->classBody = n->a;
             if (env && env->self)
             {
-                vClass.envUp = env->self;
+                vClass.fnData->envUp = env->self;
                 GcRegisterEnv(env);   // capture-time registry (Round 34)
             }
             for (Env* e = env; e; e = e->parent.get())
                 if (e->nsTable && !e->bNsInst)
                 {
-                    vClass.nsClosure = e->nsTable;
+                    vClass.fnData->nsClosure = e->nsTable;
                     break;
                 }
             auto classEnv = std::make_shared<Env>();
@@ -4036,7 +4040,7 @@ Value Interp::Exec(const PNode& n, Env* env)
                         // native iterators (fiber.generator, io.file
                         // each/lines) must not go through CallVmFunc —
                         // they have no AST body
-                        Value r = it.native ? it.native(iterArgs)
+                        Value r = it.native ? it.native(it.nativeCtx.get(), iterArgs)
                                             : CallVmFunc(it, iterArgs);
                         rs.add(r);
                         if (r.t == Value::Null)
@@ -4340,8 +4344,8 @@ Value Interp::NsPath(const vector<wstring>& names, Env* env, bool bRoot)
 Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
         {
             if (f.native)
-                return f.native(args);
-            if (f.t != Value::Func || !f.fn)
+                return f.native(f.nativeCtx.get(), args);
+            if (f.t != Value::Func || !f.fnData->fn)
             {
                 (*err) = L"运行错误: 回调不是函数";
                 return Value();
@@ -4349,8 +4353,8 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             auto local = std::make_shared<Env>();
             local->self = local;
             EnvUsePooledSlots(local.get());
-            local->parent = f.envUp ? f.envUp : globals.self;
-            local->nsTable = f.nsClosure;
+            local->parent = f.fnData->envUp ? f.fnData->envUp : globals.self;
+            local->nsTable = f.fnData->nsClosure;
             local->VarAt(IdOwner()) = Value();   // native-side call: no owner
             // the callee frame and the call arguments live in C++ locals
             // — the collector needs them as roots
@@ -4358,25 +4362,25 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             GcRootScope rs;
             rs.add(f);
             rs.addAll(args);
-            for (size_t i = 0; i < f.params.size(); i++)
+            for (size_t i = 0; i < f.fnData->params.size(); i++)
             {
                 uint32_t pid = ParamIdAt(f, i);
                 if (i < args.size() && args[i].t != Value::Null)
                     local->VarAt(pid) = args[i];
-                else if (f.pdefaults &&
-                         i < f.pdefaults->size() &&
-                         (*f.pdefaults)[i])
+                else if (f.fnData->pdefaults &&
+                         i < f.fnData->pdefaults->size() &&
+                         (*f.fnData->pdefaults)[i])
                     local->VarAt(pid) =
-                        Eval((*f.pdefaults)[i], local.get());
+                        Eval((*f.fnData->pdefaults)[i], local.get());
                 else if (i < args.size())
                     local->VarAt(pid) = args[i];
                 else
                     local->VarAt(pid) = Value();
             }
-            if (f.params.size() && f.params.back() == L"..." && f.fn)
+            if (f.fnData->params.size() && f.fnData->params.back() == L"..." && f.fnData->fn)
             {
                 auto tbV = std::make_shared<Table>();
-                for (size_t k = f.params.size() - 1; k < args.size(); k++)
+                for (size_t k = f.fnData->params.size() - 1; k < args.size(); k++)
                     tbV->arr.push_back(args[k]);
                 // `arg` is the alias for the varargs table;
                 // `...` expands it at call sites.
@@ -4385,15 +4389,15 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
                 vDots.bDots = true;
                 local->VarAt(IdDots()) = vDots;
                 local->VarAt(IdArg()) = vDots;
-                for (size_t i = 0; i + 1 < f.params.size(); i++)
-                    if (f.params[i] == L"arg" && i < args.size())
+                for (size_t i = 0; i + 1 < f.fnData->params.size(); i++)
+                    if (f.fnData->params[i] == L"arg" && i < args.size())
                         local->VarAt(IdArg()) = args[i];
             }
             Value oldRet = ret;
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;
             nReturn = 0;
             ret = Value();
-            ExecBlock(f.fn, local.get());
+            ExecBlock(f.fnData->fn, local.get());
             Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR;
             nBreak = oldB;

@@ -153,6 +153,32 @@ namespace NodioVM
         ~Table();
     };
 
+    // ---- 函数/类专属数据（Value 的侧表，第 40 轮）----
+    // 旧 Value 把这 9 个字段内联：sizeof(Value)=328B 里 ~200B 只有 Func/Class
+    // 用得上，每次 Value 拷贝还白付 7 次原子引用计数。收进一个 shared_ptr：
+    // Value ~136B，拷贝 3 次原子操作；函数值创建时分配一次，之后随值共享。
+    struct FuncData
+    {
+        PNode fn;                             // function literal body
+        PNode classBody;                      // class body statement block
+        vector<wstring> params;
+        wstring fname;                        // debug
+        shared_ptr<Table> nsClosure;          // defining namespace (lexical upvalue)
+        shared_ptr<Env> envUp;                // defining frame chain (closure upvalues)
+        shared_ptr<vector<PNode>> pdefaults;  // FuncLit param defaults
+        shared_ptr<Value> thisVal;            // lexical this captured at function definition
+        shared_ptr<Value> ownerVal;           // lexical owner captured at function definition
+    };
+
+    // native builtin（round 19 → 第 40 轮）：64B 内联的 std::function 换成
+    // 裸函数指针 + 可选上下文，调用点签名 (ctx, args)。经 NF/Native_ 注册
+    // 的无捕获 lambda 零上下文零分配（ctx 指向类型级静态空对象）。
+    template <class F>
+    Value NativeTrampoline(void* ctx, std::vector<Value>& args)
+    {
+        return (*reinterpret_cast<F*>(ctx))(args);
+    }
+
     struct Value
     {
         enum T { Null, Bool, Num, Str, Func, TableT, Class, Pointer } t = Null;
@@ -160,28 +186,41 @@ namespace NodioVM
         double n = 0;
         wstring s;
         void* ptr = nullptr;
-        PNode fn;                       // function literal body
-        PNode classBody;                // class body statement block
-        vector<wstring> params;
-        wstring fname;                  // debug
         shared_ptr<Table> tab;
-        shared_ptr<Table> nsClosure;    // defining namespace (lexical upvalue)
-        shared_ptr<Env> envUp;          // defining frame chain (closure upvalues)
-        shared_ptr<vector<PNode>> pdefaults;  // FuncLit param defaults
+        shared_ptr<FuncData> fnData;          // Func/Class 专属（见 FuncData）
         shared_ptr<vector<Value>> mrets;      // extra return values
         bool bDots = false;             // `...` packed value: mrets holds ALL varargs
         bool bUtf16 = false;            // UTF-16 (ustring) flag
         bool bRawBytes = false;         // raw binary bytes (string& / raw buffer)
-        shared_ptr<Value> thisVal;            // lexical this captured at function definition
-        shared_ptr<Value> ownerVal;           // lexical owner captured at function definition
-        // native builtin (round 19): C++-backed callable surfaced as a Func
-        using NativeFn = std::function<Value(std::vector<Value>&)>;
-        NativeFn native;
+        // native builtin: 裸指针 + 可选上下文（见 NativeTrampoline）
+        Value (*native)(void* ctx, std::vector<Value>&) = nullptr;
+        shared_ptr<void> nativeCtx;
+        template <class F>
+        void SetNative(F f)
+        {
+            using Fx = std::decay_t<F>;
+            native = &NativeTrampoline<Fx>;
+            if constexpr (std::is_empty_v<Fx>)
+            {
+                static Fx inst(f);   // 拷贝构造：C++17 下无捕获 lambda 无默认构造   // 无捕获 lambda：静态空对象，别名指针不拥有
+                nativeCtx = std::shared_ptr<void>(std::shared_ptr<void>(),
+                                                  (void*)&inst);
+            }
+            else
+                nativeCtx = std::make_shared<Fx>(std::move(f));
+        }
+        template <class F>
+        static Value Native_(F f)
+        {
+            Value x; x.t = Func;
+            x.fnData = std::make_shared<FuncData>();
+            x.SetNative(std::move(f));
+            return x;
+        }
         static Value Num_(double v) { Value x; x.t = Num; x.n = v; return x; }
         static Value Bool_(bool v) { Value x; x.t = Bool; x.b = v; return x; }
         static Value Str_(const wstring& v, bool isUtf16 = false) { Value x; x.t = Str; x.s = v; x.bUtf16 = isUtf16; return x; }
         static Value Table_(shared_ptr<Table> tb) { Value x; x.t = TableT; x.tab = tb; return x; }
-        static Value Native_(NativeFn f) { Value x; x.t = Func; x.native = std::move(f); return x; }
         static Value Pointer_(void* p) { Value x; x.t = Pointer; x.ptr = p; return x; }
         bool Truthy() const;
         wstring ToString() const;
@@ -368,7 +407,8 @@ namespace NodioVM
             return 54936;
         return defCp;
     }
-    inline Value NF(Value::NativeFn f) { return Value::Native_(std::move(f)); }
+    template <class F>
+    inline Value NF(F f) { return Value::Native_(std::move(f)); }
 
     // Environment flag helper. getenv() does not see every variable the
     // desktop runtime injects into the process, so the diagnostics read
@@ -664,7 +704,7 @@ namespace NodioVM
     // per dll.api() bind: it loads integer-class params into
     // RCX,RDX,R8,R9 (then the stack just past the 32-byte shadow space),
     // float-class params into XMM0..3 (then 8-byte stack cells), calls
-    // frame->fn, and funnels a float/double return from XMM0 back into
+    // frame->fnData->fn, and funnels a float/double return from XMM0 back into
     // RAX so the C++ side can bit-cast it.
     //
     // frame layout (RCX at stub entry):
@@ -1416,9 +1456,9 @@ namespace NodioVM
     // (native-constructed function values).
     inline uint32_t ParamIdAt(const Value& f, size_t i)
     {
-        if (f.fn && f.fn->nameSeqOff && i < f.params.size())
-            return NameSeqAt(f.fn->nameSeqOff, i);
-        return NameId(f.params[i]);
+        if (f.fnData->fn && f.fnData->fn->nameSeqOff && i < f.fnData->params.size())
+            return NameSeqAt(f.fnData->fn->nameSeqOff, i);
+        return NameId(f.fnData->params[i]);
     }
 
     // Interned id of names[i] on a node (VarDecl / ForIn bind sites).

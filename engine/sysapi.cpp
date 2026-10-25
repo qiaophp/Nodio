@@ -221,14 +221,14 @@ namespace NodioVM
             return Value();
 
         vector<Value> da{ Value::Str_(def->dll) };
-        Value dv = itLoad->second.native(da);
+        Value dv = itLoad->second.native(itLoad->second.nativeCtx.get(), da);
         if (dv.t != Value::TableT || !dv.tab) return Value();
         auto itApi = dv.tab->map.find(L"api");
         if (itApi == dv.tab->map.end() || !itApi->second.native) return Value();
 
         vector<Value> aa{ Value::Str_(def->exportName),
                           Value::Str_(def->sig) };
-        Value fn = itApi->second.native(aa);
+        Value fn = itApi->second.native(itApi->second.nativeCtx.get(), aa);
         if (fn.t == Value::Null) return Value();
         cache[name] = fn;
         return fn;

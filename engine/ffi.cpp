@@ -2231,7 +2231,7 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
 
                 return vRet;
             });
-            fWrap.fname = funcName;
+            fWrap.fnData->fname = funcName;
             fWrap.ptr = fn;
             return fWrap;
         }

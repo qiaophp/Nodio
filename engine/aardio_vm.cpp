@@ -525,7 +525,7 @@ namespace NodioVM
                     const RtSlot& rs = args[k];
                     a.push_back(rs.box ? rs.box->value.val : rs.val);
                 }
-                Value out = fn.val.native(a);
+                Value out = fn.val.native(fn.val.nativeCtx.get(), a);
                 WriteReturns(frames.back(), retSlot, retCount, out);
                 return 0;
             }

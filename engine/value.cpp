@@ -71,7 +71,7 @@ namespace NodioVM
         {
             wchar_t buf[32];
             swprintf(buf, 32, L"func:%p",
-                     v.native ? (void*)&v.native : (void*)v.fn.get());
+                     v.native ? (void*)&v.native : (void*)v.fnData->fn.get());
             return buf;
         }
         case Value::Pointer:
