@@ -66,6 +66,11 @@ canvas = function(winform, opt){
 		snap    = true;
 		// 网格线显示开关（官方 USR.CFG 的 dlg_grid）
 		showGrid = (opt.showGrid !== false);
+		// Tab 顺序模式（第五十九轮续）：winform.add() 的顺序 = Tab 键
+		// 导航顺序（官方语义）。进入模式后按想要的顺序逐个点击控件，
+		// 点空白退出；徽章 = 当前 add() 序位。
+		tabMode = false;
+		__tabSeq = 0;
 		// 控件吸附对齐开关（官方 USR.CFG 的 dlg_snap：拖拽时磁性吸附相邻控件边界）
 		alignSnap = (opt.alignSnap !== false);
 		// 设计器缩放（百分比，默认 100；官方 USR.CFG 的 dlg_zoom_defalut）
@@ -156,6 +161,11 @@ canvas = function(winform, opt){
 	// 点空白处：选中**窗体本身**（官方设计器行为 —— 属性格改 标题/宽度/高度）；
 	// 点手柄 → 开始改尺寸
 	self.bg.onMouseDown = function(x, y, bd, lp){
+		if(self.tabMode){
+			// Tab 顺序模式：点空白 = 改完退出（新顺序保留）
+			self.setTabMode(false);
+			return;
+		}
 		var hi = self.__hitHandle(x, y);
 		if(hi && self.selected){
 			var m = ..nodio.ui.mouseScreen(self.bg.ctrl.hwnd, lp);
@@ -551,6 +561,11 @@ canvas = function(winform, opt){
 		try{
 			var sub = ..nodio.ui.subclass(item.ctrl.hwnd, function(hwnd,msg,wp,lp){
 				if(msg == 0x201){        // WM_LBUTTONDOWN
+					if(self.tabMode){
+						// Tab 顺序模式：点一下 = 排进点击序列（不选中不拖动）
+						self.__tabPick(item);
+						return 1;
+					}
 					var isCtrl = (::User32.GetKeyState(0x11/*VK_CONTROL*/) & 0x8000) != 0;
 					var isShift = (::User32.GetKeyState(0x10/*VK_SHIFT*/) & 0x8000) != 0;
 					self.select(item.name, isCtrl || isShift);
@@ -1288,6 +1303,36 @@ canvas = function(winform, opt){
 		self.__refresh();
 	}
 
+	// ---------- Tab 顺序（第五十九轮续）----------
+	// winform.add() 的顺序 = Tab 键导航顺序（官方 aardio 语义），所以
+	// 改顺序 = 重排 self.items —— toDSG 自然按新顺序输出 add()。
+	self.setTabMode = function(on){
+		on = on ? true : false;
+		if(on == self.tabMode) return;
+		self.tabMode = on;
+		self.__tabSeq = 0;
+		if(on) self.pushUndo();   // 顺序改动可撤销（Ctrl+Z 回原顺序）
+		self.__refresh();
+	}
+	// 点击序列：把 item 搬到第 __tabSeq+1 个槽位（0 基计数）
+	// 已点过的控件再点 = 搬到当前位置之后（WinForms 同款语义）
+	self.__tabPick = function(item){
+		var n = #self.items;
+		var from = 0;
+		for(i=1;n;1){
+			if(self.items[i] == item){ from = i; break }
+		}
+		if(!from) return;
+		var target = self.__tabSeq + 1;
+		if(target > n) target = n;
+		if(from != target){
+			var it = ..table.remove(self.items, from);
+			..table.insert(self.items, target, it);
+		}
+		self.__tabSeq = self.__tabSeq + 1;
+		self.__refresh();
+	}
+
 	// ---------- 绘制 ----------
 	// 工作区 + 窗体表面（标题栏/边框/客户底色）+ 客户区网格 + 边距线 +
 	// 吸附参考线 + 选中框 + 8 个手柄。
@@ -1398,6 +1443,29 @@ canvas = function(winform, opt){
 			var dpen = ..gdip.pen(self.frameColor, 1);
 			graphics.drawRectangle(dpen, dx0, dy0, dw0, dh0);
 			dpen.delete();
+		}
+		// Tab 顺序徽章（第五十九轮续）：每个控件左上角画「序位」
+		// —— 序位 = self.items 里的位置 = winform.add() 的顺序。
+		// 半透明蓝圆角块 + 白字；模式开着才画。
+		if(self.tabMode){
+			var tz = self.zoomScale ? self.zoomScale() : 1.0;
+			var tbs = ..nodio.ui.px(16);
+			var tbrush = ..gdip.solidBrush(0xE11F6FB2);
+			var tfont = ..nodio.ui.boardFont(9, "Microsoft YaHei UI");
+			var tfmt = ..nodio.ui.boardFormat();
+			var ttext = ..gdip.solidBrush(0xFFFFFFFF);
+			for(i=1;#self.items;1){
+				var tIt = self.items[i];
+				var tx = cOffX + math.round(..nodio.ui.px(tIt.x) * tz);
+				var ty = cOffY + math.round(..nodio.ui.px(tIt.y) * tz) - tbs - 2;
+				if(ty < cOffY) ty = cOffY;
+				graphics.fillRect(tbrush, tx, ty, tbs, tbs);
+				graphics.drawString(tostring(i), tfont,
+					::RECTF(tx, ty + ..nodio.ui.px(1), tbs, tbs), tfmt, ttext);
+			}
+			ttext.delete();
+			tfont.delete();
+			tbrush.delete();
 		}
 		// 选中「窗体本身」：表面整框（含标题栏；尺寸在属性格改）
 		if(self.__formSel){

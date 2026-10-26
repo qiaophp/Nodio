@@ -1348,6 +1348,7 @@ install = function(){
 			{ "打开设计器"; function(id){ if(hooks.onDesigner) hooks.onDesigner() } };
 			{ "-"; null };
 			{ "窗体设置"; function(id){ if(hooks.onDesignerForm) hooks.onDesignerForm() } };
+			{ "Tab 顺序"; function(id){ if(hooks.onDesignerTabOrder) hooks.onDesignerTabOrder() } };
 			{ "显示网格线"; function(id){ if(hooks.onDesignerGrid) hooks.onDesignerGrid() } };
 			{ "对齐网格"; function(id){ if(hooks.onDesignerSnap) hooks.onDesignerSnap() } };
 			{ "控件吸附对齐"; function(id){ if(hooks.onDesignerAlignSnap) hooks.onDesignerAlignSnap() } };

@@ -1984,6 +1984,14 @@ shell.hooks.onDesignerForm = function(){
 	// 标题/宽度/高度/底色/边框一处改完；画布空白点击仍走属性格
 	designer.showFormDialog();
 };
+shell.hooks.onDesignerTabOrder = function(){
+	// 第五十九轮续：Tab 顺序模式——按想要的顺序逐个点击控件，
+	// 点空白退出；winform.add() 的顺序 = Tab 键导航顺序
+	var on = designer.tabOrderMode();
+	shell.setStatus(on
+		? "Tab 顺序：按想要的顺序逐个点击控件，点空白退出"
+		: "Tab 顺序：已退出（顺序已保留，Ctrl+Z 可撤销）");
+};
 shell.hooks.onDesignerGrid = function(){
 	designer.canvas.showGrid = designer.canvas.showGrid ? false : true;
 	designer.canvas.__refresh();
@@ -3535,37 +3543,85 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		else{
 			io.print("DROP-E2E:SKIP");
 		}
-		// —— 窗体属性对话框（第五十九轮续）——
-		// ① DSG 往返：border/bgcolor 从 DSG 头读回、toDSG 原样写出；
-		// ② 全链：菜单「窗体设置」→ 对话框填字段 → 确定 → applyFormProps
-		//    写回 canvas.form（DSG 头跟着变），对话框自关。
-		if(!app.designer.isActive()){
-			if(shell.hooks.onDesigner) shell.hooks.onDesigner();
-		}
-		var __dsg0 = '/*DSG{{*/\r\nwinform = win.form(text="测试";right=600;bottom=400;bgcolor=0x3C3C3C;border="resize")\r\nwinform.add(\r\n)\r\n/*}}*/';
-		app.designer.fromDSG(__dsg0);
-		var __rtF = app.designer.toDSG();
-		var __fRT = ((..string.indexOf(__rtF, 'border="resize"') !== null)
-			&& (..string.indexOf(__rtF, 'bgcolor=0x3C3C3C') !== null)) ? 1 : 0;
-		io.print("FORM-DSG-RT:" ++ tostring(__fRT));
-		var __dlg = app.designer.formDialogRef();
-		var __fDlg = 0;
-		if(__dlg){
-			if(shell.hooks.onDesignerForm) shell.hooks.onDesignerForm();
-			..nodio.ui.setCtrlText(__dlg.edText, "冒烟窗体");
-			..nodio.ui.setCtrlText(__dlg.edW, "520");
-			..nodio.ui.setCtrlText(__dlg.edH, "380");
-			..nodio.ui.setCtrlText(__dlg.edBg, "0x2B2B2B");
-			..nodio.ui.setCtrlText(__dlg.edBd, "dialog");
-			__dlg.__ok();
-			var __f2 = app.designer.formGet();
-			__fDlg = ((__f2.text == "冒烟窗体") && (__f2.w == 520)
-				&& (__f2.h == 380) && (__f2.bgcolor == 0x2B2B2B)
-				&& (__f2.border == "dialog") && !__dlg.visible) ? 1 : 0;
-			// 还原画布（别把后续断言弄脏）
-			app.designer.fromDSG('/*DSG{{*/\r\nwinform = win.form(text="窗体";right=759;bottom=469)\r\nwinform.add(\r\n)\r\n/*}}*/');
-		}
-		io.print("FORM-DLG:" ++ tostring(__fDlg));
+		// —— 窗体属性对话框 + Tab 顺序（第五十九轮续）——
+		// ⚠ ⑥ 的 DROP-MSG 是异步的（200ms 后才查结果），而下面 fromDSG
+		//   会**清画布**——同步跑会跟它抢共享画布（实测 DROP-MSG 被砸）。
+		//   整块延后到它的定时器完成之后。
+		shell.winform.setTimeout(function(){
+			// —— 窗体属性对话框（第五十九轮续）——
+			// ① DSG 往返：border/bgcolor 从 DSG 头读回、toDSG 原样写出；
+			// ② 全链：菜单「窗体设置」→ 对话框填字段 → 确定 → applyFormProps
+			//    写回 canvas.form（DSG 头跟着变），对话框自关。
+			if(!app.designer.isActive()){
+				if(shell.hooks.onDesigner) shell.hooks.onDesigner();
+			}
+			var __dsg0 = '/*DSG{{*/\r\nwinform = win.form(text="测试";right=600;bottom=400;bgcolor=0x3C3C3C;border="resize")\r\nwinform.add(\r\n)\r\n/*}}*/';
+			app.designer.fromDSG(__dsg0);
+			var __rtF = app.designer.toDSG();
+			var __fRT = ((..string.indexOf(__rtF, 'border="resize"') !== null)
+				&& (..string.indexOf(__rtF, 'bgcolor=0x3C3C3C') !== null)) ? 1 : 0;
+			io.print("FORM-DSG-RT:" ++ tostring(__fRT));
+			var __dlg = app.designer.formDialogRef();
+			var __fDlg = 0;
+			if(__dlg){
+				if(shell.hooks.onDesignerForm) shell.hooks.onDesignerForm();
+				..nodio.ui.setCtrlText(__dlg.edText, "冒烟窗体");
+				..nodio.ui.setCtrlText(__dlg.edW, "520");
+				..nodio.ui.setCtrlText(__dlg.edH, "380");
+				..nodio.ui.setCtrlText(__dlg.edBg, "0x2B2B2B");
+				..nodio.ui.setCtrlText(__dlg.edBd, "dialog");
+				__dlg.__ok();
+				var __f2 = app.designer.formGet();
+				__fDlg = ((__f2.text == "冒烟窗体") && (__f2.w == 520)
+					&& (__f2.h == 380) && (__f2.bgcolor == 0x2B2B2B)
+					&& (__f2.border == "dialog") && !__dlg.visible) ? 1 : 0;
+				// 还原画布（别把后续断言弄脏）
+				app.designer.fromDSG('/*DSG{{*/\r\nwinform = win.form(text="窗体";right=759;bottom=469)\r\nwinform.add(\r\n)\r\n/*}}*/');
+			}
+			io.print("FORM-DLG:" ++ tostring(__fDlg));
+			// —— Tab 顺序（第五十九轮续）——
+			// 加两个控件 → 进 Tab 模式 → 用**真实窗口消息**把 WM_LBUTTONDOWN
+			// 打进组件自己的窗口过程，按「倒序」点两个控件 → add() 顺序
+			// 必须跟着变（winform.add() 顺序 = Tab 键导航顺序，toDSG 按
+			// 新顺序输出 add()）。
+			var __tabOK = 0;
+			var __tabAdded = false;
+			if(app.designer.isActive()){
+				var __nBefore = app.designer.canvasCount();
+				var __b1 = app.designer.canvasAddCls("button", 20, 20);
+				var __b2 = app.designer.canvasAddCls("button", 200, 200);
+				if(__b1 && __b2){
+					__tabAdded = true;
+					var __its0 = app.designer.canvasItemsRef();
+					var __h1 = __its0[__nBefore + 1].hwnd;   // 先加的
+					var __nm1 = __its0[__nBefore + 1].name;
+					var __h2 = __its0[__nBefore + 2].hwnd;   // 后加的
+					var __nm2 = __its0[__nBefore + 2].name;
+					app.designer.tabOrderMode(true);
+					// 倒序点：先点后加的（→槽1），再点先加的（→槽2）
+					::PostMessage(__h2, 0x201/*WM_LBUTTONDOWN*/, 1, (5 << 16) | 5);
+					::PostMessage(__h1, 0x201/*WM_LBUTTONDOWN*/, 1, (5 << 16) | 5);
+					// ⚠ PostMessage 异步：延后一拍再查顺序（同 DROP-MSG 的招）
+					shell.winform.setTimeout(function(){
+						var __its1 = app.designer.canvasItemsRef();
+						var __swapped = (__its1[__nBefore + 1].name == __nm2)
+							&& (__its1[__nBefore + 2].name == __nm1);
+						var __dsgT = app.designer.toDSG();
+						var __p2 = ..string.indexOf(__dsgT, __nm2 ++ "=");
+						var __p1 = ..string.indexOf(__dsgT, __nm1 ++ "=");
+						var __ok2 = (__swapped && __p2 !== null && __p1 !== null
+							&& __p2 < __p1) ? 1 : 0;
+						app.designer.tabOrderMode(false);
+						app.designer.canvasRemove(__nm1);
+						app.designer.canvasRemove(__nm2);
+						io.print("TAB-ORDER:" ++ tostring(__ok2));
+						return null;
+					}, 200);
+				}
+			}
+			if(!__tabAdded) io.print("TAB-ORDER:0");
+			return null;
+		}, 350);
 		// ⑦ 闪烁回归（第五十八轮）：连续 show(true) 不该反复整块重画
 		//
 		// IDE 的心跳每 300ms 调一次开始页的 show —— 而 show(true) 原来

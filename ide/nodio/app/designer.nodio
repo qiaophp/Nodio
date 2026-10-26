@@ -448,6 +448,39 @@ isActive = lambda() visible;
 // 供回归：窗体属性对话框实例（无头测试直接驱动字段 + __ok）
 formDialogRef = function(){ return formDialog }
 
+// ---------- Tab 顺序（第五十九轮续）----------
+//
+// winform.add() 的顺序 = Tab 键导航顺序（官方语义）。模式开 → 画布上
+// 每个控件带序位徽章，按想要的顺序逐个点击，点空白退出。
+tabOrderMode = function(on){
+	if(!canvas) return false;
+	if(on === null || on === undefined) on = !canvas.tabMode;
+	canvas.setTabMode(on);
+	return canvas.tabMode;
+}
+
+// 供回归：画布控件列表的**浅视图**（名字 + 原生控件句柄，
+// 无头测试用 PostMessage 打进组件自己的窗口过程来模拟点击）
+canvasItemsRef = function(){
+	if(!canvas) return {};
+	var out = {};
+	for(i=1;#canvas.items;1){
+		..table.push(out, {
+			name = canvas.items[i].name;
+			hwnd = canvas.items[i].ctrl ? canvas.items[i].ctrl.hwnd : null;
+		});
+	}
+	return out;
+}
+
+// 供回归：按**类名**往画布加控件（无头测试造夹具用）
+canvasAddCls = function(cls, x, y){
+	if(!canvas) return null;
+	var spec = nodio.designer.__findSpec(cls);
+	if(!spec) return null;
+	return canvas.add(spec, {x=x; y=y; w=120; h=30});
+}
+
 canvasSelected = function(){
 	return canvas ? canvas.selected : null;
 }

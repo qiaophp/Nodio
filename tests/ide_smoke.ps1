@@ -356,6 +356,9 @@ if ($out -notmatch 'VARS-LAZY:OK')  { Write-Output 'FAIL: variables tree lazy ex
 if ($out -notmatch 'FORM-DSG-RT:1') { Write-Output 'FAIL: form DSG border/bgcolor round-trip broken'; exit 1 }
 if ($out -notmatch 'FORM-DLG:1')    { Write-Output 'FAIL: form properties dialog chain broken'; exit 1 }
 
+# Tab 顺序（第五十九轮续）：真实消息点击 → add() 顺序重排 → toDSG 输出
+if ($out -notmatch 'TAB-ORDER:1')   { Write-Output 'FAIL: tab order reorder chain broken'; exit 1 }
+
 # 设计器拖拽落点（第五十六轮）：工具箱 → 画布的拖拽入口 + 坐标换算 + 避让。
 #   DROP-WIRED:1   工具箱 onDrop 回调已接线
 #   SPOT-FREE:OK   已有控件占着 (20,20) 时，新落点不与它重叠

@@ -6364,3 +6364,30 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
 - 验证：VM 98/0/1、IDE 冒烟 SMOKE OK（含新断言）、ide_debug 88 项全绿。
 - ❌ 剩余（设计器）：Tab 顺序、窗体级事件一览、布局器（anchors 画布
   生效）、资源视图 + 控件分类自定义。
+
+---
+
+## 1.69 第五十九轮续：设计器之二——Tab 顺序
+
+- **画布 Tab 顺序模式**（`lib/nodio/designer/canvas.nodio`）：官方语义
+  —— `winform.add()` 的顺序 = Tab 键导航顺序，所以改顺序 = 重排
+  `canvas.items`（toDSG 自然按新顺序输出 add()，零协议改动）。
+  - `setTabMode(on)`：进入即 pushUndo（顺序改动可撤销）；徽章 = 当前
+    add() 序位（半透明蓝块 + 白字，画在拖拽预览层之后）；
+  - 点击序列（WinForms 同款）：组件 WM_LBUTTONDOWN 在 Tab 模式下
+    「点一下 = 排进点击序列」（`__tabPick`，table.remove+insert 搬槽位，
+    不选中不拖动）；点空白 = 改完退出（新顺序保留）。
+- **入口**（`app/designer.nodio` / `shell.nodio` / `main.nodio`）：设计
+  菜单「Tab 顺序」→ `hooks.onDesignerTabOrder` → `designer.tabOrderMode()`
+  翻转 + 状态栏提示。
+- **回归锁**（`ide_smoke.ps1` 增 1 断言）：TAB-ORDER——真实造两个控件
+  → 进模式 → **真实窗口消息**（WM_LBUTTONDOWN 打进组件自己的窗口
+  过程）倒序点两个 → items 顺序交换 + toDSG 的 add() 顺序跟着换。
+  ⚠ PostMessage 异步 → 断言延后一拍（setTimeout 200ms，同 DROP-MSG）；
+  ⚠ 本块 fromDSG 会清画布，与 DROP-MSG 的定时器抢共享画布（实测把
+  DROP-MSG 砸了）→ 整块再延后到 350ms 之后跑。
+- **测试基建**（`app/designer.nodio`）：`canvasItemsRef()`（名字+句柄
+  浅视图）、`canvasAddCls()`（按类名造夹具）。
+- 验证：VM 98/0/1、IDE 冒烟 SMOKE OK（含新断言）、ide_debug 88 项全绿。
+- ❌ 剩余（设计器）：窗体级事件一览、布局器（anchors 画布生效）、
+  资源视图 + 控件分类自定义。
