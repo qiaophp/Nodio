@@ -144,13 +144,19 @@ dsg = {
 
 	// item 数组 → DSG 文本（formBg 可选：明确知道窗体底色时写进头部，
 	// 老调用方不传就不写 —— DSG 往返保持对称）
-	generate = function(items, formText, formW, formH, formBg){
+	// formBorder（第五十九轮续：窗体属性对话框）同理可选 —— 空串/null
+	// 都不写（官方 win.form 不写 border 时用默认边框）。
+	generate = function(items, formText, formW, formH, formBg, formBorder){
 		items = items : {};
 		var sb = '/*DSG{{*/\r\n';
 		sb = sb ++ 'winform = win.form(text="' ++ (formText : '窗体')
 			++ '";right=' ++ (formW : 759) ++ ';bottom=' ++ (formH : 469);
 		if(formBg !== null && formBg !== undefined){
 			sb = sb ++ ';bgcolor=' ++ string.format('0x%X', formBg);
+		}
+		if(formBorder !== null && formBorder !== undefined
+			&& formBorder != ''){
+			sb = sb ++ ';border="' ++ dsg.__escape(tostring(formBorder)) ++ '"';
 		}
 		sb = sb ++ ')\r\n';
 		sb = sb ++ 'winform.add(\r\n';

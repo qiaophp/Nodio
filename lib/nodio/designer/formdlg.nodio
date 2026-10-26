@@ -1,0 +1,266 @@
+// nodio.designer.formdlg — 窗体属性对话框（就地浮层，非真模态窗）。
+//
+// 官方 IDE 的「窗体设置」是一个属性对话框；Nodio 上**不建第二顶层窗口**
+//（官方 win.form 的 doModal/endModal 在树遍历解释器上没验证过，见
+// nodio.ui.prompt 的说明）—— 和 prompt 一样做成主窗体上的浮层：
+// 标题栏 + 五行输入（标题/宽度/高度/底色/边框）+ 确定/取消。
+//
+// 用法：
+//   dlg = nodio.designer.formdlg(winform, {})
+//   dlg.show(form, function(np){ ... })   // form = {text;w;h;bgcolor;border}
+//                                        // np = 解析后的新值（number 化）
+//   Esc / 取消 = 关闭不改；回车 = 确定。
+//
+// 字段语义（与 canvas.applyFormProps 对齐）：
+//   text    标题
+//   w/h     宽度/高度（设计坐标=逻辑像素；<60 拒绝）
+//   bgcolor 底色，接受 0xRRGGBB 十六进制（空 = 保持不变）
+//   border  边框（win.form 的 border 参数；空 = 不写 DSG，官方默认边框）
+//
+// 坐标：物理像素（board 约定），常量按逻辑像素写、px() 换算。
+namespace nodio.designer{
+import nodio.ui.board;
+import nodio.ui.dpi;
+import nodio.ui.theme;
+import nodio.ui.subclass;
+import nodio.ui.richedit;
+import gdip;
+
+var __fdSeq = 0;
+
+formdlg = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	// 设计常量（逻辑像素）
+	var W = 356, H = 236;
+	var ROW_H = 26, LBL_W = 62, PAD = 14;
+	var BTN_W = 72, BTN_H = 24, BTN_GAP = 10;
+
+	var self = {
+		winform = winform;
+		rect = opt.rect;
+		visible = false;
+		hover = 0;          // 0=无 1=确定 2=取消
+		onApply = null;     // function(np) —— np = {text;w;h;bgcolor;border}
+	};
+
+	__fdSeq = __fdSeq + 1;
+	var seq = __fdSeq;
+
+	// ---------- 控件 ----------
+	// 面板（后建的 edit z 更高，盖在画布/属性格上面）
+	self.panel = nodio.ui.board(winform, {
+		left = 0; top = 0; right = ..nodio.ui.px(W); bottom = ..nodio.ui.px(H);
+		fontSize = 12; z = 80;
+	});
+	self.edText = ..nodio.ui.addCtrl(winform, "fdText" ++ seq, {
+		cls="edit"; left=0; top=0; right=200; bottom=22; z=81 });
+	self.edW = ..nodio.ui.addCtrl(winform, "fdW" ++ seq, {
+		cls="edit"; left=0; top=0; right=80; bottom=22; z=81 });
+	self.edH = ..nodio.ui.addCtrl(winform, "fdH" ++ seq, {
+		cls="edit"; left=0; top=0; right=80; bottom=22; z=81 });
+	self.edBg = ..nodio.ui.addCtrl(winform, "fdBg" ++ seq, {
+		cls="edit"; left=0; top=0; right=200; bottom=22; z=81 });
+	self.edBd = ..nodio.ui.addCtrl(winform, "fdBd" ++ seq, {
+		cls="edit"; left=0; top=0; right=200; bottom=22; z=81 });
+
+	// 深色化（原生 edit 不吃自绘配色，见 nodio.ui.richedit 的说明）
+	..nodio.ui.richedit.darkenEdit(self.edText, th);
+	..nodio.ui.richedit.darkenEdit(self.edW, th);
+	..nodio.ui.richedit.darkenEdit(self.edH, th);
+	..nodio.ui.richedit.darkenEdit(self.edBg, th);
+	..nodio.ui.richedit.darkenEdit(self.edBd, th);
+
+	// 回车 = 确定、Esc = 取消（五个输入框都接）
+	var __editKey = function(hwnd, msg, wp, lp){
+		if(msg == 0x100){
+			var vk = tonumber(wp);
+			if(vk == 0x0D){ self.__ok(); return 1 }
+			if(vk == 0x1B){ self.close(); return 1 }
+		}
+		return null;
+	};
+	self.__subs = {
+		..nodio.ui.subclass(self.edText.hwnd, __editKey);
+		..nodio.ui.subclass(self.edW.hwnd, __editKey);
+		..nodio.ui.subclass(self.edH.hwnd, __editKey);
+		..nodio.ui.subclass(self.edBg.hwnd, __editKey);
+		..nodio.ui.subclass(self.edBd.hwnd, __editKey);
+	};
+
+	// ---------- 几何 ----------
+	// 输入框/按钮的矩形（面板客户区物理坐标）；面板摆到主窗体中央时
+	// 一起平移 —— __place(edCtrl, x, y, w, h) 统一处理。
+	var __edRects = function(){
+		var x0 = ..nodio.ui.px(PAD + LBL_W + 6);
+		var w0 = ..nodio.ui.px(W - PAD * 2 - LBL_W - 6);
+		var rowY = function(i){
+			return ..nodio.ui.px(34 + (i - 1) * (ROW_H + 6));
+		};
+		return {
+			{ x = x0; y = rowY(1); w = w0; h = ..nodio.ui.px(ROW_H) };   // 标题
+			{ x = x0; y = rowY(2); w = ..nodio.ui.px(80); h = ..nodio.ui.px(ROW_H) };  // 宽
+			{ x = x0 + ..nodio.ui.px(90); y = rowY(2); w = ..nodio.ui.px(80); h = ..nodio.ui.px(ROW_H) };  // 高
+			{ x = x0; y = rowY(3); w = w0; h = ..nodio.ui.px(ROW_H) };   // 底色
+			{ x = x0; y = rowY(4); w = w0; h = ..nodio.ui.px(ROW_H) };   // 边框
+		};
+	};
+	// 按钮矩形（面板客户区物理坐标；idx 1=确定 2=取消，从右往左）
+	self.__btnRect = function(idx){
+		var bw = ..nodio.ui.px(BTN_W), bh = ..nodio.ui.px(BTN_H);
+		var x = ..nodio.ui.px(W - PAD) - (idx == 1 ? bw : bw * 2 + ..nodio.ui.px(BTN_GAP));
+		var y = ..nodio.ui.px(H - PAD - BTN_H);
+		return {left = x; top = y; right = x + bw; bottom = y + bh};
+	};
+	self.__hitBtn = function(x, y){
+		for(i=1; 2; 1){
+			var b = self.__btnRect(i);
+			if(x >= b.left && x < b.right && y >= b.top && y < b.bottom) return i;
+		}
+		return 0;
+	};
+
+	// ---------- 动作 ----------
+	var __curForm = null;   // 取消时对比用（其实只是存档，v1 不做 diff）
+
+	self.show = function(form, onApply){
+		if(!form) return;
+		__curForm = form;
+		self.onApply = onApply;
+		// 填字段（bgcolor 以十六进制串呈现）
+		..nodio.ui.setCtrlText(self.edText, tostring(form.text : ""));
+		..nodio.ui.setCtrlText(self.edW, tostring(form.w : 759));
+		..nodio.ui.setCtrlText(self.edH, tostring(form.h : 469));
+		..nodio.ui.setCtrlText(self.edBg,
+			(form.bgcolor !== null && form.bgcolor !== undefined)
+				? string.format("0x%X", form.bgcolor) : "");
+		..nodio.ui.setCtrlText(self.edBd, tostring(form.border : ""));
+		// 面板居中于主窗体客户区
+		try{
+			var rc = winform.getClientRect();
+			var w = rc.width ? rc.width() : 0;
+			var h = rc.height ? rc.height() : 0;
+			if(w && h){
+				var px = ..nodio.ui.px(W), py = ..nodio.ui.px(H);
+				var ox = ..math.floor((w - px) / 2);
+				var oy = ..math.floor((h - py) / 3);
+				self.panel.layout(ox, oy, ox + px, oy + py);
+			}
+		}catch(eC){}
+		// 输入框按面板位置摆（面板客户区偏移 + 行内偏移）
+		var br = { left = 0; top = 0 };
+		try{
+			var pr = self.panel.ctrl.getRect();
+			if(pr && pr.left !== null){ br.left = pr.left; br.top = pr.top }
+		}catch(eR){}
+		var er = __edRects();
+		var eds = { self.edText; self.edW; self.edH; self.edBg; self.edBd };
+		for(i=1;#eds;1){
+			..nodio.ui.setRect(eds[i],
+				br.left + er[i].x, br.top + er[i].y,
+				br.left + er[i].x + er[i].w, br.top + er[i].y + er[i].h);
+		}
+		self.panel.show(true);
+		for(i=1;#eds;1){ eds[i].show(true) }
+		self.visible = true;
+		try{ self.edText.setFocus() }catch(eF){}
+	};
+
+	self.close = function(){
+		self.visible = false;
+		self.panel.show(false);
+		var eds = { self.edText; self.edW; self.edH; self.edBg; self.edBd };
+		for(i=1;#eds;1){ try{ eds[i].show(false) }catch(eH){} }
+	};
+
+	self.__ok = function(){
+		if(!self.visible) return;
+		// 解析：数字字段非法就保持原值；底色空 = 不变；边框空 = 不写 DSG
+		var np = {
+			text = ..string.trim(tostring(..nodio.ui.getCtrlText(self.edText) : ""));
+			w = tonumber(..string.trim(tostring(..nodio.ui.getCtrlText(self.edW) : "")));
+			h = tonumber(..string.trim(tostring(..nodio.ui.getCtrlText(self.edH) : "")));
+			bgcolor = tonumber(..string.trim(tostring(..nodio.ui.getCtrlText(self.edBg) : "")));
+			border = ..string.trim(tostring(..nodio.ui.getCtrlText(self.edBd) : ""));
+		};
+		if(np.w === null && __curForm) np.w = __curForm.w;
+		if(np.h === null && __curForm) np.h = __curForm.h;
+		if(np.bgcolor === null && __curForm) np.bgcolor = __curForm.bgcolor;
+		self.close();
+		if(self.onApply) self.onApply(np);
+	};
+
+	// ---------- 绘制 ----------
+	self.panel.onDraw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var w = rc.right - rc.left, h = rc.bottom - rc.top;
+		// 底 + 边框
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var pb = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(pb, rc.left, rc.top, w, h);
+		pb.delete();
+		// 标题
+		var tb = ..gdip.solidBrush(th.text);
+		graphics.drawString("窗体属性", font,
+			::RECTF(rc.left + ..nodio.ui.px(PAD), rc.top + ..nodio.ui.px(8),
+				w, ..nodio.ui.px(22)), fmt, tb);
+		tb.delete();
+		// 标题下线
+		var lp = ..gdip.pen(th.border, 1);
+		graphics.drawLine(lp, rc.left, rc.top + ..nodio.ui.px(32),
+			rc.right, rc.top + ..nodio.ui.px(32));
+		lp.delete();
+		// 标签
+		var lb = ..gdip.solidBrush(th.textDim);
+		var lbls = { "标题"; "宽度"; "高度"; "底色"; "边框" };
+		var lx = rc.left + ..nodio.ui.px(PAD);
+		var rowY2 = function(i){
+			return rc.top + ..nodio.ui.px(34 + (i - 1) * (ROW_H + 6));
+		};
+		for(i=1;#lbls;1){
+			graphics.drawString(lbls[i], font,
+				::RECTF(lx, rowY2(i) + 2, ..nodio.ui.px(LBL_W), ..nodio.ui.px(ROW_H)),
+				fmt, lb);
+		}
+		// 边框字段的提示（值语义在标签里说不下，画一行淡字）
+		graphics.drawString("空=默认边框；如 none/dialog/resize", font,
+			::RECTF(lx, rowY2(5) + ..nodio.ui.px(ROW_H + 2), w, ..nodio.ui.px(ROW_H)),
+			fmt, lb);
+		lb.delete();
+		// 按钮
+		var names = { "确定"; "取消" };
+		for(i=1;2;1){
+			var b = self.__btnRect(i);
+			var bb = ..gdip.solidBrush(self.hover == i ? th.hoverBg : th.panel2);
+			graphics.fillRect(bb, b.left, b.top, b.right - b.left, b.bottom - b.top);
+			bb.delete();
+			var bp = ..gdip.pen(th.border, 1);
+			graphics.drawRectangle(bp, b.left, b.top, b.right - b.left, b.bottom - b.top);
+			bp.delete();
+			var bt = ..gdip.solidBrush(th.text);
+			graphics.drawString(names[i], font,
+				::RECTF(b.left, b.top + ..nodio.ui.px(3), b.right - b.left,
+					b.bottom - b.top), fmt, bt);
+			bt.delete();
+		}
+	};
+	self.panel.onMouseMove = function(x, y, bd){
+		var hb = self.__hitBtn(x, y);
+		if(hb != self.hover){
+			self.hover = hb;
+			self.panel.invalidate();
+		}
+	};
+	self.panel.onMouseClick = function(x, y, bd){
+		var hb = self.__hitBtn(x, y);
+		if(hb == 1) self.__ok();
+		elseif(hb == 2) self.close();
+	};
+
+	return self;
+}
+
+}

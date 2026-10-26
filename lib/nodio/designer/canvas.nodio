@@ -58,7 +58,9 @@ canvas = function(winform, opt){
 		// bgcolor：窗体底色（DSG 头 bgcolor=），透明系控件（static/分组框/
 		// checkbox/radio）的底色跟着它走 —— 不给底色的话透明控件透出的是
 		// IDE 深色壳（实测灰/黑条的根因）。
-		form    = { text = "窗体"; w = 759; h = 469; bgcolor = 0xF0F0F0 };
+		// border（第五十九轮续：窗体属性对话框）："" = 不写 DSG
+		//（官方 win.form 不写 border 时用默认边框）；有值原样输出。
+		form    = { text = "窗体"; w = 759; h = 469; bgcolor = 0xF0F0F0; border = "" };
 		// 对齐网格：拖动/缩放时把坐标吸附到 GRID_SIZE 的整数倍
 		// （官方 USR.CFG 的 dlg_restraint；属性格改的精确值不吸附）
 		snap    = true;
@@ -897,7 +899,8 @@ canvas = function(winform, opt){
 	// ---------- 画布专属 Undo/Redo 事务 ----------
 	self.__snapshot = function(){
 		var st = {
-			form = { text = self.form.text; w = self.form.w; h = self.form.h };
+			form = { text = self.form.text; w = self.form.w; h = self.form.h;
+				bgcolor = self.form.bgcolor; border = self.form.border };
 			items = {};
 		};
 		for(i=1;#self.items;1){
@@ -936,7 +939,8 @@ canvas = function(winform, opt){
 	}
 	self.__restoreSnapshot = function(st){
 		if(!st) return;
-		self.form = { text = st.form.text; w = st.form.w; h = st.form.h };
+		self.form = { text = st.form.text; w = st.form.w; h = st.form.h;
+			bgcolor = st.form.bgcolor; border = st.form.border };
 		for(i=#self.items;1;-1){
 			self.__unhook(self.items[i]);
 			try{ self.items[i].ctrl.close() }catch(e){}
@@ -969,6 +973,12 @@ canvas = function(winform, opt){
 				{key="text";   name="标题"; value=self.form.text; type="string"; cat="外观"};
 				{key="width";  name="宽度"; value=self.form.w;    type="number"; cat="位置"};
 				{key="height"; name="高度"; value=self.form.h;    type="number"; cat="位置"};
+				// 底色以十六进制串呈现（tonumber("0x..") 直接可用）
+				{key="bgcolor"; name="底色";
+					value=string.format("0x%X", self.form.bgcolor : 0xF0F0F0);
+					type="string"; cat="外观"};
+				{key="border"; name="边框";
+					value=self.form.border : ""; type="string"; cat="样式"};
 			};
 		};
 	}
@@ -1000,6 +1010,14 @@ canvas = function(winform, opt){
 				if(nv !== null && nv >= 60){
 					if(p.key == "width" && nv != self.form.w){ self.form.w = nv; n = n + 1 }
 					elseif(p.key == "height" && nv != self.form.h){ self.form.h = nv; n = n + 1 }
+				}
+			}
+			elseif(p.key == "border"){
+				// 窗体边框（win.form 的 border 参数）：空串 = 不写 DSG
+				//（官方默认边框）；其他值原样写回（官方 win.form 校验）
+				var nv = tostring(p.value : "");
+				if(nv != self.form.border){
+					self.form.border = nv; n = n + 1;
 				}
 			}
 			elseif(p.key == "bgcolor"){
@@ -1193,7 +1211,8 @@ canvas = function(winform, opt){
 			});
 		}
 		return ..nodio.designer.dsg.generate(arr,
-			self.form.text, self.form.w, self.form.h, self.form.bgcolor);
+			self.form.text, self.form.w, self.form.h, self.form.bgcolor,
+			self.form.border);
 	}
 
 	// 从 DSG 载入（窗体头一并解析 —— 设计视图里改窗体设置，关设计器写回）
@@ -1205,11 +1224,13 @@ canvas = function(winform, opt){
 		var fr = tonumber(..string.match(text, ';right=(\d+)'));
 		var fb = tonumber(..string.match(text, ';bottom=(\d+)'));
 		var fbg = tonumber(..string.match(text, ';bgcolor=(0x[0-9A-Fa-f]+)'));
+		var fbd = ..string.match(text, ';border="([^"]*)"');
 		self.form = {
 			text = ft : self.form.text;
 			w = fr : self.form.w;
 			h = fb : self.form.h;
 			bgcolor = fbg : self.form.bgcolor;
+			border = (fbd !== null ? fbd : "");
 		};
 		var items = ..nodio.designer.dsg.parse(text);
 		for(i=1;#items;1){

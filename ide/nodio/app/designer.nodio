@@ -20,6 +20,7 @@ import win;          // win.toClient：屏幕坐标 → 客户区坐标（拖拽
 import nodio.designer.registry;
 import nodio.designer.toolbox;
 import nodio.designer.propertyGrid;
+import nodio.designer.formdlg;
 import nodio.designer.canvas;
 import nodio.designer.dsg;
 import nodio.ui.list;
@@ -30,6 +31,7 @@ var toolbox = null;
 var propGrid = null;
 var canvas = null;
 var eventList = null;    // 事件一览（第五十六轮）
+var formDialog = null;   // 窗体属性对话框（第五十九轮续）
 var visible = false;
 var curItem = null;
 
@@ -80,6 +82,8 @@ create = function(sh){
 	canvas = nodio.designer.canvas(shell.winform, {
 		left = 0; top = 0; right = 400; bottom = 300;
 	});
+	// 窗体属性对话框（第五十九轮续）：就地浮层（非真模态窗）
+	formDialog = nodio.designer.formdlg(shell.winform, {});
 	layout();
 
 	// wiring
@@ -275,7 +279,7 @@ open = function(){
 				// 没有设计块的文档给**空画布**：窗体设置也回到默认
 				//（不带走上一个文档的窗体标题/尺寸）
 				canvas.clear();
-				canvas.form = {text="窗体"; w=759; h=469; bgcolor = canvas.form.bgcolor : 0xF0F0F0};
+				canvas.form = {text="窗体"; w=759; h=469; bgcolor = canvas.form.bgcolor : 0xF0F0F0; border = ""};
 			}
 		}
 	}
@@ -338,6 +342,32 @@ close = function(){
 
 toggle = function(){
 	if(visible) close(); else open();
+}
+
+// ---------- 窗体属性对话框（第五十九轮续）----------
+//
+// 「设计」菜单的「窗体设置」从「选中窗体 + 去左栏属性格改」升级为
+// 官方同款**属性对话框**：标题/宽度/高度/底色/边框一处改完。
+// 画布空白点击仍走属性格路径（两入口同一份数据源 canvas.form）。
+showFormDialog = function(){
+	if(!canvas || !formDialog) return;
+	if(!visible) open();
+	canvas.selectForm();
+	formDialog.show(canvas.form, function(np){
+		// 写回：走 applyFormProps 的 props 形状（四元组），一条路径
+		// 进 DSG 头（toDSG 的 win.form(...)）——对话框不自己碰 form
+		var props = {
+			{ key = "text";   value = np.text };
+			{ key = "width";  value = np.w };
+			{ key = "height"; value = np.h };
+			{ key = "bgcolor"; value = np.bgcolor };
+			{ key = "border"; value = np.border };
+		};
+		var n = canvas.applyFormProps(props);
+		// 属性格若正显示窗体本身，同步刷新
+		canvas.selectForm();
+		shell.setStatus("已修改窗体设置: " ++ n ++ " 项（标题/宽度/高度/底色/边框）");
+	});
 }
 
 // Discover user components under <projectDir>\components.
@@ -414,6 +444,9 @@ readFromSource = function(src){
 // setControlParam / getActiveForm 都要摸到画布状态；画布是本模块的
 // 模块级变量（打开设计器才有），这里给出最小访问面。
 isActive = lambda() visible;
+
+// 供回归：窗体属性对话框实例（无头测试直接驱动字段 + __ok）
+formDialogRef = function(){ return formDialog }
 
 canvasSelected = function(){
 	return canvas ? canvas.selected : null;

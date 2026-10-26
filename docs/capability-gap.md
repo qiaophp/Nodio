@@ -6334,3 +6334,33 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   全绿。
 - ❌ 剩余（调试器五件套已齐）；⚠ setVariable 的 UI 消费（右键「修改
   值...」）随设计器轮次或变量面板增强另行挂账。
+
+---
+
+## 1.68 第五十九轮续：设计器之一——窗体属性对话框
+
+- **新组件**（`lib/nodio/designer/formdlg.nodio`）：官方同款窗体属性
+  对话框，**就地浮层**（非真模态窗——官方 win.form 的 doModal/endModal
+  在 Nodio 上没验证过，同 nodio.ui.prompt 的既有策略）：标题 + 五行
+  输入（标题/宽度/高度/底色/边框）+ 确定/取消板；回车=确定、Esc=取消；
+  数字/底色非法时保持原值；居中摆放在主窗体客户区。
+- **DSG 头 border 往返**（`dsg.nodio` / `canvas.nodio`）：
+  - `dsg.generate` 增可选 `formBorder`（空串/null 不写，官方默认边框）；
+  - `canvas.form` 增 `border` 字段；`fromDSG` 解析 `;border="..."`；
+    `toDSG` 原样输出；undo/redo 快照带上 bgcolor+border（原来连
+    bgcolor 都不带，撤销会退回旧底色——顺手修掉）；
+  - `applyFormProps` 支持 `border` 键（空串=不写 DSG）。
+- **窗体属性行补齐**（`__formItem`）：属性格的窗体行从 3 项扩到
+  5 项——补 底色（十六进制串呈现，`tonumber("0x..")` 实测可用）与
+  边框；属性格路径与对话框路径同一数据源。
+- **入口升级**（`app/designer.nodio` / `main.nodio`）：菜单「窗体设置」
+  从「选中窗体+去左栏属性格改」改为打开对话框（官方行为）；
+  `designer.showFormDialog()` 全链：selectForm → 对话框 → 确定 →
+  `applyFormProps` 写回 DSG 头 → 属性格同步刷新。画布空白点击仍走
+  属性格路径（双入口同一份数据源）。
+- **回归锁**（`ide_smoke.ps1` 增 2 断言）：FORM-DSG-RT（border/bgcolor
+  从 DSG 头读回并原样写出）、FORM-DLG（菜单→对话框填字段→确定→
+  canvas.form 变化→对话框自关，五字段全断言）。
+- 验证：VM 98/0/1、IDE 冒烟 SMOKE OK（含新断言）、ide_debug 88 项全绿。
+- ❌ 剩余（设计器）：Tab 顺序、窗体级事件一览、布局器（anchors 画布
+  生效）、资源视图 + 控件分类自定义。
