@@ -388,7 +388,7 @@ leftDock.addTab("类视图", classTree, {icon="list"});
 //     重画一遍 —— 已删除，组件的归宿是工具箱。）
 var rightDock = nodio.ui.dock(winform, {
 	rect = {left=1040; top=S(TOP0); right=1280; bottom=400};
-	tabs = {"控件"; "语法"; "标准库"; "范例"; "工具"; "AI"};
+	tabs = {"控件"; "语法"; "标准库"; "模板"; "范例"; "工具"; "AI"};
 });
 // 语法 / 标准库：自绘多列列表（原生 listview 改不了色）
 // 列宽是逻辑像素，按右栏宽度（RIGHT_W）分配，别留一大截空白。
@@ -396,6 +396,9 @@ var syntaxList = nodio.ui.list(winform, {columns={{"语法";300}}});
 rightDock.addTab("语法", syntaxList);
 var stdList = nodio.ui.list(winform, {columns={{"命名空间";130};{"说明";190}}});
 rightDock.addTab("标准库", stdList);
+// 模板面板（第五十二轮）：新建文件的内置模板（main.nodio 填充 + onPick）
+var templatesList = nodio.ui.list(winform, {columns={{"模板";90};{"说明";230}}});
+rightDock.addTab("模板", templatesList);
 // 范例 / 工具：自绘树
 var exTree = nodio.ui.tree(winform, {left=0;top=0;right=300;bottom=600});
 rightDock.addTab("范例", exTree);

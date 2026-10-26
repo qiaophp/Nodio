@@ -201,6 +201,8 @@ if ($env:NODIO_IDE_PROJECT) {
         Write-Output 'FAIL: manifest rename did not persist'; exit 1
     }
     if ($out -notmatch 'PROJOPS-REL:app\\c\.nodio') { Write-Output 'FAIL: relPath is wrong'; exit 1 }
+    # 类视图工程级扫描（第五十二轮）：ide.nproj 真跑，文件节点 ≥ 1
+    if ($out -notmatch 'CVPROJ-N:[1-9]\d*') { Write-Output 'FAIL: class-view project scan found nothing'; exit 1 }
 }
 
 # 钩子链路：shell.hooks.onOpenFile → main.nodio 的 openFile → 真的打开页签
@@ -270,6 +272,9 @@ if ($out -notmatch 'CLASSVIEW:truetruetrue') {
     Write-Output 'FAIL: class view hierarchy scan broken'
     exit 1
 }
+
+# 模板面板：双击模板 → 新建文档落内容（第五十二轮）
+if ($out -notmatch 'TPL-NEW:true')    { Write-Output 'FAIL: template pick did not create a document'; exit 1 }
 
 # self-drawn document tab strip: add / remove must keep the count in sync
 if ($out -notmatch 'TABSTRIP-COUNT:1')        { Write-Output 'FAIL: document tab strip did not open the first tab'; exit 1 }

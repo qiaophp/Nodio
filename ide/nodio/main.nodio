@@ -730,12 +730,10 @@ var fillOutline = function(){
 // 扫描纪律与 fillOutline 相同：string.indexOf 字面包含（string.find 是
 // 模式匹配，字面判断会被 ".": 1 坑死）、空串是真值用 #name == 0 拦、
 // 循环临时变量提到外面。
-var fillClassView = function(){
-	shell.classTree.clear();
-	var path = shell.tabCurPath();
-	if(!path) return 0;
-	var text = shell.tabGetText(path);
-	if(!text) return 0;
+// 类视图扫描核心（第五十二轮）：text 的 class/namespace 层级挂到
+// baseNode（null=树根）；filePath 非空时节点带 .path（工程级跨文件跳转）。
+// 返回节点数。stack/depth 每次调用独立。
+var scanClassInto = function(tree, baseNode, text, filePath){
 	var lines = ..string.split(text, '\n');
 	var stack = {};          // {node; depth}——class/namespace 进栈；
 	var stackTop = 0;        // 栈顶用索引管理，不依赖 table.remove 的单参语义
@@ -801,14 +799,15 @@ var fillClassView = function(){
 		}
 		// 花括号净深度必须每行都计（含注释外的普通行）
 		depth += (#..string.split(line, "{") - 1) - (#..string.split(line, "}") - 1);
-		if(!name || #name == 0) continue;
+		if(#name == 0) continue;
+		var parent = top ? top.node : baseNode;
 		if(icon == "folder" and bOpen){
-			// class/namespace：挂到当前栈顶（或根），进栈
-			node = top ? shell.classTree.addNode(name, null, top.node)
-				: shell.classTree.addNode(name, null, null);
+			// class/namespace：挂到当前栈顶（或基节点），进栈
+			node = tree.addNode(name, filePath, parent);
 			if(node){
 				node.icon = icon;
 				node.line = i;
+				if(filePath) node.path = filePath;
 				stackTop++;
 				stack[stackTop] = {node = node; depth = depth};
 			}
@@ -816,23 +815,120 @@ var fillClassView = function(){
 			continue;
 		}
 		// 成员/顶层条目
-		node = top ? shell.classTree.addNode(name, null, top.node)
-			: shell.classTree.addNode(name, null, null);
+		node = tree.addNode(name, filePath, parent);
 		if(node){
 			node.icon = icon;
 			node.line = i;
+			if(filePath) node.path = filePath;
 		}
 		n = n + 1;
 	}
 	return n;
 };
 
-// 类视图：点条目跳到对应行（与大纲同款）
+// 当前文档模式（心跳重扫走这条；工程模式见 fillClassViewProject）
+var classViewMode = "doc";
+var fillClassView = function(){
+	classViewMode = "doc";
+	shell.classTree.clear();
+	var path = shell.tabCurPath();
+	if(!path) return 0;
+	var text = shell.tabGetText(path);
+	if(!text) return 0;
+	return scanClassInto(shell.classTree, null, text, null);
+};
+
+// 工程级扫描（第五十二轮）：工程每个文件的 class/namespace 挂到文件节点
+// 之下。左栏切到「类视图」页时触发（onSelChange），心跳不扫（成本高）；
+// 工程里一个类都没有就退回当前文档视图。
+var fillClassViewProject = function(){
+	classViewMode = "project";
+	shell.classTree.clear();
+	if(!proj || !proj.files) return fillClassView();
+	var count = 0;
+	for(i=1;#proj.files;1){
+		var rel = proj.files[i].path;
+		if(proj.files[i].ignored) continue;
+		var full = proj.root ++ rel;
+		var text = ..string.load(full);
+		if(!text) continue;
+		var fnode = shell.classTree.addNode(rel, full, null);
+		if(fnode) fnode.icon = "folder";
+		count += scanClassInto(shell.classTree, fnode, text, full);
+	}
+	if(count == 0) return fillClassView();
+	return count;
+};
+
+// 类视图：点条目跳行；工程模式下节点带 .path，先开文件再跳
 shell.classTree.onSelect = function(node){
-	if(node && node.line) app.editor.gotoLine(shell.editor, node.line);
+	if(!node) return;
+	if(node.path && node.path != shell.tabCurPath()){
+		if(shell.hooks.onOpenFile) shell.hooks.onOpenFile(node.path);
+	}
+	if(node.line) app.editor.gotoLine(shell.editor, node.line);
+};
+// 左栏切到「类视图」页 → 工程级扫描（第五十二轮）
+shell.leftDock.onSelChange = function(idx, name){
+	if(name == "类视图" and classViewMode != "project") fillClassViewProject();
 };
 
 // ---------- right dock data: 标准库 / 范例 ----------
+// ---------- 模板面板（右栏「模板」页，第五十二轮）----------
+// 内置模板集：双击 → newFile 落模板内容（新文档的初始文本通道）。
+var fileTemplates = {
+	{ name = "空白文档"; desc = "空 aardio 源文件"; text = null };
+	{ name = "控制台程序"; desc = "console 输出与暂停";
+	  text = "import console;" ++ '\r\n\r\n'
+		++ "console.log(""Hello, Nodio!"");" ++ '\r\n'
+		++ "console.pause();" };
+	{ name = "窗口程序"; desc = "win.form 窗体 + DSG 设计块";
+	  text = "import win.ui;" ++ '\r\n'
+		++ "/*DSG{{*/" ++ '\r\n'
+		++ "var winform = win.form(text=""我的窗体"";right=599;bottom=449)" ++ '\r\n'
+		++ "winform.add(" ++ '\r\n'
+		++ "\tbutton={cls=""button"";text=""确定"";left=460;top=380;right=560;bottom=420;z=1}" ++ '\r\n'
+		++ ")" ++ '\r\n'
+		++ "/*}}*/" ++ '\r\n'
+		++ "winform.show();" ++ '\r\n'
+		++ "win.loopMessage();" };
+	{ name = "类模块"; desc = "namespace + class 骨架";
+	  text = "namespace myLib{" ++ '\r\n\r\n'
+		++ "class myClass{" ++ '\r\n'
+		++ "\tctor(...)" ++ '\r\n'
+		++ "\t{" ++ '\r\n' + '\r\n'
+		++ "\t};" ++ '\r\n'
+		++ "\tmethod = function()" ++ '\r\n'
+		++ "\t{" ++ '\r\n'
+		++ "\t\t..io.print(""myClass.method"");" ++ '\r\n'
+		++ "\t}" ++ '\r\n\r\n'
+		++ "}" ++ '\r\n\r\n'
+		++ "}" };
+	{ name = "线程函数"; desc = "thread.create 骨架";
+	  text = "import thread;" ++ '\r\n'
+		++ "var h = thread.create(function(...)" ++ '\r\n'
+		++ "{" ++ '\r\n'
+		++ "\t// 线程函数：独立的全局环境" ++ '\r\n'
+		++ "\treturn true;" ++ '\r\n'
+		++ "}, ""参数"");" ++ '\r\n'
+		++ "io.print(thread.waitOne(h, 5000));" };
+};
+var fillTemplates = function(){
+	var rows = {};
+	for(i=1;#fileTemplates;1){
+		..table.push(rows, {
+			cells = { fileTemplates[i].name; fileTemplates[i].desc };
+			tag = fileTemplates[i]
+		});
+	}
+	shell.templatesList.setRows(rows);
+};
+fillTemplates();
+// 双击模板 → 新建文档落模板内容
+shell.templatesList.onDoubleClick = function(row){
+	if(row && row.tag) newFile(row.tag.text);
+};
+
 fillLibrary = function(){
 	// 标准库：命名空间清单 + 官方中文说明
 	// （右栏已是**自绘列表** nodio.ui.list —— 原生 listview 改不了色）
@@ -2390,7 +2486,8 @@ shell.winform.setInterval(function(){
 		if(outlineDirty){
 			outlineDirty = false;
 			fillOutline();
-			fillClassView();
+			// 类视图的工程模式不被心跳清掉（切页/文档事件才重扫）
+			if(classViewMode == "doc") fillClassView();
 		}
 		// 符号树（导航栏面包屑的层级链）同理
 		if(symTreeDirty){
@@ -2812,6 +2909,14 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 	app.editor.setText(shell.editor, `io.print("ide-smoke-echo")`);
 	fillClassView();
 
+	// 模板面板（第五十二轮）：双击模板 → 新建文档落内容；测完关掉
+	// 模板页签，别把后面的 TABSTRIP-COUNT 顶爆
+	shell.templatesList.onDoubleClick({ tag = fileTemplates[2] }, 1);
+	var tplText = shell.tabGetText(shell.tabCurPath());
+	io.print("TPL-NEW:" ++ tostring(..string.indexOf(tplText, "console.log") !== null));
+	shell.tabClose(shell.tabCurPath());
+	app.editor.setText(shell.editor, `io.print("ide-smoke-echo")`);
+
 	// 自绘页签：增删
 	io.print("TABSTRIP-COUNT:" ++ tostring(shell.docStrip.count()));
 	shell.docStrip.addTab("临时页签");
@@ -2934,6 +3039,10 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 			var tn = projRefresh();
 			io.print("PROJ-FILES:" ++ tostring(proj.count));
 			io.print("PROJ-START:" ++ tostring(proj.start));
+			// 类视图工程级扫描（第五十二轮）：ide.nproj 真跑——
+			// 每个工程文件的 class/namespace 挂到文件节点之下
+			fillClassViewProject();
+			io.print("CVPROJ-N:" ++ tostring(#shell.classTree.nodes));
 			io.print("TREE-CTRL:" ++ tostring(shell.projTree.ctrl ? 1 : 0));
 			io.print("TREE-NODES:" ++ tostring(tn));
 			io.print("SEARCH-SCOPE:" ++ tostring(#shell.searchPanel.files));
@@ -3120,7 +3229,12 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		io.print("VIS-TOOLBOX:" ++ tostring(..win.isVisible(shell.rightDock.pages[1].ctrl.hwnd)));
 		// AI 页签：切过去面板内容应当显示，切回来应当隐藏
 		// （面板给 dock 的是「可见性代理」，dock 只切这一个 ctrl）
-		shell.rightDock.setSelIndex(6);
+		// AI 页索引动态查找——右栏页签会增（第五十二轮加了「模板」）
+		var aiIdx = 1;
+		for(i=1;#shell.rightDock.tabs;1){
+			if(shell.rightDock.tabs[i] == "AI") aiIdx = i;
+		}
+		shell.rightDock.setSelIndex(aiIdx);
 		var aiOn = ..win.isVisible(shell.aiPanel.head.ctrl.hwnd);
 		shell.rightDock.setSelIndex(1);
 		var aiOff = ..win.isVisible(shell.aiPanel.head.ctrl.hwnd);
