@@ -725,6 +725,113 @@ var fillOutline = function(){
 	return n;
 };
 
+// ---------- 类视图（左栏「类视图」页，第五十一轮）----------
+// 层级树：class/namespace → 成员函数/成员变量（缩进归属 + 花括号配平）。
+// 扫描纪律与 fillOutline 相同：string.indexOf 字面包含（string.find 是
+// 模式匹配，字面判断会被 ".": 1 坑死）、空串是真值用 #name == 0 拦、
+// 循环临时变量提到外面。
+var fillClassView = function(){
+	shell.classTree.clear();
+	var path = shell.tabCurPath();
+	if(!path) return 0;
+	var text = shell.tabGetText(path);
+	if(!text) return 0;
+	var lines = ..string.split(text, '\n');
+	var stack = {};          // {node; depth}——class/namespace 进栈；
+	var stackTop = 0;        // 栈顶用索引管理，不依赖 table.remove 的单参语义
+	var depth = 0;           // 花括号净深度（配平弹栈）
+	var n = 0;
+	var raw = "";
+	var line = "";
+	var indent = 0;
+	var name = "";
+	var icon = "";
+	var top = null;
+	var node = null;
+	var pb = null;
+	var ps = null;
+	var pe = null;
+	var nm = "";
+	var bFunc = false;
+	var bOpen = false;
+	for(i=1;#lines;1){
+		raw = lines[i];
+		line = ..string.trim(raw);
+		if(line == '') continue;
+		if(..string.startsWith(line, "//")) continue;
+		// 弹栈：花括号**严格浅于**进栈时的深度（== 时还在类体内）
+		while(stackTop && depth < stack[stackTop].depth){
+			stack[stackTop] = null;
+			stackTop--;
+		}
+		top = stackTop ? stack[stackTop] : null;
+		name = "";
+		icon = "";
+		bOpen = ..string.indexOf(line, "{") !== null;
+		// ① class X{ / namespace X{（进栈）
+		if(bOpen and (..string.startsWith(line, "class ")
+			or ..string.startsWith(line, "namespace "))){
+			pb = ..string.split(line, "{");
+			ps = ..string.split(pb[1], " ");
+			nm = #ps >= 2 ? ..string.trim(ps[#ps]) : "";
+			if(#nm > 0 && !..string.indexOf(nm, "(")
+				&& !..string.indexOf(nm, "=")){
+				name = nm;
+				icon = "folder";
+			}
+		}
+		// ② 成员/顶层：name = function(...)（函数）/ name = ...（变量）
+		if(#name == 0){
+			pe = ..string.split(line, "=");
+			if(#pe >= 2){
+				nm = ..string.trim(pe[1]);
+				if(#nm > 0 && !..string.indexOf(nm, " ")
+					&& !..string.indexOf(nm, "(")
+					&& !..string.indexOf(nm, ".")
+					&& !..string.startsWith(nm, "//")){
+					bFunc = ..string.indexOf(line, "function") !== null;
+					// 函数才算类成员；普通赋值（如 self.x = 1）在类体里
+					// 太密，v1 只收函数成员与顶层变量
+					if(top === null or bFunc){
+						name = nm;
+						icon = bFunc ? "list" : "list";
+					}
+				}
+			}
+		}
+		// 花括号净深度必须每行都计（含注释外的普通行）
+		depth += (#..string.split(line, "{") - 1) - (#..string.split(line, "}") - 1);
+		if(!name || #name == 0) continue;
+		if(icon == "folder" and bOpen){
+			// class/namespace：挂到当前栈顶（或根），进栈
+			node = top ? shell.classTree.addNode(name, null, top.node)
+				: shell.classTree.addNode(name, null, null);
+			if(node){
+				node.icon = icon;
+				node.line = i;
+				stackTop++;
+				stack[stackTop] = {node = node; depth = depth};
+			}
+			n = n + 1;
+			continue;
+		}
+		// 成员/顶层条目
+		node = top ? shell.classTree.addNode(name, null, top.node)
+			: shell.classTree.addNode(name, null, null);
+		if(node){
+			node.icon = icon;
+			node.line = i;
+		}
+		n = n + 1;
+	}
+	return n;
+};
+
+// 类视图：点条目跳到对应行（与大纲同款）
+shell.classTree.onSelect = function(node){
+	if(node && node.line) app.editor.gotoLine(shell.editor, node.line);
+};
+
 // ---------- right dock data: 标准库 / 范例 ----------
 fillLibrary = function(){
 	// 标准库：命名空间清单 + 官方中文说明
@@ -1157,6 +1264,7 @@ newFile = function(initialText){
 	shell.tabAdd(name, initialText);
 	curFile = name;
 	fillOutline();
+	fillClassView();
 	shell.setStatus("新建文档: " ++ name);
 	shell.editor.setFocus();
 	return true;
@@ -1172,6 +1280,7 @@ openTab = function(path){
 	shell.tabAdd(path, txt);
 	curFile = path;
 	fillOutline();
+	fillClassView();
 	lspEnsure();
 	// LSP 是多文档的：换文件要把**当前文档**切过去，
 	// 否则补全/诊断/定义查询全都作用在旧文件上。
@@ -1313,6 +1422,7 @@ closeTab = function(path){
 	shell.tabClose(path);
 	if(curFile == path) curFile = shell.tabCurPath();
 	fillOutline();
+	fillClassView();
 	return true;
 }
 
@@ -2092,6 +2202,7 @@ designer.hooks.onEventCode = genEventStub;
 shell.hooks.onTabChange   = function(path){
 	curFile = path;
 	fillOutline();
+	fillClassView();
 	// 换文档 → 符号树要重拉，导航栏面包屑跟着换
 	curSymTree = [ @{_type="array"} ];
 	symTreeDirty = true;
@@ -2279,6 +2390,7 @@ shell.winform.setInterval(function(){
 		if(outlineDirty){
 			outlineDirty = false;
 			fillOutline();
+			fillClassView();
 		}
 		// 符号树（导航栏面包屑的层级链）同理
 		if(symTreeDirty){
@@ -2682,6 +2794,23 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		if(shell.editor.compItems[i].label == "_AARDIO_VERSION") compLib = true;
 	}
 	io.print("INTEL-ENTRY:" ++ tostring(compLib));
+
+	// 类视图（第五十一轮）：class → 成员函数 + 顶层变量的层级扫描。
+	// 测完恢复编辑器原文，别让后面的段落读到夹具。
+	app.editor.setText(shell.editor, `class demoCls{` ++ '\r\n' ++ `	mf = function(){` ++ '\r\n' ++ `	}` ++ '\r\n' ++ `}` ++ '\r\n' ++ `topVar = 1;`);
+	fillClassView();
+	var cvRoots = shell.classTree.nodes;
+	var bCls = false;
+	var bMem = false;
+	var bTop = false;
+	if(#cvRoots >= 2){
+		bCls = cvRoots[1].text == "demoCls";
+		bMem = #cvRoots[1].children == 1 and cvRoots[1].children[1].text == "mf";
+		bTop = cvRoots[2].text == "topVar";
+	}
+	io.print("CLASSVIEW:" ++ tostring(bCls) ++ tostring(bMem) ++ tostring(bTop));
+	app.editor.setText(shell.editor, `io.print("ide-smoke-echo")`);
+	fillClassView();
 
 	// 自绘页签：增删
 	io.print("TABSTRIP-COUNT:" ++ tostring(shell.docStrip.count()));

@@ -265,6 +265,12 @@ if ($out -notmatch 'INTEL-ENTRY:true') {
     exit 1
 }
 
+# 类视图：class → 成员函数层级 + 顶层变量（第五十一轮）
+if ($out -notmatch 'CLASSVIEW:truetruetrue') {
+    Write-Output 'FAIL: class view hierarchy scan broken'
+    exit 1
+}
+
 # self-drawn document tab strip: add / remove must keep the count in sync
 if ($out -notmatch 'TABSTRIP-COUNT:1')        { Write-Output 'FAIL: document tab strip did not open the first tab'; exit 1 }
 if ($out -notmatch 'TABSTRIP-AFTER-ADD:2')    { Write-Output 'FAIL: document tab strip did not add a tab'; exit 1 }

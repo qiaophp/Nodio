@@ -375,6 +375,9 @@ showSearchPage = function(){
 }
 var outlineTree = nodio.ui.tree(winform, {left=0;top=0;right=LEFT_W;bottom=600});
 leftDock.addTab("大纲", outlineTree, {icon="list"});
+// 类视图（第五十一轮）：class/namespace → 成员的层级树（main.nodio 填充）
+var classTree = nodio.ui.tree(winform, {left=0;top=0;right=LEFT_W;bottom=600});
+leftDock.addTab("类视图", classTree, {icon="list"});
 // 「属性」页留给设计器的属性格（main.nodio 接入）
 
 // ---------- 右栏: 控件 / 语法 / 标准库 / 范例 / 工具 / AI ----------
