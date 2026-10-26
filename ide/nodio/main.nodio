@@ -2645,8 +2645,12 @@ win.loopMessage();`);
 			});
 		}
 		return arr;
-	})());
-	io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
+	})(), designer.formGet().text, designer.formGet().w, designer.formGet().h, designer.formGet().bgcolor);
+	// 第五十一轮：dsg2 生成带上真实窗体状态——原来单参调用靠「generate
+	// 默认值恰好等于画布默认」的巧合对齐，toDSG 把 bgcolor 写进头部后
+	// 巧合破产（套件里必挂、单跑偶挂的 DSG round-trip 假红）。带上状态
+	// 后断言反而更强：头部字段也参与字节级往返校验。
+io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 	var types = {};
 	for(i=1;#back;1){
 		for(k,v in back[i].props){ types[k] = type(v) }

@@ -173,7 +173,7 @@ open = function(){
 				// 没有设计块的文档给**空画布**：窗体设置也回到默认
 				//（不带走上一个文档的窗体标题/尺寸）
 				canvas.clear();
-				canvas.form = {text="窗体"; w=759; h=469};
+				canvas.form = {text="窗体"; w=759; h=469; bgcolor = canvas.form.bgcolor : 0xF0F0F0};
 			}
 		}
 	}
@@ -248,6 +248,14 @@ discover = function(dir){
 toDSG = function(){
 	if(!canvas) return "";
 	return canvas.toDSG();
+}
+
+// 第五十一轮：当前设计的窗体状态（标题/尺寸/底色）——外部驱动（冒烟/
+// ideCommand）生成 DSG 头时必须用同一份状态，否则字节级往返校验会
+// 靠「generate 默认值恰好等于画布默认」的巧合对齐（已实测破产）。
+formGet = function(){
+	if(!canvas) return null;
+	return canvas.form;
 }
 
 // Load a DSG block into the canvas.
