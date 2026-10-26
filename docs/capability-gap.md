@@ -5610,3 +5610,57 @@ Win32 五参 DrawTextW 契约（原四参映射把 rect 当 cch、flags 当 rect
   call 1.058/lenfn 1.061/callv 1.030）；x86 方向翻转/持平（1.001/
   **0.974**/0.989/0.996）——定性 MSVC 编译布局效应（§1.51 同因先例），
   非语义回退（R1 触及的 g_cbs/g_forms 遍历在四夹具下均为空容器）。
+
+## 1.56 第五十一轮：IDE 功能补全第一批（恢复 + 词库 + 类视图）——18/18
+
+### 1.56.1 接手与恢复
+
+并行会话最后一轮在其工作树留下一次**失败的批量重命名**（editor/winform
+→ "renamed"，波及 shell.nodio 60 行 + lib editor 1 行，全部为损坏碎片、
+零有意内容，阻塞 IDE 启动数日）。核验 HEAD 完好后 `git checkout` 恢复，
+零内容损失。其已提交成果（nproj 发布、RTF/HTML 复制、调用帧池化回退）
+全部保留。
+
+### 1.56.2 ide_smoke 的 DSG 往返假红（真修复）
+
+恢复后全量 17/18，唯一红项 ide_smoke 的「DSG round-trip not stable」
+在套件内必挂、单跑偶挂。根因：冒烟的 dsg2 用**单参 generate**，靠
+「generate 默认值恰好等于画布默认」的巧合与 dsg1 对齐；第四十八轮
+toDSG 把 bgcolor 写进头部后巧合破产。修法：app.designer 导出
+**formGet()**（canvas.form 此前从未导出，main 作用域拿到的是 null——
+引擎对 null 成员访问静默返回 null，四个实参全 null 走了默认值），
+dsg2 带上真实窗体状态；「打开无设计块文档」的重置路径补 bgcolor。
+断言反而更强：头部字段也参与字节级往返。
+
+### 1.56.3 官方 intellisense 词库接入（❌ 清零第一项）
+
+新组件 `lib/nodio/intellisense.nodio`：解析官方
+config/intellisense/kernel.txt（659 行）+ winform.txt（251 行）→ 613
+词条。格式全覆盖（`----` 前头说明跳过、函数形参段截除、^/! 前缀剥除、
+值侧 @ 模板 kind=15、`?.` 占位排除、命名空间取末段标签、大小写不敏感
+前缀匹配——官方 ^IGNORECASE_NODE_KEY=1）。编辑器 requestComplete 补传
+词前缀（第三参），onComplete 合并词库（LSP 优先、词库补差集、去重）。
+冒烟断言 INTEL-ENTRY（词库前缀直呼 onComplete，候选必须出现 kernel.txt
+常量）+ t100 固件锁（6 断言：解析/分型/大小写/模板/空前缀/悬停）；
+run_vm_tests 的测试名模式 `t\d\d` → `t\d+`（t100 起三位）。
+
+### 1.56.4 类视图（❌ 清零第二项）
+
+左栏新增「类视图」页：**层级树**（class/namespace → 成员函数，缩进
+归属 + 花括号配平弹栈；普通赋值不入树），点条目跳行；五个文档刷新点
+与大纲同步（含按键标脏→心跳重扫路径）。冒烟断言 CLASSVIEW（demoCls→mf
+层级 + topVar 顶层）。
+
+**途中三坑**（都是 aardio 语义层的，留档）：
+1. **空串是真值**——`if(!name)` 在 name="" 时为假，成员分支从未执行
+   （fillOutline 的注释早就警告过，复述了教训还是写反了；cvdbg 独立
+   探针 + 分支入口打印定位）。一律 `#name == 0` 判断。
+2. **table.remove 单参语义存疑**——弹栈改纯索引管理（stackTop），
+   不依赖库行为；死循环以 90s 冒烟超时形式暴露。
+3. 弹栈条件须**严格浅于**进栈深度（== 时还在类体内）。
+
+### 1.56.5 回归
+
+ide_smoke 新增 INTEL-ENTRY/CLASSVIEW 两断言后全量 **18/18**（x64）；
+VM 套件 97/0/0。轮 D 候选（❌ 剩余）：模板面板、开始页、拆分窗口组、
+打印管线、LSP 九方法、类视图的工程级扫描。

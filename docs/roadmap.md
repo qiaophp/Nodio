@@ -1782,3 +1782,13 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 > ⑤ 普查 9→6 次/1.4KB→966B（-30%）；时间噪声带内。t99 envcheck
 >    门控；VM x64 97/0/0、x86 96/0/1；gcstress ×2；IDE 族红项仍为
 >    并行会话在飞 shell.nodio（代定位 679/690 行）。
+
+> **第五十一轮（IDE 功能补全第一批——恢复 + 词库 + 类视图，18/18）**。
+> ① 接手 IDE 线：恢复并行会话的 renamed 重命名实验损坏（HEAD 零损失）；
+>   ide_smoke 的 DSG 往返假红真修复（app.designer 导出 formGet，dsg2 带
+>   真实窗体状态）。② 官方 intellisense 词库接入：kernel/winform.txt →
+>   613 词条并入补全（LSP 优先词库补差）；INTEL-ENTRY 冒烟 + t100 锁。
+> ③ 类视图：class/namespace→成员层级树（花括号配平 + 缩进归属），五刷新
+>   点同步；CLASSVIEW 冒烟。④ 三坑留档：空串真值、table.remove 单参、
+>   弹栈严格浅于。⑤ 全量 18/18；❌ 剩余：模板面板/开始页/拆分窗口组/
+>   打印/LSP 九方法。
