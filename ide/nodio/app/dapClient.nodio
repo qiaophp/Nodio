@@ -116,13 +116,30 @@ launch = function(scriptPath){
 
 // breakpoints: lines = array of 1-based line numbers (client passes them
 // 0-based → we add 1 so the editor's 0-based marks map cleanly)
-setBreakpoints = function(path, lines0){
+// metas（第五十九轮，可选）：与 lines0 平行的数组，元素为
+//   {condition="..."; hitCount=N}（都是可空）——条件/命中次数断点。
+// ⚠ breakpoints 必须是 **JSON 数组**，不是对象：
+//   用 `{}` + 数字键去拼，JSON.stringify 出来是 {"1":{...}}，
+//   服务端按数组解析 → 断点一个都建不起来。
+// ⚠ 空数组也必须发出去（= 清除全部断点）：服务端按整表重建，
+//   旧实现「空表不发」→ 消掉最后一个断点后引擎侧永远留着。
+setBreakpoints = function(path, lines0, metas){
 	if(!p) return;
-	// ⚠ breakpoints 必须是 **JSON 数组**，不是对象：
-	//   用 `{}` + 数字键去拼，JSON.stringify 出来是 {"1":{...}}，
-	//   服务端按数组解析 → 断点一个都建不起来。
 	var bps = [ @{_type="array"} ];
-	for(i=1;#lines0;1){ ..table.push(bps, { line = lines0[i] + 1 }) }
+	for(i=1;#lines0;1){
+		var m = metas ? metas[i] : null;
+		var cond = "";
+		var hit = 0;
+		if(m){
+			cond = tostring(m.condition : "");
+			hit = tonumber(m.hitCount : 0) : 0;
+		}
+		..table.push(bps, {
+			line = lines0[i] + 1;
+			condition = cond;
+			hitCount = hit;
+		});
+	}
 	request("setBreakpoints", { source = { path = path }; breakpoints = bps });
 };
 

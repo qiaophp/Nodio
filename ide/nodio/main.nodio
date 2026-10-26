@@ -1649,14 +1649,17 @@ debugRun = function(){
 	if(r !== true){ shell.setStatus("调试启动失败: " ++ tostring(r)); app.dapClient.stop(); dbgSession = null; return }
 	// 调试会话起来之后，把**之前**就打好的断点补发给适配器
 	// （断点是在会话之前点的，当时没有地方可发）。
+	// 第五十九轮：条目可能是元数据表 {condition;hitCount}（条件断点），
+	// 补发时一并带上。
 	if(curFile && breakpoints[curFile]){
 		var bl = {};
+		var bm = {};
 		var bn = 0;
 		var bp0 = breakpoints[curFile];
-		for(l,on in bp0){
-			if(on){ bn = bn + 1; bl[bn] = l - 1 }
+		for(l,v in bp0){
+			if(v){ bn = bn + 1; bl[bn] = l - 1; bm[bn] = v }
 		}
-		if(bn) app.dapClient.setBreakpoints(curFile, bl);
+		if(bn) app.dapClient.setBreakpoints(curFile, bl, bm);
 	}
 	if(dbgTimer) shell.winform.clearInterval(dbgTimer);
 	dbgTimer = shell.winform.setInterval(pollDebug, 120);
@@ -1670,20 +1673,68 @@ stopDebug = function(){
 }
 
 // one IDE-side breakpoint slot per line on the debugged file
+// 第五十九轮：条目从 true 升级为**元数据表**（普通过点 = {}，
+// 条件断点 = {condition="..."; hitCount=N}）——表在 aardio 里恒为真值，
+// `if(条目)` 的旧判断不受影响。
 var breakpoints = {};
-var setBreakpoint = function(path, line, onOff){
+var setBreakpoint = function(path, line, onOff, meta){
 	breakpoints[path] = breakpoints[path] : {};
-	breakpoints[path][line] = onOff ? true : null;
+	breakpoints[path][line] = onOff ? (meta : {}) : null;
 	if(dbgSession && app.dapClient.ready()){
 		var lines = {};
+		var metas = {};
 		var n = 0;
 		var bp = breakpoints[path] : {};
-		for(l,on in bp){
-			if(on){ n = n + 1; lines[n] = l - 1 }   // 0-based for DAP
+		for(l,v in bp){
+			if(v){
+				n = n + 1;
+				lines[n] = l - 1;    // 0-based for DAP
+				metas[n] = v;
+			}
 		}
-		app.dapClient.setBreakpoints(path, lines);
+		app.dapClient.setBreakpoints(path, lines, metas);
 	}
 }
+
+// 条件/命中次数断点（第五十九轮）：Shift+F9 在当前行设/改条件断点。
+// 输入格式「条件表达式 | 命中次数N」——竖线分隔，两边都可留空：
+//   只写条件 → 每次到达都判条件，真值才停（真值语义同 if）；
+//   只写数字 → 每第 N 次到达才停；
+//   全空     → 退化为普通断点。
+// 该行没打过断点时先点亮断点标记，再挂元数据。
+var toggleConditionalBp = function(){
+	var line = shell.editor.curLine;
+	if(!curFile || !line){ shell.setStatus("没有可设断点的行"); return }
+	var bp = breakpoints[curFile] : {};
+	var old = bp[line] : null;
+	var def = "";
+	if(old){
+		var c = tostring(old.condition : "");
+		var h = tonumber(old.hitCount : 0) : 0;
+		def = c;
+		if(h > 0) def = (#def ? def ++ " | " : "") ++ h;
+	}
+	shell.showPrompt("条件断点 行" ++ line ++ "（条件 | 命中次数N，可留空）", def, function(t){
+		var cond = ..string.trim(tostring(t : ""));
+		var hit = 0;
+		var bar = ..string.indexOf(cond, "|");
+		if(bar !== null){
+			hit = tonumber(..string.trim(..string.slice(cond, bar + 1))) : 0;
+			cond = ..string.trim(..string.left(cond, bar - 1));
+		}
+		if(#cond == 0 && hit <= 0){
+			setBreakpoint(curFile, line, true, {});
+			shell.setStatus("已设断点（无条件） 行 " ++ line);
+			return true;
+		}
+		setBreakpoint(curFile, line, true, { condition = cond; hitCount = hit });
+		shell.setStatus("已设条件断点 行 " ++ line
+			++ (#cond ? " 条件: " ++ cond : "")
+			++ (hit > 0 ? " 每第 " ++ hit ++ " 次" : ""));
+		return true;
+	});
+}
+shell.hooks.onBpCondition = toggleConditionalBp;
 
 pollDebug = function(){
 	if(!dbgSession) return;
@@ -1755,6 +1806,20 @@ shell.hooks.onNewFile     = newFile;
 shell.hooks.onSave        = saveFile;
 shell.hooks.onSaveAs      = function(){ return saveFileAs() };
 shell.hooks.onSaveAll     = saveAllFiles;
+// 打印（第五十六轮）：页数测量 → 确认 prompt → EM_FORMATRANGE 渲染
+var printDocument = function(){
+	var pages = shell.editor.pageCount();
+	if(pages == 0){
+		shell.setStatus("打印：未找到默认打印机");
+		return;
+	}
+	shell.showPrompt("打印确认", "共 " ++ pages ++ " 页（回车打印，Esc 取消）", function(t){
+		var n = shell.editor.print();
+		shell.setStatus("已打印 " ++ tostring(n) ++ " 页到默认打印机");
+		return true;
+	});
+};
+shell.hooks.onPrint       = printDocument;
 shell.hooks.onCloseTab    = closeTab;
 shell.hooks.onCloseOtherTabs = function(keepPath){
 	keepPath = keepPath : shell.curTab;
@@ -2963,6 +3028,10 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		if(shell.editor.compItems[i].label == "_AARDIO_VERSION") compLib = true;
 	}
 	io.print("INTEL-ENTRY:" ++ tostring(compLib));
+
+	// 打印管线（第五十六轮）：页数测量走默认打印机 DC 的
+	// EM_FORMATRANGE 测量遍历（无打印机/无法取 DC → 0，断言只验链路）
+	io.print("PRINT-PAGES:" ++ tostring(shell.editor.pageCount()));
 
 	// 类视图（第五十一轮）：class → 成员函数 + 顶层变量的层级扫描。
 	// 测完恢复编辑器原文，别让后面的段落读到夹具。

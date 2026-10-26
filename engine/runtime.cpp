@@ -3177,16 +3177,23 @@ Value Interp::ExecBlock(const PNode& blk, Env* env)
                         strErrFile.clear();
                     }
                 }
-                if (bDebug && st->line > 0 && InUserScript() &&
-                    (bStep || breakpoints.count(st->line)))
+                if (bDebug && st->line > 0 && InUserScript())
                 {
-                    // "next"/"step" from a DAP session stops exactly once —
-                    // clear the one-shot flag before serving the stop so a
-                    // subsequent continue really continues
-                    bool bOnce = bStep;
-                    if (bOnce) bStep = false;
-                    DebugStop(st->line, env);
-                    (void)bOnce;
+                    if (bStep)
+                    {
+                        // "next"/"step" from a DAP session stops exactly once —
+                        // clear the one-shot flag before serving the stop so a
+                        // subsequent continue really continues
+                        bStep = false;
+                        DebugStop(st->line, env, "step");
+                    }
+                    else if (breakpoints.count(st->line) &&
+                             BpShouldStop(st->line, env))
+                    {
+                        // 第五十九轮：条件/命中次数断点在 BpShouldStop 里
+                        // 判定（行号命中 ≠ 必停：条件为假/未到命中次数不停）
+                        DebugStop(st->line, env, "breakpoint");
+                    }
                 }
                 if (!err->empty())
                     break;

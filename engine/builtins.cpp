@@ -6040,6 +6040,104 @@ void Interp::InitBuiltins()
                     res->map[fieldName] = Value::Table_(arrTab);
                     return Value::Table_(res);
                 });
+                // 第五十四轮/第五十六轮：richedit 打印——EM_FORMATRANGE
+                // 全链下沉 C++ 侧（结构体编组在 aardio FFI 不可靠：实测
+                // 动态 ::User32.SendMessageW 连 EM_GETTEXTLENGTH 都回 0，
+                // 显式 pointer 形参也收不到 class 实例的地址）。
+                // raw.printRichedit(hwndEdit, hdc, render)：
+                //   render=false → 仅测量（返回页数）
+                //   render=true  → StartPage/EndPage 逐页渲染打印
+                // 返回页数；hdc/hwndEdit 无效返回 0。收尾释放 richedit
+                // 缓存的设备信息（EM_FORMATRANGE,0,0）。
+                tb->map[L"printRichedit"] = NF([this](vector<Value>& a)
+                    -> Value {
+                    if (a.size() < 3) return Value::Num_(0);
+                    // aardio 的 hwnd/hdc：Pointer（官方控件的 hwnd 带
+                    // _meta._topointer 元方法——ptr 可能为 0，真句柄在
+                    // 元方法里）或纯数值。与 raw FFI 的 case-5 解引用同款。
+                    auto resolveH = [this](const Value& v) -> void* {
+                        if (v.t == Value::Pointer)
+                        {
+                            if (v.ptr) return (void*)v.ptr;
+                            if (v.tab)
+                            {
+                                auto im = v.tab->map.find(L"_meta");
+                                if (im != v.tab->map.end() &&
+                                    (im->second.t == Value::TableT ||
+                                     im->second.t == Value::Class) &&
+                                    im->second.tab)
+                                {
+                                    auto itp = im->second.tab->map.find(L"_topointer");
+                                    if (itp != im->second.tab->map.end())
+                                    {
+                                        if (itp->second.t == Value::Pointer)
+                                            return (void*)itp->second.ptr;
+                                        if (itp->second.t == Value::Func ||
+                                            itp->second.native)
+                                        {
+                                            vector<Value> noArgs;
+                                            Value r = CallOwner(itp->second, v, noArgs);
+                                            if (r.t == Value::Pointer)
+                                                return (void*)r.ptr;
+                                            return (void*)(INT_PTR)BNum(r);
+                                        }
+                                    }
+                                }
+                            }
+                            return nullptr;
+                        }
+                        return (void*)(INT_PTR)BNum(v);
+                    };
+                    HWND hwndEdit = (HWND)resolveH(a[0]);
+                    HDC hdc = (HDC)resolveH(a[1]);
+                    bool bRender = BNum(a[2]) != 0;
+                    if (!hwndEdit || !hdc) return Value::Num_(0);
+                    // richedit.h 不在本编译单元：FORMATRANGE/CHARRANGE 内联定义
+                    struct CHARRANGE_T { LONG cpMin; LONG cpMax; };
+                    struct FORMATRANGE_T
+                    {
+                        HDC hdc;
+                        HDC hdcTarget;
+                        RECT rc;
+                        RECT rcPage;
+                        CHARRANGE_T chrg;
+                    };
+                    LONG last = 0;
+                    int pages = 0;
+                    while (pages < 9999)
+                    {
+                        FORMATRANGE_T fr = {};
+                        fr.hdc = hdc;
+                        fr.hdcTarget = hdc;
+                        RECT rc = {0, 0,
+                            GetDeviceCaps(hdc, 8 /*HORZRES*/),
+                            GetDeviceCaps(hdc, 10 /*VERTRES*/)};
+                        fr.rc = rc;
+                        fr.rcPage = rc;
+                        fr.chrg.cpMin = last;
+                        fr.chrg.cpMax = -1;
+                        LONG next;
+                        if (bRender)
+                        {
+                            StartPage(hdc);
+                            next = (LONG)SendMessageW(hwndEdit,
+                                0x43D /*EM_FORMATRANGE*/, 1, (LPARAM)&fr);
+                            EndPage(hdc);
+                        }
+                        else
+                        {
+                            next = (LONG)SendMessageW(hwndEdit,
+                                0x43D /*EM_FORMATRANGE*/, 0, (LPARAM)&fr);
+                        }
+                        if (next <= last) break;
+                        pages++;
+                        last = next;
+                    }
+                    SendMessageW(hwndEdit, 0x43D, 0, 0);
+                    // 诊断：pages==0 时回传 -hwnd（非 0 = 句柄已到位、消息真返回 0）
+                    if (pages == 0) return Value::Num_(-(double)(INT_PTR)hwndEdit);
+                    return Value::Num_(pages);
+                });
                 tb->map[L"loadDll"] = NF([this](vector<Value>& a)
                     -> Value {
                     HMODULE hMod = nullptr;

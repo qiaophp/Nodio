@@ -86,6 +86,18 @@ namespace NodioVM
         bool bDebug = false;            // hooks armed
         bool bStep = false;             // stop at every statement
         std::set<int> breakpoints;      // armed lines
+        // 第五十九轮：条件/命中次数断点。breakpoints 仍是快速路径的行号集；
+        // bpMeta 保存行号 → 条件/命中次数，两条命令（lines/bp2）都整表重建。
+        // 停点判定（ExecBlock）＝ 行号命中 && BpShouldStop：
+        //   hitCount>0 时每次到达都计数，curHits % N == 0 才可能停；
+        //   condition 在当前帧求值（真值语义同 if），假值或求值失败不停。
+        struct BpMeta
+        {
+            wstring condition;
+            int hitCount = 0;
+            int curHits = 0;
+        };
+        std::unordered_map<int, BpMeta> bpMeta;
         // external debug session (DAP): when set, DebugStop talks to the
         // adapter over two unidirectional named pipes instead of the console
         void* hDebugPipe = nullptr;     // events pipe (engine -> adapter)
@@ -248,13 +260,22 @@ namespace NodioVM
         bool EvalExprInEnv(const std::string& expr, Env* env,
                            wstring& valueOut, wstring& typeOut,
                            wstring& errOut);
+        // 第五十九轮：条件断点求值 —— 在 env 里求值并按 if 的真值语义
+        // 返回（Falsy 仅 null/false）。求值失败返回 false 并写 errOut。
+        bool EvalCondInEnv(const std::string& expr, Env* env, bool& bOut,
+                           wstring& errOut);
+        // 第五十九轮：到达行号时是否真的停（条件/命中次数判定，
+        // 纯行号断点没有 bpMeta 条目 → 直接停）。
+        bool BpShouldStop(int nLine, Env* env);
         void DumpVars(Env* env);
-        void DebugStop(int nLine, Env* env);
+        void DebugStop(int nLine, Env* env,
+                       const char* stopReason = "breakpoint");
         // external debug session: serve one stop over the named pipe.
         // Reads "continue" / "next" / "step" / "vars" JSON commands from
         // the pipe and writes back "stopped" / "vars" replies. Returns
         // false when the session ended (pipe broken / disconnect).
-        bool DebugPipeStop(int nLine, Env* env);
+        bool DebugPipeStop(int nLine, Env* env,
+                           const char* stopReason = "breakpoint");
     };
 
     // gc.cpp - the reachability collector

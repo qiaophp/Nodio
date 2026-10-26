@@ -6186,3 +6186,51 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
 - **A/B 纪律留档**：首轮对照是脏的——old 用 1474538（含主树并行 perf 提交）、
   new 用 3dd464e 基线+R1+R2（不含并行提交），call5m 报出 0.595 的假「提速」；
   作废并改为同基线三方合并重跑。**对照与被测必须同基线。**
+
+---
+
+## 1.64 第五十九轮：调试器剩余四件套之一——条件/命中次数断点全链 + 收录打印管线 v1
+
+### 1.64.1 条件/命中次数断点（引擎 → nodio-dap → IDE 全链）
+
+- **引擎**（`engine/interp.h` / `debug.cpp` / `runtime.cpp`）：新增
+  `bpMeta`（行号 → 条件 + 命中次数）。停点判定改两段：`bStep` 照旧直停；
+  行号命中后再过 `BpShouldStop`——hitCount>0 时每次到达计数、
+  `curHits % N == 0` 才可能停（每第 N 次）；condition 在**当前帧环境**
+  求值（`EvalCondInEnv`，真值语义同 `if`：Falsy 仅 null/false），假值
+  或求值失败不停。条件解析复用第五十五轮求值器的 Lex/Parser 前缀
+  （抽成 `ParseExprUtf8` 一份两用）。
+- **DAP**（`apps/nodio-dap/main.cpp`）：`setBreakpoints` 逐断点解析
+  `condition` / `hitCondition`（DAP 规范字段，字符串形态数字；兼容
+  数字形态 `hitCount`），转发引擎新命令 `{"cmd":"bp2","bps":[...]}`。
+  **空数组也必须转发**（= 全部清除）——顺带修掉一个既有 bug：旧实现
+  lines 为空就不发，消掉最后一个断点后引擎侧永远留着。
+  `initialize` 能力声明加 `supportsConditionalBreakpoints` /
+  `supportsHitCounts`；stopped 事件透传引擎停因（launch 首停 = "step"，
+  断点 = "breakpoint"）；响应带回 `verified` 断点列表。
+- **IDE**：`dapClient.setBreakpoints(path, lines, metas)` 第三参带元数据；
+  `main.nodio` 断点槽从 `true` 升级为元数据表（普通 = `{}`，条件 =
+  `{condition;hitCount}`，表恒真值、旧判断不受影响）；**Shift+F9** 设
+  条件断点（输入「条件 | 命中次数N」竖线分隔、两边可空），菜单
+  「运行 → 条件断点...」同款；编辑器新增 `setBreakpointMark`（直接置
+  标记不切换，给条件断点在无标记行上点亮用）。
+- **回归锁**：`tests/dap_bp_check.py`（条件停/命中次数停/恒假不停/
+  空表真清除/停因透传/verified 回包，22 项）挂进
+  `tests/ide_debug_check.ps1`（合计 41 项）。
+
+### 1.64.2 收录打印管线 v1（前会话工作树遗留，未提交即未落账）
+
+- 修 `engine/builtins.cpp` `printRichedit` 的 lambda 捕获编译错
+  （外层 NF 无捕获、内层 `[this]` 不可用 → 外层补 `[this]`，与
+  loadDll/topointer 同款）。
+- `lib/nodio/ui/printdc.nodio` 落库：raw 层 pages==0 回传 `-hwnd`
+  诊断值，封装层钳成 0（对外契约「0 = 无打印机/测不出」，
+  冒烟 `PRINT-PAGES:\d+` 才能锁住链路）。
+
+### 1.64.3 验证
+
+- VM 套件 **98/0/1**（x64，`build-x64\Release\nodio.exe`）。
+- IDE 冒烟 **SMOKE OK**（含 PRINT-PAGES 链路）。
+- `ide_debug_check` **41 项全绿**（eval 19 + 条件断点 22）。
+- ❌ 剩余（调试器）：真实多帧调用栈、变量结构化展开 + setVariable、
+  独立监视窗（下一轮）；❌ 剩余（打印）：PrintDlgW 对话框、打印预览。

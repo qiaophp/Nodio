@@ -1,4 +1,4 @@
-# DAP 表达式求值回归锁（nodio-dap evaluate → 引擎求值）。
+﻿# DAP 表达式求值回归锁（nodio-dap evaluate → 引擎求值）。
 #
 # 无头：直接跑 tests\dap_eval_check.py（Python 写的 DAP 客户端），
 # 断言逐条 PASS。
@@ -48,6 +48,27 @@ if ($out -notmatch '== DAP EVAL OK ==') {
     Write-Host '  FAIL 缺少收尾标记 ''== DAP EVAL OK =='''
     $fail++
 }
+
+# 第五十九轮：条件/命中次数断点协议锁（dap_bp_check.py）
+$script2 = Join-Path $PSScriptRoot 'dap_bp_check.py'
+if (Test-Path $script2) {
+    $out2 = & $py $script2 $Exe 2>&1 | Out-String
+    $code2 = $LASTEXITCODE
+    Write-Output $out2
+    foreach ($l in ($out2 -split "`r?`n")) {
+        if ($l -match '^FAIL ') { Write-Host "  FAIL $l"; $fail++ }
+    }
+    $pass += @($out2 -split "`r?`n" | Where-Object { $_ -match '^PASS ' }).Count
+    if ($out2 -notmatch '== DAP BP OK ==') {
+        Write-Host '  FAIL 缺少收尾标记 ''== DAP BP OK =='''
+        $fail++
+    }
+    if ($code2 -ne 0) { $fail++ }
+} else {
+    Write-Host '  FAIL 缺少 dap_bp_check.py（条件断点回归锁）'
+    $fail++
+}
+
 if ($fail -eq 0 -and $code -eq 0) {
     Write-Host "== IDE-DEBUG OK ($pass 项) =="
     exit 0

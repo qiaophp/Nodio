@@ -1,0 +1,71 @@
+// nodio.ui.printdc — 打印管线（第五十四轮/第五十六轮）。
+//
+// ── 打印路径 ────────────────────────────────
+// richedit 的 EM_FORMATRANGE（0x43D）全链在 **C++ 侧**
+// （raw.printRichedit，engine/builtins.cpp）：结构体编组在 aardio FFI
+// 不可靠——实测动态 ::User32.SendMessageW 连 EM_GETTEXTLENGTH 都回 0、
+// 显式 pointer 形参也收不到 class 实例的地址（两次实测留档）。
+// C++ 内建：wParam=1 逐页渲染（StartPage/EndPage）、wParam=0 测量、
+// 收尾释放 richedit 缓存的设备信息。
+//
+// ── aardio 侧职责 ────────────────────────────────
+// 默认打印机名（winspool GetDefaultPrinterW）+ 打印机 DC
+// （gdi32 CreateDCW）的获取与 DeleteDC 收尾。
+//
+// ⚠ NUL 必须用 '\u0000'（filedlg 头注同款教训：'\0' 是字节转义，
+// 会把整串降级成字节串，raw.readW 读回的名称里 NUL 之后全是垃圾）。
+namespace nodio.ui{
+import nodio.ui.rect;
+
+var NUL2 = '\u0000';
+
+// 默认打印机名（无打印机 → ""；缓冲区残留用 NUL 截断 + trim）
+printerGetDefault = function(){
+	var sp = ..raw.loadDll("winspool.drv");
+	var getDef = sp.api("GetDefaultPrinterW", "int(addr name, int &len)");
+	var buf = ..raw.buffer(1040);
+	var len = 520;
+	var ok = getDef(buf, len);
+	if(!ok) return "";
+	var s = ..raw.readW(buf, 260) : "";
+	var nul = ..string.indexOf(s, NUL2);
+	if(nul !== null) s = ..string.slice(s, 1, nul - 1);
+	return ..string.trim(s);
+}
+
+// 默认打印机的 DC（无打印机 → null）。调用方负责 printerDeleteDC。
+printerGetDC = function(){
+	var name = printerGetDefault();
+	if(#name == 0) return null;
+	var gdi = ..raw.loadDll("gdi32.dll");
+	var createDC = gdi.api("CreateDCW", "pointer(ustring driver, ustring device, null, null)");
+	var hdc = createDC("WINSPOOL", name, null, null);
+	if(!hdc) return null;
+	return { hdc = hdc; name = name };
+}
+
+// 页数测量（render=false 的 raw.printRichedit；无打印机 → 0）
+// ⚠ raw 层 pages==0 时回传 -hwnd 作诊断值（句柄已到位、消息真返回 0），
+//   封装层一律钳成 0 —— 对外契约「0 = 无打印机/测不出页数」。
+printerPageCount = function(hdc, hwndEdit){
+	if(!hdc || !hwndEdit) return 0;
+	var n = ..raw.printRichedit(hwndEdit, hdc, false);
+	return (tonumber(n) : 0) > 0 ? n : 0;
+}
+
+// 渲染打印到默认打印机，返回页数
+printerPrint = function(hdc, hwndEdit){
+	if(!hdc || !hwndEdit) return 0;
+	var n = ..raw.printRichedit(hwndEdit, hdc, true);
+	return (tonumber(n) : 0) > 0 ? n : 0;
+}
+
+// DC 收尾
+printerDeleteDC = function(hdc){
+	if(!hdc) return;
+	var gdi = ..raw.loadDll("gdi32.dll");
+	var del = gdi.api("DeleteDC", "int(pointer hdc)");
+	del(hdc);
+}
+
+}

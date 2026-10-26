@@ -137,9 +137,12 @@ static DWORD WINAPI ReaderThread(LPVOID)
             std::string ln = JsonNumber(line, "line");
             int nLine0 = ln.empty() ? 0 : atoi(ln.c_str()) - 1;
             if (nLine0 < 0) nLine0 = 0;
+            // 第五十九轮：停因（"breakpoint"/"step"）原样透传给 DAP 客户端
+            std::string reason = FindStringField(line, "reason");
+            if (reason != "step") reason = "breakpoint";
             InterlockedExchange(&g_stopped, 1);
             Event("stopped",
-                  "{\"reason\":\"breakpoint\",\"threadId\":1,"
+                  "{\"reason\":\"" + reason + "\",\"threadId\":1,"
                   "\"line\":" + std::to_string(nLine0) +
                   ",\"allThreadsStopped\":true}");
         }
@@ -367,7 +370,8 @@ int main()
             Reply(seq, command,
                 "{\"supportsConfigurationDoneRequest\":true,"
                 "\"supportsFunctionBreakpoints\":false,"
-                "\"supportsConditionalBreakpoints\":false}");
+                "\"supportsConditionalBreakpoints\":true,"
+                "\"supportsHitCounts\":true}");
         }
         else if (command == "launch" || command == "attach")
         {
@@ -460,37 +464,105 @@ int main()
         }
         else if (command == "setBreakPoints" || command == "setBreakpoints")
         {
-            // body: {breakpoints:[{line:N}...]} — 1-based source lines.
-            // Forward live to the engine via the command pipe (also works
-            // while stopped; the engine re-arms its breakpoint set).
-            std::string body = JsonString(msg, "body");
-            std::string lines;
+            // body: {breakpoints:[{line:N, condition:"...", hitCondition:"N"}
+            //       ...]} — 1-based source lines.
+            // 第五十九轮：条件/命中次数断点 —— 每个断点的 condition /
+            // hitCondition（DAP 规范字段，字符串形态的数字）原样转发给引擎
+            // 的 bp2 命令，整表重建。**空数组也必须转发**（= 全部清除），
+            // 旧实现 lines 为空就不发 → 消掉最后一个断点后引擎侧永远留着。
+            std::string bpsJson = "[";
+            std::string verified = "[";
             {
                 std::string b = msg;
                 size_t p = b.find("\"breakpoints\"");
                 if (p != std::string::npos)
                 {
-                    size_t e = b.find(']', p);
-                    if (e != std::string::npos)
-                        b = b.substr(p, e - p);
-                    size_t pos = 0;
-                    bool first = true;
-                    while ((pos = b.find("\"line\":", pos)) !=
-                           std::string::npos)
+                    size_t pA = b.find('[', p);
+                    if (pA != std::string::npos)
                     {
-                        pos += 7;
-                        size_t e2 = b.find_first_of(",}]", pos);
-                        if (e2 == std::string::npos) break;
-                        if (!first) lines += ",";
-                        lines += b.substr(pos, e2 - pos);
-                        first = false;
-                        pos = e2;
+                        // string-aware scan to the matching ']' — a
+                        // condition string may contain ']'
+                        size_t i = pA + 1;
+                        bool inStr = false;
+                        int depth = 1;
+                        while (i < b.size() && depth > 0)
+                        {
+                            char c = b[i];
+                            if (inStr)
+                            {
+                                if (c == '\\') i++;
+                                else if (c == '"') inStr = false;
+                            }
+                            else
+                            {
+                                if (c == '"') inStr = true;
+                                else if (c == '[') depth++;
+                                else if (c == ']') depth--;
+                            }
+                            i++;
+                        }
+                        if (i > b.size()) i = b.size();
+                        b = b.substr(pA + 1, i - pA - 1);
+                        size_t pos = 0;
+                        bool first = true;
+                        while ((pos = b.find('{', pos)) != std::string::npos)
+                        {
+                            // split one object (string-aware braces)
+                            size_t j = pos + 1;
+                            bool oStr = false;
+                            int oDepth = 1;
+                            while (j < b.size() && oDepth > 0)
+                            {
+                                char c = b[j];
+                                if (oStr)
+                                {
+                                    if (c == '\\') j++;
+                                    else if (c == '"') oStr = false;
+                                }
+                                else
+                                {
+                                    if (c == '"') oStr = true;
+                                    else if (c == '{') oDepth++;
+                                    else if (c == '}') oDepth--;
+                                }
+                                j++;
+                            }
+                            if (j > b.size()) j = b.size();
+                            std::string obj = b.substr(pos, j - pos);
+                            pos = j;
+                            std::string ln = JsonNumber(obj, "line");
+                            if (ln.empty()) continue;
+                            if (!first) { bpsJson += ","; verified += ","; }
+                            first = false;
+                            bpsJson += "{\"line\":" + ln;
+                            verified += "{\"verified\":true,\"line\":" + ln + "}";
+                            std::string cond;
+                            if (JsonStrFieldDecoded(obj, "condition", cond) &&
+                                !cond.empty())
+                                bpsJson += ",\"condition\":" + Quote(cond);
+                            std::string hit;
+                            int nHit = 0;
+                            if (JsonStrFieldDecoded(obj, "hitCondition", hit))
+                                nHit = atoi(hit.c_str());
+                            if (nHit <= 0)
+                            {
+                                // IDE 侧也可能直接给数字形态的 hitCount
+                                size_t h0 = obj.find("\"hitCount\":");
+                                if (h0 != std::string::npos)
+                                    nHit = atoi(obj.c_str() + h0 + 11);
+                            }
+                            if (nHit > 0)
+                                bpsJson += ",\"hitCount\":" +
+                                           std::to_string(nHit);
+                            bpsJson += "}";
+                        }
                     }
                 }
             }
-            if (!lines.empty())
-                SendToEngine("{\"cmd\":\"bp\",\"lines\":\"" + lines + "\"}");
-            Reply(seq, command, "{\"breakpoints\":[]}");
+            bpsJson += "]";
+            verified += "]";
+            SendToEngine("{\"cmd\":\"bp2\",\"bps\":" + bpsJson + "}");
+            Reply(seq, command, "{\"breakpoints\":" + verified + "}");
         }
         else if (command == "threads")
         {

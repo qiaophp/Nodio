@@ -324,6 +324,7 @@ var hooks = {
 	onDesigner    = null;     // function() — open/close the designer
 	onDesignerSave = null;    // function() — 把设计写回当前文档的 DSG 块
 	onDesignerLoad = null;    // function() — 从当前文档的 DSG 块载入设计
+	onPrint = null;           // function() — 打印当前文档（第五十六轮）
 	onDesignerSaveAs = null;  // function() — 设计另存为 .dsg
 	onDesignerOpen = null;    // function() — 打开 .dsg 文件
 	onDesignerForm = null;    // function() — 选中窗体本身（改 标题/宽度/高度）
@@ -1118,6 +1119,9 @@ install = function(){
 		if(editor) editor.toggleBreakpoint(editor.curLine);
 	}, 0, 0x78/*VK_F9*/); // F9 —— 切换当前行断点
 	winform.reghotkey(function(id,mod,vk){
+		if(hooks.onBpCondition) hooks.onBpCondition();
+	}, MOD_SHIFT, 0x78/*VK_F9*/); // Shift+F9 —— 条件/命中次数断点（第五十九轮）
+	winform.reghotkey(function(id,mod,vk){
 		if(hooks.onDesigner) hooks.onDesigner();
 	}, MOD_SHIFT, 0x76/*VK_F7*/); // Shift+F7 —— 设计视图/代码视图切换
 	winform.reghotkey(function(id,mod,vk){
@@ -1163,6 +1167,7 @@ install = function(){
 		..table.push(items, { "保存  Ctrl+S"; function(id){ if(hooks.onSave) hooks.onSave() } });
 		..table.push(items, { "另存为..."; function(id){ if(hooks.onSaveAs) hooks.onSaveAs() } });
 		..table.push(items, { "全部保存"; function(id){ if(hooks.onSaveAll) hooks.onSaveAll() } });
+		..table.push(items, { "打印..."; function(id){ if(hooks.onPrint) hooks.onPrint() } });
 		..table.push(items, { "-"; null });
 		..table.push(items, { "关闭标签页  Ctrl+W"; function(id){ if(hooks.onCloseTab) hooks.onCloseTab(curTab) } });
 		..table.push(items, { "关闭其他标签页"; function(id){ if(hooks.onCloseOtherTabs) hooks.onCloseOtherTabs(curTab); else closeOtherTabs(curTab); } });
@@ -1294,6 +1299,7 @@ install = function(){
 			{ "停止调试  Ctrl+F9"; function(id){ if(hooks.onStopDebug) hooks.onStopDebug() } };
 			{ "-"; null };
 			{ "切换断点  F9"; function(id){ if(editor) editor.toggleBreakpoint(editor.curLine) } };
+			{ "条件断点...  Shift+F9"; function(id){ if(hooks.onBpCondition) hooks.onBpCondition() } };
 			{ "-"; null };
 			{ "添加监视表达式..."; function(id){ if(hooks.onAddWatch) hooks.onAddWatch() } };
 			{ "清空监视列表"; function(id){ if(hooks.onClearWatch) hooks.onClearWatch() } };

@@ -39,6 +39,7 @@ import nodio.ui.subclass;
 import nodio.ui.rect;
 import nodio.ui.dpi;
 import nodio.ui.theme;
+import nodio.ui.printdc;   // 第五十六轮：打印（EM_FORMATRANGE 全链）
 import gdip;
 import raw;
 import win.api;
@@ -3379,6 +3380,14 @@ editor = function(winform, opt){
 			self.onToggleBreakpoint(line, self.breakpoints[line] ? true : false);
 		}
 	}
+	// 直接置/清断点标记（不切换、不回调）——给「条件断点」用：
+	// Shift+F9 在没有标记的行上设条件断点时，标记要由 IDE 侧主动点亮。
+	self.setBreakpointMark = function(line, on){
+		if(!line) return;
+		if(on) self.breakpoints[line] = true;
+		else self.breakpoints[line] = null;
+		self.__updateGutter();
+	}
 	// 当前文档的断点行号表（给 IDE 转给 DAP）
 	self.breakpointLines = function(){
 		var out = [ @{_type="array"} ];
@@ -4395,6 +4404,25 @@ editor = function(winform, opt){
 	self.control = function(){
 		return ctrl;
 	}
+
+	// ---------- 打印（第五十四轮/第五十六轮）----------
+	// 页数测量：默认打印机的 DC 上 EM_FORMATRANGE 测量遍历。
+	// 无默认打印机返回 0（FFI 细节见 nodio.ui.printdc 头注）。
+	self.pageCount = function(){
+		var pr = ..nodio.ui.printerGetDC();
+		if(!pr) return 0;
+		var n = ..nodio.ui.printerPageCount(pr.hdc, ctrl.hwnd);
+		..nodio.ui.printerDeleteDC(pr.hdc);
+		return n;
+	};
+	// 打印全文到默认打印机。返回页数（0 = 无打印机/无内容）。
+	self.print = function(){
+		var pr = ..nodio.ui.printerGetDC();
+		if(!pr) return 0;
+		var n = ..nodio.ui.printerPrint(pr.hdc, ctrl.hwnd);
+		..nodio.ui.printerDeleteDC(pr.hdc);
+		return n;
+	};
 
 	// ---------- 启动 ----------
 	// 查找条必须**最后**建：它是本函数体内对 self 成员的调用，

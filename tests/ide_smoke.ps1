@@ -267,6 +267,12 @@ if ($out -notmatch 'INTEL-ENTRY:true') {
     exit 1
 }
 
+# 打印管线（第五十六轮）：页数测量链路通（无打印机/无 DC 时为 0 也算通）
+if ($out -notmatch 'PRINT-PAGES:\d+') {
+    Write-Output 'FAIL: print page-count pipeline did not run'
+    exit 1
+}
+
 # 类视图：class → 成员函数层级 + 顶层变量（第五十一轮）
 if ($out -notmatch 'CLASSVIEW:truetruetrue') {
     Write-Output 'FAIL: class view hierarchy scan broken'

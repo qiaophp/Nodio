@@ -189,6 +189,122 @@ namespace
         }
         return o;
     }
+
+    // 从一行 JSON 里取数字字段（"line":3 → 3）。找不到返回 false。
+    bool JsonNumField(const std::string& line, const char* key, int& out)
+    {
+        std::string pat = std::string("\"") + key + "\":";
+        size_t p = line.find(pat);
+        if (p == std::string::npos) return false;
+        p += pat.size();
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) p++;
+        if (p >= line.size() || line[p] == '"') return false;
+        out = atoi(line.c_str() + p);
+        return true;
+    }
+
+    // 第五十九轮：解析 bp2 的 bps 数组，整表重建 breakpoints + bpMeta。
+    // 逐对象扫描要**感知字符串**：条件表达式里可以有 '{'/'}'（JSON 里
+    // 原样输出），裸找配对括号会被字符串内容带偏。
+    void ParseBpList(Interp* it, const std::string& line)
+    {
+        it->breakpoints.clear();
+        it->bpMeta.clear();
+        size_t pA = line.find("\"bps\":");
+        if (pA == std::string::npos) return;
+        pA = line.find('[', pA);
+        if (pA == std::string::npos) return;
+        size_t p = pA + 1;
+        for (;;)
+        {
+            size_t obj0 = line.find('{', p);
+            if (obj0 == std::string::npos) break;
+            size_t i = obj0 + 1;
+            bool inStr = false;
+            int depth = 1;
+            while (i < line.size() && depth > 0)
+            {
+                char c = line[i];
+                if (inStr)
+                {
+                    if (c == '\\') i++;          // skip escaped char
+                    else if (c == '"') inStr = false;
+                }
+                else
+                {
+                    if (c == '"') inStr = true;
+                    else if (c == '{') depth++;
+                    else if (c == '}') depth--;
+                }
+                i++;
+            }
+            if (i > line.size()) break;
+            std::string obj = line.substr(obj0, i - obj0);
+            int nL = 0;
+            if (JsonNumField(obj, "line", nL) && nL > 0)
+            {
+                Interp::BpMeta m;   // 嵌套类型：自由函数里必须带类名限定
+                std::string cond;
+                if (JsonStrField(obj, "condition", cond) && !cond.empty())
+                {
+                    int cw = MultiByteToWideChar(CP_UTF8, 0, cond.data(),
+                                                 (int)cond.size(), nullptr, 0);
+                    if (cw > 0)
+                    {
+                        m.condition.resize((size_t)cw);
+                        MultiByteToWideChar(CP_UTF8, 0, cond.data(),
+                                            (int)cond.size(),
+                                            &m.condition[0], cw);
+                    }
+                }
+                int nHit = 0;
+                if (!JsonNumField(obj, "hitCount", nHit))
+                {
+                    // DAP 规范字段是 hitCondition（字符串形态的数字）
+                    std::string hs;
+                    if (JsonStrField(obj, "hitCondition", hs))
+                        nHit = atoi(hs.c_str());
+                }
+                m.hitCount = nHit > 0 ? nHit : 0;
+                it->breakpoints.insert(nL);
+                if (!m.condition.empty() || m.hitCount > 0)
+                    it->bpMeta[nL] = m;
+            }
+            p = i;
+        }
+    }
+}
+
+// 表达式文本（UTF-8 字节）→ AST。Lex → Parser → ParseExpr →
+// AnnotateNameIds 是 EvalExprInEnv（DAP evaluate）与 EvalCondInEnv
+//（条件断点，第五十九轮）的公共前缀，抽出来只留一份。
+static bool ParseExprUtf8(const std::string& expr, const wstring& baseDir,
+                          PNode& nodeOut, wstring& errOut)
+{
+    nodeOut = nullptr;
+    errOut.clear();
+    if (expr.empty()) { errOut = L"空表达式"; return false; }
+
+    wstring wexpr;
+    int cw = MultiByteToWideChar(CP_UTF8, 0, expr.data(),
+                                 (int)expr.size(), nullptr, 0);
+    if (cw <= 0) { errOut = L"表达式编码无效"; return false; }
+    wexpr.resize((size_t)cw);
+    MultiByteToWideChar(CP_UTF8, 0, expr.data(), (int)expr.size(),
+                        &wexpr[0], cw);
+
+    wstring lerr;
+    vector<Tok> toks = Lex(wexpr, &lerr);
+    if (!lerr.empty()) { errOut = lerr; return false; }
+
+    Parser ps{ std::move(toks), 0, &lerr };
+    ps.strEmbedBase = baseDir;
+    ps.strEmbedRoot = EmbedRoot();
+    nodeOut = ps.ParseExpr();
+    if (!lerr.empty()) { errOut = lerr; return false; }
+    if (!nodeOut) { errOut = L"表达式解析为空"; return false; }
+    AnnotateNameIds(nodeOut);
+    return true;
 }
 
 // 在 env 里求值一段表达式，返回显示用的值与类型名。
@@ -202,30 +318,9 @@ bool Interp::EvalExprInEnv(const std::string& expr, Env* env,
     valueOut.clear();
     typeOut.clear();
     errOut.clear();
-    if (expr.empty()) { errOut = L"空表达式"; return false; }
 
-    // 表达式文本是 UTF-8 字节 → wstring
-    wstring wexpr;
-    {
-        int cw = MultiByteToWideChar(CP_UTF8, 0, expr.data(),
-                                     (int)expr.size(), nullptr, 0);
-        if (cw <= 0) { errOut = L"表达式编码无效"; return false; }
-        wexpr.resize((size_t)cw);
-        MultiByteToWideChar(CP_UTF8, 0, expr.data(), (int)expr.size(),
-                            &wexpr[0], cw);
-    }
-
-    wstring lerr;
-    vector<Tok> toks = Lex(wexpr, &lerr);
-    if (!lerr.empty()) { errOut = lerr; return false; }
-
-    Parser ps{ std::move(toks), 0, &lerr };
-    ps.strEmbedBase = baseDir;
-    ps.strEmbedRoot = EmbedRoot();
-    PNode node = ps.ParseExpr();
-    if (!lerr.empty()) { errOut = lerr; return false; }
-    if (!node) { errOut = L"表达式解析为空"; return false; }
-    AnnotateNameIds(node);
+    PNode node;
+    if (!ParseExprUtf8(expr, baseDir, node, errOut)) return false;
 
     // ⚠ 保存/清空引擎错误槽：求值失败不能污染后续执行
     wstring savedErr = err ? *err : wstring();
@@ -246,6 +341,67 @@ bool Interp::EvalExprInEnv(const std::string& expr, Env* env,
     if (vs.size() > 200) vs = vs.substr(0, 200) + L"...";
     valueOut = vs;
     typeOut = TypeNameOf(v);
+    return true;
+    }
+
+// ---- 第五十九轮：条件断点求值 ----
+// 在 env 里求值并按 if 的真值语义返回（Value::Truthy：Falsy 仅 null/false）。
+// 真值判定必须跟 if 一致——用户写 `x >= 3` 期望的就是 if (x>=3) 的行为。
+bool Interp::EvalCondInEnv(const std::string& expr, Env* env, bool& bOut,
+                           wstring& errOut)
+    {
+    bOut = false;
+    errOut.clear();
+    PNode node;
+    if (!ParseExprUtf8(expr, baseDir, node, errOut)) return false;
+
+    wstring savedErr = err ? *err : wstring();
+    if (err) err->clear();
+    Value v = Eval(node, env);
+    if (err && !err->empty())
+    {
+        errOut = *err;
+        err->clear();
+        if (err) *err = savedErr;
+        return false;
+    }
+    if (err) *err = savedErr;
+    bOut = v.Truthy();
+    return true;
+    }
+
+// ---- 第五十九轮：条件/命中次数停点判定 ----
+// 行号已命中 breakpoints（快速路径）后调用：
+//   hitCount>0：每次到达都计数，curHits % N == 0 才可能停（每第 N 次）；
+//   condition：在当前帧求值，假值或求值失败 → 不停（求值失败静默跳过，
+//   否则一个写错的条件会在循环里把断点变成每步都停）。
+// 两者同时设置时都满足才停；纯行号断点（无 bpMeta 条目）直接停。
+bool Interp::BpShouldStop(int nLine, Env* env)
+    {
+    auto it = bpMeta.find(nLine);
+    if (it == bpMeta.end()) return true;
+    BpMeta& m = it->second;
+    if (m.hitCount > 0)
+    {
+        m.curHits++;
+        if (m.curHits % m.hitCount != 0) return false;
+    }
+    if (!m.condition.empty())
+    {
+        std::string u8;
+        int cb = WideCharToMultiByte(CP_UTF8, 0, m.condition.c_str(),
+                                     (int)m.condition.size(), nullptr, 0,
+                                     nullptr, nullptr);
+        u8.resize((size_t)(std::max)(cb, 0));
+        if (cb > 0)
+            WideCharToMultiByte(CP_UTF8, 0, m.condition.c_str(),
+                                (int)m.condition.size(), &u8[0], cb,
+                                nullptr, nullptr);
+        bool bOk = false;
+        wstring condErr;
+        if (!EvalCondInEnv(u8, env, bOk, condErr)) return false;
+        return bOk;
+    }
     return true;
     }
 
@@ -288,13 +444,13 @@ void Interp::DumpVars(Env* env)
         // enter=continue, s=step, c=continue w/o stepping, v=vars, q=abort
 
 // ---- DebugStop ----
-void Interp::DebugStop(int nLine, Env* env)
+void Interp::DebugStop(int nLine, Env* env, const char* stopReason)
         {
             if (hDebugPipe)
             {
                 // external session owns the stop protocol; on session end
                 // fall through to plain continue (never abort the script)
-                DebugPipeStop(nLine, env);
+                DebugPipeStop(nLine, env, stopReason);
                 return;
             }
             while (true)
@@ -321,7 +477,7 @@ void Interp::DebugStop(int nLine, Env* env)
         }
 
 // ---- DebugPipeStop (external DAP session) ----
-bool Interp::DebugPipeStop(int nLine, Env* env)
+bool Interp::DebugPipeStop(int nLine, Env* env, const char* stopReason)
         {
             HANDLE hEv = (HANDLE)hDebugPipe;   // events (write)
             HANDLE hCmd = (HANDLE)hDebugCmd;   // commands (read)
@@ -423,9 +579,13 @@ bool Interp::DebugPipeStop(int nLine, Env* env)
 
             auto stopEvent = [&]() -> bool
             {
+                // stopReason 只会是 "breakpoint"/"step" 两个 ASCII 字面量，
+                // 判定成 wstring 字面量再拼（wchar_t[] + const char* 不合法）
+                wstring wReason = (stopReason && strcmp(stopReason, "step") == 0)
+                                  ? L"step" : L"breakpoint";
                 wstring j = L"{\"event\":\"stopped\",\"line\":" +
-                            std::to_wstring(nLine) + L",\"vars\":" +
-                            varsJson(env) + L"}";
+                            std::to_wstring(nLine) + L",\"reason\":\"" +
+                            wReason + L"\",\"vars\":" + varsJson(env) + L"}";
                 return writeLine(j);
             };
 
@@ -533,6 +693,16 @@ bool Interp::DebugPipeStop(int nLine, Env* env)
                             }
                         }
                     }
+                    continue;
+                }
+                if (wcmd.find(L"\"cmd\":\"bp2\"") != wstring::npos)
+                {
+                    // 第五十九轮：{"cmd":"bp2","bps":[{"line":3,
+                    //   "condition":"x>1","hitCount":2},...]}
+                    // 整表重建 breakpoints + bpMeta（条件是转义过的 JSON
+                    // 字符串，走 JsonStrField 反转义；空数组 = 全部清除）。
+                    std::string cmdU8(cmd.begin(), cmd.end());
+                    ParseBpList(this, cmdU8);
                     continue;
                 }
                 if (wcmd.find(L"\"disconnect\"") != wstring::npos ||
