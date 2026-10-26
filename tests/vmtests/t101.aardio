@@ -1,0 +1,22 @@
+// 第五十三轮回归锁：开始页组件（矩形/最近列表/显隐回调面）
+import win.ui;
+import nodio.ui.startPane;
+var frm = win.form(text="t101";right=799;bottom=599);
+var sp = nodio.ui.startPane(frm, {left=0;top=0;right=800;bottom=600});
+sp.layout(0, 0, 800, 600);
+var opened = null;
+sp.onOpenFile = function(path){ opened = path };
+sp.setRecent({ "D:\a\one.aardio"; "D:\a\two.aardio" });
+var nodes = sp.recentTree.nodes;
+io.print("N=" ++ #nodes ++ " t1=" ++ (nodes[1] ? nodes[1].text : "null"));
+sp.show(true);
+io.print("VIS=" ++ tostring(sp.visible));
+// 空列表：占位行而不是崩
+sp.setRecent({});
+var n2 = sp.recentTree.nodes;
+io.print("EMPTY-N=" ++ #n2);
+// 点选回调面
+sp.setRecent({ "D:\a\one.aardio" });
+sp.recentTree.onSelect(sp.recentTree.nodes[1]);
+io.print("OPENED=" ++ tostring(opened));
+io.print("T101-OK");

@@ -23,6 +23,7 @@ import nodio.designer.registry;
 import nodio.intellisense;   // 第五十一轮：官方 intellisense 词库（补全并入）
 import nodio.ui.dpi;
 import nodio.ui.board;   // nodio.ui.redrawAll（窗口显示后统一强制重画）
+import nodio.ui.startPane;   // 第五十三轮：开始页（无文档时的落地页）
 import nodio.ui.rect;    // nodio.ui.setCtrlText（AI 面板冒烟要往输入框写字）
 import nodio.ai.cred;    // AI 面板冒烟：隔离凭据名 + 写/删测试 Key
 import app.ideCommand;   // 官方 ide.command 37 命令外部命令面
@@ -91,6 +92,28 @@ var curFile = null;   // file loaded in the editor
 // The design canvas lives over the editor; the toolbox is the right dock's
 // 控件 page and the property grid the left dock's 属性 page.
 var designer = app.designer.create(shell);
+
+// ---------- 开始页（第五十三轮） ----------
+// 无文档时盖在编辑区上的落地页：标题 + 最近文件。可见性由心跳按页签数
+// 驱动，矩形跟随编辑区（与设计器画布同款）；recent 变化才重建树。
+var startPane = nodio.ui.startPane(shell.winform, {left=0;top=0;right=0;bottom=0});
+startPane.onOpenFile = function(path){
+	if(shell.hooks.onOpenFile) shell.hooks.onOpenFile(path);
+};
+var startPaneLastRecent = "";
+var updateStartPane = function(){
+	var w,h = shell.clientWH();
+	var er = shell.editorRect(w,h);
+	startPane.layout(er.left, er.top + shell.docTabH(), er.right, er.bottom);
+	var list = app.settings.recentGet();
+	var sig = "";
+	for(i=1;#list;1){ sig = sig ++ list[i] ++ "|" }
+	if(sig != startPaneLastRecent){
+		startPaneLastRecent = sig;
+		startPane.setRecent(list);
+	}
+	startPane.show(#shell.tabOrder == 0);
+};
 
 // ---------- LSP ----------
 //
@@ -2392,6 +2415,7 @@ var relayout = function(){
 	lastClientW = w; lastClientH = h;
 	shell.layout();
 	designer.layout();
+	updateStartPane();
 	if( ..string.getenv("NODIO_IDE_DIAG") ){
 		io.print("DIAG relayout client=" ++ w ++ "x" ++ h
 			++ " cost=" ++ tostring(..time.tick() - t0) ++ "ms");
@@ -2480,6 +2504,7 @@ shell.winform.setInterval(function(){
 	try{
 		bootTick();
 		relayout();
+		updateStartPane();   // 开始页：矩形/可见性/最近列表（第五十三轮）
 		lspSync();
 		lspPoll();
 		// 大纲跟着文档内容走（按键回调只标脏，重扫放在这里做）

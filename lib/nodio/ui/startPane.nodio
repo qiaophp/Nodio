@@ -1,0 +1,116 @@
+// nodio.ui.startPane — 开始页（第五十三轮）。
+//
+// 无文档时盖在编辑区上的落地页：深色板底 + 大标题 + 最近打开文件
+// （树，点选打开）+ 快捷键提示。真实控件（自绘板 + 官方 tree），
+// 显示/隐藏由宿主按页签数驱动（tabOrder==0 → show），矩形跟随编辑区。
+//
+// 用法：
+//   sp = nodio.ui.startPane(winform, {left=..;top=..;right=..;bottom=..})
+//   sp.setRecent({ "D:\a\aardio"; ... })   —— 刷新最近列表（去重已由调用方做）
+//   sp.show(true/false)
+//   sp.layout(l,t,r,b)                      —— 跟随编辑区矩形（物理像素）
+//   sp.onOpenFile = function(path){}        —— 点最近文件
+//
+// 空串是真值：所有「有没有」判断一律 #s == 0（见 capability-gap §1.56.4）。
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.tree;
+import nodio.ui.rect;
+import nodio.ui.dpi;
+
+startPane = function(winform, opt){
+	opt = opt : {};
+	var self = {
+		board = null;
+		recentTree = null;
+		rect = opt.rect;
+		visible = false;
+		onOpenFile = null;
+	};
+
+	var r = opt.rect : {left=0; top=0; right=400; bottom=300};
+
+	// 板底：深色 + 标题 + 副标题 + 提示行（全在 onDraw 里画）
+	self.board = nodio.ui.board(winform, {
+		left = r.left; top = r.top; right = r.right; bottom = r.bottom;
+	});
+	self.board.onDraw = function(graphics, rc, bd){
+		var w = rc.right - rc.left;
+		var h = rc.bottom - rc.top;
+		var bg = ..gdip.solidBrush(0xFF252526);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		// 大标题
+		var tFont = ..nodio.ui.boardFont(30, "Microsoft YaHei UI");
+		var tBrush = ..gdip.solidBrush(0xFFE8E8E8);
+		graphics.drawString("Nodio", tFont,
+			::RECTF(rc.left + ..nodio.ui.px(60), rc.top + ..nodio.ui.px(46),
+				w - ..nodio.ui.px(120), ..nodio.ui.px(52)),
+			..nodio.ui.boardFormat(), tBrush);
+		tBrush.delete();
+		// 副标题
+		var sFont = ..nodio.ui.boardFont(11, "Microsoft YaHei UI");
+		var sBrush = ..gdip.solidBrush(0xFF8A8A8A);
+		graphics.drawString("轻量 aardio 开发环境", sFont,
+			::RECTF(rc.left + ..nodio.ui.px(62), rc.top + ..nodio.ui.px(104),
+				w - ..nodio.ui.px(120), ..nodio.ui.px(24)),
+			..nodio.ui.boardFormat(), sBrush);
+		// 提示行（画在最近列表下面）
+		graphics.drawString("双击最近文件打开 · Ctrl+N 新建 · Ctrl+O 打开", sFont,
+			::RECTF(rc.left + ..nodio.ui.px(60), rc.bottom - ..nodio.ui.px(56),
+				w - ..nodio.ui.px(120), ..nodio.ui.px(24)),
+			..nodio.ui.boardFormat(), sBrush);
+		sBrush.delete();
+	}
+
+	// 最近文件树（真实控件，点选打开）
+	self.recentTree = nodio.ui.tree(winform, {
+		left = r.left + ..nodio.ui.px(60);
+		top = r.top + ..nodio.ui.px(150);
+		right = r.right - ..nodio.ui.px(60);
+		bottom = r.bottom - ..nodio.ui.px(90);
+	});
+	self.recentTree.onSelect = function(node){
+		if(!node) return;
+		if(node.path and #node.path > 0 and self.onOpenFile) self.onOpenFile(node.path);
+	};
+
+	self.layout = function(l, t, r2, b2){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r2 = rc.right; b2 = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r2; bottom=b2};
+		self.board.layout(l, t, r2, b2);
+		// 树跟着板内缩（标题让出顶部、提示行让出底部）
+		var tl = l + ..nodio.ui.px(60);
+		var tt = t + ..nodio.ui.px(150);
+		var tr = r2 - ..nodio.ui.px(60);
+		var tb = b2 - ..nodio.ui.px(90);
+		self.recentTree.layout(tl, tt, tr, tb);
+	}
+
+	self.show = function(flag){
+		self.visible = flag ? true : false;
+		self.board.show(self.visible);
+		self.recentTree.show(self.visible);
+	}
+
+	self.setRecent = function(paths){
+		self.recentTree.clear();
+		if(!paths or #paths == 0){
+			self.recentTree.addNode("（暂无最近打开的文件）", null, null);
+			return;
+		}
+		for(i=1;#paths;1){
+			var node = self.recentTree.addNode(paths[i], paths[i], null);
+			if(node) node.icon = "list";
+		}
+	}
+
+	self.layout();
+	return self;
+}
+
+}
