@@ -90,6 +90,72 @@ comp = read()
 check("completion returns items", comp is not None and '"items"' in comp)
 check("completion lists keywords", comp is not None and "function" in comp)
 
+# 第五十三轮：LSP 协议补全（八方法）
+# declaration/typeDefinition/implementation 与 definition 同义：
+# didOpen 的源码第 3 行应有函数定义（见上方 didOpen 段的源码），把位置
+# 放在那个函数名上，别名三方法必须回出与 definition 一致的 location。
+send({"jsonrpc": "2.0", "method": "textDocument/definition", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"},
+    "position": {"line": 1, "character": 10}}, "id": 20})
+d0 = read()
+for i, m in enumerate(["textDocument/declaration",
+                       "textDocument/typeDefinition",
+                       "textDocument/implementation"]):
+    send({"jsonrpc": "2.0", "method": m, "params": {
+        "textDocument": {"uri": "file:///d:/probe.nodio"},
+        "position": {"line": 1, "character": 10}}, "id": 21 + i})
+    r = read()
+    check("alias %s matches definition" % m.split("/")[-1],
+          d0 is not None and r is not None and
+          d0.replace('"id":20', "") == r.replace('"id":%d' % (21 + i), ""))
+
+# prepareRename：位置上符号的范围 + placeholder
+send({"jsonrpc": "2.0", "method": "textDocument/prepareRename", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"},
+    "position": {"line": 1, "character": 10}}, "id": 30})
+pr = read()
+check("prepareRename range+placeholder",
+      pr is not None and '"placeholder"' in pr and '"range"' in pr)
+
+# selectionRange：词范围单层
+send({"jsonrpc": "2.0", "method": "textDocument/selectionRange", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"},
+    "positions": [{"line": 1, "character": 10}]}, "id": 31})
+sr = read()
+check("selectionRange word range",
+      sr is not None and '"parent":null' in sr and '"range"' in sr)
+
+# foldingRange：缩进折叠至少一个区（didOpen 源码含函数体）
+send({"jsonrpc": "2.0", "method": "textDocument/foldingRange", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"}}, "id": 32})
+fr = read()
+check("foldingRange non-empty",
+      fr is not None and '"startLine"' in fr and fr != '"result":[]')
+
+# formatting：全文重排返回 textEdits 数组且 newText 带缩进
+send({"jsonrpc": "2.0", "method": "textDocument/formatting", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"},
+    "options": {"tabSize": 4, "insertSpaces": False}}, "id": 33})
+fmt = read()
+check("formatting returns textEdits",
+      fmt is not None and '"newText"' in fmt and fmt != '"result":[]')
+
+# codeAction（v1 空数组）/ signatureHelp（v1 null）：协议完整不阻塞
+send({"jsonrpc": "2.0", "method": "textDocument/codeAction", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"},
+    "range": {"start": {"line": 0, "character": 0},
+              "end": {"line": 0, "character": 0}},
+    "context": {"diagnostics": []}}, "id": 34})
+ca = read()
+check("codeAction replies empty array",
+      ca is not None and '"result":[]' in ca)
+send({"jsonrpc": "2.0", "method": "textDocument/signatureHelp", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"},
+    "position": {"line": 1, "character": 10}}, "id": 35})
+sh = read()
+check("signatureHelp replies null",
+      sh is not None and '"result":null' in sh)
+
 # unknown request -> null result, no hang
 send({"jsonrpc": "2.0", "method": "textDocument/unknownXyz", "params": {
     "textDocument": {"uri": "file:///d:/probe.nodio"}}, "id": 7})

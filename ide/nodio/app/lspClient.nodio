@@ -315,6 +315,56 @@ hover = function(line, character){
 	return tostring(c);
 };
 
+// 第五十三轮：LSP 协议补全的客户端包装。
+//
+// 这些方法目前主要由**外部客户端**与回归驱动；IDE 自身的对应功能
+// （折叠/格式化/参数提示）走本地实现。包装保持协议面完整。
+
+// foldingRange -> [{ startLine; endLine }] or null
+foldingRange = function(){
+	if(!p) return null;
+	var id = request("textDocument/foldingRange", { textDocument = { uri = curUri } });
+	var r = waitReply(id, 50);
+	if(r === null) return null;
+	return r.result;
+};
+
+// formatting -> [{ range; newText }] or null
+formatting = function(){
+	if(!p) return null;
+	var id = request("textDocument/formatting", {
+		textDocument = { uri = curUri };
+		options = { tabSize = 4; insertSpaces = false };
+	});
+	var r = waitReply(id, 50);
+	if(r === null) return null;
+	return r.result;
+};
+
+// prepareRename -> { range; placeholder } or null
+prepareRename = function(line, character){
+	if(!p) return null;
+	var id = request("textDocument/prepareRename", {
+		textDocument = { uri = curUri };
+		position = { line = line; character = character };
+	});
+	var r = waitReply(id, 50);
+	if(r === null) return null;
+	return r.result;
+};
+
+// selectionRange -> { range; parent } or null
+selectionRange = function(line, character){
+	if(!p) return null;
+	var id = request("textDocument/selectionRange", {
+		textDocument = { uri = curUri };
+		positions = { { line = line; character = character } };
+	});
+	var r = waitReply(id, 50);
+	if(r === null) return null;
+	return r.result;
+};
+
 // 文档符号（**层级树**）-> [{ name; kind; line; col; children }]
 //
 // 服务端回的是 LSP 的 DocumentSymbol：

@@ -1413,6 +1413,132 @@ static std::string RenameFor(const wstring& text, const wstring& uri,
     return out + "}}";
 }
 
+// ---------------- 第五十三轮：LSP 协议补全（九方法中的八个） ----------------
+//
+//  · declaration / typeDefinition / implementation —— aardio 单一符号
+//    宇宙，三类跳转与 definition 同义（分发层直接复用 DefinitionFor）。
+//  · prepareRename —— 位置上符号的范围 + placeholder。
+//  · selectionRange —— 词范围单层（parent=null）。
+//  · foldingRange —— 缩进折叠（与编辑器行号栏折叠同族：下一非空行
+//    缩进更深则成区，回到或更浅则收区；空行不计）。
+//  · formatting —— 全文重排：花括号深度缩进（编辑器 Shift+Alt+F 同族
+//    算法的精简版；行首连续 } 先减深度再套层级）。字符串字面量里的
+//    括号会影响深度计数——与客户端 v1 同类限制，语义层修复挂账。
+//  · signatureHelp —— 形参数据源暂缺（客户端悬浮签名/词库承担），
+//    返回 null（协议完整，客户端不阻塞）。
+//  · codeAction —— v1 无 quick-fix 源，返回空数组。
+//
+// semanticTokens 需要 LSP 侧词法模型，本轮不做（台账挂账）。
+
+static std::string PrepareRenameFor(const wstring& text, int line1, int col0)
+{
+    WordAt w = WordAtPos(text, line1, col0);
+    if (!w.ok) return "null";
+    return "{\"range\":" + Range(w.line, w.col, w.line, w.col + w.len) +
+           ",\"placeholder\":\"" + JStr(w.word) + "\"}";
+}
+
+static std::string SelectionRangeFor(const wstring& text, int line1, int col0)
+{
+    WordAt w = WordAtPos(text, line1, col0);
+    if (!w.ok) return "null";
+    return "{\"range\":" + Range(w.line, w.col, w.line, w.col + w.len) +
+           ",\"parent\":null}";
+}
+
+static std::string FoldingRangeFor(const wstring& text)
+{
+    std::vector<size_t> off;
+    ComputeLineOffsets(text, off);
+    int nLines = (int)off.size();
+    // 每行首非空白列（-1 = 空行/纯空白行）
+    std::vector<int> ind(nLines, -1);
+    for (int i = 0; i < nLines; i++)
+    {
+        size_t ls = off[i];
+        size_t le = ((size_t)i + 1 < off.size()) ? off[i + 1] : text.size();
+        while (le > ls && (text[le - 1] == L'\n' || text[le - 1] == L'\r')) le--;
+        size_t p = ls;
+        while (p < le && (text[p] == L' ' || text[p] == L'\t')) p++;
+        if (p < le) ind[i] = (int)(p - ls);
+    }
+    std::string out;
+    std::vector<std::pair<int, int>> stk;   // {indent, startLine0}
+    for (int i = 0; i < nLines; i++)
+    {
+        if (ind[i] < 0) continue;
+        while (!stk.empty() && ind[i] <= stk.back().first)
+        {
+            int s = stk.back().second;
+            stk.pop_back();
+            if (i - 1 > s)
+            {
+                if (!out.empty()) out += ",";
+                out += "{\"startLine\":" + std::to_string(s) +
+                       ",\"endLine\":" + std::to_string(i - 1) + "}";
+            }
+        }
+        stk.push_back(std::make_pair(ind[i], i));
+    }
+    while (!stk.empty())
+    {
+        int s = stk.back().second;
+        stk.pop_back();
+        if (nLines - 1 > s)
+        {
+            if (!out.empty()) out += ",";
+            out += "{\"startLine\":" + std::to_string(s) +
+                   ",\"endLine\":" + std::to_string(nLines - 1) + "}";
+        }
+    }
+    return "[" + out + "]";
+}
+
+static std::string FormattingFor(const wstring& text)
+{
+    std::vector<size_t> off;
+    ComputeLineOffsets(text, off);
+    int nLines = (int)off.size();
+    std::string out = "[";
+    int depth = 0;
+    bool first = true;
+    for (int i = 0; i < nLines; i++)
+    {
+        size_t ls = off[i];
+        size_t le = ((size_t)i + 1 < off.size()) ? off[i + 1] : text.size();
+        while (le > ls && (text[le - 1] == L'\n' || text[le - 1] == L'\r')) le--;
+        size_t p = ls, q = le;
+        while (p < q && (text[p] == L' ' || text[p] == L'\t')) p++;
+        while (q > p && (text[q - 1] == L' ' || text[q - 1] == L'\t' ||
+                         text[q - 1] == L'\r'))
+            q--;
+        wstring line = text.substr(p, q - p);
+        if (!line.empty())
+        {
+            // 行首连续 } 属于上一层的闭合：先减深度再套层级
+            int closes = 0;
+            size_t k = 0;
+            while (k < line.size() && line[k] == L'}') { closes++; k++; }
+            int d = depth - closes;
+            if (d < 0) d = 0;
+            std::wstring ind;
+            for (int t = 0; t < d; t++) ind += L'\t';
+            if (!first) out += ",";
+            first = false;
+            out += "{\"range\":" + Range(i + 1, 0, i + 1, (int)(le - ls)) +
+                   ",\"newText\":\"" + JStr(ind + line) + "\"}";
+        }
+        for (size_t k2 = 0; k2 < line.size(); k2++)
+        {
+            if (line[k2] == L'{') depth++;
+            else if (line[k2] == L'}') depth--;
+        }
+        if (depth < 0) depth = 0;
+    }
+    out += "]";
+    return out;
+}
+
 // 工作区符号搜索（项目符号搜索框）
 static std::string WorkspaceSymbols(const wstring& query)
 {
@@ -1592,6 +1718,70 @@ int main()
             if (it != g_docs.end() && !newName.empty())
                 result = RenameFor(it->second.text, uri, line, col, newName);
             Respond(id, result);
+        }
+        else if (method == "textDocument/declaration" ||
+              method == "textDocument/typeDefinition" ||
+              method == "textDocument/implementation")
+        {
+            // aardio 单一符号宇宙：三类跳转与 definition 同义（第五十三轮）
+            int line, col;
+            ParamPos(msg, &line, &col);
+            wstring uri = ParamUri(msg);
+            auto it = g_docs.find(uri);
+            std::string result = "null";
+            if (it != g_docs.end())
+                result = DefinitionFor(it->second.text, UriToPath(uri), line, col);
+            Respond(id, result);
+        }
+        else if (method == "textDocument/prepareRename")
+        {
+            int line, col;
+            ParamPos(msg, &line, &col);
+            wstring uri = ParamUri(msg);
+            auto it = g_docs.find(uri);
+            std::string result = "null";
+            if (it != g_docs.end())
+                result = PrepareRenameFor(it->second.text, line, col);
+            Respond(id, result);
+        }
+        else if (method == "textDocument/selectionRange")
+        {
+            int line, col;
+            ParamPos(msg, &line, &col);
+            wstring uri = ParamUri(msg);
+            auto it = g_docs.find(uri);
+            std::string result = "null";
+            if (it != g_docs.end())
+                result = SelectionRangeFor(it->second.text, line, col);
+            Respond(id, result);
+        }
+        else if (method == "textDocument/foldingRange")
+        {
+            wstring uri = ParamUri(msg);
+            auto it = g_docs.find(uri);
+            std::string result = "[]";
+            if (it != g_docs.end())
+                result = FoldingRangeFor(it->second.text);
+            Respond(id, result);
+        }
+        else if (method == "textDocument/formatting")
+        {
+            wstring uri = ParamUri(msg);
+            auto it = g_docs.find(uri);
+            std::string result = "[]";
+            if (it != g_docs.end())
+                result = FormattingFor(it->second.text);
+            Respond(id, result);
+        }
+        else if (method == "textDocument/codeAction")
+        {
+            // v1：无 quick-fix 源，返回空数组（协议完整）
+            Respond(id, "[]");
+        }
+        else if (method == "textDocument/signatureHelp")
+        {
+            // v1：形参数据源暂缺（客户端悬浮签名/词库承担），返回 null
+            Respond(id, "null");
         }
         else if (method == "workspace/symbol")
         {
