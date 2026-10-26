@@ -1792,3 +1792,11 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 >   点同步；CLASSVIEW 冒烟。④ 三坑留档：空串真值、table.remove 单参、
 >   弹栈严格浅于。⑤ 全量 18/18；❌ 剩余：模板面板/开始页/拆分窗口组/
 >   打印/LSP 九方法。
+
+> **第五十二轮（模板面板 + 类视图工程级扫描）**。① 右栏「模板」页：
+>   内置五模板双击落新文档。② 类视图扫描核心抽参（baseNode/filePath），
+>   左栏切页触发工程级扫描（ide.nproj 真跑 11 节点），跨文件跳行，
+>   心跳模式守卫。③ AI 页索引动态查找（右栏加页顶位）。④ 并行会话
+>   陈旧缓冲覆盖 main.nodio 一次（git 恢复，零损失）；提交粒度压缩。
+> ⑤ ide_smoke 新增 TPL-NEW/CVPROJ-N；全量 18/18。❌ 剩余：开始页/
+>   拆分窗口组/打印/LSP 九方法。

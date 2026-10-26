@@ -5664,3 +5664,39 @@ run_vm_tests 的测试名模式 `t\d\d` → `t\d+`（t100 起三位）。
 ide_smoke 新增 INTEL-ENTRY/CLASSVIEW 两断言后全量 **18/18**（x64）；
 VM 套件 97/0/0。轮 D 候选（❌ 剩余）：模板面板、开始页、拆分窗口组、
 打印管线、LSP 九方法、类视图的工程级扫描。
+
+## 1.57 第五十二轮：模板面板 + 类视图工程级扫描（❌ 清零继续）——18/18
+
+### 1.57.1 模板面板
+
+右栏新增「模板」页（控件/语法/标准库/模板/范例/工具/AI）：内置五模板
+（空白文档/控制台程序/窗口程序 win.form+DSG/类模块 namespace+class/
+线程函数 thread.create），双击 → newFile 的初始文本通道落成新文档。
+官方 IDE 的模板内嵌在二进制里没有数据文件可读，故走内置集；接官方
+config 模板目录留作 v2。
+
+### 1.57.2 类视图工程级扫描
+
+类视图扫描核心抽成 scanClassInto(tree, baseNode, text, filePath)
+（baseNode=null=树根；filePath 非空时节点带 .path）。左栏切到「类视图」
+页触发 fillClassViewProject：工程每个文件的 class/namespace 挂到文件
+节点之下（忽略 ignored 项，全工程零类则退回当前文档视图）。心跳重扫带
+模式守卫（classViewMode），工程树不被文档心跳清掉。节点 .path 支持
+**跨文件跳行**（先 onOpenFile 开文件再 gotoLine）。
+
+### 1.57.3 途中
+
+右栏加页把 AI 页从 6 顶到 7——冒烟的 AI-TAB 硬编码索引改动态查找
+（按页名遍历 rightDock.tabs）。工程扫描断言挪进 NODIO_IDE_PROJECT
+门控段（ide.nproj 真跑，CVPROJ-N:11）；模板测试后关闭页签，别把
+TABSTRIP-COUNT 顶爆。
+
+### 1.57.4 协同事故与回归
+
+并行会话 15:31 用**陈旧编辑器缓冲**覆盖了 main.nodio（第五十一轮的
+stackTop/#name 修复在工作树被清零，HEAD 完好）——git checkout 恢复。
+两代理共写同一工作树、同持旧缓冲时会互相清零：提交粒度已压缩到
+「编辑完立刻提交」，后续仍需用户层协调（并行会话需重载其编辑器缓冲）。
+
+回归：ide_smoke 新增 TPL-NEW/CVPROJ-N 两断言后全量 **18/18**（x64）；
+VM 套件 97/0/0。❌ 剩余：开始页、拆分窗口组、打印管线、LSP 九方法。
