@@ -243,6 +243,11 @@ namespace NodioVM
 
         // ---- debug.cpp (console mini-debugger + external DAP session) ----
         PNode ExprToNode(const Value& v);
+        // 第五十五轮：表达式求值（DAP evaluate）——在 env 里求值一段
+        // aardio 表达式，返回显示值 / 类型名 / 错误信息。
+        bool EvalExprInEnv(const std::string& expr, Env* env,
+                           wstring& valueOut, wstring& typeOut,
+                           wstring& errOut);
         void DumpVars(Env* env);
         void DebugStop(int nLine, Env* env);
         // external debug session: serve one stop over the named pipe.

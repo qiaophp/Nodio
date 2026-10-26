@@ -1839,3 +1839,14 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 > 兜底；semanticTokens 挂账（需 LSP 侧词法模型）。客户端四包装；
 > lsp_smoke 扩展八断言 LSP-SMOKE-OK；全量 20/20（套件扩至 20 项，
 > 并行会话第五十四轮补全做深同树验证）。
+>
+> **第五十五轮·补（立即窗口入口可见性）**。求值链路全绿后复查真实使用
+> 路径，发现「立即」页签默认排在底栏**最后一位**——特性在、用户摸不到，
+> 等于没做。补四处入口：视图菜单「立即窗口」、运行菜单「立即窗口
+> Ctrl+Shift+I」、快捷键 **Ctrl+Shift+I**、切到该页签时自动聚焦输入框；
+> 按页签名切页（`dock.selectCaption`）而不写死序号（`addTab` 是追加，
+> 序号会随页签增删漂移）。回归锁：导出 `dockHasTab()` / `menuLabels()`
+> 供冒烟断言 `IMMEDIATE-TAB:OK` / `IMMEDIATE-MENU:OK`，入口被删冒烟立刻红。
+> 踩坑：模块体内写 `shell.xxx =` **挂不到模块表**（模块体内没有 `shell`
+> 这个变量，会写到临时表上），必须裸赋值 —— 靠 `RECENT-MENU-HIT:1` 长期
+> 为绿才反推出「函数体内裸赋值进模块表」这条规则。

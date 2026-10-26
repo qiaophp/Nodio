@@ -203,6 +203,32 @@ stackTrace = function(){
 	return lastStack;
 };
 
+// evaluate -> {result; type} 或 null
+//
+// 第五十五轮：表达式求值（立即窗口）。
+// ⚠ 适配器那边会把请求转成引擎命令 {"cmd":"eval","expr":...}，
+//   等引擎回 {"event":"eval",...} 再回 DAP 响应 —— 最长 3 秒。
+//   所以这里的等待上限要比适配器长一点（4 秒），否则会先超时。
+evaluate = function(expr){
+	if(!p) return null;
+	var ex = tostring(expr : "");
+	if(#ex == 0) return null;
+	var seq = request("evaluate", { expression = ex; context = "repl" });
+	for(i=1;200;1){
+		sleep(20);
+		var r = poll(seq);
+		if(r !== null){
+			var b = r.body;
+			if(!b) return null;
+			return {
+				result = tostring(b.result : "");
+				type = tostring(b.type : "");
+			};
+		}
+	}
+	return null;
+}
+
 // ev(name, data) callback; returns false when the session ended.
 // stoppedFlag stays set after the event — getVars()/next()/resume()
 // consume it, so callers can inspect variables between stops.

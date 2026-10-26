@@ -7,7 +7,16 @@
 //   engine -> adapter : {"event":"stopped","line":N,"vars":{...}}
 //                     | {"event":"vars","vars":{...}}
 //                     | {"event":"terminated"}
+//
+// 第五十五轮：加表达式求值（evaluate）——
+//   adapter -> engine : {"cmd":"eval","expr":"<aardio 表达式>"}
+//   engine -> adapter : {"event":"eval","value":"...","type":"..."}
+//                     | {"event":"eval","error":"..."}
+// 求值在**当前帧的环境**里做（所以能看到局部变量），实现照抄
+// builtins.cpp 的 CompileToFunc 范式：Lex → Parser → ParseExpr →
+// AnnotateNameIds → Interp::Eval。
 #include "engine/interp.h"
+#include "engine/parser.h"
 
 #include <algorithm>
 
@@ -55,6 +64,190 @@ PNode Interp::ExprToNode(const Value& v)
             else n->k = Node::NullK;
             return n;
         }
+
+// ---- 第五十五轮：表达式求值（DAP evaluate）----
+
+namespace
+{
+    // 从一行 JSON 里取字符串字段并**反转义**。
+    //
+    // ⚠ 不能用子串匹配（现有 continue/next 就是子串匹配，那没坑是因为
+    //   它们是固定字面量）；表达式里可能有引号/反斜杠/换行，适配器发过来
+    //   是 JSON 编码过的（\" \\ \n \r \t \uXXXX），必须还原。
+    //
+    // ⚠ 管道是**字节**流，一行必须是纯 ASCII 才安全（varsJson 那边已经
+    //   这么做了：非 ASCII 走 \uXXXX）→ 这里同样只认 \uXXXX 形式的转义。
+    bool JsonStrField(const std::string& line, const char* key,
+                      std::string& out)
+    {
+        std::string pat = std::string("\"") + key + "\":";
+        size_t p = line.find(pat);
+        if (p == std::string::npos) return false;
+        p += pat.size();
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) p++;
+        if (p >= line.size() || line[p] != '"') return false;
+        p++;
+        std::string o;
+        while (p < line.size())
+        {
+            char c = line[p];
+            if (c == '"') { out = o; return true; }
+            if (c == '\\' && p + 1 < line.size())
+            {
+                char e = line[p + 1];
+                p += 2;
+                switch (e)
+                {
+                case '"':  o += '"';  break;
+                case '\\': o += '\\'; break;
+                case '/':  o += '/';  break;
+                case 'n':  o += '\n'; break;
+                case 'r':  o += '\r'; break;
+                case 't':  o += '\t'; break;
+                case 'b':  o += '\b'; break;
+                case 'f':  o += '\f'; break;
+                case 'u':
+                {
+                    if (p + 4 > line.size()) return false;
+                    unsigned code = 0;
+                    for (int k = 0; k < 4; k++)
+                    {
+                        char h = line[p + k];
+                        code <<= 4;
+                        if (h >= '0' && h <= '9') code |= (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') code |= (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') code |= (unsigned)(h - 'A' + 10);
+                        else return false;
+                    }
+                    p += 4;
+                    // UTF-8 编码（代理对不合成——调试表达式里用不到）
+                    if (code < 0x80) o += (char)code;
+                    else if (code < 0x800)
+                    {
+                        o += (char)(0xC0 | (code >> 6));
+                        o += (char)(0x80 | (code & 0x3F));
+                    }
+                    else
+                    {
+                        o += (char)(0xE0 | (code >> 12));
+                        o += (char)(0x80 | ((code >> 6) & 0x3F));
+                        o += (char)(0x80 | (code & 0x3F));
+                    }
+                    break;
+                }
+                default: o += e; break;
+                }
+                continue;
+            }
+            o += c;
+            p++;
+        }
+        return false;
+    }
+
+    // Value 的类型名（DAP evaluate 的 type 字段）
+    const wchar_t* TypeNameOf(const Value& v)
+    {
+        switch (v.t)
+        {
+        case Value::Num:   return L"number";
+        case Value::Str:   return L"string";
+        case Value::Bool:  return L"boolean";
+        case Value::Null:  return L"null";
+        case Value::TableT: return L"table";
+        case Value::Func:  return L"function";
+        case Value::Class: return L"class";
+        default:           return L"unknown";
+        }
+    }
+
+    // wstring → **纯 ASCII** 的 JSON 字符串内容（不含首尾引号）。
+    //
+    // ⚠ 管道是字节流：事件行必须是纯 ASCII 才安全（varsJson 那边同样
+    //   这么做）→ 非 ASCII 一律转成 \uXXXX。
+    wstring JsonEscapeAscii(const wstring& w)
+    {
+        wstring o;
+        wchar_t buf[8];
+        for (wchar_t c : w)
+        {
+            switch (c)
+            {
+            case L'"':  o += L"\\\""; break;
+            case L'\\': o += L"\\\\"; break;
+            case L'\n': o += L"\\n";  break;
+            case L'\r': o += L"\\r";  break;
+            case L'\t': o += L"\\t";  break;
+            default:
+                if (c < 0x20 || c > 0x7E)
+                {
+                    if (c >= 0xD800 && c <= 0xDFFF) o += c;  // 代理项原样
+                    else { swprintf(buf, 8, L"\\u%04x", (unsigned)c); o += buf; }
+                }
+                else o += c;
+            }
+        }
+        return o;
+    }
+}
+
+// 在 env 里求值一段表达式，返回显示用的值与类型名。
+//
+// ⚠ 出错时（比如调用了不存在的成员）**必须把引擎的 err 清干净**：
+//   err 是解释器的全局错误槽，留着会让后续执行带着一条假错误。
+bool Interp::EvalExprInEnv(const std::string& expr, Env* env,
+                           wstring& valueOut, wstring& typeOut,
+                           wstring& errOut)
+    {
+    valueOut.clear();
+    typeOut.clear();
+    errOut.clear();
+    if (expr.empty()) { errOut = L"空表达式"; return false; }
+
+    // 表达式文本是 UTF-8 字节 → wstring
+    wstring wexpr;
+    {
+        int cw = MultiByteToWideChar(CP_UTF8, 0, expr.data(),
+                                     (int)expr.size(), nullptr, 0);
+        if (cw <= 0) { errOut = L"表达式编码无效"; return false; }
+        wexpr.resize((size_t)cw);
+        MultiByteToWideChar(CP_UTF8, 0, expr.data(), (int)expr.size(),
+                            &wexpr[0], cw);
+    }
+
+    wstring lerr;
+    vector<Tok> toks = Lex(wexpr, &lerr);
+    if (!lerr.empty()) { errOut = lerr; return false; }
+
+    Parser ps{ std::move(toks), 0, &lerr };
+    ps.strEmbedBase = baseDir;
+    ps.strEmbedRoot = EmbedRoot();
+    PNode node = ps.ParseExpr();
+    if (!lerr.empty()) { errOut = lerr; return false; }
+    if (!node) { errOut = L"表达式解析为空"; return false; }
+    AnnotateNameIds(node);
+
+    // ⚠ 保存/清空引擎错误槽：求值失败不能污染后续执行
+    wstring savedErr = err ? *err : wstring();
+    if (err) err->clear();
+
+    Value v = Eval(node, env);
+
+    if (err && !err->empty())
+    {
+        errOut = *err;
+        err->clear();
+        if (err) *err = savedErr;
+        return false;
+    }
+    if (err) *err = savedErr;
+
+    wstring vs = v.ToString();
+    if (vs.size() > 200) vs = vs.substr(0, 200) + L"...";
+    valueOut = vs;
+    typeOut = TypeNameOf(v);
+    return true;
+    }
 
 // ---- DumpVars ----
 void Interp::DumpVars(Env* env)
@@ -281,6 +474,38 @@ bool Interp::DebugPipeStop(int nLine, Env* env)
                     writeLine(L"{\"event\":\"vars\",\"line\":" +
                               std::to_wstring(nLine) + L",\"vars\":" +
                               varsJson(env) + L"}");
+                    continue;
+                }
+                if (wcmd.find(L"\"cmd\":\"eval\"") != wstring::npos)
+                {
+                    // 第五十五轮：表达式求值。
+                    //   {"cmd":"eval","expr":"<表达式>"}
+                    // 回 {"event":"eval","value":..,"type":..} 或
+                    //    {"event":"eval","error":..}
+                    std::string cmdU8(cmd.begin(), cmd.end());
+                    std::string expr;
+                    wstring val, type, evalErr;
+                    if (!JsonStrField(cmdU8, "expr", expr))
+                    {
+                        evalErr = L"eval 命令缺少 expr 字段";
+                    }
+                    else
+                    {
+                        EvalExprInEnv(expr, env, val, type, evalErr);
+                    }
+                    // ⚠ 事件行必须纯 ASCII（管道按字节读）→ 值/错误都转义
+                    wstring j = L"{\"event\":\"eval\",";
+                    if (!evalErr.empty())
+                    {
+                        j += L"\"error\":\"" + JsonEscapeAscii(evalErr) + L"\"";
+                    }
+                    else
+                    {
+                        j += L"\"value\":\"" + JsonEscapeAscii(val) +
+                             L"\",\"type\":\"" + type + L"\"";
+                    }
+                    j += L"}";
+                    writeLine(j);
                     continue;
                 }
                 if (wcmd.find(L"\"cmd\":\"bp\"") != wstring::npos)

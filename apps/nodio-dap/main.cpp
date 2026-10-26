@@ -54,6 +54,16 @@ static volatile long g_stopped = 0;              // engine is stopped
 static std::string g_sourcePath;
 static std::string g_lastVarsJson = "{}";        // latest vars from the engine
 
+// 第五十五轮：表达式求值（evaluate）的请求-响应关联。
+// 引擎回一条 {"event":"eval",...}，适配器把它转成 DAP response body。
+// 顺序：先写 g_lastEvalBody，再置 g_evalReady（主循环看到标志才读串）。
+static volatile long g_evalReady = 0;
+static std::string g_lastEvalBody;
+
+static bool JsonStrFieldDecoded(const std::string& line, const char* key,
+                                 std::string& out);
+static std::string Quote(const std::string& s);
+
 // minimal JSON string field reader (values without escapes)
 static std::string FindStringField(const std::string& s, const char* key)
 {
@@ -138,6 +148,29 @@ static DWORD WINAPI ReaderThread(LPVOID)
             Event("terminated", "");
             break;
         }
+        else if (ev == "eval")
+        {
+            // 第五十五轮：引擎回的求值结果 → DAP evaluate 响应体
+            //   {"event":"eval","value":"...","type":"..."}
+            //   {"event":"eval","error":"..."}
+            std::string val, type, errTxt;
+            bool bErr = JsonStrFieldDecoded(line, "error", errTxt);
+            std::string body;
+            if (bErr)
+            {
+                body = "{\"result\":" + Quote(errTxt) +
+                       ",\"type\":\"error\",\"variablesReference\":0}";
+            }
+            else
+            {
+                JsonStrFieldDecoded(line, "value", val);
+                JsonStrFieldDecoded(line, "type", type);
+                body = "{\"result\":" + Quote(val) + ",\"type\":" +
+                       Quote(type) + ",\"variablesReference\":0}";
+            }
+            g_lastEvalBody = body;
+            InterlockedExchange(&g_evalReady, 1);
+        }
         line.clear();
     }
     // events pipe closed — the debuggee is gone
@@ -155,9 +188,166 @@ static bool SendToEngine(const std::string& cmd)
                      nullptr) && wrote == wire.size();
 }
 
+// JSON 字符串转义（**含引号**）。
+//
+// ⚠ 第五十五轮修掉一个**既存 bug**：原来这里只是加引号、不转义 →
+//   process / stackTrace 事件里的 Windows 路径（"C:\Users\...\x.aardio"）
+//   会把 JSON 弄坏（\U 不是合法转义）→ 客户端 json.loads 直接抛
+//   "Invalid \escape"。改成真转义后这些事件才合法。
+// ⚠ 非 ASCII 一律转 \uXXXX：管道/事件行都是字节流，纯 ASCII 最安全。
 static std::string Quote(const std::string& s)
 {
-    return "\"" + s + "\"";
+    std::string o = "\"";
+    char buf[8];
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        unsigned char c = (unsigned char)s[i];
+        switch (c)
+        {
+        case '"':  o += "\\\""; break;
+        case '\\': o += "\\\\"; break;
+        case '\n': o += "\\n";  break;
+        case '\r': o += "\\r";  break;
+        case '\t': o += "\\t";  break;
+        case '\b': o += "\\b";  break;
+        case '\f': o += "\\f";  break;
+        default:
+            if (c < 0x20 || c > 0x7E)
+            {
+                // 多字节 UTF-8 → 解码成码点再转 \uXXXX（不能按字节转，
+                // 那是 Latin-1 语义，会把中文变成乱码）
+                unsigned cp = 0;
+                int extra = 0;
+                if ((c & 0xE0) == 0xC0) { cp = c & 0x1Fu; extra = 1; }
+                else if ((c & 0xF0) == 0xE0) { cp = c & 0x0Fu; extra = 2; }
+                else if ((c & 0xF8) == 0xF0) { cp = c & 0x07u; extra = 3; }
+                else { snprintf(buf, sizeof(buf), "\\u%04x", c); o += buf; break; }
+                if (i + (size_t)extra >= s.size()) { cp = 0xFFFD; extra = 0; }
+                for (int k = 1; k <= extra; k++)
+                {
+                    unsigned char cc = (unsigned char)s[i + (size_t)k];
+                    if ((cc & 0xC0) != 0x80) { cp = 0xFFFD; extra = 0; break; }
+                    cp = (cp << 6) | (cc & 0x3Fu);
+                }
+                i += (size_t)extra;
+                if (cp >= 0x10000)
+                {
+                    cp -= 0x10000;
+                    snprintf(buf, sizeof(buf), "\\u%04x", 0xD800 + (cp >> 10));
+                    o += buf;
+                    snprintf(buf, sizeof(buf), "\\u%04x", 0xDC00 + (cp & 0x3FF));
+                    o += buf;
+                }
+                else
+                {
+                    snprintf(buf, sizeof(buf), "\\u%04x", cp);
+                    o += buf;
+                }
+                break;
+            }
+            o += (char)c;
+        }
+    }
+    o += "\"";
+    return o;
+}
+
+// 从一行 JSON 里取字符串字段并**反转义**（\uXXXX → UTF-8）。
+//
+// ⚠ FindStringField 不反转义 → 引擎那边一律发 \uXXXX（纯 ASCII），
+//   不解码的话 IDE 侧看到的就是一串 "\u4e2d\u6587" 而不是中文。
+static bool JsonStrFieldDecoded(const std::string& line, const char* key,
+                                 std::string& out)
+{
+    std::string pat = std::string("\"") + key + "\":";
+    size_t p = line.find(pat);
+    if (p == std::string::npos) return false;
+    p += pat.size();
+    while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) p++;
+    if (p >= line.size() || line[p] != '"') return false;
+    p++;
+    std::string o;
+    while (p < line.size())
+    {
+        char c = line[p];
+        if (c == '"') { out = o; return true; }
+        if (c == '\\' && p + 1 < line.size())
+        {
+            char e = line[p + 1];
+            p += 2;
+            switch (e)
+            {
+            case '"':  o += '"';  break;
+            case '\\': o += '\\'; break;
+            case '/':  o += '/';  break;
+            case 'n':  o += '\n'; break;
+            case 'r':  o += '\r'; break;
+            case 't':  o += '\t'; break;
+            case 'b':  o += '\b'; break;
+            case 'f':  o += '\f'; break;
+            case 'u':
+            {
+                if (p + 4 > line.size()) return false;
+                unsigned cp = 0;
+                for (int k = 0; k < 4; k++)
+                {
+                    char h = line[p + k];
+                    cp <<= 4;
+                    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                    else return false;
+                }
+                p += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF && p + 6 <= line.size() &&
+                    line[p] == '\\' && line[p + 1] == 'u')
+                {
+                    unsigned lo = 0;
+                    bool okLo = true;
+                    for (int k = 0; k < 4; k++)
+                    {
+                        char h = line[p + 2 + k];
+                        lo <<= 4;
+                        if (h >= '0' && h <= '9') lo |= (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') lo |= (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') lo |= (unsigned)(h - 'A' + 10);
+                        else { okLo = false; break; }
+                    }
+                    if (okLo && lo >= 0xDC00 && lo <= 0xDFFF)
+                    {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        p += 6;
+                    }
+                }
+                if (cp < 0x80) o += (char)cp;
+                else if (cp < 0x800)
+                {
+                    o += (char)(0xC0 | (cp >> 6));
+                    o += (char)(0x80 | (cp & 0x3F));
+                }
+                else if (cp < 0x10000)
+                {
+                    o += (char)(0xE0 | (cp >> 12));
+                    o += (char)(0x80 | ((cp >> 6) & 0x3F));
+                    o += (char)(0x80 | (cp & 0x3F));
+                }
+                else
+                {
+                    o += (char)(0xF0 | (cp >> 18));
+                    o += (char)(0x80 | ((cp >> 12) & 0x3F));
+                    o += (char)(0x80 | ((cp >> 6) & 0x3F));
+                    o += (char)(0x80 | (cp & 0x3F));
+                }
+                break;
+            }
+            default: o += e; break;
+            }
+            continue;
+        }
+        o += c;
+        p++;
+    }
+    return false;
 }
 
 int main()
@@ -342,6 +532,41 @@ int main()
             SendToEngine("{\"cmd\":\"next\"}");
             InterlockedExchange(&g_stopped, 0);
             Reply(seq, command, "");
+        }
+        else if (command == "evaluate")
+        {
+            // 第五十五轮：表达式求值。
+            //   请求体：{"expression":"<aardio 表达式>","context":"repl"}
+            // 流程：清标志 → 把 eval 命令写进命令管道 → 等引擎回
+            //   {"event":"eval",...}（ReaderThread 收，转成响应体）→ 回 DAP。
+            std::string expr;
+            if (!JsonStrFieldDecoded(msg, "expression", expr))
+                JsonStrFieldDecoded(msg, "expr", expr);
+            if (expr.empty())
+            {
+                Reply(seq, command,
+                      "{\"result\":\"\",\"type\":\"\",\"variablesReference\":0}",
+                      false);
+                continue;
+            }
+            g_lastEvalBody.clear();
+            InterlockedExchange(&g_evalReady, 0);
+            SendToEngine("{\"cmd\":\"eval\",\"expr\":" + Quote(expr) + "}");
+            // 等引擎回包（最多 3 秒；引擎此刻正停在 DebugPipeStop 里）
+            for (int i = 0; i < 600; i++)
+            {
+                if (InterlockedCompareExchange(&g_evalReady, 0, 0) == 1) break;
+                Sleep(5);
+            }
+            std::string body = g_lastEvalBody;
+            if (body.empty())
+            {
+                Reply(seq, command,
+                      "{\"result\":\"(引擎没有响应求值)\",\"type\":\"error\","
+                      "\"variablesReference\":0}", false);
+                continue;
+            }
+            Reply(seq, command, body);
         }
         else if (command == "pause")
         {

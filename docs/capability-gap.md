@@ -5858,6 +5858,38 @@ variables 仍工作、terminated。已挂进 `run_regression.ps1`（19 → **20 
 
 回归：全量 **x64 20/20、x86 20/20**；IDE 冒烟（含新增底栏页签）全绿。
 
+### 1.60.5 补「入口可见性」——求值做出来了，用户找不到
+
+求值链路全绿之后复查真实使用路径，发现一个**功能性缺口**（不是 bug，
+是设计漏项）：「立即」页签默认排在底栏**最后一位**（问题/输出/调试/终端/
+引用/立即），底栏本身又不显眼 → 特性在、用户摸不到，等于没做。
+
+补的四处入口：
+
+- 「视图」菜单 → 「立即窗口」
+- 「运行」菜单 → 「立即窗口  Ctrl+Shift+I」
+- 快捷键 **Ctrl+Shift+I**（`winform.reghotkey`，与既有 Ctrl+Shift+F/T 同范式）
+- 切到「立即」页签时**自动聚焦输入框**（`bottomDock.onSelChange`）——
+  否则点了页签还得再点一下输入框才能打字
+
+按页签名切页用 `dock.selectCaption("立即")`（`lib/nodio/ui/dock.nodio:185`，
+官方 `pluginViewShow` 语义），不用写死页签序号——`addTab` 是**追加**，
+序号会随页签增删漂移（今天「立即」是第 6 个，明天加个「任务」就变第 7 个）。
+
+**回归锁**：导出了两个查询给冒烟用 —— `dockHasTab(caption)`（底部面板里
+有没有这个页签）与 `menuLabels()`（全部菜单的条目文本，仿既有
+`fileMenuLabels()`），`main.nodio` 的 smoke 分支据此打
+`IMMEDIATE-TAB:OK` / `IMMEDIATE-MENU:OK`，`tests/ide_smoke.ps1` 断言这两行。
+入口以后被人删掉，冒烟立刻红。
+
+⚠ 踩了一个**作用域坑**：模块体内写 `shell.dockHasTab = function(){...}`
+**挂不上去** —— `shell.nodio` 模块体内根本没有名为 `shell` 的变量，
+`shell.xxx =` 会写到一张临时表上，`app.shell` 上看不到这个成员，
+`main.nodio` 取 `shell.dockHasTab` 拿到 nil（冒烟立刻报
+`IMMEDIATE-TAB:MISSING`）。必须**裸赋值**（`dockHasTab = function(){...}`），
+函数体内的裸赋值同样进模块表（既有 `fileMenuLabels` 就是这么做的，
+`RECENT-MENU-HIT:1` 断言长期为绿可证）。
+
 ❌ 剩余：修改变量（setVariable）、真实多帧调用栈、条件断点/命中次数断点、
 异常断点（exceptionInfo）、变量值的结构化展开（表/数组仍是字符串）、
 DAP goto。

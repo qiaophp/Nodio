@@ -330,6 +330,12 @@ foreach ($v in @('VIS-LEFT','VIS-RIGHT','VIS-BOTTOM','VIS-DOC','VIS-ED','VIS-TOO
     if ($out -notmatch ($v + ':true')) { Write-Output "FAIL: $v is not visible"; exit 1 }
 }
 
+# 「立即窗口」入口（第五十五轮表达式求值）：底部页签 + 菜单项都得在。
+# 求值链路做出来了但入口没人找得到，等于白做 —— 页签默认排最后一位，
+# 很容易被当成「不存在」，所以把两处入口都锁进冒烟自检。
+if ($out -notmatch 'IMMEDIATE-TAB:OK')  { Write-Output 'FAIL: immediate window tab is missing'; exit 1 }
+if ($out -notmatch 'IMMEDIATE-MENU:OK') { Write-Output 'FAIL: immediate window menu entry is missing'; exit 1 }
+
 # AI 面板（app.ai）：页签切过去要显示、切回来要隐藏；控件与会话都在
 if ($out -notmatch 'AI-TAB:true/false') { Write-Output 'FAIL: AI panel tab visibility is wrong'; exit 1 }
 if ($out -notmatch 'AI-CTRLS:1/1')      { Write-Output 'FAIL: AI panel controls are missing'; exit 1 }

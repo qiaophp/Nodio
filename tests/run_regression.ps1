@@ -45,6 +45,7 @@ $tests = @(
     @{ name = 'ide_ai';      script = 'ide_ai_check.ps1';          args = @('-Exe', $Exe) },
     @{ name = 'ide_font';    script = 'ide_font_check.ps1';        args = @('-Exe', $Exe) },
     @{ name = 'ide_complete';script = 'ide_completion_check.ps1';   args = @('-Exe', $Exe) },
+    @{ name = 'ide_debug';   script = 'ide_debug_check.ps1';        args = @('-Exe', $Exe) },
     @{ name = 'ide_threadgc';script = 'ide_thread_gc_check.ps1';   args = @('-Exe', $Exe) },
     @{ name = 'editor';      script = 'run_editor_tests.ps1';      args = @('-Exe', $Exe) },
     @{ name = 'input';       script = 'run_input_tests.ps1';       args = @('-Exe', $Exe) },

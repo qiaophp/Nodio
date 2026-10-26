@@ -1724,6 +1724,24 @@ debugStep = function(){
 	if(dbgSession) app.dapClient.next();
 }
 
+// 立即窗口求值（第五十五轮）
+//
+// 底栏「立即」页签里敲一个表达式回车 → 在**当前暂停帧的环境**里求值
+// （引擎侧 debug.cpp 的 eval 命令：Lex → Parser → Eval(node, env)）。
+// 所以它能看到局部变量，而不只是全局。
+//
+// ⚠ 返回 null = 没有可用的调试会话（调用方会给出提示）；
+//   引擎侧报错（语法错/运行时错）会以 type="error" 回来。
+shell.hooks.onDebugEval = function(expr){
+	if(!dbgSession || !app.dapClient.ready() || !app.dapClient.isStopped()){
+		return null;
+	}
+	var r = app.dapClient.evaluate(expr);
+	if(!r) return "（求值没有响应）";
+	if(r.type == "error") return "错误: " ++ r.result;
+	return r.result;
+};
+
 // 行号栏点一下打/消断点 → 转给 DAP 适配器
 shell.editor.onToggleBreakpoint = function(line, on){
 	if(!curFile) return;
@@ -2756,6 +2774,20 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 	io.print("SMOKE-BRANCH");
 	// DPI 缩放系数（设计坐标是逻辑像素，控件实际尺寸 = 逻辑值 × 系数）
 	io.print("DPI-SCALE:" ++ tostring(..nodio.ui.dpiScale()));
+	// 「立即窗口」入口自检（第五十五轮）：底部页签 + 菜单项都得在。
+	// 求值功能做出来了但入口没人找得到，等于白做 —— 页签默认排在最后一位，
+	// 很容易被当成「不存在」，所以把它锁进冒烟自检。
+	var __imTab = shell.dockHasTab ? shell.dockHasTab("立即") : false;
+	io.print("IMMEDIATE-TAB:" ++ (__imTab ? "OK" : "MISSING"));
+	var __ml = shell.menuLabels ? shell.menuLabels() : {};
+	var __imMenu = false;
+	for(__imI=1;#__ml;1){
+		if(..string.indexOf(tostring(__ml[__imI] : ""), "立即窗口") > 0){
+			__imMenu = true;
+			break;
+		}
+	}
+	io.print("IMMEDIATE-MENU:" ++ (__imMenu ? "OK" : "MISSING"));
 	var target = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_smoke.aardio");
 	app.editor.setText(shell.editor, `io.print("ide-smoke-echo")`);
 	..io.writeFile(target, app.editor.text(shell.editor));

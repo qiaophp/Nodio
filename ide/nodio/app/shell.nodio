@@ -30,6 +30,7 @@ import nodio.ui.projectTree;
 import nodio.ui.searchPanel;
 import nodio.ui.tabstrip;
 import nodio.ui.board;
+import nodio.ui.subclass;
 import nodio.ui.list;
 import nodio.ui.tree;
 import nodio.ui.theme;
@@ -435,9 +436,54 @@ var termEd = bottomDock.addTab("终端", "richedit", {multiline=true;vscroll=tru
 // 引用面板：Shift+F12「查找引用」的结果列表（跨文件）
 var refList = nodio.ui.list(winform, {columns={{"文件";240};{"行";50};{"说明";260}}});
 var refLv = bottomDock.addTab("引用", refList, {icon="search"});
+// 立即窗口（第五十五轮）：单行输入，回车 → 在**当前暂停帧**里求值
+//   （表达式由 IDE 侧 shell.hooks.onDebugEval 转给 DAP → 引擎）
+var imEd = bottomDock.addTab("立即", "richedit", {multiline=false; vscroll=false; icon="terminal"});
+// 供回归：底部面板里有没有某个页签（按页签名查）。
+// 「立即」页签是第五十五轮新增的，但它默认排在最后、很容易被当成不存在 ——
+// 用这条查询把它锁进冒烟自检。
+//
+// ⚠ 必须**裸赋值**（不能写 shell.dockHasTab）：模块体内没有名为 shell 的
+//   变量，`shell.xxx =` 会写到一张临时表上，app.shell 上根本看不到这个成员
+//   （main.nodio 取 shell.dockHasTab 会拿到 nil）。模块层裸赋值才进模块表。
+dockHasTab = function(caption){
+	if(!bottomDock || !bottomDock.tabs) return false;
+	for(i=1;#bottomDock.tabs;1){
+		if(bottomDock.tabs[i] == caption) return true;
+	}
+	return false;
+}
 darkenRichEdit(outEd);
 darkenRichEdit(dbgEd);
 darkenRichEdit(termEd);
+darkenRichEdit(imEd);
+// 回车求值：子类化吃回车，并**推迟到消息循环**再问——
+//   DAP 求值是同步阻塞的（最长 4 秒），在窗口过程里做会卡住整个 IDE。
+var __imSub = nodio.ui.subclass(imEd.hwnd, function(hwnd, msg, wp, lp){
+	if(msg == 0x100 && tonumber(wp) == 0x0D){    // WM_KEYDOWN + VK_RETURN
+		var txt = ..string.trim(tostring(imEd.text : ""));
+		if(#txt){
+			imEd.text = "";
+			try{
+				winform.setTimeout(function(){
+					var res = null;
+					try{
+						if(shell.hooks.onDebugEval) res = shell.hooks.onDebugEval(txt);
+					}catch(eEval){}
+					if(res === null || res === undefined){
+						dbgAppend("立即> " ++ txt ++ "  （没有可用的调试会话）");
+					}
+					else{
+						dbgAppend("立即> " ++ txt ++ " = " ++ tostring(res));
+					}
+					return null;
+				}, 1);
+			}catch(e){}
+		}
+		return 1;      // 吃掉回车（单行 richedit 本来也不插换行）
+	}
+	return 0;
+});
 // 「AI」页不是原生 richedit 了（是 app.ai 面板），染色由面板自己做
 // 问题列表已改成自绘（nodio.ui.list），不再受原生 listview 的配色限制
 
@@ -1077,6 +1123,9 @@ install = function(){
 	winform.reghotkey(function(id,mod,vk){
 		if(hooks.onDesigner) hooks.onDesigner();
 	}, 0, 0x76/*VK_F7*/); // F7 —— 设计视图/代码视图切换
+	winform.reghotkey(function(id,mod,vk){
+		bottomDock.selectCaption("立即");
+	}, MOD_CTRL + MOD_SHIFT, 0x49/*VK_I*/); // Ctrl+Shift+I —— 立即窗口（表达式求值）
 
 	// 菜单：自绘标题栏的一行（不再是原生系统菜单栏）。
 	// 表结构：{ {"标题"; { {"菜单项"; 函数}; {"-"; null} }} }
@@ -1248,6 +1297,8 @@ install = function(){
 			{ "-"; null };
 			{ "添加监视表达式..."; function(id){ if(hooks.onAddWatch) hooks.onAddWatch() } };
 			{ "清空监视列表"; function(id){ if(hooks.onClearWatch) hooks.onClearWatch() } };
+			{ "-"; null };
+			{ "立即窗口  Ctrl+Shift+I"; function(id){ bottomDock.selectCaption("立即") } };
 		} };
 		{ "视图";{
 			{ "属性格"; function(id){ leftDock.setSelIndex(2) } };
@@ -1255,6 +1306,7 @@ install = function(){
 			{ "输出"; function(id){ bottomDock.setSelIndex(2) } };
 			{ "调试"; function(id){ bottomDock.setSelIndex(3) } };
 			{ "终端"; function(id){ bottomDock.setSelIndex(4) } };
+			{ "立即窗口"; function(id){ bottomDock.selectCaption("立即") } };
 			{ "-"; null };
 			{ "双栏对比"; function(id){ toggleSplitDiff() } };
 			{ "下一个差异"; function(id){ if(hooks.onNextDiff) hooks.onNextDiff() } };
@@ -1332,6 +1384,21 @@ install = function(){
 		if(!menusDef || !menusDef[1] || !menusDef[1][2]) return out;
 		for(i=1;#menusDef[1][2];1){
 			..table.push(out, tostring(menusDef[1][2][i][1] : ""));
+		}
+		return out;
+	}
+	// 供回归：**全部**菜单的条目文本（各顶级菜单的条目拼在一起）。
+	// 「立即窗口」这类入口只存在于菜单表里，外部看不到 —— 用它把入口锁住。
+	// （裸赋值进模块表，同 fileMenuLabels —— 见上方 dockHasTab 的坑注释）
+	menuLabels = function(){
+		var out = {};
+		if(!menusDef || !#menusDef) return out;
+		for(m=1;#menusDef;1){
+			var items = menusDef[m][2];
+			if(!items || !#items) continue;
+			for(i=1;#items;1){
+				..table.push(out, tostring(items[i][1] : ""));
+			}
 		}
 		return out;
 	}
@@ -1424,7 +1491,14 @@ install = function(){
 	// page switches
 	leftDock.onSelChange   = function(i, page){ setStatus("工程面板: " ++ i) }
 	rightDock.onSelChange  = function(i, page){ setStatus("工具面板: " ++ i) }
-	bottomDock.onSelChange = function(i, page){ setStatus("输出面板: " ++ i) }
+	bottomDock.onSelChange = function(i, page){
+		setStatus("输出面板: " ++ i);
+		// 切到「立即」页签时自动聚焦输入框：
+		// 否则用户点了页签还得再点一下输入框才能打字，白白多一步。
+		if(page && page.ctrl == imEd){
+			try{ imEd.setFocus() }catch(eFocus){}
+		}
+	}
 
 	// the editor tab strip drives the document model
 	docStrip.onSelect = function(idx){
