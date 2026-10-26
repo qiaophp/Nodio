@@ -258,6 +258,13 @@ if ($out -notmatch 'DSG-TYPES:left=number text=string') {
     exit 1
 }
 
+# 官方 intellisense 词库接入：词库前缀直呼 onComplete，候选必须出现
+# kernel.txt 的常量（第五十一轮）
+if ($out -notmatch 'INTEL-ENTRY:true') {
+    Write-Output 'FAIL: intellisense word-lib entry missing from completion'
+    exit 1
+}
+
 # self-drawn document tab strip: add / remove must keep the count in sync
 if ($out -notmatch 'TABSTRIP-COUNT:1')        { Write-Output 'FAIL: document tab strip did not open the first tab'; exit 1 }
 if ($out -notmatch 'TABSTRIP-AFTER-ADD:2')    { Write-Output 'FAIL: document tab strip did not add a tab'; exit 1 }

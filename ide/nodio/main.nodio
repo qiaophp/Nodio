@@ -20,6 +20,7 @@ import app.library;
 import app.lspClient;
 import app.dapClient;
 import nodio.designer.registry;
+import nodio.intellisense;   // 第五十一轮：官方 intellisense 词库（补全并入）
 import nodio.ui.dpi;
 import nodio.ui.board;   // nodio.ui.redrawAll（窗口显示后统一强制重画）
 import nodio.ui.rect;    // nodio.ui.setCtrlText（AI 面板冒烟要往输入框写字）
@@ -149,11 +150,27 @@ var editorDiags = {};// 代码补全：编辑器算好前缀 → 这里问 LSP �
 //
 // ⚠ lspClient.completion 是**同步阻塞**的（最多等 1 秒）。
 //   本地 LSP 正常 ~20~40ms 就回；服务器没起来时最多卡 1 秒。
-shell.editor.onComplete = function(line, col){
+shell.editor.onComplete = function(line, col, prefix){
 	var items = null;
 	if(app.lspClient.isRunning()){
 		items = app.lspClient.completion(line - 1, col - 1);
 	}
+	// 第五十一轮：官方词库条目并入（config/intellisense kernel/winform.txt
+	// 经 nodio.intellisense 解析，前缀过滤）。LSP 结果优先，词库补差集。
+	try{
+		var lib = nodio.intellisense.complete(prefix : "");
+		if(lib && #lib){
+			var merged = {};
+			var seen = {};
+			if(items) for(k,v in items){ seen[v.label] = true; ..table.push(merged, v) }
+			for(k,v in lib){
+				if(seen[v.label]) continue;
+				seen[v.label] = true;
+				..table.push(merged, v);
+			}
+			items = merged;
+		}
+	}catch(eLib){}
 	if(!items || !#items){
 		items = {
 			{label="function"; kind=14; detail="keyword"};
@@ -2656,6 +2673,15 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		for(k,v in back[i].props){ types[k] = type(v) }
 	}
 	io.print("DSG-TYPES:left=" ++ tostring(types.left) ++ " text=" ++ tostring(types.text));
+
+	// 官方词库接入（第五十一轮）：onComplete 合并词库条目——
+	// 用词库前缀直呼 onComplete，候选里必须出现 kernel.txt 的常量
+	shell.editor.onComplete(1, 5, "_AARD");
+	var compLib = false;
+	for(i=1;#shell.editor.compItems;1){
+		if(shell.editor.compItems[i].label == "_AARDIO_VERSION") compLib = true;
+	}
+	io.print("INTEL-ENTRY:" ++ tostring(compLib));
 
 	// 自绘页签：增删
 	io.print("TABSTRIP-COUNT:" ++ tostring(shell.docStrip.count()));

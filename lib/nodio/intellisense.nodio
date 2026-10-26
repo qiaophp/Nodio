@@ -1,0 +1,154 @@
+// nodio.intellisense — 官方 intellisense 词库接入（第五十一轮）。
+//
+// 数据源：官方 config/intellisense/*.txt（kernel.txt 全局符号 659 行 +
+// winform.txt 窗体成员 251 行）。格式（文件头自带说明，`----` 分隔线
+// 之后才是数据）：
+//   key = 说明               普通条目（key 可含 . / :: 命名空间路径，
+//                            函数条目带 (.(形参) 形参提示）
+//   ^key = 说明              系统参数（照常补全，kind=常数）
+//   !key = @模板             模板条目（值以 @ 开头，__ 为光标插入位）
+// 说明里的 \n 是字面量（换行占位），detail 里折成「; 」并截断。
+//
+// 补全标签取 key 的**最后一段**（table.range / string.trimLeft 都以
+// range/trimLeft 呈现，detail 带全路径），大小写不敏感前缀匹配
+// （官方 ^IGNORECASE_NODE_KEY=1）。
+//
+// 用法：
+//   nodio.intellisense.complete(prefix)   → {label;kind;detail} 数组（惰性加载）
+//   nodio.intellisense.hover(word)        → 说明文本或 ""
+//   nodio.intellisense.loadFrom(dir)      —— 显式数据目录（headless 测试用）
+//
+// v2 挂账：值侧 @ 模板的**插入**展开（__ → 编辑器 $0 光标位），当前
+// 模板条目只作候选呈现、插入的是函数名。
+namespace nodio.intellisense{
+
+var entries = null;      // 惰性加载后的词条表 {label;kind;detail;full}
+var kDescMax = 160;
+
+// 说明清洗：字面量 \n 折行占位 → 「; 」；超长截断
+__cleanDesc = function(s){
+	s = tostring(s);
+	s = ..string.replaceLiteral(s, "\n", "; ");
+	if(#s > kDescMax) s = ..string.slice(s, 1, kDescMax) ++ "…";
+	return s;
+}
+
+// key → {label; kind}。key 样本：
+//   table.range(.(tab) / winform.add(controlsPropertiesTable)
+//   _AARDIO_VERSION / ^MAXTIER / _IMPORTURL.?
+__classify = function(rawKey){
+	var key = ..string.trim(rawKey);
+	var kind = 5;                       // field/其他
+	var bFunc = ..string.indexOf(key, "(") !== null;
+	if(bFunc) kind = 3;                 // function
+	if(..string.indexOf(key, "::") !== null or ..string.charAt(key, 1) == ".") kind = 9;
+	if(..string.charAt(key, 1) == "_") kind = 21;   // constant
+	// 形参提示段截掉：label 取 ( 之前
+	var head = key;
+	var pc = ..string.indexOf(key, "(");
+	if(pc !== null) head = ..string.slice(key, 1, pc - 1);
+	// label = 最后一段（. / :: 分隔）
+	var label = head;
+	var pos = ..string.lastIndexOf(head, ".");
+	if(pos !== null) label = ..string.slice(head, pos + 1);
+	var pos2 = ..string.lastIndexOf(head, "::");
+	if(pos2 !== null) label = ..string.slice(head, pos2 + 2);
+	if(#label == 0) return null;
+	return { label = label; kind = kind; full = key };
+}
+
+// 一个数据文件的解析：`----` 分隔线之后才是数据
+__parseFile = function(text, out){
+	var lines = ..string.split(text, '\n');
+	var bData = false;
+	for(i=1;#lines;1){
+		var line = ..string.trim(lines[i]);
+		if(line == '') continue;
+		if(!bData){
+			if(..string.indexOf(line, "----") !== null) bData = true;
+			continue;
+		}
+		// key = desc（第一个 " = " 切分；值里可能还有等号）
+		var eq = ..string.indexOf(line, " = ");
+		if(eq === null) continue;
+		var rawKey = ..string.slice(line, 1, eq - 1);
+		var desc = ..string.slice(line, eq + 3);
+		if(#rawKey == 0) continue;
+		// 值侧 @ = 代码模板（kind=snippet）
+		var kindSnip = 0;
+		if(..string.charAt(desc, 1) == "@"){
+			kindSnip = 15;
+			desc = ..string.slice(desc, 2);
+		}
+		// key 侧 ^ / ! 前缀：系统参数/标记——剥掉
+		var c1 = ..string.charAt(rawKey, 1);
+		if(c1 == "^" or c1 == "!") rawKey = ..string.slice(rawKey, 2);
+		if(#rawKey == 0) continue;
+		// 参数占位提示（_IMPORTURL.? 这类）不进补全
+		if(..string.indexOf(rawKey, ".?") !== null) continue;
+		var c = __classify(rawKey);
+		if(c === null) continue;
+		if(kindSnip) c.kind = kindSnip;
+		..table.push(out, {
+			label = c.label; kind = c.kind;
+			detail = c.full ++ " — " ++ __cleanDesc(desc);
+			full = c.full;
+		});
+	}
+}
+
+loadFrom = function(dir){
+	entries = {};
+	var names = {"kernel.txt"; "winform.txt"};
+	for(i=1;#names;1){
+		var p = dir ++ "\\" ++ names[i];
+		var text = ..string.load(p);
+		if(!text) continue;
+		__parseFile(text, entries);
+	}
+	return #entries;
+}
+
+__ensure = function(){
+	if(entries !== null) return entries;
+	// 官方词库目录：<NODIO_LIBDIR>\..\config\intellisense（lib 的兄弟目录）。
+	// 后缀判断用字符串精确比较，不走模式匹配。
+	var libDir = ..string.getenv("NODIO_LIBDIR");
+	if(libDir === null || libDir == "") libDir = "D:\aardio\lib";
+	var dir = "D:\aardio\config\intellisense";
+	var tail = ..string.lastIndexOf(libDir, "\lib");
+	if(tail !== null and ..string.slice(libDir, tail) == "\lib"){
+		dir = ..string.slice(libDir, 1, tail - 1) ++ "\config\intellisense";
+	}
+	loadFrom(dir);
+	return entries;
+}
+
+// 前缀补全：大小写不敏感 startswith，上限 40
+complete = function(prefix){
+	var es = __ensure();
+	var out = {};
+	prefix = ..string.lower(tostring(prefix : ""));
+	if(#prefix == 0) return out;
+	for(i=1;#es;1){
+		var e = es[i];
+		if(..string.indexOf(..string.lower(e.label), prefix) == 1){
+			..table.push(out, {label = e.label; kind = e.kind; detail = e.detail});
+			if(#out >= 40) break;
+		}
+	}
+	return out;
+}
+
+// 精确词悬停：命中的说明，未命中 ""
+hover = function(word){
+	var es = __ensure();
+	var w = ..string.lower(tostring(word : ""));
+	if(#w == 0) return "";
+	for(i=1;#es;1){
+		if(..string.lower(es[i].label) == w) return es[i].detail;
+	}
+	return "";
+}
+
+}

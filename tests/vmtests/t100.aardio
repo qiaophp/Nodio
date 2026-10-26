@@ -1,0 +1,34 @@
+// 第五十一轮回归锁：intellisense 词库解析与补全（fixture 驱动，不依赖
+// 本机是否有官方 config 目录）。
+import nodio.intellisense;
+import fsys;
+var dir = ..io.appData ++ "\nodio_t100_fixture";
+fsys.createDir(dir);
+// 格式样本覆盖：头说明跳过、函数形参段、系统参数、值侧模板、占位 ?.、
+// 命名空间路径取末段
+var txt = `配置文件格式：关键字 等号 代码说明。
+------------------------------------------
+table.range(.(tab) = 返回表的最小最大索引。\n通常用于稀疏数组。
+_AARDIO_TEST = 内核测试常量
+!winform.add(controlsTable) = @.add( __ )
+_IMPORTURL.? = 占位提示不进补全
+string trimLeft(.(str) = 无等号行跳过
+^MAXTIER = 36`;
+..io.writeFile(dir ++ "\kernel.txt", txt);
+..io.writeFile(dir ++ "\winform.txt", `------------------------------------------
+winform.msgbox(.(文本) = 弹窗说明`);
+var n = nodio.intellisense.loadFrom(dir);
+io.print("N=" ++ n);
+var r = nodio.intellisense.complete("range");
+io.print("RANGE=" ++ #r ++ " k=" ++ (r[1] ? r[1].kind : -1));
+var r2 = nodio.intellisense.complete("_aardio");
+io.print("CI-AARDIO=" ++ #r2 ++ " k=" ++ (r2[1] ? r2[1].kind : -1));
+var r3 = nodio.intellisense.complete("add");
+io.print("SNIP=" ++ #r3 ++ " k=" ++ (r3[1] ? r3[1].kind : -1));
+var r4 = nodio.intellisense.complete("msgbox");
+io.print("MSGBOX=" ++ #r4);
+var r5 = nodio.intellisense.complete("");
+io.print("EMPTY=" ++ #r5);
+io.print("HOVER=" ++ tostring(nodio.intellisense.hover("MAXTIER") != ""));
+fsys.delete(dir);
+io.print("T100-OK");

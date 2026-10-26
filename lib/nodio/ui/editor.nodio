@@ -2412,7 +2412,7 @@ editor = function(winform, opt){
 		self.compPrefix = w.word;
 		self.compStart = w.start;
 		self.compIndex = 0;
-		if(self.onComplete) self.onComplete(w.line, w.col);
+		if(self.onComplete) self.onComplete(w.line, w.col, w.word);
 		return w.word;
 	}
 	// 把补全请求**推迟到下一个消息循环**再发
