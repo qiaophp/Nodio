@@ -1800,3 +1800,8 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 >   陈旧缓冲覆盖 main.nodio 一次（git 恢复，零损失）；提交粒度压缩。
 > ⑤ ide_smoke 新增 TPL-NEW/CVPROJ-N；全量 18/18。❌ 剩余：开始页/
 >   拆分窗口组/打印/LSP 九方法。
+
+> **第五十三轮（开始页）**。无文档落地页组件（标题+最近文件树，矩形
+> 跟随编辑区、心跳按页签数驱动、recent 签名比对重建）；t101 锁；
+> 全量 18/18。perl 改 UTF-8 文件第二次损坏整文件——永久弃用，改结构化
+> 编辑。❌ 剩余：拆分窗口组/打印/LSP 九方法。
