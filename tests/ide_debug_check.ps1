@@ -69,6 +69,26 @@ if (Test-Path $script2) {
     $fail++
 }
 
+# 第五十九轮续：变量结构化展开 + setVariable 协议锁（dap_vars_check.py）
+$script3 = Join-Path $PSScriptRoot 'dap_vars_check.py'
+if (Test-Path $script3) {
+    $out3 = & $py $script3 $Exe 2>&1 | Out-String
+    $code3 = $LASTEXITCODE
+    Write-Output $out3
+    foreach ($l in ($out3 -split "`r?`n")) {
+        if ($l -match '^FAIL ') { Write-Host "  FAIL $l"; $fail++ }
+    }
+    $pass += @($out3 -split "`r?`n" | Where-Object { $_ -match '^PASS ' }).Count
+    if ($out3 -notmatch '== DAP VARS OK ==') {
+        Write-Host '  FAIL 缺少收尾标记 ''== DAP VARS OK =='''
+        $fail++
+    }
+    if ($code3 -ne 0) { $fail++ }
+} else {
+    Write-Host '  FAIL 缺少 dap_vars_check.py（变量展开/setVariable 回归锁）'
+    $fail++
+}
+
 if ($fail -eq 0 -and $code -eq 0) {
     Write-Host "== IDE-DEBUG OK ($pass 项) =="
     exit 0

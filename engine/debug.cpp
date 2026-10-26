@@ -15,6 +15,16 @@
 // 求值在**当前帧的环境**里做（所以能看到局部变量），实现照抄
 // builtins.cpp 的 CompileToFunc 范式：Lex → Parser → ParseExpr →
 // AnnotateNameIds → Interp::Eval。
+//
+// 第五十九轮续：vars 结构化 + 变量树 + setVariable——
+//   vars 事件从平面对象 {"name":"value"} 升级为数组
+//     [{"name","type","value","ref"}]，Table 分配 ref（varRefs，
+//     每次 stop 清空重建，ref = 索引+101（0/100 留给帧/全局作用域），
+//     仅停点期间有效）；
+//   adapter -> engine : {"cmd":"varsRef","ref":N}   展开第 N 个表
+//     回 {"event":"varsRef","vars":[...][,"error":"..."]}
+//   adapter -> engine : {"cmd":"setVar","ref":N,"name":"x","value":"<expr>"}
+//     回 {"event":"setVar","ok":true|false[,"error":"..."]}
 #include "engine/interp.h"
 #include "engine/parser.h"
 
@@ -307,15 +317,15 @@ static bool ParseExprUtf8(const std::string& expr, const wstring& baseDir,
     return true;
 }
 
-// 在 env 里求值一段表达式，返回显示用的值与类型名。
+// 在 env 里求值一段表达式，返回**真值**（Value）与类型名。
+// EvalExprInEnv / EvalCondInEnv / setVariable 赋值共用这条求值路径。
 //
 // ⚠ 出错时（比如调用了不存在的成员）**必须把引擎的 err 清干净**：
 //   err 是解释器的全局错误槽，留着会让后续执行带着一条假错误。
-bool Interp::EvalExprInEnv(const std::string& expr, Env* env,
-                           wstring& valueOut, wstring& typeOut,
-                           wstring& errOut)
+bool Interp::EvalValueInEnv(const std::string& expr, Env* env, Value& vOut,
+                            wstring& typeOut, wstring& errOut)
     {
-    valueOut.clear();
+    vOut = Value();
     typeOut.clear();
     errOut.clear();
 
@@ -336,11 +346,26 @@ bool Interp::EvalExprInEnv(const std::string& expr, Env* env,
         return false;
     }
     if (err) *err = savedErr;
+    vOut = v;
+    typeOut = TypeNameOf(v);
+    return true;
+    }
+
+// 在 env 里求值一段表达式，返回显示用的值与类型名。
+bool Interp::EvalExprInEnv(const std::string& expr, Env* env,
+                           wstring& valueOut, wstring& typeOut,
+                           wstring& errOut)
+    {
+    valueOut.clear();
+    typeOut.clear();
+    errOut.clear();
+
+    Value v;
+    if (!EvalValueInEnv(expr, env, v, typeOut, errOut)) return false;
 
     wstring vs = v.ToString();
     if (vs.size() > 200) vs = vs.substr(0, 200) + L"...";
     valueOut = vs;
-    typeOut = TypeNameOf(v);
     return true;
     }
 
@@ -352,22 +377,79 @@ bool Interp::EvalCondInEnv(const std::string& expr, Env* env, bool& bOut,
     {
     bOut = false;
     errOut.clear();
-    PNode node;
-    if (!ParseExprUtf8(expr, baseDir, node, errOut)) return false;
-
-    wstring savedErr = err ? *err : wstring();
-    if (err) err->clear();
-    Value v = Eval(node, env);
-    if (err && !err->empty())
-    {
-        errOut = *err;
-        err->clear();
-        if (err) *err = savedErr;
-        return false;
-    }
-    if (err) *err = savedErr;
+    Value v;
+    wstring typeOut;
+    if (!EvalValueInEnv(expr, env, v, typeOut, errOut)) return false;
     bOut = v.Truthy();
     return true;
+    }
+
+// ---- 第五十九轮续：setVariable（修改变量）----
+// 值表达式先经 EvalValueInEnv 求成真值（所以能写 x+1、{a=1} 这样的
+// 表达式，不只是字面量），再写入目标：
+//   ref 0/100 —— 当前帧变量（FindInSelf 命中才写；没有则回退全局）；
+//   ref>100  —— varRefs[ref-101] 表的成员：name 为普通键写 map，
+//               "[i]" 写 arr[i-1]。引用失效（stop 前进后旧 ref）
+//               报错让客户端重新展开，不静默写错地方。
+// 只写**已存在**的名字——求值窗口不该凭空造变量。
+bool Interp::DebugSetVar(const std::string& name, const std::string& expr,
+                         int ref, Env* env, wstring& errOut, Value* vOut)
+    {
+    errOut.clear();
+    if (name.empty()) { errOut = L"缺少 name"; return false; }
+
+    Value nv;
+    wstring typeOut;
+    if (!EvalValueInEnv(expr, env, nv, typeOut, errOut)) return false;
+
+    wstring wname;
+    int cw = MultiByteToWideChar(CP_UTF8, 0, name.data(),
+                                 (int)name.size(), nullptr, 0);
+    if (cw <= 0) { errOut = L"变量名编码无效"; return false; }
+    wname.resize((size_t)cw);
+    MultiByteToWideChar(CP_UTF8, 0, name.data(), (int)name.size(),
+                        &wname[0], cw);
+
+    if (ref > 100)
+    {
+        if (ref > (int)varRefs.size() + 100)
+        {
+            errOut = L"引用已失效（停点前进后需重新展开）";
+            return false;
+        }
+        Value& tv = varRefs[ref - 101];
+        if (tv.t != Value::TableT || !tv.tab)
+        {
+            errOut = L"引用不是表";
+            return false;
+        }
+        if (wname.size() > 2 && wname[0] == L'[' &&
+            wname[wname.size() - 1] == L']')
+        {
+            int idx = _wtoi(wname.c_str() + 1);
+            if (idx < 1 || idx > (int)tv.tab->arr.size())
+            {
+                errOut = L"数组下标越界: " + wname;
+                return false;
+            }
+            tv.tab->arr[idx - 1] = nv;
+            if (vOut) *vOut = nv;
+            return true;
+        }
+        tv.tab->map[wname] = nv;
+        if (vOut) *vOut = nv;
+        return true;
+    }
+
+    // ref 0/100：帧变量优先，全局兜底；两处都没有 → 报错
+    uint32_t gid = NameId(wname);
+    if (env)
+    {
+        if (Value* pv = env->FindInSelf(gid)) { *pv = nv; if (vOut) *vOut = nv; return true; }
+    }
+    if (Value* pv = globals.FindInSelf(gid)) { *pv = nv; if (vOut) *vOut = nv; return true; }
+    errOut = L"没有这个变量: " + wname;
+    return false;
     }
 
 // ---- 第五十九轮：条件/命中次数停点判定 ----
@@ -509,52 +591,29 @@ bool Interp::DebugPipeStop(int nLine, Env* env, const char* stopReason)
                                  nullptr) && wrote == u8.size();
             };
 
+            // 第五十九轮续：vars 从平面对象升级为**结构化数组**——
+            //   [{"name","type","value","ref"}]，Table 分配 ref（>0 可用
+            //   varsRef 命令展开子级）。每次进入 stop 先清 varRefs
+            //  （旧 ref 失效，客户端在下一个停点重新请求）。
+            varRefs.clear();
+
+            // Table → ref（varRefs 追加，ref = 索引+101；
+            //   0/100 被 DAP 的帧作用域占用，容器引用必须错开）
+            auto refOf = [&](const Value& v) -> int
+            {
+                if (v.t == Value::TableT && v.tab)
+                {
+                    varRefs.push_back(v);
+                    return (int)varRefs.size() + 100;
+                }
+                return 0;
+            };
+
             auto varsJson = [&](Env* e) -> wstring
             {
-                // one JSON object of the current frame's user variables;
-                // values render via ToString with JSON string escaping.
-                // Non-ASCII becomes \uXXXX: the pipe line is consumed as a
-                // raw byte frame, and keeping it pure ASCII makes the
-                // frame byte-safe for every reader.
-                auto esc = [](const wstring& s) -> wstring
-                {
-                    wchar_t buf[8];
-                    wstring o;
-                    for (wchar_t c : s)
-                    {
-                        switch (c)
-                        {
-                        case L'"': o += L"\\\""; break;
-                        case L'\\': o += L"\\\\"; break;
-                        case L'\n': o += L"\\n"; break;
-                        case L'\r': o += L"\\r"; break;
-                        case L'\t': o += L"\\t"; break;
-                        default:
-                            if (c < 0x20 || c > 0x7E)
-                            {
-                                if (c >= 0xD800 && c <= 0xDBFF)
-                                {
-                                    // high surrogate: emit pair with the
-                                    // next low surrogate (string may have
-                                    // been built as UTF-16 pairs)
-                                    o += c;   // pass through; low half follows
-                                }
-                                else if (c >= 0xDC00 && c <= 0xDFFF)
-                                {
-                                    o += c;
-                                }
-                                else
-                                {
-                                    swprintf(buf, 8, L"\\u%04x", (unsigned)c);
-                                    o += buf;
-                                }
-                            }
-                            else o += c;
-                        }
-                    }
-                    return o;
-                };
-                wstring o = L"{";
+                // 结构化变量数组；值经 ToString + \uXXXX 转义（事件行
+                // 必须纯 ASCII），类型名取自 TypeNameOf。
+                wstring o = L"[";
                 bool first = true;
                 std::vector<std::pair<wstring, Value>> list;
                 if (e)
@@ -572,9 +631,51 @@ bool Interp::DebugPipeStop(int nLine, Env* env, const char* stopReason)
                     wstring val = kv.second.ToString();
                     if (val.size() > 120)
                         val = val.substr(0, 120) + L"...";
-                    o += L"\"" + esc(kv.first) + L"\":\"" + esc(val) + L"\"";
+                    o += L"{\"name\":\"" + JsonEscapeAscii(kv.first) +
+                         L"\",\"type\":\"" + TypeNameOf(kv.second) +
+                         L"\",\"value\":\"" + JsonEscapeAscii(val) +
+                         L"\",\"ref\":" + std::to_wstring(refOf(kv.second)) +
+                         L"}";
                 }
-                return o + L"}";
+                return o + L"]";
+            };
+
+            // 表成员子级（varsRef 用）：map 键 + arr 下标（"[i]"），
+            // 每项同样分配 ref；上限 100 子级防巨型表拖死协议。
+            auto tableChildrenJson = [&](const std::shared_ptr<Table>& tb)
+                -> wstring
+            {
+                wstring o = L"[";
+                bool first = true;
+                int n = 0;
+                for (auto& kv : tb->map)
+                {
+                    if (n++ >= 100) break;
+                    if (!first) o += L",";
+                    first = false;
+                    wstring val = kv.second.ToString();
+                    if (val.size() > 120)
+                        val = val.substr(0, 120) + L"...";
+                    o += L"{\"name\":\"" + JsonEscapeAscii(kv.first) +
+                         L"\",\"type\":\"" + TypeNameOf(kv.second) +
+                         L"\",\"value\":\"" + JsonEscapeAscii(val) +
+                         L"\",\"ref\":" + std::to_wstring(refOf(kv.second)) +
+                         L"}";
+                }
+                for (size_t i = 0; i < tb->arr.size() && n < 100; i++, n++)
+                {
+                    if (!first) o += L",";
+                    first = false;
+                    wstring val = tb->arr[i].ToString();
+                    if (val.size() > 120)
+                        val = val.substr(0, 120) + L"...";
+                    o += L"{\"name\":\"[" + std::to_wstring(i + 1) +
+                         L"]\",\"type\":\"" + TypeNameOf(tb->arr[i]) +
+                         L"\",\"value\":\"" + JsonEscapeAscii(val) +
+                         L"\",\"ref\":" +
+                         std::to_wstring(refOf(tb->arr[i])) + L"}";
+                }
+                return o + L"]";
             };
 
             auto stopEvent = [&]() -> bool
@@ -629,11 +730,69 @@ bool Interp::DebugPipeStop(int nLine, Env* env, const char* stopReason)
                     bStep = true;
                     return true;
                 }
-                if (wcmd.find(L"\"vars\"") != wstring::npos)
+                if (wcmd.find(L"\"vars\"") != wstring::npos &&
+                    wcmd.find(L"\"cmd\":\"varsRef\"") == wstring::npos)
                 {
                     writeLine(L"{\"event\":\"vars\",\"line\":" +
                               std::to_wstring(nLine) + L",\"vars\":" +
                               varsJson(env) + L"}");
+                    continue;
+                }
+                if (wcmd.find(L"\"cmd\":\"varsRef\"") != wstring::npos)
+                {
+                    // 第五十九轮续：变量树展开。
+                    //   {"cmd":"varsRef","ref":N}
+                    // 回 {"event":"varsRef","vars":[...]}（varRefs[N-101]，N>100
+                    //   表的子级，子 Table 同样分配新 ref；ref 失效回
+                    //   {"event":"varsRef","vars":[],"error":"..."}）。
+                    std::string cmdU8(cmd.begin(), cmd.end());
+                    int ref = 0;
+                    wstring j = L"{\"event\":\"varsRef\",\"vars\":[";
+                    JsonNumField(cmdU8, "ref", ref);
+                    if (ref < 101 || ref > (int)varRefs.size() + 100)
+                    {
+                        j += L"],\"error\":\"引用已失效（停点前进后需重新展开）\"}";
+                    }
+                    else
+                    {
+                        Value& tv = varRefs[ref - 101];
+                        if (tv.t != Value::TableT || !tv.tab)
+                        {
+                            j += L"],\"error\":\"引用不是表\"}";
+                        }
+                        else
+                        {
+                            j += tableChildrenJson(tv.tab) + L"}";
+                        }
+                    }
+                    writeLine(j);
+                    continue;
+                }
+                if (wcmd.find(L"\"cmd\":\"setVar\"") != wstring::npos)
+                {
+                    // 第五十九轮续：修改变量（setVariable 全链引擎端）。
+                    //   {"cmd":"setVar","ref":0,"name":"x","value":"42"}
+                    // ref 0/100 = 当前帧变量（找不到则全局）；ref>100 =
+                    // varRefs[ref-101] 表成员（name 为 "key" 或数组 "[i]"）。
+                    // 回 {"event":"setVar","ok":true|false[,"error":"..."]}
+                    std::string cmdU8(cmd.begin(), cmd.end());
+                    std::string nm, vexpr;
+                    int ref = 0;
+                    JsonStrField(cmdU8, "name", nm);
+                    JsonStrField(cmdU8, "value", vexpr);
+                    JsonNumField(cmdU8, "ref", ref);
+                    wstring err;
+                    Value nv;
+                    bool ok = DebugSetVar(nm, vexpr, ref, env, err, &nv);
+                    wstring j = L"{\"event\":\"setVar\",\"ok\":";
+                    j += ok ? L"true" : L"false";
+                    if (!ok)
+                        j += L",\"error\":\"" + JsonEscapeAscii(err) + L"\"";
+                    else
+                        j += L",\"value\":\"" + JsonEscapeAscii(nv.ToString()) +
+                             L"\",\"type\":\"" + TypeNameOf(nv) + L"\"";
+                    j += L"}";
+                    writeLine(j);
                     continue;
                 }
                 if (wcmd.find(L"\"cmd\":\"eval\"") != wstring::npos)

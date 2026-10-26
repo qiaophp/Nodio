@@ -67,6 +67,15 @@ static volatile long g_stackReady = 0;
 static std::string g_lastStackBody;
 static int g_lastStopLine0 = 0;   // 最近一次 stopped 的 0 基行号（兜底帧用）
 
+// 第五十九轮续：变量树（varsRef）与 setVariable 的请求-响应关联。
+// g_lastVarsJson / g_lastVarsRefJson 保存引擎 vars 数组的**原文**
+// ([{"name","type","value","ref"}]，\uXXXX 转义、字符串感知切分后才
+// 取字段)，variables 请求统一走 VarsBody 转 DAP 形状。
+static volatile long g_varsRefReady = 0;
+static std::string g_lastVarsRefJson;
+static volatile long g_setVarReady = 0;
+static std::string g_lastSetVarBody;
+
 static bool JsonStrFieldDecoded(const std::string& line, const char* key,
                                  std::string& out);
 static std::string Quote(const std::string& s);
@@ -93,27 +102,48 @@ static std::string FindStringField(const std::string& s, const char* key)
 
 static std::string VarsBody(const std::string& varsJson)
 {
-    // varsJson: {"name":"value",...} -> DAP variables array (flat)
+    // 第五十九轮续：varsJson 已是引擎的**结构化数组**——
+    //   [{"name":"x","type":"number","value":"7","ref":0},...]
+    // 逐对象（字符串感知配平花括号——值串里可能有 {} 或引号）转成
+    // DAP variables 条目；ref 原样透传（0=不可展开，>100=varsRef 容器）。
     std::string out = "[";
-    size_t i = 0, n = varsJson.size();
+    size_t pos = 0;
     bool first = true;
-    while (i < n)
+    while ((pos = varsJson.find('{', pos)) != std::string::npos)
     {
-        size_t k0 = varsJson.find('"', i);
-        if (k0 == std::string::npos) break;
-        size_t k1 = varsJson.find('"', k0 + 1);
-        size_t c0 = varsJson.find(':', k1);
-        if (k1 == std::string::npos || c0 == std::string::npos) break;
-        size_t v0 = varsJson.find('"', c0);
-        size_t v1 = v0 == std::string::npos ? std::string::npos
-                                            : varsJson.find('"', v0 + 1);
-        if (v1 == std::string::npos) break;
+        size_t j = pos + 1;
+        bool oStr = false;
+        int oDepth = 1;
+        while (j < varsJson.size() && oDepth > 0)
+        {
+            char c = varsJson[j];
+            if (oStr)
+            {
+                if (c == '\\') j++;
+                else if (c == '"') oStr = false;
+            }
+            else
+            {
+                if (c == '"') oStr = true;
+                else if (c == '{') oDepth++;
+                else if (c == '}') oDepth--;
+            }
+            j++;
+        }
+        if (j > varsJson.size()) j = varsJson.size();
+        std::string obj = varsJson.substr(pos, j - pos);
+        pos = j;
+        std::string nm, ty, vl;
+        bool bNm = JsonStrFieldDecoded(obj, "name", nm);
+        JsonStrFieldDecoded(obj, "type", ty);
+        bool bVl = JsonStrFieldDecoded(obj, "value", vl);
+        std::string rf = JsonNumber(obj, "ref");
+        if (!bNm && !bVl) continue;
         if (!first) out += ",";
         first = false;
-        out += "{\"name\":\"" + varsJson.substr(k0 + 1, k1 - k0 - 1) +
-               "\",\"value\":\"" + varsJson.substr(v0 + 1, v1 - v0 - 1) +
-               "\",\"type\":\"string\",\"variablesReference\":0}";
-        i = v1 + 1;
+        out += "{\"name\":" + Quote(nm) + ",\"value\":" + Quote(vl) +
+               ",\"type\":" + Quote(ty) + ",\"variablesReference\":" +
+               (rf.empty() ? "0" : rf) + "}";
     }
     return out + "]";
 }
@@ -132,14 +162,34 @@ static DWORD WINAPI ReaderThread(LPVOID)
         std::string ev = FindStringField(line, "event");
         if (ev == "stopped")
         {
-            size_t v = line.find("\"vars\":");
+            // 第五十九轮续：vars 现在是数组——字符串感知配平到匹配的
+            // ']'（值串里可能有 ']'，JSON 不转义它，rfind 会吃错）。
+            size_t v = line.find("\"vars\":[");
             if (v != std::string::npos)
             {
-                size_t vStart = v + 7;
-                size_t vEnd = line.rfind('}');
-                if (vEnd != std::string::npos && vEnd > vStart)
-                    g_lastVarsJson = line.substr(vStart, vEnd - vStart);
+                size_t i = v + 8;
+                bool inStr = false;
+                int depth = 1;
+                while (i < line.size() && depth > 0)
+                {
+                    char c = line[i];
+                    if (inStr)
+                    {
+                        if (c == '\\') i++;
+                        else if (c == '"') inStr = false;
+                    }
+                    else
+                    {
+                        if (c == '"') inStr = true;
+                        else if (c == '[') depth++;
+                        else if (c == ']') depth--;
+                    }
+                    i++;
+                }
+                if (i > line.size()) i = line.size();
+                g_lastVarsJson = line.substr(v + 8, i - v - 9);
             }
+            else g_lastVarsJson = "[]";
             // forward the engine's 1-based stop line (0-based for DAP)
             std::string ln = JsonNumber(line, "line");
             int nLine0 = ln.empty() ? 0 : atoi(ln.c_str()) - 1;
@@ -174,6 +224,68 @@ static DWORD WINAPI ReaderThread(LPVOID)
             }
             else g_lastStackBody.clear();
             InterlockedExchange(&g_stackReady, 1);
+        }
+        else if (ev == "varsRef")
+        {
+            // 第五十九轮续：varsRef 应答 → 保存 vars 数组原文。
+            //   {"event":"varsRef","vars":[...][,"error":"..."]}
+            // 展开失败且数组为空时伪造一条错误条目，客户端至少能看到原因。
+            std::string errTxt;
+            bool bErr = JsonStrFieldDecoded(line, "error", errTxt);
+            size_t p = line.find("\"vars\":[");
+            if (p != std::string::npos)
+            {
+                size_t i = p + 8;
+                bool inStr = false;
+                int depth = 1;
+                while (i < line.size() && depth > 0)
+                {
+                    char c = line[i];
+                    if (inStr)
+                    {
+                        if (c == '\\') i++;
+                        else if (c == '"') inStr = false;
+                    }
+                    else
+                    {
+                        if (c == '"') inStr = true;
+                        else if (c == '[') depth++;
+                        else if (c == ']') depth--;
+                    }
+                    i++;
+                }
+                if (i > line.size()) i = line.size();
+                g_lastVarsRefJson = line.substr(p + 8, i - p - 9);
+            }
+            else g_lastVarsRefJson.clear();
+            if (bErr && !errTxt.empty() && g_lastVarsRefJson.empty())
+                g_lastVarsRefJson =
+                    "{\"name\":\"(展开失败)\",\"type\":\"error\","
+                    "\"value\":" + Quote(errTxt) + ",\"ref\":0}";
+            InterlockedExchange(&g_varsRefReady, 1);
+        }
+        else if (ev == "setVar")
+        {
+            // 第五十九轮续：setVar 应答 → setVariable 响应体。
+            //   {"event":"setVar","ok":true,"value":"..","type":".."}
+            //   {"event":"setVar","ok":false,"error":".."}
+            std::string body;
+            if (line.find("\"ok\":true") != std::string::npos)
+            {
+                std::string val, type;
+                JsonStrFieldDecoded(line, "value", val);
+                JsonStrFieldDecoded(line, "type", type);
+                body = "{\"success\":true,\"value\":" + Quote(val) +
+                       ",\"type\":" + Quote(type) + "}";
+            }
+            else
+            {
+                std::string errTxt;
+                JsonStrFieldDecoded(line, "error", errTxt);
+                body = "{\"success\":false,\"message\":" + Quote(errTxt) + "}";
+            }
+            g_lastSetVarBody = body;
+            InterlockedExchange(&g_setVarReady, 1);
         }
         else if (ev == "eval")
         {
@@ -395,6 +507,7 @@ int main()
                 "{\"supportsConfigurationDoneRequest\":true,"
                 "\"supportsFunctionBreakpoints\":false,"
                 "\"supportsConditionalBreakpoints\":true,"
+                "\"supportsSetVariable\":true,"
                 "\"supportsHitCounts\":true}");
         }
         else if (command == "launch" || command == "attach")
@@ -687,9 +800,56 @@ int main()
         }
         else if (command == "variables")
         {
-            // serve the latest vars snapshot captured at the last stop
-            Reply(seq, command,
-                  "{\"variables\":" + VarsBody(g_lastVarsJson) + "}");
+            // 第五十九轮续：ref=100（Local 作用域）→ 最近停点的顶层
+            // 变量快照；ref>100 → 转发 varsRef 展开第 ref 个容器
+            //（引擎此刻停在 DebugPipeStop 命令循环里，等回包）。
+            std::string rs = JsonNumber(msg, "variablesReference");
+            int ref = rs.empty() ? 100 : atoi(rs.c_str());
+            if (ref > 100)
+            {
+                g_lastVarsRefJson.clear();
+                InterlockedExchange(&g_varsRefReady, 0);
+                SendToEngine("{\"cmd\":\"varsRef\",\"ref\":" +
+                             std::to_string(ref) + "}");
+                for (int i = 0; i < 400; i++)
+                {
+                    if (InterlockedCompareExchange(&g_varsRefReady, 0, 0) == 1)
+                        break;
+                    Sleep(5);
+                }
+                Reply(seq, command,
+                      "{\"variables\":" + VarsBody(g_lastVarsRefJson) + "}");
+            }
+            else
+            {
+                Reply(seq, command,
+                      "{\"variables\":" + VarsBody(g_lastVarsJson) + "}");
+            }
+        }
+        else if (command == "setVariable")
+        {
+            // 第五十九轮续：DAP setVariable → 引擎 setVar（值是表达式，
+            // 引擎在当前帧求值后写入；应答带写入后的新值与类型）。
+            std::string nm, vexpr;
+            JsonStrFieldDecoded(msg, "name", nm);
+            JsonStrFieldDecoded(msg, "value", vexpr);
+            std::string rs = JsonNumber(msg, "variablesReference");
+            int ref = rs.empty() ? 100 : atoi(rs.c_str());
+            g_lastSetVarBody.clear();
+            InterlockedExchange(&g_setVarReady, 0);
+            SendToEngine("{\"cmd\":\"setVar\",\"ref\":" +
+                         std::to_string(ref) + ",\"name\":" + Quote(nm) +
+                         ",\"value\":" + Quote(vexpr) + "}");
+            for (int i = 0; i < 600; i++)
+            {
+                if (InterlockedCompareExchange(&g_setVarReady, 0, 0) == 1)
+                    break;
+                Sleep(5);
+            }
+            std::string body = g_lastSetVarBody;
+            if (body.empty())
+                body = "{\"success\":false,\"message\":\"引擎没有响应\"}";
+            Reply(seq, command, body, false);
         }
         else if (command == "continue")
         {

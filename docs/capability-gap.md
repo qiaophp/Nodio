@@ -6261,3 +6261,43 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   名字/行号/序断言），合计 35 项；`ide_debug_check` 合计 54 项。
 - 验证：VM 98/0/1、IDE 冒烟 SMOKE OK、ide_debug 54 项全绿。
 - ❌ 剩余（调试器）：变量结构化展开 + setVariable、独立监视窗。
+
+---
+
+## 1.66 第五十九轮续：调试器之三——变量结构化展开 + setVariable
+
+- **引擎**（`engine/interp.h` / `debug.cpp`）：
+  - vars 协议从平面对象 `{"name":"value"}` 升级为**结构化数组**
+    `[{"name","type","value","ref"}]`（类型名来自 `TypeNameOf`，值
+    ToString 截 120 字符；stopEvent 与 `vars` 命令同形）。
+  - 新增 `std::vector<Value> varRefs`：每次进入停点**清空重建**，
+    Table 值分配 `ref = 索引+101`（0/100 被 DAP Local 作用域与帧变量
+    语义占用，容器引用必须错开）；ref 仅停点期间有效。
+  - 新命令 `{"cmd":"varsRef","ref":N}`：展开 `varRefs[N-101]` 的子级
+    （map 键 + arr 下标 `"[i]"`，每层各分配新 ref，单层上限 100 子级
+    防巨型表拖死协议）；引用失效回 error 字段。
+  - 新命令 `{"cmd":"setVar","ref","name","value"}`：值是**表达式**
+    （经 `EvalValueInEnv` 在当前帧求值——所以能写 `x+1`、`{a=1}`）；
+    ref 0/100 写当前帧变量（`FindInSelf` 命中才写，全局兜底，不凭空
+    造变量），ref>100 写表成员（普通键→map，`"[i]"`→`arr[i-1]`，下标
+    越界/引用失效报错）。应答 `{"event":"setVar","ok",value,type|error}`。
+  - 求值路径重构：`EvalValueInEnv`（真值 + 错误槽保存/清空/恢复）成为
+    `EvalExprInEnv` / `EvalCondInEnv` / setVar 三方共用的底层。
+- **DAP**（`apps/nodio-dap/main.cpp`）：capabilities 增
+  `supportsSetVariable`；`variables` 请求 ref>100 时转发 `varsRef`
+  （等回包最长 2 秒），ref=100 仍走停点快照；新增 `setVariable` 请求
+  → `setVar` 命令（应答带写入后的新值）。`VarsBody` 重写：字符串感知
+  配平花括号逐对象解析（值串里可能有 `{}`/引号），name/type/value 解码
+  后重新 Quote、ref 透传为 `variablesReference`；stopped 事件的 vars
+  数组按字符串感知配平 `]` 提取（值串里可能有 `]`，rfind 会吃错）。
+- **IDE**（`app/dapClient.nodio`）：`getVars` 条目升级
+  `{name;value;type;ref}`；新增 `getVarChildren(ref)`（逐层展开，子表
+  同样带 ref）与 `setVariable(ref,name,value)`（返回
+  `{ok,value,type}|{ok,error}`）。UI 消费（变量树/监视窗）留给下一轮。
+- **回归锁**：新增 `tests/dap_vars_check.py` 34 项——结构化分型、
+  ref 分配（>100 且两表不同）、表/数组子级展开、setVariable 三路
+  （帧变量/表成员/数组元素）求值复读、不存在变量必须失败、失效引用
+  不崩、`supportsSetVariable` 能力声明；`ide_debug_check` 合计 88 项。
+  ⚠ 停点快照是**语句执行前**的状态（与条件断点 x==3 同一语义）。
+- 验证：VM 98/0/1、IDE 冒烟 SMOKE OK、ide_debug 88 项全绿。
+- ❌ 剩余（调试器）：独立监视窗（消费本轮协议）。

@@ -130,6 +130,9 @@ namespace NodioVM
             DbgFrameScope(const DbgFrameScope&) = delete;
             DbgFrameScope& operator=(const DbgFrameScope&) = delete;
         };
+        // 第五十九轮续：变量结构化展开。stop 时清空重建；ref = 索引+1，
+        // 只对 Table 分配（DAP variablesReference）。只在停点期间有效。
+        std::vector<Value> varRefs;
         // external debug session (DAP): when set, DebugStop talks to the
         // adapter over two unidirectional named pipes instead of the console
         void* hDebugPipe = nullptr;     // events pipe (engine -> adapter)
@@ -296,7 +299,17 @@ namespace NodioVM
         // 返回（Falsy 仅 null/false）。求值失败返回 false 并写 errOut。
         bool EvalCondInEnv(const std::string& expr, Env* env, bool& bOut,
                            wstring& errOut);
-        // 第五十九轮：到达行号时是否真的停（条件/命中次数判定，
+        // 第五十九轮续：求出**真值**（Value）而非显示串 —— setVariable
+        // 赋值要原值；EvalExprInEnv 在它之上做 ToString。
+        bool EvalValueInEnv(const std::string& expr, Env* env, Value& vOut,
+                            wstring& typeOut, wstring& errOut);
+        // 第五十九轮续：setVariable —— 把表达式求值结果写进变量。
+        // ref==0/100 → 当前帧或全局变量；ref>100 → varRefs[ref-1] 表的
+        // 成员（name 形如 "key" 或数组下标 "[i]"）。
+        bool DebugSetVar(const std::string& name, const std::string& expr,
+                         int ref, Env* env, wstring& errOut,
+                         Value* vOut = nullptr);
+        // 第五十九轮续：到达行号时是否真的停（条件/命中次数判定，
         // 纯行号断点没有 bpMeta 条目 → 直接停）。
         bool BpShouldStop(int nLine, Env* env);
         void DumpVars(Env* env);

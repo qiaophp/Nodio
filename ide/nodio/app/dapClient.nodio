@@ -169,7 +169,8 @@ refresh = function(){
 	// r1/r2 captured via poll side effects; re-request through poll results
 };
 
-// vars from the last stop — array of {name;value}
+// vars from the last stop — array of {name;value;type;ref}
+// ref（第五十九轮续）：>100 = 表容器，可用 getVarChildren(ref) 展开
 getVars = function(){
 	if(!p) return {};
 	if(!stoppedFlag) return lastVars;
@@ -185,6 +186,8 @@ getVars = function(){
 					..table.push(out, {
 						name = tostring(v.name);
 						value = tostring(v.value);
+						type = tostring(v.type : "");
+						ref = tonumber(v.variablesReference : 0) : 0;
 					});
 				}
 			}
@@ -193,6 +196,66 @@ getVars = function(){
 		}
 	}
 	return lastVars;
+};
+
+// 变量子级展开（第五十九轮续）：ref 来自 getVars/getVarChildren 条目的
+// ref 字段（0 = 不可展开）。返回 [{name;value;type;ref}]，子表同样带 ref
+//（可以逐层展开）。⚠ 停点前进后旧 ref 失效（引擎每次停点重建引用表），
+//   适配器对失效引用会回一条 (展开失败) 条目而不是空数组。
+getVarChildren = function(ref){
+	if(!p) return {};
+	var seq = request("variables",
+		{ variablesReference = tonumber(ref : 0) : 0 });
+	var out = {};
+	for(i=1;200;1){
+		sleep(20);
+		var r = poll(seq);
+		if(r !== null){
+			var vs = r.body ? r.body.variables : null;
+			if(vs){
+				for(k,v in vs){
+					..table.push(out, {
+						name = tostring(v.name);
+						value = tostring(v.value);
+						type = tostring(v.type : "");
+						ref = tonumber(v.variablesReference : 0) : 0;
+					});
+				}
+			}
+			return out;
+		}
+	}
+	return out;
+};
+
+// setVariable（第五十九轮续）：修改变量。
+//   ref=100 → 当前帧变量；ref>100 → 表成员（name 为键名或数组 "[i]"）；
+//   value 是**表达式**——引擎在当前帧求值后写入，所以能写 x+1、{a=1}。
+// 返回 {ok=true; value; type}（value=写入后的新值渲染）或 {ok=false; error}。
+setVariable = function(ref, name, value){
+	if(!p) return { ok = false; error = "调试会话未启动" };
+	var seq = request("setVariable", {
+		variablesReference = tonumber(ref : 0) : 0;
+		name = tostring(name : "");
+		value = tostring(value : "");
+	});
+	for(i=1;200;1){
+		sleep(20);
+		var r = poll(seq);
+		if(r !== null){
+			var b = r.body;
+			if(!b) return { ok = false; error = "空响应" };
+			if(b.success){
+				return {
+					ok = true;
+					value = tostring(b.value : "");
+					type = tostring(b.type : "");
+				};
+			}
+			return { ok = false; error = tostring(b.message : "修改变量失败") };
+		}
+	}
+	return { ok = false; error = "适配器没有响应" };
 };
 
 // stack — array of {line(0-based);name}
