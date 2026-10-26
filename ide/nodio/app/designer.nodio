@@ -22,19 +22,24 @@ import nodio.designer.toolbox;
 import nodio.designer.propertyGrid;
 import nodio.designer.canvas;
 import nodio.designer.dsg;
+import nodio.ui.list;
 
 // state
 var shell = null;        // the app.shell module
 var toolbox = null;
 var propGrid = null;
 var canvas = null;
+var eventList = null;    // 事件一览（第五十六轮）
 var visible = false;
 var curItem = null;
 
 // 钩子收进**表**（谁改都看得见 —— 模块级的裸标量会被帧局部副本遮蔽，
 // 外部灌进来的钩子内部永远读到 null，见 capability-gap §1.20.3 的教训）
 var hooks = {
-	onEventCode = null;    // function(item) —— 双击组件 / 右键「查看事件代码」时回调
+	// function(item, ev) —— 生成事件处理函数桩。
+	// ev 省略 = 该控件的**默认**事件（双击组件 / 右键「查看事件代码」）；
+	// ev 指定 = 事件一览里双击的那个事件（第五十六轮）。
+	onEventCode = null;
 };
 
 // Bind the designer to the IDE shell.
@@ -58,6 +63,18 @@ create = function(sh){
 		left = 0; top = 0; right = 240; bottom = 200;
 	});
 	shell.leftDock.addTab("属性", propGrid);
+
+	// 事件一览 → left dock, 事件 page（第五十六轮）
+	//
+	// 选中控件 → 列出它**真的支持**的事件（数据对齐官方 win.ui 的事件
+	// 成员，见 nodio.designer.registry.eventsOf）；双击某个事件 → 生成
+	// 对应的处理函数桩（走 hooks.onEventCode —— 设计器不认识编辑器）。
+	var pageEvt = shell.leftDock.addTab("事件");
+	eventList = nodio.ui.list(pageEvt, {
+		left = 0; top = 0; right = 240; bottom = 260;
+		columns = {{"事件";120};{"说明";110}};
+	});
+	shell.leftDock.addTab("事件", eventList);
 
 	// the design canvas: a self-drawn board laid over the editor area
 	canvas = nodio.designer.canvas(shell.winform, {
@@ -130,13 +147,39 @@ create = function(sh){
 		canvas.select(item.name);
 		shell.setStatus("已加入控件: " ++ spec.name ++ "（" ++ spot.x ++ "," ++ spot.y ++ "）");
 	}
+	// 刷新事件一览（选中控件变化时）
+	//
+	// 事件清单来自 registry.eventsOf —— 那是对齐官方 win.ui 真实事件
+	// 成员的静态表（通用 oncommand/onnotify + 控件特有事件）。
+	var refreshEvents = function(item){
+		if(!eventList) return;
+		if(!item || !item.spec){
+			eventList.setRows({});
+			return;
+		}
+		var evs = nodio.designer.registry.eventsOf(item.spec.cls);
+		var rows = {};
+		for(i=1;#evs;1){
+			..table.push(rows, {cells = {evs[i]; nodio.designer.registry.eventDesc(evs[i])};
+				tag = evs[i]});
+		}
+		eventList.setRows(rows);
+	};
+	// 双击某个事件 → 生成它的处理函数桩
+	// （生成动作在 IDE 侧：hooks.onEventCode，设计器不认识编辑器）
+	eventList.onDoubleClick = function(row, index){
+		if(!curItem || !row || !row.tag) return;
+		if(hooks.onEventCode) hooks.onEventCode(curItem, row.tag);
+	}
 	canvas.onSelect = function(item){
 		curItem = item;
 		propGrid.setItems(item ? item.props : {});
+		refreshEvents(item);
 	}
 	canvas.onChange = function(item){
 		curItem = item;
 		propGrid.setItems(item ? item.props : {});
+		refreshEvents(item);
 		shell.setStatus("设计器: " ++ tostring(item ? item.name : ""));
 	}
 	// 双击组件 → 事件代码（官方 IDE 的行为：双击控件切到代码视图，
@@ -449,6 +492,14 @@ simulateToolboxDrop = function(specName, screenX, screenY){
 	return toolbox.simulateDrag(specName, screenX, screenY);
 }
 
+// simulateToolboxDropMsg：同一次拖拽，但走**真实窗口消息**路径
+// （PostMessage → 子类化窗口过程 → onMouseDown/Move/Up）。
+// 这是最接近「用户真的用鼠标拖」的一条路。
+simulateToolboxDropMsg = function(specName, screenX, screenY){
+	if(!toolbox) return false;
+	return toolbox.simulateDragMsg(specName, screenX, screenY);
+}
+
 // 画布上的控件数（拖拽前后对比 = 控件确实建出来了）
 canvasCount = function(){
 	return canvas ? #canvas.items : 0;
@@ -458,6 +509,13 @@ canvasCount = function(){
 canvasRemove = function(name){
 	if(!canvas) return false;
 	return canvas.remove(name);
+}
+
+// 供回归：当前选中控件的事件清单（第五十六轮）
+// 每行 {cells={事件名;说明}; tag=事件名}
+eventItems = function(){
+	if(!eventList) return {};
+	return eventList.rows;
 }
 
 // 窗体表面在**屏幕坐标**里的矩形（拖拽落点的目标区域）

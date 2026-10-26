@@ -1869,3 +1869,32 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 > aardio 语义坑：`#table` 是数组长度语义，对字符串键的 table 恒为 0，
 > 判「选中」不能写 `#sel > 0`。全量 x64 20/20、x86 20/20。
 > ❌ 剩余：控件事件一览、窗体属性对话框、布局器、Tab 顺序、资源视图。
+>
+> **第五十七轮（设计器体验做深·二——控件事件一览）**。左栏新增「事件」
+> 页签：选中控件 → 列出它支持的事件 → 双击某个事件 → 生成**那个事件**
+> 的处理函数桩（`hooks.onEventCode(item, ev)` 的 ev 省略时仍是默认事件，
+> 双击组件的旧行为不变）。事件清单**对齐官方**而非凭印象：通用
+> `oncommand`/`onnotify`（官方 `lib/win/ui/_.aardio:748/:813`）+ 官方各
+> 控件类自带的 `_commandFuncnames` 映射（edit/richedit/ipaddress/
+> combobox/listbox）。⚠ 先试过运行时读控件实例的 `_commandFuncnames` ——
+> **读不到**（独立探针里控件还没创建；IDE 画布上的真实控件有 hwnd 但
+> 表为 null，`EV-TABLE:0`）→ 改为静态对齐官方源码，探针
+> `tests/probe_events.aardio` 留档了这个结论。冒烟 3 条断言：
+> `EVENT-LIST:2/1` / `EVENTS-EDIT:11` / `EVENT-STUB-EV:1`。
+>
+> **第五十八轮（修「IDE 频繁闪」+ 拖拽真实消息验证）**。用户反馈图标
+> 用字体、组件拖不动、IDE 频繁闪。① **闪的根因**：`board.show(true)`
+> 每次都整块重画，而心跳每 300ms 调一次开始页的 show → 无文档时每
+> 300ms 闪一次（一次 show 还连着重画两块板）。改成只有「隐藏→显示」
+> 才重画，重复 show 不动它；板子暴露 `redrawCount()`，冒烟断言连续
+> 两次 show 的重画增量 = 0（`SHOW-REDRAW:0`）。② **拖拽验证升级**：
+> 加 `toolbox.simulateDragMsg` —— 用 `::PostMessage` 把
+> WM_LBUTTONDOWN/MOVE/UP 投给工具箱板，走**真实窗口过程**（子类化 →
+> 回调 → 状态机 → onDrop），与用户真拖同一条路（同款做法见
+> `tests/ide_click.ps1`）；目标点在工具箱左边的画布上 → 客户区坐标是
+> **负数**，正好覆盖上一轮修的 `mouseScreen` 有符号解读。断言
+> `DROP-MSG:1`（与回调路径 `DROP-E2E:1` 并存）。③ **图标**：官方 lib
+> 全树只有一个 png、没有任何图标集 —— 官方 IDE 的图标也是代码画的，
+> 没有现成资源可抄；Nodio 的工具条/页签图标是 FontAwesome **字体**
+> 字形（工具箱里的控件缩略图已经是 GDI+ 手绘）。改法三条路
+> （自绘矢量 / 系统 Segoe MDL2 图标字体 / 位图资源）待用户拍板。

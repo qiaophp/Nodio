@@ -152,6 +152,63 @@ registry = {
 		return n;
 	}
 
+	// ---------- 控件事件一览（第五十六轮） ----------
+	//
+	// 数据来源是官方 win.ui 的**真实事件成员**（不是按印象猜的）：
+	//
+	//   · 通用事件（所有控件都能挂）：
+	//       oncommand —— WM_COMMAND 派发（官方 lib/win/ui/_.aardio:748）
+	//       onnotify  —— WM_NOTIFY 派发（官方 lib/win/ui/_.aardio:813）
+	//   · 控件特有事件：官方各控件类在创建时带的 `_commandFuncnames`
+	//     映射（消息码 → 事件函数名）：
+	//       edit.aardio:104 / richedit.aardio:97 / ipaddress.aardio:32
+	//       combobox.aardio:44 / listbox.aardio:24
+	//
+	// ⚠ 运行时读不到控件实例上的 `_commandFuncnames`（Nodio 的控件创建
+	//   路径下那张表没建出来 —— 探针实测 hwnd 有但表为 null），
+	//   所以这里按官方源码**静态对齐**。
+	//
+	// 顺序：特有事件在前（最常用的 onChange/onSelChange 在最前），
+	// 通用事件在后。
+	eventsOf = function(cls){
+		var out = {};
+		var special = {
+			edit     = {"onChange";"onFocusGot";"onFocusLost"};
+			richedit = {"onChange";"onFocusGot";"onFocusLost"};
+			combobox = {"onSelChange";"onEditChange";"onFocusGot";"onFocusLost";
+				"onDropDown";"onCloseUp";"onOk";"onCancel"};
+			listbox  = {"onSelChange";"onSelCancel";"onDoubleClickItem";
+				"onFocusGot";"onFocusLost"};
+		};
+		var sp = special[cls];
+		if(sp){
+			for(i=1;#sp;1) ..table.push(out, sp[i]);
+		}
+		..table.push(out, "oncommand");
+		..table.push(out, "onnotify");
+		return out;
+	}
+
+	// 事件的中文说明（事件一览的第二列）
+	eventDesc = function(ev){
+		var t = {
+			oncommand = "控件命令";
+			onnotify = "原生通知";
+			onChange = "内容变化";
+			onSelChange = "选中项变化";
+			onSelCancel = "选择被取消";
+			onEditChange = "编辑内容变化";
+			onFocusGot = "获得焦点";
+			onFocusLost = "失去焦点";
+			onDropDown = "下拉展开";
+			onCloseUp = "下拉收起";
+			onOk = "确认";
+			onCancel = "取消";
+			onDoubleClickItem = "双击某一项";
+		};
+		return t[ev] : "";
+	}
+
 	// 内置控件集
 	// 每个控件都带 左/上/宽/高 四个几何属性：属性格改它们时
 	// 画布会真的移动/缩放控件（见 nodio.designer.canvas.applyProps）。

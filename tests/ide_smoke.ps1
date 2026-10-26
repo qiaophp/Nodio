@@ -347,6 +347,17 @@ if ($out -notmatch 'COORD-RT:OK')    { Write-Output 'FAIL: designer coordinate r
 if ($out -notmatch 'SURFACE-HIT:OK') { Write-Output 'FAIL: designer form-surface hit test is wrong'; exit 1 }
 # DROP-E2E:1    端到端：模拟一次真实拖拽（按下→移动→松开）后，控件真的落到了画布上
 if ($out -notmatch 'DROP-E2E:1')     { Write-Output 'FAIL: designer drag-and-drop did not create a control'; exit 1 }
+# DROP-MSG:1     真实窗口消息路径的拖拽（PostMessage → 窗口过程 → 状态机）
+if ($out -notmatch 'DROP-MSG:1')      { Write-Output 'FAIL: designer drag via real window messages failed'; exit 1 }
+# 事件一览（第五十六轮）
+#   EVENT-LIST:2/1   button 的事件清单有 2 项且含 oncommand
+#   EVENTS-EDIT:11   edit 的事件表含 onChange + onFocusGot（对齐官方 edit.aardio:104）
+#   EVENT-STUB-EV:1  指定事件（onSelChange）能生成处理函数桩
+if ($out -notmatch 'EVENT-LIST:2/1')   { Write-Output 'FAIL: designer event list is wrong'; exit 1 }
+if ($out -notmatch 'EVENTS-EDIT:11')   { Write-Output 'FAIL: designer event table does not match official win.ui'; exit 1 }
+if ($out -notmatch 'EVENT-STUB-EV:1')  { Write-Output 'FAIL: designer did not generate the stub for a picked event'; exit 1 }
+# SHOW-REDRAW:0  连续 show(true) 不再反复整块重画（第五十八轮修的闪烁）
+if ($out -notmatch 'SHOW-REDRAW:0')   { Write-Output 'FAIL: board.show keeps repainting on every call (flicker)'; exit 1 }
 
 # AI 面板（app.ai）：页签切过去要显示、切回来要隐藏；控件与会话都在
 if ($out -notmatch 'AI-TAB:true/false') { Write-Output 'FAIL: AI panel tab visibility is wrong'; exit 1 }

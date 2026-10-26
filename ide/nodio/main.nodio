@@ -2305,9 +2305,13 @@ var lineOfPos = function(src, pos){
 	for(c in ..string.gmatch(head, '\n')) n = n + 1;
 	return n;
 };
-var genEventStub = function(item){
+// 生成事件处理函数桩
+//
+// ev 省略 = 该控件的默认事件（双击组件 / 右键「查看事件代码」）；
+// ev 指定 = 事件一览里双击的那个事件（第五十六轮）。
+var genEventStub = function(item, ev){
 	if(!item || !item.spec) return;
-	var ev = item.spec.event : defaultEventOf(item.spec.cls);
+	ev = ev ? ev : (item.spec.event : defaultEventOf(item.spec.cls));
 	if(!ev){ shell.setStatus("「" ++ item.spec.name ++ "」没有默认事件"); return }
 	var path = shell.tabCurPath();
 	if(!path){ shell.setStatus("没有打开的文档"); return }
@@ -3009,6 +3013,36 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		io.print("EVENT-CODE-VIEW:" ++ tostring(designer.visible ? 0 : 1));
 	}
 
+	// ---------- 事件一览（第五十六轮） ----------
+	//
+	// 选中控件 → 左栏「事件」页列出它支持的事件；双击某个事件 →
+	// 生成那个事件的处理函数桩。
+	//
+	// ① 事件清单（button：通用 oncommand/onnotify）
+	designer.canvas.select(item.name);
+	var __evs = app.designer.eventItems();
+	var __evCnt = 0, __hasCmd = 0;
+	for(ei=1;#__evs;1){
+		__evCnt = __evCnt + 1;
+		if(__evs[ei].tag == "oncommand") __hasCmd = 1;
+	}
+	io.print("EVENT-LIST:" ++ __evCnt ++ "/" ++ tostring(__hasCmd));
+	// ② 事件表对齐官方：edit 有 onChange / onFocusGot（官方 edit.aardio:104）
+	var __editEvs = nodio.designer.registry.eventsOf("edit");
+	var __hasChg = 0, __hasFocus = 0;
+	for(ej=1;#__editEvs;1){
+		if(__editEvs[ej] == "onChange") __hasChg = 1;
+		if(__editEvs[ej] == "onFocusGot") __hasFocus = 1;
+	}
+	io.print("EVENTS-EDIT:" ++ tostring(__hasChg) ++ tostring(__hasFocus));
+	// ③ 指定事件生成桩（事件一览里双击 onSelChange）
+	if(item){
+		designer.hooks.onEventCode(item, "onSelChange");
+		var evStub = 'winform.' ++ item.name ++ '.onSelChange = function(id,event)';
+		io.print("EVENT-STUB-EV:" ++ tostring(
+			..string.indexOf(shell.tabGetText(target), evStub) !== null ? 1 : 0));
+	}
+
 	// ---------- 设计 ↔ 源码同步（switchActiveForm 语义） ----------
 	//
 	// 开设计器 = 从源码载入设计块；关设计器 = 把当前设计写回源码。
@@ -3352,8 +3386,38 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 			// 清理：测试加的控件删掉，别把画布弄脏（后面的断言还要用画布）
 			if(__hasSel) app.designer.canvasRemove(__sel.name);
 		}
+		// ⑥ 真实窗口消息路径的拖拽（PostMessage → 子类化窗口过程 → 状态机）
+		//
+		// 这是最接近「用户真的用鼠标拖」的一条路：消息进工具箱板的
+		// 窗口过程 → onMouseDown/Move/Up → 拖拽状态机 → onDrop。
+		// PostMessage 是异步的，所以延后一拍再查结果。
+		var __n0c = app.designer.canvasCount();
+		if(__rect){
+			var __ranC = app.designer.simulateToolboxDropMsg("按钮",
+				__rect.left + 200, __rect.top + 120);
+			shell.winform.setTimeout(function(){
+				var __n1c = app.designer.canvasCount();
+				io.print("DROP-MSG:" ++ tostring((__ranC && __n1c == __n0c + 1) ? 1 : 0));
+				var __selC = app.designer.canvasSelected();
+				if(__selC) app.designer.canvasRemove(__selC.name);
+			}, 200);
+		}
 		else{
 			io.print("DROP-E2E:SKIP");
+		}
+		// ⑦ 闪烁回归（第五十八轮）：连续 show(true) 不该反复整块重画
+		//
+		// IDE 的心跳每 300ms 调一次开始页的 show —— 而 show(true) 原来
+		// 每次都整块重画 → **每 300ms 闪一次**（无文档时最明显）。
+		// 现在只有「隐藏→显示」这一下才重画。
+		var __bd = shell.rightDock.strip.board;
+		if(__bd && __bd.redrawCount){
+			__bd.show(true);
+			var __c1 = __bd.redrawCount();
+			__bd.show(true);
+			__bd.show(true);
+			var __c2 = __bd.redrawCount();
+			io.print("SHOW-REDRAW:" ++ tostring(__c2 - __c1));
 		}
 	},900);
 

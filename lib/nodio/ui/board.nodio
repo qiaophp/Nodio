@@ -245,6 +245,7 @@ board = function(winform, opt){
 		format = boardFormat();
 		downX = 0; downY = 0; bDown = false;
 		dblClick = false;       // 最近一次按下是不是双击
+		__shown = false;        // 上一次 show 的可见性（重复 show 不再整块重画）
 		onDraw = null;          // function(graphics, rc, self)
 		onMouseDown = null;    // function(x, y, self)
 		onMouseMove = null;
@@ -417,6 +418,7 @@ board = function(winform, opt){
 	// 为什么整窗失效就够：官方 plus 的 WM_PAINT 用「本次失效区域」
 	// 当裁剪区，整窗失效 ⇒ 裁剪区 = 整个客户区 ⇒ 内容完整重画 ✓
 	self.redraw = function(){
+		self.__redrawCount = (self.__redrawCount : 0) + 1;
 		try{
 			::InvalidateRect(self.ctrl.hwnd, 0, 1/*erase*/);
 			// UpdateWindow 会**立刻**把这一块 WM_PAINT 掉并上屏。
@@ -429,6 +431,11 @@ board = function(winform, opt){
 		}
 	}
 
+	// 重画次数（给回归锁看「有没有在无缘无故地反复重画」）
+	self.redrawCount = function(){
+		return self.__redrawCount : 0;
+	}
+
 	// 显示/隐藏
 	//
 	// ⚠ 显示之后**必须强制重画一次**：
@@ -439,10 +446,24 @@ board = function(winform, opt){
 	//   窗口在、IsWindowVisible 为真、矩形也对，屏幕上却什么都没有。
 	//   （设计器画布、提示条、查找条、补全浮层、下拉菜单全踩过这个坑。）
 	//   所以 show(true) 之后统一按整块失效 + 立刻重画。
+	//
+	// ⚠⚠ 但**不能每次 show(true) 都重画**（第五十八轮修的闪烁）：
+	//   IDE 的心跳每 300ms 调一次开始页的 show（可见性跟着页签数走），
+	//   而 show(true) 会整块重画 → **每 300ms 闪一次**（无文档时最明显：
+	//   开始页一直可见，每拍都重画）。
+	//   所以只有「隐藏 → 显示」这一下才重画；重复 show(true) 不动它
+	//   （内容变了应该调 invalidate/redraw，不是 show）。
 	self.show = function(flag){
+		flag = flag ? true : false;
 		self.ctrl.show(flag);
 		if(flag){
-			self.redraw();
+			if(self.__shown !== true){
+				self.__shown = true;
+				self.redraw();
+			}
+		}
+		else{
+			self.__shown = false;
 		}
 	}
 

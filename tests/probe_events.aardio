@@ -1,0 +1,48 @@
+// tests/probe_events.aardio — 官方 win.ui 控件的**真实事件清单**探测。
+//
+// 背景（第五十七轮做「控件事件一览」）：官方 win.ui 的每个控件类在
+// 创建时都会带一张 `_commandFuncnames` 表（消息码 → 事件函数名），
+// 见 D:\aardio\lib\win\ui\ctrl\*.aardio（如 edit.aardio:104、
+// combobox.aardio:44、listbox.aardio:24）。
+//
+// ⚠ **本探针的结论（留档，勿当成失败）**：在 Nodio 的控件创建路径下，
+//   这张表**读不到** ——
+//     · 独立探针里 f.add() 之后控件还没创建（hwnd=null，官方 form.add
+//       在窗体显示前是延迟的）；
+//     · IDE 画布上的真实控件有 hwnd，但 `ctrl._commandFuncnames` 仍是
+//       null（冒烟里实测 EV-TABLE:0）。
+//   ⇒ 事件一览改为**静态对齐官方源码**：把各控件类的
+//     `_commandFuncnames` 映射抄进 nodio.designer.registry.eventsOf
+//     （通用 oncommand/onnotify + edit/richedit/combobox/listbox 的
+//     特有事件），见该文件里的出处注释。
+//
+// 跑法：NODIO_RUN=tests\probe_events.aardio nodio.exe
+import win.ui;
+
+var f = win.form();
+var btn = f.add(["btn1"] = {cls="button"; text="按钮"});
+var ed  = f.add(["ed1"]  = {cls="edit"});
+var cb  = f.add(["cb1"] = {cls="combobox"});
+var lv  = f.add(["lv1"]  = {cls="listview"; columns={{"列";80}}});
+
+var dump = function(name, ctrl){
+	io.print("== " ++ name);
+	if(!ctrl){ io.print("  NO-CTRL"); return; }
+	io.print("  type=" ++ tostring(type(ctrl)) ++ " hwnd=" ++ tostring(ctrl.hwnd));
+	io.print("  cls=" ++ tostring(ctrl.cls) ++ " text=" ++ tostring(ctrl.text));
+	var fn = ctrl._commandFuncnames;
+	if(!fn){ io.print("  NO-TABLE"); return; }
+	for(k in fn){
+		io.print("  " ++ tostring(k) ++ " -> " ++ tostring(fn[k]));
+	}
+};
+
+dump("button", btn);
+dump("edit", ed);
+dump("combobox", cb);
+dump("listview", lv);
+
+// 通用事件（不在 _commandFuncnames 里，但所有控件都能挂）
+io.print("BUTTON-ONCOMMAND:" ++ tostring(btn.oncommand ? 1 : 0));
+io.print("BUTTON-ONNOTIFY:" ++ tostring(btn.onnotify ? 1 : 0));
+io.print("PROBE-OK");

@@ -6005,3 +6005,125 @@ DSG 往返 / anchors 往返，见 §6），但**工具箱这条路径几乎还�
 
 ❌ 剩余（用户点名的设计器项里还没做的）：控件事件一览、窗体属性对话框、
 布局器、Tab 顺序、资源视图（类视图第五十二轮已做）、控件分类自定义。
+
+---
+
+## 1.62 第五十七轮：设计器体验做深·二——控件事件一览
+
+用户点名的设计器项之一。现状：双击控件能生成**默认**事件的桩
+（`docs/ide-components.md` 的 `_commandFuncnames` 一栏），但**看不到这个
+控件到底有哪些事件** —— 想挂 `onSelChange` 得先知道它存在。
+
+### 1.62.1 事件数据**对齐官方**，不靠印象
+
+事件清单取自官方 win.ui 的**真实事件成员**：
+
+- **通用事件**（所有控件都能挂）：`oncommand`（WM_COMMAND 派发，
+  官方 `lib/win/ui/_.aardio:748`）、`onnotify`（WM_NOTIFY 派发，
+  同文件 `:813`）；
+- **控件特有事件**：官方各控件类在创建时带的 `_commandFuncnames`
+  映射（消息码 → 事件函数名）：
+  `edit.aardio:104` / `richedit.aardio:97` / `ipaddress.aardio:32`
+  → `onChange` / `onFocusGot` / `onFocusLost`；
+  `combobox.aardio:44` → 8 个（`onSelChange` / `onEditChange` /
+  `onFocusGot` / `onFocusLost` / `onDropDown` / `onCloseUp` /
+  `onOk` / `onCancel`）；`listbox.aardio:24` → 5 个
+  （`onSelChange` / `onSelCancel` / `onDoubleClickItem` /
+  `onFocusGot` / `onFocusLost`）。
+
+⚠ 先试过**运行时**问控件自己（`ctrl._commandFuncnames`），**读不到**：
+   独立探针里控件还没创建（官方 `form.add` 在窗体显示前延迟创建，
+   `hwnd=null`）；IDE 画布上的真实控件有 hwnd 但那张表仍是 null
+   （冒烟实测 `EV-TABLE:0`）。所以改为**静态对齐官方源码** ——
+   探针 `tests/probe_events.aardio` 留档了这个结论。
+
+### 1.62.2 UI 与接线
+
+- 左栏新增「**事件**」页签（`nodio.ui.list`，两列：事件 / 说明）：
+  选中控件 → 列出它支持的事件；双击某个事件 → 生成**那个事件**的桩。
+- `app/designer.nodio`：`canvas.onSelect` / `onChange` 都会刷新事件列表；
+  `hooks.onEventCode(item, ev)` 的第二个参数是**可选**的事件名
+  （省略 = 该控件的默认事件，双击组件的旧行为不变）。
+- `main/nodio` 的 `genEventStub(item, ev)` 按指定事件生成，
+  签名仍按事件类型区分（`onChange` → `function()`、
+  `onnotify` → `function(id,code,ptr)`、其余 → `function(id,event)`）。
+
+### 1.62.3 回归锁
+
+冒烟新增 3 条断言：
+
+| 断言 | 含义 |
+|---|---|
+| `EVENT-LIST:2/1` | button 的事件清单有 2 项且含 `oncommand` |
+| `EVENTS-EDIT:11` | edit 的事件表含 `onChange` + `onFocusGot`（对齐官方 `edit.aardio:104`） |
+| `EVENT-STUB-EV:1` | 指定事件（`onSelChange`）能生成处理函数桩 |
+
+全量回归：x64 20/20、x86 20/20。
+
+❌ 剩余：窗体属性对话框、布局器、Tab 顺序、资源视图、控件分类自定义、
+窗体级事件一览（onCreate/onClose/onSize…）。
+
+---
+
+## 1.63 第五十八轮：修「IDE 频繁闪」+ 拖拽走**真实窗口消息**验证
+
+用户反馈三件事：① 图标为什么用字体不用图标；② 组件没法拖拽设计；
+③ **IDE 频繁闪**。逐条查证（结论见下），这轮先修能修的。
+
+### 1.63.1 闪：根因是 `board.show(true)` 每次都整块重画
+
+追链：心跳每 300ms 调 `updateStartPane()`（`main.nodio`）→ 它调
+`startPane.show(#shell.tabOrder == 0)` → `startPane.show` 调
+`board.show(flag)` → **`board.show(true)` 每次都 `self.redraw()`**
+（`lib/nodio/ui/board.nodio`：显示后必须强制重画一次，因为官方 plus 的
+WM_PAINT 只画「本次失效区域」，首次显示的更新区常是空的）。
+
+于是**无文档时（开始页一直可见）每 300ms 整块重画一次** = 每 300ms
+闪一次；而且心跳里一次 show 会连着重画**两块**板（开始页的板 + 最近
+文件树的板）。
+
+修法：`board.show` 记一个 `__shown`，**只有「隐藏 → 显示」这一下才
+重画**，重复 `show(true)` 不动它（内容变了应该调 `invalidate`/`redraw`，
+不是 `show`）。首次显示那一次重画照旧保留（那个是必须的）。
+
+回归锁：板子暴露 `redrawCount()`，冒烟断言连续两次 `show(true)` 的
+重画增量 = **0**（`SHOW-REDRAW:0`）。
+
+> 顺带说明：`relayout()`（心跳里另一个重排入口）**有**尺寸守卫，
+> 不是闪烁源；`board.layout` 也只在尺寸变化时重画 ✓。
+
+### 1.63.2 拖拽：加一条**真实窗口消息**路径的验证
+
+用户说「组件没办法拖拽设计」。本轮把拖拽的验证从「直接调回调」升级到
+**真实窗口消息路径**：`toolbox.simulateDragMsg` 用 `::PostMessage` 把
+WM_LBUTTONDOWN / WM_MOUSEMOVE / WM_LBUTTONUP 投给工具箱板
+（同线程队列保序），走的是**子类化窗口过程 → onMouseDown/Move/Up →
+拖拽状态机 → onDrop**，与用户真的用鼠标拖是同一条路（仓库里已有同款
+做法：`tests/ide_click.ps1` 直接向命中的子窗口发鼠标消息，因为桌面锁屏
+时合成鼠标事件送不到 IDE）。
+
+冒烟断言 `DROP-MSG:1`（与回调路径的 `DROP-E2E:1` 并存）。
+
+⚠ 目标坐标在工具箱**左边**的画布上 → 客户区坐标是**负数** ——
+   这正是上一轮修的 `mouseScreen` 有符号解读要覆盖的场景，两条断言
+   一起把「拖出控件范围」这件事钉住。
+
+### 1.63.3 图标：官方**没有图标资源**，只能自研
+
+查实：官方 `D:\aardio\lib` 全树只有**一个** png（`win/ui/ctrl/pick/.res/
+color.png`），没有任何 ico/png 图标集 —— 官方 IDE 的工具条图标是
+**代码画**的（`lib/ide/aifix.aardio` 是闭源字节码，画法不可见）。
+
+Nodio 现状分两类：
+- **工具条 / 页签图标**：`nodio.ui.icons` 用 **FontAwesome 4.7 字体**
+  （官方 lib 自带 `lib/fonts/.res/FontAwesome.ttf`）画字形 → 用户看到的
+  就是「字体当图标」；
+- **工具箱里的控件缩略图**：**已经是 GDI+ 手绘**（`nodio.ui.icons.drawWidget`
+  按 16×16 设计稿画按钮/编辑框/复选框…），不是字体。
+
+改法有三条路（自绘矢量 / 换系统 Segoe MDL2 图标字体 / 引入位图资源），
+走哪条要用户拍板 —— 见本轮交付说明。
+
+❌ 剩余：图标方案落地；设计器侧还有窗体属性对话框、布局器、Tab 顺序、
+资源视图；拖拽时预览框刷新仍会整块重画底布（拖动过程中的轻微闪烁，
+与心跳那处不是一回事）。

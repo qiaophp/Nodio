@@ -37,6 +37,8 @@ pelican-bike.html
 !tests/editor_fold_probe.aardio
 !tests/editor_comp_probe.aardio
 !tests/editor_clip_probe.aardio
+# 官方 win.ui 事件清单探测（第五十七轮「控件事件一览」的依据，留档）
+!tests/probe_events.aardio
 
 # 发布回归自产的可执行产物（回归锁每次重新发布）
 tests/fixtures_dist/*.exe

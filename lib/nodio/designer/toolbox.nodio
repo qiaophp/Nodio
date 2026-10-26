@@ -162,6 +162,45 @@ toolbox = function(winform, opt){
 		return true;
 	}
 
+	// 供回归：**真实窗口消息**路径的拖拽模拟
+	//
+	// simulateDrag 直接调回调，能测状态机，但绕过了窗口过程；
+	// 这里用 ::PostMessage 把 WM_LBUTTONDOWN / WM_MOUSEMOVE /
+	// WM_LBUTTONUP 投给工具箱板 —— 走的是**真实消息路径**
+	// （子类化窗口过程 → onMouseDown/Move/Up → 拖拽状态机），
+	// 和用户真的用鼠标拖是同一条路。
+	// 仓库里已有同款做法：tests/ide_click.ps1 就是直接向命中的子窗口
+	// 发 WM_LBUTTONDOWN/UP（桌面锁屏时合成鼠标事件送不到 IDE）。
+	//
+	// 三条消息进同一个线程的消息队列，顺序保证（down → move → up）。
+	// 目标坐标在工具箱**左边**的画布上 → 客户区坐标是负数 ——
+	// 这正是有符号解读要覆盖的场景。
+	self.simulateDragMsg = function(specName, screenX, screenY){
+		var idx = 0;
+		for(i=1;#self.rows;1){
+			var row = self.rows[i];
+			if(row.kind == "item" && row.spec && row.spec.name == specName){
+				idx = i;
+				break;
+			}
+		}
+		if(!idx) return false;
+		var r0 = self.rows[idx];
+		var bx = 10, by = r0.y + math.floor(r0.h/2);
+		var hwnd = self.board.ctrl.hwnd;
+		// 目标屏幕坐标 → 客户区坐标（基准是客户区原点，与 mouseScreen 一致）
+		var ox, oy = ..win.toScreen(hwnd, 0, 0);
+		if(ox === null || ox === undefined) return false;
+		var lpx = screenX - ox;
+		var lpy = screenY - oy;
+		var lpDown = (by << 16) | (bx & 0xFFFF);
+		var lpMove = ((lpy & 0xFFFF) << 16) | (lpx & 0xFFFF);
+		::PostMessage(hwnd, 0x201/*WM_LBUTTONDOWN*/, 1, lpDown);
+		::PostMessage(hwnd, 0x200/*WM_MOUSEMOVE*/, 0, lpMove);
+		::PostMessage(hwnd, 0x202/*WM_LBUTTONUP*/, 0, lpMove);
+		return true;
+	}
+
 	// 重新生成行
 	self.refresh = function(){
 		self.rows = {};
