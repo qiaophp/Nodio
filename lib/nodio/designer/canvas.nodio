@@ -70,6 +70,8 @@ canvas = function(winform, opt){
 		zoom = opt.zoom : 100;
 		// 动态对齐参考线（拖拽时生成，松手清空）
 		__guideLines = {};
+		// 拖拽落点预览（第五十六轮：从工具箱拖控件时画一个半透明框）
+		__dropPreview = null;
 		// 多选与撤销
 		selection = {};
 		undoStack = {};
@@ -437,6 +439,108 @@ canvas = function(winform, opt){
 		self.__hook(item);
 		return item;
 	}
+
+	// ---------- 落点换算（第五十六轮：工具箱拖拽） ----------
+	//
+	// 拖控件进画布要两件事：
+	//   ① 屏幕/客户区坐标 → **设计坐标**（DSG 里的 left/top，逻辑像素）
+	//   ② 判断落点是不是在**窗体表面**里（落在工作区灰色地带不算）
+	//
+	// 反推依据是 __place 的正变换（canvas.nodio:286）：
+	//   客户区X = origin.left + fs.x + round(px(item.x) * zoom)
+	//   客户区Y = origin.top  + fs.y + fs.capH + round(px(item.y) * zoom)
+	// px() 是逻辑→物理（DPI 缩放），zoom 是设计器缩放比例。
+	// ⚠ 反算有 ±1 物理像素的舍入误差（正变换里 round 过一次）——
+	//   放置时再 round 一次即可，不影响肉眼。
+
+	// 主窗体客户区坐标 → 设计坐标
+	self.clientToDesign = function(cx, cy){
+		var fs = self.__fs();
+		var sc = ..nodio.ui.dpiScale();
+		var zs = self.zoomScale ? self.zoomScale() : 1.0;
+		var ox = self.origin.left + fs.x;
+		var oy = self.origin.top + fs.y + fs.capH;
+		var k = sc * zs;
+		if(!k) k = 1;
+		return {x = (cx - ox) / k; y = (cy - oy) / k};
+	};
+
+	// 主窗体客户区坐标是否落在**窗体表面的客户区**里
+	// （窗体表面 = 标题栏 + 边框 + 客户底色那块；外面是工作区）
+	self.hitSurface = function(cx, cy){
+		var fs = self.__fs();
+		var ox = self.origin.left + fs.x;
+		var oy = self.origin.top + fs.y + fs.capH;
+		if(cx < ox || cy < oy) return false;
+		if(cx >= ox + fs.w || cy >= oy + fs.h) return false;
+		return true;
+	};
+
+	// 设计坐标 → 主窗体客户区坐标（正变换；预览框要画在屏幕位置）
+	self.designToClient = function(dx, dy){
+		var fs = self.__fs();
+		var sc = ..nodio.ui.dpiScale();
+		var zs = self.zoomScale ? self.zoomScale() : 1.0;
+		var ox = self.origin.left + fs.x;
+		var oy = self.origin.top + fs.y + fs.capH;
+		return {
+			x = ox + math.round(..nodio.ui.px(dx) * zs);
+			y = oy + math.round(..nodio.ui.px(dy) * zs);
+		};
+	};
+
+	// ---------- 自动避让（第五十六轮） ----------
+	//
+	// 以前从工具箱加控件一律落在 (20,20) —— 连点三次就是三个控件叠在
+	// 左上角，谁也点不中第二个。这在官方设计器里是**拖出来**的，
+	// 单击添加也有个默认落点，但绝不叠在一起。
+	//
+	// 这里找**第一个不与现有控件相交**的位置：先向右排开，排不下就换行。
+	// 相交判定留 2 个逻辑像素的间隙（挨着的控件不算重叠）。
+	//
+	// ⚠ freeSpotIn 是**纯函数**（控件列表由外面传进来，不摸画布状态）：
+	//   这样它能被回归锁单独断言 —— 不必真在画布上加/删控件来试。
+	self.freeSpotIn = function(items, w, h, preferX, preferY, maxX, maxY){
+		w = w : 120; h = h : 30;
+		preferX = preferX : GRID_SIZE;
+		preferY = preferY : GRID_SIZE;
+		if(maxX === null || maxX === undefined) maxX = 0;
+		if(maxY === null || maxY === undefined) maxY = 0;
+		// 已经有控件挡着吗
+		var __overlap = function(x, y){
+			for(i=1;#items;1){
+				var it = items[i];
+				if(!it) continue;
+				if(x < it.x + it.w + 2 && x + w + 2 > it.x
+					&& y < it.y + it.h + 2 && y + h + 2 > it.y) return true;
+			}
+			return false;
+		};
+		var x = preferX, y = preferY;
+		for(n=1; 64; 1){
+			if(x > maxX){
+				x = preferX;
+				y = y + h + GRID_SIZE;
+			}
+			if(y > maxY) break;
+			if(!__overlap(x, y)) return {x=x; y=y; w=w; h=h};
+			x = x + w + GRID_SIZE;
+		}
+		// 窗体塞满了 → 回首选点（重叠也比没有落点强）
+		return {x=preferX; y=preferY; w=w; h=h};
+	};
+
+	// 画布版：拿当前所有控件算一个空位
+	self.freeSpot = function(w, h, preferX, preferY){
+		var list = {};
+		for(i=1;#self.items;1){
+			var it = self.items[i];
+			if(!it) continue;
+			..table.push(list, {x=it.x; y=it.y; w=it.w; h=it.h});
+		}
+		return self.freeSpotIn(list, w, h, preferX, preferY,
+			self.form.w - (w : 120), self.form.h - (h : 30));
+	};
 
 	// 组件自己的窗口过程：选中 + 拖动
 	// 子类化用 nodio.ui.subclass：所有控件共用一个原生 trampoline，
@@ -1148,6 +1252,21 @@ canvas = function(winform, opt){
 		return #self.items;
 	}
 
+	// ---------- 拖拽落点预览（第五十六轮） ----------
+	//
+	// 从工具箱拖控件进画布时，鼠标位置要能看出**会落在哪** ——
+	// 盲拖（松手才知道落哪）不是设计器的做法。
+	// 预览框是**设计坐标**，画在底板上（与选中框同一层）。
+	self.setDropPreview = function(x, y, w, h){
+		self.__dropPreview = {x=x; y=y; w=w; h=h};
+		self.__refresh();
+	}
+	self.clearDropPreview = function(){
+		if(!self.__dropPreview) return;
+		self.__dropPreview = null;
+		self.__refresh();
+	}
+
 	// ---------- 绘制 ----------
 	// 工作区 + 窗体表面（标题栏/边框/客户底色）+ 客户区网格 + 边距线 +
 	// 吸附参考线 + 选中框 + 8 个手柄。
@@ -1242,6 +1361,22 @@ canvas = function(winform, opt){
 				}
 			}
 			gpen.delete();
+		}
+		// 拖拽落点预览（第五十六轮）：半透明蓝底 + 实线边框
+		// 画在底板上（与选中框同一层），松手后自动清掉
+		if(self.__dropPreview){
+			var dp = self.__dropPreview;
+			var dpz = self.zoomScale ? self.zoomScale() : 1.0;
+			var dx0 = cOffX + math.round(..nodio.ui.px(dp.x) * dpz);
+			var dy0 = cOffY + math.round(..nodio.ui.px(dp.y) * dpz);
+			var dw0 = math.round(..nodio.ui.px(dp.w) * dpz);
+			var dh0 = math.round(..nodio.ui.px(dp.h) * dpz);
+			var dbrush = ..gdip.solidBrush(0x301F6FB2);
+			graphics.fillRect(dbrush, dx0, dy0, dw0, dh0);
+			dbrush.delete();
+			var dpen = ..gdip.pen(self.frameColor, 1);
+			graphics.drawRectangle(dpen, dx0, dy0, dw0, dh0);
+			dpen.delete();
 		}
 		// 选中「窗体本身」：表面整框（含标题栏；尺寸在属性格改）
 		if(self.__formSel){

@@ -3309,6 +3309,52 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		io.print("AI-TAB:" ++ tostring(aiOn) ++ "/" ++ tostring(aiOff));
 		io.print("AI-CTRLS:" ++ tostring(shell.aiPanel.log ? 1 : 0) ++ "/"
 			++ tostring(shell.aiPanel.input ? 1 : 0));
+
+		// ---------- 第五十六轮：设计器拖拽落点 ----------
+		//
+		// ① 接线完整性：工具箱的 onDrop 回调挂上了吗
+		io.print("DROP-WIRED:" ++ tostring(app.designer.dropReady() ? 1 : 0));
+		// ② 避让算法：已有控件占着 (20,20) 时，落点必须避开它
+		//    （以前从工具箱加控件一律落在 (20,20)，连点三次就叠一起）
+		var __spot = app.designer.canvasFreeSpotIn(
+			{ {x=20; y=20; w=120; h=30} }, 120, 30, 20, 20, 600, 400);
+		var __ovl = (__spot.x < 142 && __spot.x + 122 > 20
+			&& __spot.y < 52 && __spot.y + 32 > 20) ? 1 : 0;
+		io.print("SPOT-FREE:" ++ (__ovl ? "OVERLAP" : "OK"));
+		// ③ 坐标往返：设计坐标 → 客户区 → 设计坐标，误差 ≤ 1 设计像素
+		var __c = app.designer.canvasDesignToClient(40, 30);
+		var __d = app.designer.canvasClientToDesign(__c.x, __c.y);
+		var __err = math.abs(__d.x - 40) + math.abs(__d.y - 30);
+		io.print("COORD-RT:" ++ (__err <= 2 ? "OK" : ("BAD:" ++ tostring(__err))));
+		// ④ 表面命中：窗体表面内 true、表面外 false
+		var __inS = app.designer.canvasHitSurface(__c.x, __c.y);
+		var __outS = app.designer.canvasHitSurface(5, 5);
+		io.print("SURFACE-HIT:" ++ ((__inS && !__outS) ? "OK" : "BAD"));
+
+		// ⑤ 端到端：模拟一次**真实拖拽**（按下 → 移动 → 松开），
+		//    控件必须真的落到画布上（走工具箱自己的鼠标回调路径）。
+		if(!app.designer.isActive()){
+			if(shell.hooks.onDesigner) shell.hooks.onDesigner();
+		}
+		var __n0 = app.designer.canvasCount();
+		var __rect = app.designer.surfaceScreenRect();
+		var __e2e = 0;
+		if(__rect){
+			var __ran = app.designer.simulateToolboxDrop("按钮",
+				__rect.left + 120, __rect.top + 80);
+			var __n1 = app.designer.canvasCount();
+			var __sel = app.designer.canvasSelected();
+			// ⚠ 不能用 `#__sel` 判空：aardio 的 `#` 是**数组长度**语义，
+			//   对字符串键的 table（组件描述）恒为 0 —— 写 `#>0` 会永远判假。
+			var __hasSel = (__sel !== null && __sel !== undefined) ? 1 : 0;
+			__e2e = (__ran && __n1 == __n0 + 1 && __hasSel) ? 1 : 0;
+			io.print("DROP-E2E:" ++ tostring(__e2e));
+			// 清理：测试加的控件删掉，别把画布弄脏（后面的断言还要用画布）
+			if(__hasSel) app.designer.canvasRemove(__sel.name);
+		}
+		else{
+			io.print("DROP-E2E:SKIP");
+		}
 	},900);
 
 	// ---------- AI 发送链路：等结果出来再断言 ----------

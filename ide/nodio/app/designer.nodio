@@ -16,6 +16,7 @@
 // 官方对应机制见 docs/official-ide-reference.md §3（ide.customCtrl 的
 // "真实类名 » 设计器替身类名" 映射，对应本模块的 drawAs 字段）。
 import win.ui;
+import win;          // win.toClient：屏幕坐标 → 客户区坐标（拖拽落点用）
 import nodio.designer.registry;
 import nodio.designer.toolbox;
 import nodio.designer.propertyGrid;
@@ -67,9 +68,67 @@ create = function(sh){
 	// wiring
 	toolbox.onPick = function(spec){
 		if(!spec) return;
-		var item = canvas.add(spec, {x=20; y=20; w=120; h=30});
+		if(!visible){
+			shell.setStatus("请先打开设计器（Shift+F7）再添加控件");
+			return;
+		}
+		// 落点不再固定在 (20,20)：每次都找一个**不与现有控件重叠**的位置。
+		// （以前连点三次 = 三个控件叠在左上角，第二个根本点不中。）
+		var spot = canvas.freeSpot(120, 30, 20, 20);
+		var item = canvas.add(spec, spot);
+		if(!item) return;
 		canvas.select(item.name);
 		shell.setStatus("已加入控件: " ++ spec.name);
+	}
+	// 落点计算（拖拽预览与真正放置共用）
+	//
+	// 坐标链路：屏幕坐标 → 主窗体客户区坐标（win.toClient）→ 设计坐标
+	//（canvas.clientToDesign）。落点必须在**窗体表面**里 ——
+	// 拖到外面的工作区灰色地带不算（官方行为也是无效）。
+	//
+	// 返回 {x;y;w;h}（设计坐标）或 null（不在表面内 / 画布没开）。
+	var __dropSpot = function(screenX, screenY, w, h){
+		if(!canvas || !visible) return null;
+		var cx, cy = ..win.toClient(shell.winform.hwnd, screenX, screenY);
+		if(!canvas.hitSurface(cx, cy)) return null;
+		var d = canvas.clientToDesign(cx, cy);
+		var x = math.round(d.x - w/2);
+		var y = math.round(d.y - h/2);
+		if(x < 0) x = 0;
+		if(y < 0) y = 0;
+		return {x=x; y=y; w=w; h=h};
+	};
+	// 拖动过程中：画落点预览框（看不到落点就是盲拖）
+	toolbox.onDragMove = function(spec, screenX, screenY){
+		if(!spec) return;
+		var spot = __dropSpot(screenX, screenY, 120, 30);
+		if(!spot){
+			canvas.clearDropPreview();
+			shell.setStatus("拖到窗体表面内再放下");
+			return;
+		}
+		canvas.setDropPreview(spot.x, spot.y, spot.w, spot.h);
+	}
+	// 拖拽落点（第五十六轮）：从工具箱**拖**到窗体表面，松手就在那儿建控件。
+	toolbox.onDrop = function(spec, screenX, screenY){
+		if(!spec) return;
+		canvas.clearDropPreview();
+		if(!visible){
+			shell.setStatus("请先打开设计器（Shift+F7）再添加控件");
+			return;
+		}
+		var spot = __dropSpot(screenX, screenY, 120, 30);
+		if(!spot){
+			shell.setStatus("请把控件拖到窗体表面内再放下");
+			return;
+		}
+		var item = canvas.add(spec, spot);
+		if(!item){
+			shell.setStatus("添加控件失败");
+			return;
+		}
+		canvas.select(item.name);
+		shell.setStatus("已加入控件: " ++ spec.name ++ "（" ++ spot.x ++ "," ++ spot.y ++ "）");
 	}
 	canvas.onSelect = function(item){
 		curItem = item;
@@ -343,4 +402,71 @@ canvasSetParam = function(name, key, v){
 		}
 	}
 	return false;
+}
+
+// —— 第五十六轮：拖拽落点的换算与避让（供回归锁断言）——
+//
+// 拖控件进画布要两件事：屏幕坐标 → 设计坐标的换算，以及「别叠在一起」
+// 的空位查找。这两件都是纯逻辑，单独暴露出来就能被冒烟直接断言，
+// 不必真去拖鼠标、也不必在画布上加/删控件来试。
+
+// 主窗体客户区坐标 → 设计坐标
+canvasClientToDesign = function(cx, cy){
+	if(!canvas) return null;
+	return canvas.clientToDesign(cx, cy);
+}
+
+// 设计坐标 → 主窗体客户区坐标（往返一致性用）
+canvasDesignToClient = function(dx, dy){
+	if(!canvas) return null;
+	return canvas.designToClient(dx, dy);
+}
+
+// 客户区坐标是否落在窗体表面内
+canvasHitSurface = function(cx, cy){
+	if(!canvas) return false;
+	return canvas.hitSurface(cx, cy);
+}
+
+// 避让算法（纯函数）：items = {x;y;w;h} 列表
+canvasFreeSpotIn = function(items, w, h, x, y, maxX, maxY){
+	if(!canvas) return null;
+	return canvas.freeSpotIn(items, w, h, x, y, maxX, maxY);
+}
+
+// 工具箱的拖拽入口接上了吗（接线完整性）
+dropReady = function(){
+	return !!(toolbox && toolbox.onDrop);
+}
+
+// —— 端到端拖拽（供回归锁）——
+//
+// simulateToolboxDrop：模拟一次**真实拖拽**（按下 → 移动 → 松开），
+// 走的是工具箱自己的鼠标回调路径，所以拖拽状态机（阈值判定、鼠标
+// 捕获、onDrop 触发）全都被覆盖到 —— 只断言「onDrop 被调用」是自欺欺人。
+simulateToolboxDrop = function(specName, screenX, screenY){
+	if(!toolbox) return false;
+	return toolbox.simulateDrag(specName, screenX, screenY);
+}
+
+// 画布上的控件数（拖拽前后对比 = 控件确实建出来了）
+canvasCount = function(){
+	return canvas ? #canvas.items : 0;
+}
+
+// 移除一个控件（回归测试后清理，别把画布弄脏）
+canvasRemove = function(name){
+	if(!canvas) return false;
+	return canvas.remove(name);
+}
+
+// 窗体表面在**屏幕坐标**里的矩形（拖拽落点的目标区域）
+surfaceScreenRect = function(){
+	if(!canvas) return null;
+	var a = canvas.designToClient(0, 0);
+	var b = canvas.designToClient(canvas.form.w, canvas.form.h);
+	if(!a || !b) return null;
+	// 客户区原点 → 屏幕坐标
+	var ox, oy = ..win.toScreen(shell.winform.hwnd, 0, 0);
+	return {left = ox + a.x; top = oy + a.y; right = ox + b.x; bottom = oy + b.y};
 }

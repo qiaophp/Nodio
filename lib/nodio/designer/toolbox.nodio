@@ -13,6 +13,7 @@
 //   tb.refresh()
 //   tb.onPick = function(spec){ ... }   // 选中一个组件
 namespace nodio.designer{
+import win;              // win.getRect：模拟拖拽时要把屏幕坐标换回客户区坐标
 import nodio.designer.registry;
 import nodio.ui.board;
 import nodio.ui.rect;
@@ -33,7 +34,9 @@ toolbox = function(winform, opt){
 		rows = {};        // 布局好的行：{kind="cat"/"item"; text=..; spec=..; y=..; h=..}
 		hover = 0;        // 悬停行号
 		selIndex = 0;
-		onPick = null;
+		onPick = null;    // function(spec) —— 单击选中一个组件
+		onDrop = null;    // function(spec, screenX, screenY) —— **拖**到画布上
+		onDragMove = null; // function(spec, screenX, screenY) —— 拖动过程中（预览）
 		// 配色
 		bgColor     = opt.bgColor : th.panel;
 		catColor    = opt.catColor : th.text;
@@ -75,6 +78,88 @@ toolbox = function(winform, opt){
 		self.selIndex = i;
 		self.board.invalidate();
 		if(self.onPick && row.spec) self.onPick(row.spec);
+	}
+
+	// ---------- 拖拽（第五十六轮） ----------
+	//
+	// 官方设计器是把控件从工具箱**拖**到窗体上；以前这里只能「点一下」，
+	// 落点还固定在 (20,20)（designer.nodio 的 onPick）—— 连点三次就是
+	// 三个控件叠在左上角，谁也点不中第二个。
+	//
+	// 拖拽判定：按下后位移超过阈值（4px，与 board 的点击判定同值）
+	// 就算拖拽；松开时按**屏幕坐标**回报落点 ——
+	// 拖拽途中鼠标会离开工具箱，客户区坐标不再可靠。
+	//
+	// ⚠ __drag 必须用 **var** 声明为局部变量：aardio 里函数体内的裸赋值
+	//   写的是**全局表**（模块成员），这里要的是每次构造一份的局部状态。
+	var __drag = null;
+
+	self.board.onMouseDown = function(x, y, bd, lp){
+		var i = self.__hitIndex(y);
+		if(!i) return;
+		var row = self.rows[i];
+		if(row.kind != "item" || !row.spec) return;
+		// 按下时还分不清是「点」还是「拖」，先记下候选
+		__drag = {spec = row.spec; row = i; downX = x; downY = y; moved = false};
+		// 捕获鼠标：拖到工具箱外面（画布上）也要继续收到 move/up
+		self.board.setCapture(true);
+	}
+	self.board.onMouseMove = function(x, y, bd, lp){
+		if(!__drag) return;
+		if(!__drag.moved){
+			if(math.abs(x - __drag.downX) < 4 && math.abs(y - __drag.downY) < 4) return;
+			__drag.moved = true;
+		}
+		if(self.onDragMove){
+			var m = ..nodio.ui.mouseScreen(self.board.ctrl.hwnd, lp);
+			if(m) self.onDragMove(__drag.spec, m.x, m.y);
+		}
+	}
+	self.board.onMouseUp = function(x, y, bd, lp){
+		if(!__drag) return;
+		var d = __drag;
+		__drag = null;
+		self.board.setCapture(false);
+		// 没拖动 = 单击 → 交给 onMouseClick 的既有路径
+		if(!d.moved) return;
+		var m = ..nodio.ui.mouseScreen(self.board.ctrl.hwnd, lp);
+		if(!m) return;
+		if(self.onDrop) self.onDrop(d.spec, m.x, m.y);
+	}
+
+	// 供回归：模拟一次拖拽（按下 → 移动 → 松开）
+	//
+	// 走的是**真实回调路径**（onMouseDown/onMouseMove/onMouseUp），
+	// 所以拖拽状态机（阈值判定、鼠标捕获、onDrop 触发）都被覆盖到 ——
+	// 只测「onDrop 被调用」是自欺欺人。
+	//
+	// specName：工具箱里的控件名；screenX/screenY：目标**屏幕坐标**。
+	// 返回 true = 这一路模拟跑完了（不代表控件真的建出来了）。
+	self.simulateDrag = function(specName, screenX, screenY){
+		var idx = 0;
+		for(i=1;#self.rows;1){
+			var row = self.rows[i];
+			if(row.kind == "item" && row.spec && row.spec.name == specName){
+				idx = i;
+				break;
+			}
+		}
+		if(!idx) return false;
+		var r0 = self.rows[idx];
+		var bx = 10, by = r0.y + math.floor(r0.h/2);
+		// 目标屏幕坐标 → board 客户区坐标（lParam 低16位=x、高16位=y）
+		// ⚠ 基准必须用**客户区原点**（win.toScreen），与 mouseScreen 的
+		//   解读口径完全一致 —— 用窗口矩形左上会差一个边框宽度。
+		var ox, oy = ..win.toScreen(self.board.ctrl.hwnd, 0, 0);
+		if(ox === null || ox === undefined) return false;
+		var lpx = screenX - ox;
+		var lpy = screenY - oy;
+		var lp = ((lpy & 0xFFFF) << 16) | (lpx & 0xFFFF);
+		self.board.onMouseDown(bx, by, self.board, 0);
+		// 越过拖拽阈值（4px）
+		self.board.onMouseMove(bx + 40, by, self.board, 0);
+		self.board.onMouseUp(bx + 40, by, self.board, lp);
+		return true;
 	}
 
 	// 重新生成行

@@ -336,6 +336,18 @@ foreach ($v in @('VIS-LEFT','VIS-RIGHT','VIS-BOTTOM','VIS-DOC','VIS-ED','VIS-TOO
 if ($out -notmatch 'IMMEDIATE-TAB:OK')  { Write-Output 'FAIL: immediate window tab is missing'; exit 1 }
 if ($out -notmatch 'IMMEDIATE-MENU:OK') { Write-Output 'FAIL: immediate window menu entry is missing'; exit 1 }
 
+# 设计器拖拽落点（第五十六轮）：工具箱 → 画布的拖拽入口 + 坐标换算 + 避让。
+#   DROP-WIRED:1   工具箱 onDrop 回调已接线
+#   SPOT-FREE:OK   已有控件占着 (20,20) 时，新落点不与它重叠
+#   COORD-RT:OK    设计坐标 → 客户区 → 设计坐标 往返一致（误差 ≤1 设计像素）
+#   SURFACE-HIT:OK 窗体表面内命中、表面外不命中
+if ($out -notmatch 'DROP-WIRED:1')    { Write-Output 'FAIL: designer toolbox drop target is not wired'; exit 1 }
+if ($out -notmatch 'SPOT-FREE:OK')   { Write-Output 'FAIL: designer free-spot overlaps an existing control'; exit 1 }
+if ($out -notmatch 'COORD-RT:OK')    { Write-Output 'FAIL: designer coordinate round-trip is inconsistent'; exit 1 }
+if ($out -notmatch 'SURFACE-HIT:OK') { Write-Output 'FAIL: designer form-surface hit test is wrong'; exit 1 }
+# DROP-E2E:1    端到端：模拟一次真实拖拽（按下→移动→松开）后，控件真的落到了画布上
+if ($out -notmatch 'DROP-E2E:1')     { Write-Output 'FAIL: designer drag-and-drop did not create a control'; exit 1 }
+
 # AI 面板（app.ai）：页签切过去要显示、切回来要隐藏；控件与会话都在
 if ($out -notmatch 'AI-TAB:true/false') { Write-Output 'FAIL: AI panel tab visibility is wrong'; exit 1 }
 if ($out -notmatch 'AI-CTRLS:1/1')      { Write-Output 'FAIL: AI panel controls are missing'; exit 1 }

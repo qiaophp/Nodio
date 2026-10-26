@@ -142,12 +142,26 @@ addCtrl = function(form, name, tParam){
 // 光标的屏幕坐标（由窗口句柄 + lParam 算）。
 // 拖拽必须用屏幕坐标：控件在拖动过程中会跟着鼠标走，
 // lParam（客户区坐标）会跟着变，用它算增量会漂移。
+//
+// ⚠ lParam 里的客户区坐标是**有符号 16 位**：鼠标拖出控件范围时
+//   坐标会是负数（WM_LBUTTONUP 的 lParam 低/高 16 位按 signed 解读）。
+//   按无符号解读会把 -190 算成 65446 —— 落点偏到十万像素外，
+//   表现为「拖到画布上松手，控件没落下来」。
+//   （这个坑是第五十六轮的端到端拖拽断言抓出来的。）
+//
+// ⚠ 客户区原点的屏幕坐标用 win.toScreen 取，不用「窗口矩形左上 + 客户区
+//   坐标」：后者差一个边框宽度。
 mouseScreen = function(hwnd, lParam){
-	var r = ..win.getRect(hwnd, true);
-	if(!r) return null;
+	if(!hwnd) return null;
+	var ox, oy = ..win.toScreen(hwnd, 0, 0);
+	if(ox === null || ox === undefined) return null;
+	var lx = lParam & 0xFFFF;
+	if(lx > 0x7FFF) lx = lx - 0x10000;
+	var ly = (lParam >> 16) & 0xFFFF;
+	if(ly > 0x7FFF) ly = ly - 0x10000;
 	return {
-		x = r.left + (lParam & 0xFFFF);
-		y = r.top + ((lParam >> 16) & 0xFFFF);
+		x = ox + lx;
+		y = oy + ly;
 	};
 }
 
