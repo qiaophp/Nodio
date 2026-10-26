@@ -1600,7 +1600,7 @@ namespace
         if (!ctx->code) return nullptr;
         ComRawTrace(L"[comraw] stub %ls kind=%d code=%p interp=%p\n",
                     mi.name.c_str(), mi.kind, ctx->code, (void*)ctx->interp);
-        g_cbs.push_back(ctx);
+        g_cbs.push_back(spCtx);
         st->cbs.push_back(spCtx);
         return ctx->code;
     }

@@ -5567,3 +5567,46 @@ tests/vmtests/t99.envcheck.aardio。第 46 轮（并行会话）的回退判词�
 宽 uint16）后**完全稠密不再退化**：12M 分配、5665MB（-34%）、2.5-2.9s
 （-15-20%）。callbench 同步小升（GLOBAL2 0.84-0.91µs）。VM 套件 x64
 97/0/0 复跑全绿；x86 t99 带 overlay 全绿、dense12 x86 SUM=78 ✓。
+
+### 1.56 审计修复 R1——P0 三项（AUDIT-01/02/03）
+
+2026 年 10 月 VM 全面审计（docs/audit-2026-10-vm.md）分轮修复第一轮。
+基线 wt-audit @ 3dd464e 完成修复与全链路验证后，patch 落主树
+1ea693a（与第五十轮稠密槽无交互，apply --check 干净）。补丁
+.audit-r1-p0-fix.patch（7 文件 +41/−28），底稿 .audit-r1-p0-fix.md。
+
+**AUDIT-01（P0 UAF）**：回调注册表 g_cbs 由裸指针 vector<CbCtx*> 改
+vector<weak_ptr<CbCtx>>——GC mark 遍历 expired() 清理 + lock() 判活
+（rooted 语义不变），ReleaseCallback 按 lock 匹配 erase；三个注册点
+（raw.tostdcall / COM raw stub / 动态 FFI）持强引用语义不变。
+
+**AUDIT-02（P0 UAF）**：g_forms 由 map<HWND, FormState*> 改
+map<HWND, shared_ptr<FormState>>——WM_NCDESTROY 只摘注册不再 delete
+（修"窗体销毁后 WndProc 仍在用已释放 FormState"竞态）；doModal 加
+IsWindow(hwnd) 退出保险；创建失败路径 make_shared/reset 配对。
+
+**AUDIT-03（P0 AV）**：sysapi DrawText 签名补 cch 参数，对齐真实
+Win32 五参 DrawTextW 契约（原四参映射把 rect 当 cch、flags 当 rect，
+非确定性访问违例，探针坐实）。
+
+**伴随（AUDIT-09 策略）**：动态 FFI 裸函数回调按官方契约只在调用期间
+存活——lambda 作用域 dynCbs 收集，调用返回后统一 ReleaseCallback
+（跳板转中性桩返回 0，迟调用安全）。
+
+#### 1.56.1 回归数字
+
+- ASAN（build-r1-asan，基线 3dd464e+R1）：**92 passed / 5 failed /
+  0 skipped**——审计基线 84/12/1 中的 7 项 UAF（t91 + t34/35/36/37/
+  38/46）全部转绿，t23 由 SKIP 恢复执行并 PASS；剩 5 失败全部为审计
+  已定案的 ASAN 帧膨胀伪红族（t70/t94/t95/t97/t98）。
+- 普通（wt-audit 基线版）：97/97 全绿（含伪红族与 t23）。
+- 主树（1ea693a + R1，build-x64 正规目录）：**98/98 全绿、0 跳过**
+  （主树 tests 较基线多 1 用例）；七套 CLI（vm/iofile/builtin/stdlib/
+  publish/import/winclip）全绿。
+- 环境注：主树构建曾放 build-r1-main-x64 非正规目录，t30/t59/iofile
+  写盘族整片红——火绒按程序路径拦截（run_regression.ps1 头注既有记
+  载），复制到 build-x64\Release 重跑全绿，引擎无 bug。
+- A/B（perf_ab 5 轮中位，TAIL_EQ 行为等价）：x64 +3~6%（loop 1.033/
+  call 1.058/lenfn 1.061/callv 1.030）；x86 方向翻转/持平（1.001/
+  **0.974**/0.989/0.996）——定性 MSVC 编译布局效应（§1.51 同因先例），
+  非语义回退（R1 触及的 g_cbs/g_forms 遍历在四夹具下均为空容器）。

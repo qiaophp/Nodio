@@ -286,7 +286,7 @@ namespace NodioVM
         ctx->owner = Value();
         for (auto it = g_cbs.begin(); it != g_cbs.end(); ++it)
         {
-            if (*it == ctx) { g_cbs.erase(it); break; }
+            if (it->lock().get() == ctx) { g_cbs.erase(it); break; }
         }
         // Neutralize the stub. Native code may still hold the pointer (the
         // official contract warns about exactly this), and a late call must
@@ -1778,7 +1778,7 @@ namespace NodioVM
     }
 
 
-    std::vector<CbCtx*> g_cbs;
+    std::vector<std::weak_ptr<CbCtx>> g_cbs;
     CbDispatchFn g_cbDispatch = nullptr;
     std::wstring g_curModuleFile;
 
@@ -2011,6 +2011,7 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     Value origVal;
                 };
                 std::vector<DirectRef> outStructs;
+                std::vector<std::shared_ptr<CbCtx>> dynCbs;
 
                 for (size_t i = 0; i < a.size(); i++)
                 {
@@ -2148,14 +2149,16 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     else if (v.t == Value::Func)
                     {
                         // Bare script function passed to dynamic FFI: auto-wrap as stdcall callback
-                        CbCtx* ctx = new CbCtx();
+                        auto spCtx = std::make_shared<CbCtx>();
+                        CbCtx* ctx = spCtx.get();
                         ctx->fn = v;
                         ctx->sig.bCdecl = false;
                         ctx->sig.ret = ARI64;
                         for (int p = 0; p < 8; p++) ctx->sig.params.push_back(ARI64);
                         ctx->interp = this;
                         CallbackTrampoline(ctx);
-                        g_cbs.push_back(ctx);
+                        g_cbs.push_back(spCtx);
+                        dynCbs.push_back(spCtx);
                         slots.push_back((SlotT)(INT_PTR)ctx->code);
                     }
                     else
@@ -2191,6 +2194,14 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                     else
                         vRet = Value::Num_((double)(int)r);
                 }
+
+                // Temporary dynamic FFI callbacks live only for the duration
+                // of the native call (official contract); release after return.
+                for (auto& sp : dynCbs)
+                {
+                    ReleaseCallback(sp.get());
+                }
+                dynCbs.clear();
 
                 if (!outStructs.empty())
                 {

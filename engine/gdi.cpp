@@ -5,7 +5,7 @@
 
 namespace NodioVM
 {
-    std::map<HWND, FormState*> g_forms;
+    std::map<HWND, std::shared_ptr<FormState>> g_forms;
 
     struct GdiCtx
     {
@@ -148,7 +148,7 @@ namespace NodioVM
                                         LPARAM lp)
     {
         auto it = g_forms.find(hwnd);
-        FormState* fs = it != g_forms.end() ? it->second : nullptr;
+        std::shared_ptr<FormState> fs = it != g_forms.end() ? it->second : nullptr;
 
         // Form-level custom wndproc interceptor:
         // winform.wndproc = function(hwnd, message, wParam, lParam)
@@ -379,7 +379,6 @@ namespace NodioVM
             if (fs)
             {
                 g_forms.erase(hwnd);
-                delete fs;
             }
             return 0;
         }

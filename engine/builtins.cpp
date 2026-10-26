@@ -7990,7 +7990,7 @@ void Interp::InitBuiltins()
                         // callback must not be a GC root on its own
                         ctx->rooted = false;
                         CallbackTrampoline(ctx);
-                        g_cbs.push_back(ctx);
+                        g_cbs.push_back(spCtx);
                         void* pCode = ctx->code;
 
                         auto spObj = std::make_shared<Table>();
@@ -9667,7 +9667,7 @@ void Interp::InitBuiltins()
                     wstring strText = a.size() > 0 ? BStr(a[0]) : L"窗体";
                     int nW = a.size() > 1 ? (int)BNum(a[1]) : 600;
                     int nH = a.size() > 2 ? (int)BNum(a[2]) : 400;
-                    FormState* fs = new FormState();
+                    auto fs = std::make_shared<FormState>();
                     fs->it = this;
                     HWND hwnd = CreateWindowExW(
                         0, GetNodioConfig().windowClass.c_str(), strText.c_str(),
@@ -9676,7 +9676,7 @@ void Interp::InitBuiltins()
                         nullptr);
                     if (!hwnd)
                     {
-                        delete fs;
+                        fs.reset();
                         (*err) = L"运行错误: win.form 窗口创建失败";
                         return Value();
                     }
@@ -9707,8 +9707,8 @@ void Interp::InitBuiltins()
                         ShowWindow(hwnd, SW_SHOW);
                         UpdateWindow(hwnd);
                         MSG msg;
-                        while (!fs->bModalDone && GetMessageW(&msg, nullptr,
-                                                               0, 0) > 0)
+                        while (!fs->bModalDone && IsWindow(hwnd) &&
+                               GetMessageW(&msg, nullptr, 0, 0) > 0)
                         {
                             TranslateMessage(&msg);
                             DispatchMessageW(&msg);

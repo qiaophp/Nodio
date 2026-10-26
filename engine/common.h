@@ -548,7 +548,7 @@ namespace NodioVM
         bool released = false;  // script side already detached
         int popBytes = 0;       // stdcall stack cleanup of the trampoline
     };
-    extern std::vector<CbCtx*> g_cbs;
+    extern std::vector<std::weak_ptr<CbCtx>> g_cbs;
     // Release a native callback: detach the script closure, neutralize the
     // trampoline and give its slot back to the trampoline pool.
     void ReleaseCallback(CbCtx* ctx);
@@ -1585,7 +1585,7 @@ namespace NodioVM
         std::map<int, Value> menuItems;     // command id -> item table
         int nNextMenuId = 5000;
     };
-    extern std::map<HWND, FormState*> g_forms;
+    extern std::map<HWND, std::shared_ptr<FormState>> g_forms;
     LRESULT CALLBACK FormWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
     // ---------------- GC (gc.cpp) ----------------

@@ -476,7 +476,7 @@ namespace NodioVM
     {
         for (auto& kv : g_forms)
         {
-            FormState* fs = kv.second;
+            std::shared_ptr<FormState> fs = kv.second;
             if (!fs) continue;
             GcMarkValue(fs->formVal, m);
             for (auto& c : fs->callbacks) GcMarkValue(c.second, m);
@@ -495,17 +495,20 @@ namespace NodioVM
         // g_cbs. Without marking these, the collector frees the window
         // procedure and the window silently stops receiving messages
         // (timers stop firing, repaints stop).
-        for (auto* ctx : g_cbs)
+        for (auto it = g_cbs.begin(); it != g_cbs.end(); )
         {
-            if (!ctx) continue;
-            // A callback that is exposed to script (the official "cdata"
-            // object of raw.tostdcall) is reachable through its cdata table:
-            // the collector follows that edge on its own. Marking it here as
-            // well would pin the closure forever - the cdata would never
-            // become unreachable and the callback could never be released.
-            if (!ctx->rooted) continue;
-            GcMarkValue(ctx->fn, m);
-            GcMarkValue(ctx->owner, m);
+            if (it->expired())
+            {
+                it = g_cbs.erase(it);
+                continue;
+            }
+            auto ctx = it->lock();
+            if (ctx && ctx->rooted)
+            {
+                GcMarkValue(ctx->fn, m);
+                GcMarkValue(ctx->owner, m);
+            }
+            ++it;
         }
         // Suspended fibers keep their frames, their explicit roots and their
         // entry function in a native execution context. A fiber value only

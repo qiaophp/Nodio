@@ -78,7 +78,7 @@ namespace NodioVM
         { L"EndPaint", L"user32.dll", L"EndPaint",
           L"int(addr hwnd,addr ps)" },
         { L"DrawText", L"user32.dll", L"DrawTextW",
-          L"int(addr hdc,str text,addr rect,int flags)" },
+          L"int(addr hdc,str text,int cch,addr rect,int flags)" },
         { L"GetSystemMetrics", L"user32.dll", L"GetSystemMetrics",
           L"int(int index)" },
         { L"SystemParametersInfo", L"user32.dll", L"SystemParametersInfoW",
