@@ -342,6 +342,16 @@ foreach ($v in @('VIS-LEFT','VIS-RIGHT','VIS-BOTTOM','VIS-DOC','VIS-ED','VIS-TOO
 if ($out -notmatch 'IMMEDIATE-TAB:OK')  { Write-Output 'FAIL: immediate window tab is missing'; exit 1 }
 if ($out -notmatch 'IMMEDIATE-MENU:OK') { Write-Output 'FAIL: immediate window menu entry is missing'; exit 1 }
 
+# 「监视窗/变量树」入口（第五十九轮续）：同上——页签 + 菜单都得在。
+if ($out -notmatch 'WATCH-TAB:OK') { Write-Output 'FAIL: watch window tab is missing'; exit 1 }
+if ($out -notmatch 'VARS-TAB:OK')  { Write-Output 'FAIL: variables tree tab is missing'; exit 1 }
+if ($out -notmatch 'WATCH-MENU:OK') { Write-Output 'FAIL: watch window menu entry is missing'; exit 1 }
+
+# 监视窗/变量树面板逻辑（第五十九轮续）：假求值器/假数据源走面板全链
+if ($out -notmatch 'WATCH-ADD:OK')  { Write-Output 'FAIL: watch panel add/eval chain broken'; exit 1 }
+if ($out -notmatch 'VARS-TREE:OK')  { Write-Output 'FAIL: variables tree rebuild broken'; exit 1 }
+if ($out -notmatch 'VARS-LAZY:OK')  { Write-Output 'FAIL: variables tree lazy expand broken'; exit 1 }
+
 # 设计器拖拽落点（第五十六轮）：工具箱 → 画布的拖拽入口 + 坐标换算 + 避让。
 #   DROP-WIRED:1   工具箱 onDrop 回调已接线
 #   SPOT-FREE:OK   已有控件占着 (20,20) 时，新落点不与它重叠

@@ -6301,3 +6301,36 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   ⚠ 停点快照是**语句执行前**的状态（与条件断点 x==3 同一语义）。
 - 验证：VM 98/0/1、IDE 冒烟 SMOKE OK、ide_debug 88 项全绿。
 - ❌ 剩余（调试器）：独立监视窗（消费本轮协议）。
+
+---
+
+## 1.67 第五十九轮续：调试器之四——独立监视窗 + 变量树
+
+- **新面板模块**（`ide/nodio/app/watch.nodio`，仿 app/ai.nodio 的组合
+  面板套路：dock 只认一个 ctrl → 可见性代理，layout() 自己摆）：
+  - 「监视」页：表达式列表（表达式/值/类型三列）+ 底部输入行。回车 =
+    添加/更新同名监视（求值同步阻塞 → 推迟到消息循环，与「立即」窗口
+    同招）；右键菜单 删除选中/清空/立即刷新；双击行 = 立即重估。
+    求值走 DAP evaluate（main 侧 `setEvaluator` 注入，能看到局部变量、
+    支持 `x+1`/`t.a` 表达式）——替换旧版「变量名 = 值」名字匹配输出。
+    未暂停时显示「（未暂停）」占位，表达式列表不丢。
+  - 「变量」页：当前帧变量树（nodio.ui.tree）。顶层来自停点快照
+    （`getVars`，main 侧 `setProvider` 注入）；表/数组节点按需经
+    varsRef（`setChildren` → `getVarChildren`）懒展开。⚠ 引擎引用每
+    停点清空重建 → 每次停点整树重建，会话结束整树清空。
+- **树控件懒加载扩展**（`lib/nodio/ui/tree.nodio`）：节点新增
+  `hasChildren` 标记（子级未填但箭头先画）；新增 `onToggle(node,
+  expanding)` 钩子（用户点击路径触发，返回 false 取消翻转；程序化
+  expand/collapse 不经过）；懒节点必须初始 `expanded=false`（addNode
+  默认 true，否则第一次点箭头是「收起」）。
+- **入口**：视图菜单「监视窗口 Ctrl+Shift+W / 变量窗口」；Ctrl+Shift+W
+  热键；调试菜单的 添加监视表达式/清空监视列表 改挂面板
+  （showPrompt → watchPanel.add）。pollDebug 停点自动刷新两面板
+  （沿用既有 refreshWatchList 裸名钩子）。
+- **回归锁**（`ide_smoke.ps1` 增 6 断言）：页签（监视/变量）+ 菜单项
+  + 面板逻辑链——假求值器 add→求值→计数（WATCH-ADD）、假数据源
+  树重建（VARS-TREE）、懒展开经 onToggle 真正拉子级（VARS-LAZY）。
+- 验证：VM 98/0/1、IDE 冒烟 SMOKE OK（含新 6 断言）、ide_debug 88 项
+  全绿。
+- ❌ 剩余（调试器五件套已齐）；⚠ setVariable 的 UI 消费（右键「修改
+  值...」）随设计器轮次或变量面板增强另行挂账。

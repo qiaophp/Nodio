@@ -48,6 +48,8 @@ tree = function(winform, opt){
 		scroll = 0;          // 垂直滚动偏移（物理像素）
 		onSelect = null;     // function(node)
 		onOpen = null;       // function(node)  —— 双击
+		onToggle = null;     // function(node, expanding) —— 折叠箭头翻转前
+		                     //   （第五十九轮续，懒加载；返回 false 取消翻转）
 		onContextMenu = null;// function(x, y)   —— 屏幕坐标
 		// 配色
 		bgColor     = opt.bgColor : th.panel;
@@ -90,6 +92,9 @@ tree = function(winform, opt){
 
 	// 加节点：text 显示，path 存路径，parent 是父节点（null=根）
 	// iconOpen：展开时用的图标（目录的 folderOpen），没有就用 icon
+	// hasChildren（第五十九轮续）：懒加载标记——子节点还没填但宿主知道
+	//   它有孩子（比如调试变量树的表/数组节点，展开时才经 varsRef 拉子级）。
+	//   有了它箭头就先画出来，配合 onToggle 钩子实现懒加载。
 	self.addNode = function(text, path, parent){
 		var node = {
 			text = text;
@@ -98,6 +103,7 @@ tree = function(winform, opt){
 			iconOpen = null;
 			children = {};
 			expanded = true;
+			hasChildren = false;
 			parent = null;
 		};
 		if(parent){
@@ -147,6 +153,12 @@ tree = function(winform, opt){
 
 	self.toggle = function(node){
 		if(!node) return;
+		// 懒加载钩子（第五十九轮续）：翻转前给宿主一个填子节点的机会
+		//（返回 false = 取消这次翻转）。只在用户点击路径上触发，
+		// 程序化的 expand()/collapse() 不经过这里。
+		if(self.onToggle){
+			if(self.onToggle(node, !node.expanded) === false) return;
+		}
 		node.expanded = !node.expanded;
 		self.__invalidateRows();
 		self.board.invalidate();
@@ -162,7 +174,10 @@ tree = function(winform, opt){
 	self.__invalidateRows = function(){ __rowsDirty = true; }
 
 	var __build = function(node, level, out){
-		..table.push(out, {node=node; level=level; hasChild=(#node.children > 0)});
+		..table.push(out, {
+			node = node; level = level;
+			hasChild = (#node.children > 0) || node.hasChildren;
+		});
 		if(node.expanded){
 			for(i=1;#node.children;1){
 				__build(node.children[i], level + 1, out);

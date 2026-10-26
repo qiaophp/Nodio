@@ -1764,6 +1764,9 @@ pollDebug = function(){
 		}
 		elseif(ev == "terminated"){
 			shell.dbgAppend("[调试结束]");
+			// 变量树的引用只在停点期间有效（引擎每停点重建）——
+			// 会话结束整树清空，不留下可点击的假引用
+			if(shell.varsPanel) shell.varsPanel.clear();
 			stopDebug();
 		}
 	});
@@ -2138,39 +2141,53 @@ shell.hooks.onPrevDiff = function(){
 };
 
 // ---------- 监视表达式 (Watch Expressions) ----------
-var watchList = {};
+// 第五十九轮续：监视窗升级为**独立面板**（shell.watchPanel）——表达式
+// 逐条经 DAP evaluate 求值（能看到局部变量，支持 x+1、t.a 这类表达式），
+// 不再是旧版「变量名 = 值」的名字匹配输出。变量树（shell.varsPanel）
+// 同轮落地：顶层来自停点快照，表/数组节点经 varsRef 懒展开。
+// pollDebug 的每个停点都会调 refreshWatchList()（本模块裸名）→ 两面板
+// 一起刷新。
+if(shell.watchPanel){
+	shell.watchPanel.onStatus = function(s){ shell.setStatus(s) };
+	shell.watchPanel.setEvaluator(function(expr){
+		if(!dbgSession || !app.dapClient.ready() || !app.dapClient.isStopped()){
+			return null;
+		}
+		var r = app.dapClient.evaluate(expr);
+		if(!r) return { value = "（求值没有响应）"; type = "error" };
+		return { value = r.result; type = r.type };
+	});
+}
+if(shell.varsPanel){
+	shell.varsPanel.setProvider(function(){
+		if(!dbgSession || !app.dapClient.ready() || !app.dapClient.isStopped()){
+			return null;
+		}
+		return app.dapClient.getVars();
+	});
+	shell.varsPanel.setChildren(function(ref){
+		return app.dapClient.getVarChildren(ref);
+	});
+}
 var refreshWatchList = function(){
-	if(!#watchList) return;
-	var vars = {};
-	if(dbgSession && app.dapClient.ready() && app.dapClient.isStopped()){
-		vars = app.dapClient.getVars();
-	}
-	var varMap = {};
-	if(vars){
-		for(i=1;#vars;1){ varMap[vars[i].name] = vars[i].value; }
-	}
-	for(i=1;#watchList;1){
-		var expr = watchList[i];
-		var val = (varMap[expr] !== null) ? varMap[expr] : "<未定义或超出范围>";
-		shell.dbgAppend("[监视] " ++ expr ++ " = " ++ tostring(val));
-	}
+	if(shell.watchPanel) shell.watchPanel.refresh();
+	if(shell.varsPanel) shell.varsPanel.refresh();
 };
 
 shell.hooks.onAddWatch = function(){
 	shell.showPrompt("添加监视表达式", "", function(expr){
-		expr = ..string.trim(expr);
-		if(!expr) return false;
-		..table.push(watchList, expr);
-		shell.setStatus("已添加监视: " ++ expr);
-		refreshWatchList();
-		return true;
+		if(shell.watchPanel && shell.watchPanel.add(expr)){
+			shell.setStatus("已添加监视: " ++ ..string.trim(expr));
+			refreshWatchList();
+			return true;
+		}
+		return false;
 	});
 };
 
 shell.hooks.onClearWatch = function(){
-	watchList = {};
+	if(shell.watchPanel) shell.watchPanel.clearAll();
 	shell.setStatus("已清空监视列表");
-	refreshWatchList();
 };
 
 // ---------- 设置（主题 / 编辑器字号 / 外部工具）----------
@@ -2851,6 +2868,40 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 	// 很容易被当成「不存在」，所以把它锁进冒烟自检。
 	var __imTab = shell.dockHasTab ? shell.dockHasTab("立即") : false;
 	io.print("IMMEDIATE-TAB:" ++ (__imTab ? "OK" : "MISSING"));
+	// 监视窗/变量树入口自检（第五十九轮续）：同「立即窗口」的教训——
+	// 页签排在最后两位最容易被当成「不存在」，锁进冒烟自检。
+	var __wTab = shell.dockHasTab ? shell.dockHasTab("监视") : false;
+	io.print("WATCH-TAB:" ++ (__wTab ? "OK" : "MISSING"));
+	var __vTab = shell.dockHasTab ? shell.dockHasTab("变量") : false;
+	io.print("VARS-TAB:" ++ (__vTab ? "OK" : "MISSING"));
+	// 监视窗/变量树**面板逻辑**自检（第五十九轮续）：没有调试会话，
+	// 注入假求值器/假数据源——锁 add→求值→计数、树重建→懒展开两条链。
+	if(shell.watchPanel){
+		shell.watchPanel.clearAll();
+		shell.watchPanel.setEvaluator(function(expr){
+			return { value = tostring(expr) ++ "!"; type = "number" };
+		});
+		shell.watchPanel.add("1+2");
+		io.print("WATCH-ADD:" ++ ((shell.watchPanel.count() == 1) ? "OK" : "FAIL"));
+		shell.watchPanel.clearAll();
+	}
+	if(shell.varsPanel){
+		shell.varsPanel.setProvider(function(){
+			return {
+				{ name = "x"; value = "7"; type = "number"; ref = 0 };
+				{ name = "t"; value = "table"; type = "table"; ref = 101 };
+			};
+		});
+		shell.varsPanel.setChildren(function(ref){
+			return { { name = "a"; value = "1"; type = "number"; ref = 0 } };
+		});
+		shell.varsPanel.refresh();
+		io.print("VARS-TREE:" ++ ((#shell.varsPanel.tr.nodes == 2) ? "OK" : "FAIL"));
+		var __t2 = shell.varsPanel.tr.nodes[2];
+		shell.varsPanel.tr.toggle(__t2);
+		var __ok = __t2.expanded && #__t2.children == 1;
+		io.print("VARS-LAZY:" ++ (__ok ? "OK" : "FAIL"));
+	}
 	var __ml = shell.menuLabels ? shell.menuLabels() : {};
 	var __imMenu = false;
 	for(__imI=1;#__ml;1){
@@ -2860,6 +2911,14 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 		}
 	}
 	io.print("IMMEDIATE-MENU:" ++ (__imMenu ? "OK" : "MISSING"));
+	var __wMenu = false;
+	for(__imI=1;#__ml;1){
+		if(..string.indexOf(tostring(__ml[__imI] : ""), "监视窗口") > 0){
+			__wMenu = true;
+			break;
+		}
+	}
+	io.print("WATCH-MENU:" ++ (__wMenu ? "OK" : "MISSING"));
 	var target = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_smoke.aardio");
 	app.editor.setText(shell.editor, `io.print("ide-smoke-echo")`);
 	..io.writeFile(target, app.editor.text(shell.editor));

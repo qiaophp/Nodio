@@ -1,0 +1,269 @@
+// app/watch.nodio — 底部「监视」「变量」两页（第五十九轮续：调试器之四）。
+//
+// 监视窗：表达式列表 + 输入行。暂停时逐条经 DAP evaluate 求值（main 侧
+//   setEvaluator 注入，所以能看到局部变量）；每个停点自动刷新
+//   （pollDebug → refreshWatchList）。旧实现只做「变量名 = 值」的名字
+//   匹配输出到调试页签，不支持表达式——这里升级成真正的监视窗。
+// 变量窗：当前帧变量树。顶层来自停点快照（getVars），表/数组节点按需
+//   经 varsRef（getVarChildren）懒展开。⚠ 引擎的引用在每个停点**清空
+//   重建**，所以每次停点整树重建——旧 ref 展开会回「(展开失败)」条目。
+//
+// 布局套路与 app/ai.nodio 一致：dock 只认一个 ctrl，多控件面板用
+// 「可见性代理」让面板里的控件一起显隐，layout() 自己摆内部坐标。
+import nodio.ui.list;
+import nodio.ui.tree;
+import nodio.ui.richedit;
+import nodio.ui.dpi;
+import nodio.ui.subclass;
+
+var __wseq = 0;
+
+// ---------- 监视窗 ----------
+// app.watch.panel(winform, opt)
+//   opt.setStatus = function(text)   可选：状态提示
+// 建好后由 main 侧调 setEvaluator(function(expr) -> {value;type}|null)
+panel = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	var IN_H = 26;    // 输入行高（逻辑像素）
+
+	var self = {
+		winform = winform;
+		rect = opt.rect;
+		onStatus = null;
+	};
+	__wseq = __wseq + 1;
+	var seq = __wseq;
+
+	// 列表：表达式 | 值 | 类型
+	self.lv = ..nodio.ui.list(winform, {
+		rect = {left=0; top=0; right=240; bottom=300};
+		columns = { {"表达式";170}; {"值";300}; {"类型";80} };
+	});
+	// 输入行：回车 = 添加/更新同名监视
+	self.ed = ..nodio.ui.addCtrl(winform, "watchIn" ++ seq, {
+		cls="richedit"; left=0; top=0; right=200; bottom=24;
+		multiline=false; vscroll=false;
+	});
+	..nodio.ui.richedit.darken(self.ed, th);
+
+	// 数据：watches[i] = {expr=..; value=..; vtype=..}（列表序 = 显示序）
+	var watches = {};
+	var evaluator = null;
+
+	var __rebuild = function(){
+		var rows = {};
+		for(i=1;#watches;1){
+			..table.push(rows, {
+				cells = { watches[i].expr; watches[i].value; watches[i].vtype };
+			});
+		}
+		self.lv.setRows(rows);
+	};
+
+	self.setEvaluator = function(fn){ evaluator = fn };
+
+	self.add = function(expr){
+		expr = ..string.trim(tostring(expr : ""));
+		if(!#expr) return false;
+		// 同名表达式覆盖（更新而不是重复加一行）
+		for(i=1;#watches;1){
+			if(watches[i].expr == expr){
+				self.refreshOne(i);
+				return true;
+			}
+		}
+		..table.push(watches, { expr = expr; value = "…"; vtype = "" });
+		__rebuild();
+		self.refreshOne(#watches);
+		return true;
+	};
+
+	self.removeAt = function(i){
+		if(i < 1 || i > #watches) return;
+		..table.remove(watches, i);
+		__rebuild();
+	};
+
+	self.removeSelected = function(){
+		if(self.lv.selIndex >= 1) self.removeAt(self.lv.selIndex);
+	};
+
+	self.clearAll = function(){
+		watches = {};
+		__rebuild();
+	};
+
+	self.count = function(){ return #watches };
+
+	// 刷新第 i 行：evaluator(expr) → {value;type}|null（null = 没暂停，
+	// 显示「（未暂停）」占位——列表结构和表达式本身不能因为暂停状态丢失）
+	self.refreshOne = function(i){
+		if(i < 1 || i > #watches) return;
+		if(!evaluator){
+			watches[i].value = "（未暂停）";
+			watches[i].vtype = "";
+			__rebuild();
+			return;
+		}
+		var r = null;
+		try{ r = evaluator(watches[i].expr) }catch(eEval){ r = { value = "（求值出错）"; type = "error" } }
+		if(r === null || r === undefined){
+			watches[i].value = "（未暂停）";
+			watches[i].vtype = "";
+		}
+		else{
+			watches[i].value = tostring(r.value : "");
+			watches[i].vtype = tostring(r.type : "");
+		}
+		__rebuild();
+	};
+
+	self.refresh = function(){
+		for(i=1;#watches;1){ self.refreshOne(i) }
+	};
+
+	// 输入行回车 = 添加/更新。⚠ 求值是同步阻塞的（最长 4 秒），在窗口
+	//   过程里做会卡住整个 IDE —— 推迟到消息循环（与「立即」窗口同招）。
+	..nodio.ui.subclass(self.ed.hwnd, function(hwnd, msg, wp, lp){
+		if(msg == 0x100 && tonumber(wp) == 0x0D){    // WM_KEYDOWN + VK_RETURN
+			var txt = ..string.trim(tostring(self.ed.text : ""));
+			if(#txt){
+				self.ed.text = "";
+				try{
+					winform.setTimeout(function(){
+						try{ self.add(txt) }catch(eAdd){}
+						return null;
+					}, 1);
+				}catch(eSub){}
+			}
+			return 1;
+		}
+		return 0;
+	});
+
+	// 右键菜单：删除选中 / 清空 / 立即刷新
+	self.lv.onContextMenu = function(x, y){
+		var menu = win.ui.popmenu(winform);
+		var idDel = menu.add("删除选中", null);
+		var idClr = menu.add("清空", null);
+		var idRef = menu.add("立即刷新", null);
+		var id = menu.popId();
+		if(!id) return;
+		if(id == idDel) self.removeSelected();
+		elseif(id == idClr) self.clearAll();
+		elseif(id == idRef) self.refresh();
+	};
+
+	// 双击行 = 立即重估这一条
+	self.lv.onDoubleClick = function(row, index){
+		self.refreshOne(index);
+	};
+
+	// ---------- 布局 ----------
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		var ih = ..nodio.ui.px(IN_H);
+		self.lv.layout(l, t, r, b - ih);
+		..nodio.ui.setRect(self.ed, l, b - ih, r, b);
+	};
+	self.layout();
+
+	// dock 可见性代理（与 app/ai.nodio 同一个套路）
+	self.show = function(flag){
+		self.lv.show(flag);
+		self.ed.show(flag);
+	};
+	self.ctrl = {
+		show = function(flag){ self.show(flag) }
+	};
+	return self;
+}
+
+// ---------- 变量树 ----------
+// app.watch.varsPanel(winform, opt)
+//   opt.setStatus = function(text)   可选
+// main 侧注入：setProvider(function() -> [{name;value;type;ref}]|null)
+//              setChildren(function(ref) -> [{name;value;type;ref}])
+varsPanel = function(winform, opt){
+	opt = opt : {};
+
+	var self = {
+		winform = winform;
+		rect = opt.rect;
+		onStatus = null;
+	};
+
+	self.tr = ..nodio.ui.tree(winform, {
+		left=0; top=0; right=240; bottom=300;
+	});
+
+	var provider = null;   // 停点快照（getVars）
+	var children = null;   // 表/数组子级（getVarChildren）
+
+	self.setProvider = function(fn){ provider = fn };
+	self.setChildren = function(fn){ children = fn };
+
+	var __addEntry = function(e, parent){
+		// 树没有第二列：类型缀在文本后面
+		var txt = tostring(e.name : "") ++ " = " ++ tostring(e.value : "");
+		var ty = tostring(e.type : "");
+		if(#ty) txt = txt ++ "  （" ++ ty ++ "）";
+		var n = self.tr.addNode(txt, null, parent);
+		var ref = tonumber(e.ref : 0) : 0;
+		n.ref = ref;
+		n.__loaded = (ref <= 0);      // 没引用的（数字/字符串）没有子级可拉
+		n.hasChildren = (ref > 0);    // 有引用 → 先画箭头，展开时再拉
+		// ⚠ addNode 默认 expanded=true；懒节点必须**初始收起**——
+		//   否则第一次点箭头是「收起」而不是「展开拉子级」
+		if(ref > 0) n.expanded = false;
+		return n;
+	};
+
+	self.refresh = function(){
+		self.tr.clear();
+		if(!provider) return;
+		var vs = null;
+		try{ vs = provider() }catch(eProv){ vs = null }
+		if(!vs) return;   // 未暂停：树留空（旧 ref 已失效，不能复用旧快照）
+		for(i=1;#vs;1){ __addEntry(vs[i], null) }
+	};
+
+	self.clear = function(){ self.tr.clear() };
+
+	// 懒展开：第一次展开时经 varsRef 拉子级
+	self.tr.onToggle = function(node, expanding){
+		if(!expanding || node.__loaded) return true;
+		if(!children || !node.ref) return true;
+		var kids = null;
+		try{ kids = children(node.ref) }catch(eKids){ kids = null }
+		node.__loaded = true;
+		if(kids){
+			for(i=1;#kids;1){ __addEntry(kids[i], node) }
+		}
+		return true;
+	};
+
+	// ---------- 布局 ----------
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		self.tr.layout(l, t, r, b);
+	};
+	self.layout();
+
+	self.show = function(flag){ self.tr.show(flag) };
+	self.ctrl = {
+		show = function(flag){ self.show(flag) }
+	};
+	return self;
+}

@@ -42,6 +42,7 @@ import nodio.ui.prompt;
 import nodio.ui.richedit;
 import app.settings;   // 主题 / 编辑器字号 / 外部工具（持久化在 %APPDATA%\Nodio\ide.cfg）
 import app.ai;        // 右栏「AI」页：AI 聊天面板（app.ai.panel）
+import app.watch;     // 底部「监视」「变量」页：调试监视窗（app.watch.panel / varsPanel）
 import nodio.gui.designerExt;   // nodio.gui 控件 → 设计器工具箱组件（不是展厅）
 import gdip;
 
@@ -440,6 +441,15 @@ var refLv = bottomDock.addTab("引用", refList, {icon="search"});
 // 立即窗口（第五十五轮）：单行输入，回车 → 在**当前暂停帧**里求值
 //   （表达式由 IDE 侧 shell.hooks.onDebugEval 转给 DAP → 引擎）
 var imEd = bottomDock.addTab("立即", "richedit", {multiline=false; vscroll=false; icon="terminal"});
+// 监视窗 + 变量树（第五十九轮续：调试器之四）。
+// 求值钩子/数据源由 main 侧注入（dbgSession 与 app.dapClient 在那边）——
+//   watchPanel.setEvaluator / varsPanel.setProvider+setChildren。
+// ⚠ 裸赋值进模块表（同 dockHasTab 的坑注释），main.nodio 取
+//   shell.watchPanel / shell.varsPanel。
+watchPanel = app.watch.panel(winform, {});
+bottomDock.addTab("监视", watchPanel, {icon="eye"});
+varsPanel = app.watch.varsPanel(winform, {});
+bottomDock.addTab("变量", varsPanel, {icon="list"});
 // 供回归：底部面板里有没有某个页签（按页签名查）。
 // 「立即」页签是第五十五轮新增的，但它默认排在最后、很容易被当成不存在 ——
 // 用这条查询把它锁进冒烟自检。
@@ -1130,6 +1140,9 @@ install = function(){
 	winform.reghotkey(function(id,mod,vk){
 		bottomDock.selectCaption("立即");
 	}, MOD_CTRL + MOD_SHIFT, 0x49/*VK_I*/); // Ctrl+Shift+I —— 立即窗口（表达式求值）
+	winform.reghotkey(function(id,mod,vk){
+		bottomDock.selectCaption("监视");
+	}, MOD_CTRL + MOD_SHIFT, 0x57/*VK_W*/); // Ctrl+Shift+W —— 监视窗口
 
 	// 菜单：自绘标题栏的一行（不再是原生系统菜单栏）。
 	// 表结构：{ {"标题"; { {"菜单项"; 函数}; {"-"; null} }} }
@@ -1313,6 +1326,8 @@ install = function(){
 			{ "调试"; function(id){ bottomDock.setSelIndex(3) } };
 			{ "终端"; function(id){ bottomDock.setSelIndex(4) } };
 			{ "立即窗口"; function(id){ bottomDock.selectCaption("立即") } };
+			{ "监视窗口  Ctrl+Shift+W"; function(id){ bottomDock.selectCaption("监视") } };
+			{ "变量窗口"; function(id){ bottomDock.selectCaption("变量") } };
 			{ "-"; null };
 			{ "双栏对比"; function(id){ toggleSplitDiff() } };
 			{ "下一个差异"; function(id){ if(hooks.onNextDiff) hooks.onNextDiff() } };
