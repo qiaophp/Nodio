@@ -5506,3 +5506,55 @@ IDE 族仍被并行会话在飞的 shell.nodio 编译失败堵着（其 679/690 
 
 本轮只动 canvas/dsg 两文件（第四十八轮同一批），并行会话的
 shell.nodio/editor.nodio 中间态未触碰。
+
+## 1.55 第五十轮：调用路径分配普查→稠密局部槽——每调用 9→6 次堆分配
+
+### 1.55.1 工具：allocstat 尺寸窗口站点采样
+
+NODIO_ALLOC_SITES=lo-hi 对该尺寸段 1/256 采样抓栈聚合（>64KB 大站点
+机制的推广，带符号构建出真名）。普查对象：100 万次全局 2 参调用——
+**每次调用 9 次堆分配 / 1385.6MB÷1M=1.4KB churn**：256B 桶 ×6、512B
+×1、128B ×1、≤32B ×1。
+
+### 1.55.2 符号化定位与两次误判
+
+符号化显示 256B 桶的 6 次分配全部挂在 `make_shared<Env> ← EvalCall`
+名下。第一判（kSlotMax 512→2048 + 空池预置）**无效**——普查数字分毫
+不动，原因是参数 id 随 builtins+import 无界增长，早已越过 2048：id 索
+引槽对晚定义 id 根本性失效，kSlotMax 调到多大都会整帧退化 vars map。
+第二判（稠密值内联进 Env）**字节反涨**——make_shared\<Env\> 被顶进
+2K 桶（每调用 +618B）。期间还踩响一个 0xC0000005：第 46 轮回退后
+EnvUsePooledSlots 已无调用点，只设 bDense 不取缓冲=写空向量。
+
+### 1.55.3 定案：稠密局部槽（帧内紧凑编号）
+
+调用/块帧（EvalCall/CallThisOwner/CallVmFunc/InstantiateClass/
+ExecBlockScoped 五个建帧点）改走稠密模式：denseIds 内联记 8 个 intern
+id，**值存池化 8 槽缓冲**（复用既有池，稳态零堆分配）；第 9 个不同 id
+整帧退化 vars map（g_nSlotConv 延续诊断）。id 索引槽仅存驻留帧
+（globals/mainEnv）。锚定的教训进注释：官方锚定/稠密槽这类「与既有
+坐标体系打架」的机制，创建参数与载入写回两条路都要封死。
+
+**顺手修掉第 46 轮判词里的池排空根因**：GcAcquireSlotBuf 取用从不扣减
+nBytes，24MB 预算吸满后所有释放被拒、池排空、稳态每帧重新 malloc——
+acquire 现按容量饱和归还预算。
+
+### 1.55.4 数字与回归
+
+- 分配普查（100 万次调用）：**9 次→6 次/调用，1385.6MB→965.9MB
+  （-30% churn）**；2K 桶排空（池循环恢复）。
+- callbench 时间在本机噪声带内（GLOBAL2 0.92-0.98µs）——分配器的
+  尺寸类复用本就便宜，收益兑现在长会话的 GC 压力与缓存局部性。
+- 回归锁 t99 扩展 envcheck 门控（x86 的 overlay 无 exe 目录自动探测，
+  32 位按策略直接用官方 32 位库——探测不到则 SKIP）；VM 套件 x64
+  97/0/0、x86 96/0/1（skip=该门控）+ 带 overlay 手工跑 x86 t99 全绿。
+- gcstress uiprobe13 ×2 通过（WS 增量 4.2MB）；设计器画布探针全绿。
+- 全量回归 x64 11/18、x86 12/18——红项全部为 IDE 族，归因并行会话
+  在飞的 shell.nodio（其 679/690 行字符串断裂，已代定位，见 §1.54.4）。
+
+### 1.55.5 会话协调
+
+本轮动 engine/allocstat.cpp、common.h、gc.cpp、runtime.cpp 与
+tests/vmtests/t99.envcheck.aardio。第 46 轮（并行会话）的回退判词保持
+成立——稠密局部槽是对该判词的正面回应：既然 id 索引槽对调用帧无解，
+就换掉索引方式本身。

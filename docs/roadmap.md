@@ -1771,3 +1771,14 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 >    ——切段跟踪花括号净深度。③ 标题字号 10；treeview 空态判定官方
 >    本态。④ t99 扩展两断言；VM 96/0/1；IDE 族仍被并行会话在飞
 >    shell.nodio 堵着（已代定位其 679/690 行）。
+
+> **第五十轮（稠密局部槽——调用路径分配普查治理）**。
+> ① allocstat 新增 NODIO_ALLOC_SITES 尺寸窗口采样：每调用 9 次/1.4KB
+>    churn 实锤，256B 桶 6 次全挂 Env 构造名下。② 两次误判留档
+>    （kSlotMax=2048 无效：参数 id 无界；内联数组字节反涨：Env 顶进
+>    2K 桶）。③ 定案稠密局部槽：五个建帧点 bDense，denseIds 内联 +
+>    值存池化 8 槽缓冲，第 9 个 id 退化 map；id 索引槽仅存驻留帧。
+> ④ 顺手修第 46 轮判词里的池排空根因（acquire 归还预算，饱和减）。
+> ⑤ 普查 9→6 次/1.4KB→966B（-30%）；时间噪声带内。t99 envcheck
+>    门控；VM x64 97/0/0、x86 96/0/1；gcstress ×2；IDE 族红项仍为
+>    并行会话在飞 shell.nodio（代定位 679/690 行）。
