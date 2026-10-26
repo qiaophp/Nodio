@@ -263,6 +263,7 @@ board = function(winform, opt){
 		// 默认仍然是「抬起即释放」（与 capture 的原始语义一致）。
 		autoReleaseCapture = (opt.autoReleaseCapture === null) ? true : opt.autoReleaseCapture;
 		__dirty = false;       // 上次重画之后矩形（尺寸）变过 → 需要整块重画
+		__errPrinted = false;  // onDraw 首次报错打印后就静默（防刷屏）
 	};
 
 	__bdSeq = __bdSeq + 1;
@@ -293,7 +294,13 @@ board = function(winform, opt){
 			catch(e){
 				// 绘制回调出错不能把整个 IDE 带崩（plus 会吞掉异常，
 				// 表现是「画板一片空白」，极难定位）—— 打出来。
-				io.print("BOARD-DRAW-ERR[" ++ (self.ctrl ? "?" : "?") ++ "]:" ++ tostring(e));
+				// 持续性错误（比如无头冒烟里每次 WM_PAINT 都炸）只打首条，
+				// 不然一条日志刷几百行，把真正的断言淹没。
+				if(!self.__errPrinted){
+					self.__errPrinted = true;
+					io.print("BOARD-DRAW-ERR[" ++ bname ++ "]:" ++ tostring(e)
+						++ "（同类错误只打首条）");
+				}
 			}
 		}
 		return true;

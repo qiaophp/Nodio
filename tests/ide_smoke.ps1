@@ -379,6 +379,11 @@ if ($out -notmatch 'DROP-MSG:1')      { Write-Output 'FAIL: designer drag via re
 if ($out -notmatch 'EVENT-LIST:2/1')   { Write-Output 'FAIL: designer event list is wrong'; exit 1 }
 if ($out -notmatch 'EVENTS-EDIT:11')   { Write-Output 'FAIL: designer event table does not match official win.ui'; exit 1 }
 if ($out -notmatch 'EVENT-STUB-EV:1')  { Write-Output 'FAIL: designer did not generate the stub for a picked event'; exit 1 }
+# 窗体级事件一览（第五十九轮续）
+#   FORM-EVENTS:9/1  选中窗体 → 事件页列 9 个窗体级事件，说明列全有字
+#   FORM-STUB:1      双击窗体事件 → 生成 winform.onclose = function(){...}（无控件段）
+if ($out -notmatch 'FORM-EVENTS:9/1')  { Write-Output 'FAIL: designer form-level event list is wrong'; exit 1 }
+if ($out -notmatch 'FORM-STUB:1')      { Write-Output 'FAIL: designer did not generate a form-level event stub'; exit 1 }
 # SHOW-REDRAW:0  连续 show(true) 不再反复整块重画（第五十八轮修的闪烁）
 if ($out -notmatch 'SHOW-REDRAW:0')   { Write-Output 'FAIL: board.show keeps repainting on every call (flicker)'; exit 1 }
 

@@ -205,8 +205,25 @@ registry = {
 			onOk = "确认";
 			onCancel = "取消";
 			onDoubleClickItem = "双击某一项";
+			// 窗体级事件（第五十九轮续）
+			oncreate = "窗体创建完成";
+			onactivate = "窗体激活";
+			onclose = "窗体关闭（return true 可拦截）";
+			ondestroy = "窗体销毁";
+			ondropfiles = "接受文件拖放";
+			onok = "确认（模态返回 1）";
+			oncancel = "取消（模态返回 2）";
+			onminimize = "最小化";
+			onrestore = "从最小化还原";
 		};
 		return t[ev] : "";
+	}
+
+	// 窗体级事件（第五十九轮续）：win.form 本身的事件——事件代码写在
+	// DSG 块之后（winform.onclose = function(){...}），没有控件段。
+	formEvents = function(){
+		return { "oncreate"; "onactivate"; "onclose"; "ondestroy";
+			"ondropfiles"; "onok"; "oncancel"; "onminimize"; "onrestore" };
 	}
 
 	// 内置控件集

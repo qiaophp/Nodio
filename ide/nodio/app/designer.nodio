@@ -157,6 +157,18 @@ create = function(sh){
 	// 成员的静态表（通用 oncommand/onnotify + 控件特有事件）。
 	var refreshEvents = function(item){
 		if(!eventList) return;
+		if(item && item.isForm){
+			// 窗体本身（第五十九轮续）：列 win.form 的**窗体级事件**——
+			// 双击生成 winform.<ev> = function(){...}（无控件段）
+			var evs = nodio.designer.registry.formEvents();
+			var frows = {};
+			for(i=1;#evs;1){
+				..table.push(frows, {cells = {evs[i]; nodio.designer.registry.eventDesc(evs[i])};
+					tag = evs[i]});
+			}
+			eventList.setRows(frows);
+			return;
+		}
 		if(!item || !item.spec){
 			eventList.setRows({});
 			return;

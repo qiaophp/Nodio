@@ -2390,6 +2390,12 @@ var eventSigOf = function(ev){
 	if(ev == "onnotify") return "function(id,code,ptr)";
 	return "function(id,event)";
 };
+// 窗体事件的函数签名（第五十九轮续；官方 win.ui 语义，
+// ondropfiles 收拖进来的文件数组，其余无参）
+var formEventSigOf = function(ev){
+	if(ev == "ondropfiles") return "function(files)";
+	return "function()";
+};
 // pos（1 基字符位置）之前有几个换行 → 所在行（1 基）
 var lineOfPos = function(src, pos){
 	var head = ..string.left(src, pos - 1);
@@ -2397,30 +2403,17 @@ var lineOfPos = function(src, pos){
 	for(c in ..string.gmatch(head, '\n')) n = n + 1;
 	return n;
 };
-// 生成事件处理函数桩
-//
-// ev 省略 = 该控件的默认事件（双击组件 / 右键「查看事件代码」）；
-// ev 指定 = 事件一览里双击的那个事件（第五十六轮）。
-var genEventStub = function(item, ev){
-	if(!item || !item.spec) return;
-	ev = ev ? ev : (item.spec.event : defaultEventOf(item.spec.cls));
-	if(!ev){ shell.setStatus("「" ++ item.spec.name ++ "」没有默认事件"); return }
-	var path = shell.tabCurPath();
-	if(!path){ shell.setStatus("没有打开的文档"); return }
-	// 先切回代码视图：close 会把当前设计同步进文档的 DSG 块，
-	// 事件代码要插在**同步后**的源码上（官方窗体里 DSG 块在前、事件代码在后）。
-	designer.close();
+// 把事件桩插进当前文档（第五十九轮续：控件/窗体两路共用）
+//   pat  = 已存在检查（命中只跳光标不重复生成，官方同款行为）
+//   stub = 要插入的代码；okMsg = 成功后的状态栏文案
+// 插入点：有 DSG 块就插在块结束标记后面，没有就追加到文件末尾。
+var insertEventStub = function(path, pat, stub, okMsg){
 	var src = shell.tabGetText(path);
 	if(!src) return;
-	// 已有这个事件的处理函数 → 只跳过去，不重复生成（官方同款行为）
-	var pat = 'winform\.' ++ item.name ++ '\.' ++ ev ++ '\s*=';
 	if(..string.match(src, pat)){
-		shell.setStatus("已转到 " ++ item.name ++ " 的 " ++ ev ++ "（源码里已有）");
+		shell.setStatus(okMsg ++ "（源码里已有，已转到）");
 		return;
 	}
-	var stub = 'winform.' ++ item.name ++ '.' ++ ev ++ ' = '
-		++ eventSigOf(ev) ++ '{\r\n\t\r\n}\r\n';
-	// 插入点：有 DSG 块就插在块结束标记后面，没有就追加到文件末尾
 	var b = ..string.indexOf(src, '/*}}*/');
 	var ns, at;
 	if(b !== null){
@@ -2440,7 +2433,38 @@ var genEventStub = function(item, ev){
 	shell.tabSetText(path, ns);
 	// 光标落到函数体那一行（stub 的第二行），直接开写
 	shell.editor.gotoLine(lineOfPos(ns, at) + 1);
-	shell.setStatus("已生成 " ++ item.name ++ "." ++ ev ++ " 事件代码");
+	shell.setStatus(okMsg);
+};
+// 生成事件处理函数桩
+//
+// ev 省略 = 该控件的默认事件（双击组件 / 右键「查看事件代码」）；
+// ev 指定 = 事件一览里双击的那个事件（第五十六轮）。
+// 窗体本身（item.isForm，第五十九轮续）= 窗体级事件一览的双击路径，
+// 生成 winform.<ev> = function(){...}（无控件段）。
+var genEventStub = function(item, ev){
+	if(!item) return;
+	var path = shell.tabCurPath();
+	if(!path){ shell.setStatus("没有打开的文档"); return }
+	// 先切回代码视图：close 会把当前设计同步进文档的 DSG 块，
+	// 事件代码要插在**同步后**的源码上（官方窗体里 DSG 块在前、事件代码在后）。
+	designer.close();
+	if(item.isForm){
+		ev = ev ? ev : "oncreate";
+		insertEventStub(path,
+			'winform\.' ++ ev ++ '\s*=',
+			'winform.' ++ ev ++ ' = '
+				++ formEventSigOf(ev) ++ '{\r\n\t\r\n}\r\n',
+			"已生成窗体 " ++ ev ++ " 事件代码");
+		return;
+	}
+	if(!item.spec) return;
+	ev = ev ? ev : (item.spec.event : defaultEventOf(item.spec.cls));
+	if(!ev){ shell.setStatus("「" ++ item.spec.name ++ "」没有默认事件"); return }
+	insertEventStub(path,
+		'winform\.' ++ item.name ++ '\.' ++ ev ++ '\s*=',
+		'winform.' ++ item.name ++ '.' ++ ev ++ ' = '
+			++ eventSigOf(ev) ++ '{\r\n\t\r\n}\r\n',
+		"已生成 " ++ item.name ++ "." ++ ev ++ " 事件代码");
 };
 designer.hooks.onEventCode = genEventStub;
 shell.hooks.onTabChange   = function(path){
@@ -3179,6 +3203,26 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		var evStub = 'winform.' ++ item.name ++ '.onSelChange = function(id,event)';
 		io.print("EVENT-STUB-EV:" ++ tostring(
 			..string.indexOf(shell.tabGetText(target), evStub) !== null ? 1 : 0));
+	}
+
+	// ④ 窗体级事件一览（第五十九轮续）
+	//
+	// 选中窗体本身 → 事件页列 win.form 的 9 个窗体级事件（说明列都得有字，
+	// 防 eventDesc 键名大小写对不上）；双击某个事件 → 生成
+	// winform.<ev> = function(){...}（无控件段，onclose 走默认无参签名）。
+	designer.canvas.selectForm();
+	var __fevs = app.designer.eventItems();
+	var __fCnt = 0, __fDesc = 1;
+	for(fk=1;#__fevs;1){
+		__fCnt = __fCnt + 1;
+		var __fd = __fevs[fk].cells[2] : "";
+		if(__fd == "") __fDesc = 0;
+	}
+	io.print("FORM-EVENTS:" ++ __fCnt ++ "/" ++ tostring(__fDesc));
+	if(item){
+		designer.hooks.onEventCode({isForm=true; name="窗体"}, "onclose");
+		io.print("FORM-STUB:" ++ tostring(
+			..string.indexOf(shell.tabGetText(target), 'winform.onclose = function()') !== null ? 1 : 0));
 	}
 
 	// ---------- 设计 ↔ 源码同步（switchActiveForm 语义） ----------

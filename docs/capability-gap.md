@@ -6391,3 +6391,32 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
 - 验证：VM 98/0/1、IDE 冒烟 SMOKE OK（含新断言）、ide_debug 88 项全绿。
 - ❌ 剩余（设计器）：窗体级事件一览、布局器（anchors 画布生效）、
   资源视图 + 控件分类自定义。
+
+## 1.70 第五十九轮续：设计器之三——窗体级事件一览
+
+- **窗体事件表**（`lib/nodio/designer/registry.nodio`）：新增
+  `formEvents()` —— win.form 本身的 9 个窗体级事件（oncreate /
+  onactivate / onclose / ondestroy / ondropfiles / onok / oncancel /
+  onminimize / onrestore），eventDesc 补齐 9 条中文说明（含小写
+  onok/oncancel——键名大小写对不上时说明列会空白）。
+- **事件一览的窗体分支**（`app/designer.nodio`）：`refreshEvents`
+  加 `item.isForm` 路径——选中窗体本身（点空白 / 「窗体设置」）时
+  事件页列 formEvents()，双击某行生成 `winform.<ev> = function(){...}`
+  （**无控件段**，与控件事件 `winform.<名>.<ev>` 区分）。
+- **genEventStub 重构**（`main.nodio`）：插入逻辑（已有只跳转 /
+  DSG 块后插入 / EOF 追加 / 光标落函数体）抽成共享
+  `insertEventStub(path, pat, stub, okMsg)`，控件/窗体两路共用；
+  新增 `formEventSigOf`（ondropfiles → `function(files)`，其余
+  `function()`，官方 win.ui 语义）。
+- **顺手修**（`lib/nodio/ui/board.nodio`）：onDraw 异常兜底从
+  「每次重绘都打一条」改为「同类只打首条」——上一轮窗体属性浮窗在
+  无头冒烟里每 900ms 轮询重绘都炸一次 gdip InvalidParameter（board32），
+  一条冒烟日志刷 103 行噪音，把断言淹没；现在只打 1 条（板名也顺手
+  从无意义的 `[?]` 修成真实板名）。
+- **回归锁**（`ide_smoke.ps1` 增 2 断言）：FORM-EVENTS:9/1——选中
+  窗体 → 事件页恰好 9 行且说明列全有字；FORM-STUB:1——驱动
+  `hooks.onEventCode({isForm=true;...}, "onclose")` → 源码出现
+  `winform.onclose = function()`。
+- 验证：VM 98/0/1、IDE 冒烟 SMOKE OK（含新断言）、ide_debug 88 项全绿。
+- ❌ 剩余（设计器）：布局器（anchors 画布生效）、资源视图 + 控件
+  分类自定义。
