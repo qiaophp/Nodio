@@ -1817,3 +1817,25 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 > 补全浮层加底部说明区。新增夹具驱动回归锁（自带三种形态词库，23 项）
 > 并挂进总回归（19 项）。全量 19/18（winclip 为本机剪贴板竞争假红，
 > 单跑绿）。❌ 剩余：拆分窗口组/打印/LSP 九方法/@ 模板插入展开。
+>
+> **第五十五轮（调试做深——表达式求值）**。用户反馈「开发调试不好用」→
+> 查实断点/单步/变量引擎侧一直有，缺的是**求值**。三段链路打通：引擎
+> `debug.cpp` 新增 `{"cmd":"eval","expr":..}`（Lex→Parser→ParseExpr→
+> Eval(node, env)，**在当前帧环境**求值 → 看得到局部变量；求值前保存/
+> 清空引擎错误槽）；适配器 `evaluate` 请求↔`{"event":"eval"}`事件关联；
+> IDE 底栏新增「**立即**」页签（回车求值，回车处理推迟到定时器——DAP
+> 求值同步阻塞 4 秒，不能在窗口过程里做）。顺带修掉适配器**既存 JSON
+> bug**：`Quote()` 不转义 → process/stackTrace 事件里的 Windows 路径把
+> JSON 弄坏（客户端 json.loads 抛 Invalid \escape）；并补 `JsonStrFieldDecoded`
+> 反转义（此前引擎发的 `\uXXXX` 变量值在 IDE 侧不解码）。回归锁
+> `tests/dap_eval_check.py` + `ide_debug_check.ps1`（20 项：断点行号、
+> 局部变量、中文往返、引号/反斜杠转义、语法错误、内建调用、terminated），
+> 挂进总回归（20 项）。全量 x64 20/20、x86 20/20。❌ 剩余：setVariable、
+> 多帧调用栈、条件断点、异常断点、变量结构化展开。
+
+> **第五十五轮（LSP 协议补全——九方法清零八项）**。三别名（声明/类型/
+> 实现 = definition 同义）+ prepareRename + selectionRange + foldingRange
+> （缩进折叠）+ formatting（花括号深度重排）+ codeAction/signatureHelp
+> 兜底；semanticTokens 挂账（需 LSP 侧词法模型）。客户端四包装；
+> lsp_smoke 扩展八断言 LSP-SMOKE-OK；全量 20/20（套件扩至 20 项，
+> 并行会话第五十四轮补全做深同树验证）。

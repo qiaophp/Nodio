@@ -1907,7 +1907,7 @@ server 自己则随父进程退出变成孤儿。两者互相喂养：下一次 
 
 | 已实现 | 未实现 |
 |---|---|
-| `initialize`、`launch` / `attach`、`setBreakpoints`、`threads`、`stackTrace`、`scopes`、`variables`、`continue`、`next` / `stepIn` / `stepOut`、`pause`、`configurationDone`、`disconnect` / `terminate` | `evaluate`、`setVariable`、`goto`、`exceptionInfo`、`loadedSources` |
+| `initialize`、`launch` / `attach`、`setBreakpoints`、`threads`、`stackTrace`、`scopes`、`variables`、**`evaluate`（表达式求值，在当前暂停帧的环境里求值 —— 能看到局部变量）**、`continue`、`next` / `stepIn` / `stepOut`、`pause`、`configurationDone`、`disconnect` / `terminate` | `setVariable`、`goto`、`exceptionInfo`、`loadedSources` |
 
 > 注：**监视表达式**是 IDE 本地求值（`ide/nodio/main.nodio:1699-1732`），不是 DAP `evaluate`。
 
@@ -5796,3 +5796,101 @@ foo().）。已挂进 `run_regression.ps1`（18 项 → **19 项**）。
 
 ❌ 剩余：拆分窗口组、打印管线、LSP 九方法（第五十三轮并行会话在做）、
 值侧 @ 模板的**插入**展开（`__` → 编辑器 $0 光标位，仍是挂账项）。
+
+## 1.60 第五十五轮：调试做深——表达式求值（立即窗口）——20/20
+
+用户反馈「代码的开发调试」不好用。查实：断点/单步/变量**引擎侧一直有**
+（`engine/debug.cpp` 的管道协议），但**缺最关键的一项：求值**——暂停时
+不能查任意表达式，调试器就只是「看变量名 = 值」的文本流。
+
+### 1.60.1 链路：引擎 → 适配器 → IDE
+
+- **引擎**（`engine/debug.cpp`）：命令管道新增
+  `{"cmd":"eval","expr":"<表达式>"}`，回
+  `{"event":"eval","value":..,"type":..}` 或 `{"event":"eval","error":..}`。
+  求值在**当前帧的 Env** 里做（所以能看到局部变量），实现照抄
+  `builtins.cpp` 的 `CompileToFunc` 范式：`Lex → Parser → ParseExpr →
+  AnnotateNameIds → Interp::Eval(node, env)`（`Eval` 本来就是
+  `interp.h:165` 的公开成员，只是此前没人用它做调试求值）。
+  ⚠ 求值前**保存并清空引擎错误槽**（`err`）：表达式报错不能让后续执行
+  带一条假错误。
+- **适配器**（`apps/nodio-dap/main.cpp`）：`evaluate` 请求 → 把 eval 命令
+  写进命令管道 → 等 ReaderThread 收到 eval 事件 → 回 DAP 响应
+  `{result; type}`。请求-响应用 `g_evalReady` + `g_lastEvalBody` 关联
+  （先写串、再置标志，主循环看到标志才读串）。
+- **IDE**（`app/dapClient.nodio` + `app/shell.nodio` + `main.nodio`）：
+  底栏新增「**立即**」页签（单行输入框），回车 → `shell.hooks.onDebugEval`
+  → `dapClient.evaluate(expr)` → 结果写进调试输出区。
+  ⚠ 回车处理**推迟到定时器**（`winform.setTimeout`）：DAP 求值是同步阻塞的
+  （最长 4 秒），在窗口过程里做会卡住整个 IDE —— 与编辑器组件里
+  `__scheduleComplete` 同一个道理。
+
+### 1.60.2 顺带修掉适配器的**既存 JSON bug**
+
+`Quote()` 原来只是加引号、**不转义** → `process` / `stackTrace` 事件里的
+Windows 路径（`C:\Users\...\x.aardio`）会把 JSON 弄坏（`\U` 不是合法
+转义）→ 客户端 `json.loads` 直接抛 `Invalid \escape`。
+本轮把它改成真正的 JSON 字符串转义（控制字符 + 非 ASCII 转 `\uXXXX`），
+并补 `JsonStrFieldDecoded`（**反转义**）：此前引擎发的变量值是 `\uXXXX`，
+IDE 侧不解码就会显示成一串转义码。
+
+### 1.60.3 管道协议的两个坑
+
+- 引擎侧的命令解析此前是**子串匹配**（`wcmd.find(L"\"continue\"")`）——
+  固定字面量没问题，但表达式里有引号/反斜杠就会坏。eval 命令改用正经的
+  JSON 字段提取 + **反转义**（`\" \\ \n \r \t \uXXXX`）。
+- 管道是**字节**流，事件行必须是纯 ASCII 才安全 → 引擎侧的值/错误一律
+  `\uXXXX` 编码（与既有的 `varsJson` 同策略），适配器侧解码回 UTF-8。
+
+### 1.60.4 回归
+
+新增 `tests/dap_eval_check.py`（Python 写的 DAP 客户端——分帧 JSON-RPC
+在 PowerShell 里太啰嗦，仓库已有 `ai_mock_server.py` 的 Python 先例）
++ `tests/ide_debug_check.ps1` 包装（python 缺失**明确报错**，不静默降级）。
+20 项断言：initialize/launch/断点命中行号、算术、**局部变量可见**、
+局部字符串、中文往返（`\uXXXX` 编码链路）、引号/反斜杠在表达式里的
+转义、语法错误 → type=error、内建函数调用（证明走真解释器）、
+variables 仍工作、terminated。已挂进 `run_regression.ps1`（19 → **20 项**）。
+
+⚠ 写用例时被 aardio 铁律教育了一次：**双引号是原样串、单引号才是转义串**
+→ 想在字符串里放引号得写 `'a"b'`；写 `"a\"b"` 是**非法语法**（引擎报
+「字符串未终止」才是对的）。用例按官方语义改正后全绿。
+
+回归：全量 **x64 20/20、x86 20/20**；IDE 冒烟（含新增底栏页签）全绿。
+
+❌ 剩余：修改变量（setVariable）、真实多帧调用栈、条件断点/命中次数断点、
+异常断点（exceptionInfo）、变量值的结构化展开（表/数组仍是字符串）、
+DAP goto。
+
+## 1.60 第五十五轮：LSP 协议补全（九方法清零八项）——20/20
+
+服务端（apps/nodio-lsp）补齐八个 textDocument 方法：
+
+- **declaration / typeDefinition / implementation**——aardio 单一符号
+  宇宙，三类跳转与 definition 同义（分发层复用 DefinitionFor）；
+- **prepareRename**——位置符号范围 + placeholder（WordAtPos 复用）；
+- **selectionRange**——词范围单层（parent=null）；
+- **foldingRange**——缩进折叠（与编辑器行号栏折叠同族：下一非空行
+  更深成区、回到或更浅收区、空行不计、少于两行不成区）；
+- **formatting**——全文重排（花括号深度缩进，行首连续 } 先减深度；
+  字面量内括号影响深度与客户端 v1 同类限制，语义层修复挂账）；
+- **codeAction**——v1 空数组；**signatureHelp**——形参数据源暂缺
+  返回 null（客户端悬浮签名/词库承担）——均协议完整、客户端不阻塞。
+
+客户端（lspClient.nodio）补 foldingRange/formatting/prepareRename/
+selectionRange 包装（外部客户端与回归用；IDE 自身折叠/格式化走本地
+实现）。**semanticTokens 需要 LSP 侧词法模型，本轮不做**（台账挂账，
+是九方法中唯一剩余）。
+
+验证：tests/lsp_smoke.py 扩展八断言（三别名与 definition 逐字节一致、
+prepareRename/selectionRange 范围、folding 非空、formatting textEdits、
+codeAction/signatureHelp 兜底）——**LSP-SMOKE-OK**；x64/x86 双构建；
+全量回归 **20/20**（套件已扩至 20 项：并行会话新增 ide_complete/
+ide_debug，连同其引擎审计修复 R1 同树验证）。
+
+### 协同状态
+
+并行会话第五十四轮（补全做深 ba40e8d）在第五十一轮的词库合并之上
+扩展（onComplete 三参升级为 qual ++ word 限定符链），保留了我的全部
+接线——两线收敛良好。editor_clip 曾红（OpenClipboard err=5）为
+远程桌面剪贴板同步的占用争用，静置自愈（EDITOR-TESTS-OK 复跑）。
