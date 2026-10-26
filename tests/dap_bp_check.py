@@ -111,6 +111,20 @@ FIXTURE = (
     'io.print("done");\n' # 5
 )
 
+# 调用链夹具（第五十九轮续：多帧调用栈）——a() 在 main 行 8 调 b()，
+# b() 在行 3 执行赋值；断点打在行 3。
+CHAIN_FIXTURE = (
+    'var x = 0;\n'          # 1
+    'var b = function(){\n' # 2
+    '    x = x + 1;\n'      # 3  — 断点行（停时 x==1，即 a() 调 b() 第一次）
+    '}\n'                   # 4
+    'var a = function(){\n' # 5
+    '    b();\n'            # 6  — b 的调用点
+    '}\n'                   # 7
+    'a();\n'                # 8  — a 的调用点
+    'io.print("done");\n'   # 9
+)
+
 BP_LINE = 3  # 1-based；循环体语句行
 
 
@@ -228,6 +242,42 @@ def main():
         ev = d.wait_event("terminated", timeout=20)
         chk_true("never: condition-false-never-stops", ev is not None,
                  "恒假条件竟然停了")
+    finally:
+        d.close()
+
+    # ---------- 场景 D：多帧调用栈（main → a() → b()） ----------
+    chain = os.path.join(os.environ["TEMP"], "nodio_dap_chain_fixture.aardio")
+    with open(chain, "w", encoding="utf-8") as f:
+        f.write(CHAIN_FIXTURE)
+    d = Dap(dap_exe, env)
+    try:
+        ev = launch(d, exe, chain)
+        chk_true("stack: stopped-on-launch", ev is not None, "没等到首停")
+        r = d.request("setBreakpoints",
+                      {"source": {"path": chain},
+                       "breakpoints": [{"line": 3}]})
+        chk_true("stack: setBreakpoints-ok",
+                 r is not None and r.get("success"), str(r))
+        d.request("configurationDone")
+        d.request("continue")
+        ev = d.wait_event("stopped")
+        chk_true("stack: stopped-in-b", ev is not None, "没停在 b 内")
+        r = d.request("stackTrace", {"threadId": 1}, timeout=10)
+        fs = (r or {}).get("body", {}).get("stackFrames") or []
+        chk("stack: frame-count", len(fs), 3)
+        if len(fs) == 3:
+            chk("stack: frame0-name", fs[0].get("name"), "b()")
+            chk("stack: frame0-line", fs[0].get("line"), 2)   # 0 基
+            chk("stack: frame1-name", fs[1].get("name"), "a()")
+            chk("stack: frame1-line", fs[1].get("line"), 5)   # b 的调用点
+            chk("stack: frame2-line", fs[2].get("line"), 7)   # a 的调用点
+            chk_true("stack: frame0-has-source",
+                     bool(fs[0].get("source")), str(fs[0]))
+        r = d.request("setBreakpoints",
+                      {"source": {"path": chain}, "breakpoints": []})
+        d.request("continue")
+        ev = d.wait_event("terminated", timeout=20)
+        chk_true("stack: runs-to-end", ev is not None, "没跑到 terminated")
     finally:
         d.close()
 

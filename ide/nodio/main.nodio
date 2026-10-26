@@ -1750,7 +1750,10 @@ pollDebug = function(){
 			if(refreshWatchList) refreshWatchList();
 			var v = app.dapClient.stackTrace();
 			for(i=1;#v;1){
-				shell.dbgAppend("  @ 行 " ++ (v[i].line + 1));
+				// 第五十九轮续：适配器现在回真实调用栈，帧名是调用点文本
+				//（"b()"）或 "main"——main 帧不重复显示名字。
+				var nm = tostring(v[i].name : "");
+				shell.dbgAppend("  @ " ++ ((#nm && nm != "main") ? nm ++ " " : "") ++ "行 " ++ (v[i].line + 1));
 			}
 			shell.setStatus("已停止 — F10 继续, F11 单步, Ctrl+F9 停止");
 			// 光标跳到停住的那一行（不跳的话用户根本不知道停在哪）

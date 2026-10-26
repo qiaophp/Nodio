@@ -1010,6 +1010,11 @@ Value Interp::CallThisOwner(const Value& f, const Value& ths,
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;
             nReturn = nBreak = nContinue = 0;
             ret = Value();
+            // 第五十九轮续：回调/元方法路径没有调用节点，帧名退化标注
+            DbgFrameScope dfs(*this,
+                              f.fnData && !f.fnData->fname.empty()
+                                  ? f.fnData->fname : L"(method)",
+                              0, local.get());
             ExecBlock(f.fnData->fn, local.get());
             Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR; nBreak = oldB; nContinue = oldC;
@@ -1468,6 +1473,8 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
                 int oldR = nReturn, oldB = nBreak, oldC = nContinue;
                 nReturn = nBreak = nContinue = 0;
                 ret = Value();
+                // 第五十九轮续：构造体帧（无调用点行号）
+                DbgFrameScope dfsCtor(*this, L"(ctor)", 0, local.get());
                 ExecBlock(f.fnData->fn->a, local.get());
                 bool bCtorRet = (nReturn > 0);
                 Value ctorRet = ret;
@@ -1592,6 +1599,18 @@ Value Interp::InstantiateClass(const Value& f, vector<Value>& args,
         }
 
 // ---- EvalCall ----
+// 第五十九轮续：调用点表达式文本（"b()"、"t.f()"）——只拼 Ident/Member
+// 链，够调试帧名用；其余形态退化为 "(call)"。
+static wstring CalleeText(const PNode& n)
+        {
+            if (!n) return L"(call)";
+            if (n->k == Node::Ident) return n->str + L"()";
+            if (n->k == Node::Member) return CalleeText(n->a) + L"." + n->str;
+            if (n->k == Node::Index) return CalleeText(n->a) + L"[...]";
+            if (n->k == Node::Call) return CalleeText(n->a);
+            return L"(call)";
+        }
+
 Value Interp::EvalCall(const PNode& n, Env* env)
         {
             // the callee and its receiver live in C++ locals across the
@@ -2038,6 +2057,8 @@ Value Interp::EvalCall(const PNode& n, Env* env)
             int oldR = nReturn;
             nReturn = 0;
             ret = Value();
+            // 第五十九轮续：调试帧（调用点文本 + 调用行号）
+            DbgFrameScope dfs(*this, CalleeText(n->a), n->line, local.get());
             ExecBlock(f.fnData->fn, local.get());
             Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR;
@@ -4462,6 +4483,11 @@ Value Interp::CallVmFunc(const Value& f, vector<Value>& args)
             int oldR = nReturn, oldB = nBreak, oldC = nContinue;
             nReturn = 0;
             ret = Value();
+            // 第五十九轮续：native 侧入口（定时器/工作线程/FFI 回调）
+            DbgFrameScope dfsNative(*this,
+                                    f.fnData && !f.fnData->fname.empty()
+                                        ? f.fnData->fname : L"(callback)",
+                                    0, local.get());
             ExecBlock(f.fnData->fn, local.get());
             Value r = (nReturn > 0) ? ret : Value();
             nReturn = oldR;

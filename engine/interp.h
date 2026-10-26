@@ -98,6 +98,38 @@ namespace NodioVM
             int curHits = 0;
         };
         std::unordered_map<int, BpMeta> bpMeta;
+        // 第五十九轮续：DAP 多帧调用栈。在四处 VM 函数体执行入口
+        // （EvalCall / CallThisOwner / InstantiateClass 构造体 / CallVmFunc）
+        // 用 DbgFrameScope 记录，pop 由析构保证（ctor 有两条 return 路径）。
+        // 仅 bDebug 时记录（零调试开销）；fiber 交换不换栈——fiber 里的
+        // 调试帧会串到主栈上，v1 已知边界。
+        struct DbgFrame
+        {
+            wstring funcName;      // 调用点表达式文本（"b()"、"t.f()"）
+            int callLine = 0;      // 调用发生处行号（1 基；0 = 无调用点）
+            Env* env = nullptr;    // 该帧环境（供后续逐帧变量用）
+        };
+        std::vector<DbgFrame> dbgStack;
+        struct DbgFrameScope
+        {
+            Interp& I;
+            DbgFrameScope(Interp& i, const wstring& name, int callLine,
+                          Env* env) : I(i)
+            {
+                if (!I.bDebug) return;
+                DbgFrame f;
+                f.funcName = name;
+                f.callLine = callLine;
+                f.env = env;
+                I.dbgStack.push_back(f);
+            }
+            ~DbgFrameScope()
+            {
+                if (I.bDebug && !I.dbgStack.empty()) I.dbgStack.pop_back();
+            }
+            DbgFrameScope(const DbgFrameScope&) = delete;
+            DbgFrameScope& operator=(const DbgFrameScope&) = delete;
+        };
         // external debug session (DAP): when set, DebugStop talks to the
         // adapter over two unidirectional named pipes instead of the console
         void* hDebugPipe = nullptr;     // events pipe (engine -> adapter)

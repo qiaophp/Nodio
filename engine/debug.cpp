@@ -695,6 +695,41 @@ bool Interp::DebugPipeStop(int nLine, Env* env, const char* stopReason)
                     }
                     continue;
                 }
+                if (wcmd.find(L"\"cmd\":\"stack\"") != wstring::npos)
+                {
+                    // 第五十九轮续：真实多帧调用栈。
+                    // 回 {"event":"stack","frames":[{"name","line"},...]}
+                    //   frame[0] = 当前帧（停在 nLine）
+                    //   frame[i≥1] = dbgStack[i-1] 的函数、行 = dbgStack[i].callLine
+                    //   最后补一帧 main（外层调用点 dbgStack[nFrom-1].callLine）
+                    // 超 64 帧从外层截断（保栈顶与 main 帧）。行号 1 基。
+                    wstring j = L"{\"event\":\"stack\",\"frames\":[";
+                    int nEmitted = 0;
+                    auto pushFrame = [&](const wstring& name, int line)
+                    {
+                        if (nEmitted++) j += L",";
+                        j += L"{\"name\":\"" + JsonEscapeAscii(name) +
+                             L"\",\"line\":" +
+                             std::to_wstring(line > 0 ? line : 0) + L"}";
+                    };
+                    int nTot = (int)dbgStack.size();
+                    if (nTot == 0)
+                    {
+                        pushFrame(L"main", nLine);
+                    }
+                    else
+                    {
+                        int nFrom = nTot > 63 ? nTot - 63 : 1;
+                        pushFrame(dbgStack.back().funcName, nLine);
+                        for (int i = nTot - 1; i >= nFrom; i--)
+                            pushFrame(dbgStack[i - 1].funcName,
+                                      dbgStack[i].callLine);
+                        pushFrame(L"main", dbgStack[nFrom - 1].callLine);
+                    }
+                    j += L"]}";
+                    writeLine(j);
+                    continue;
+                }
                 if (wcmd.find(L"\"cmd\":\"bp2\"") != wstring::npos)
                 {
                     // 第五十九轮：{"cmd":"bp2","bps":[{"line":3,

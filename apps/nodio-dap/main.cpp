@@ -60,6 +60,13 @@ static std::string g_lastVarsJson = "{}";        // latest vars from the engine
 static volatile long g_evalReady = 0;
 static std::string g_lastEvalBody;
 
+// 第五十九轮续：stackTrace 的请求-响应关联（{"cmd":"stack"} →
+// {"event":"stack","frames":[...]}）。g_lastStackBody 保存 frames 数组
+// 的**原文**（名字是 \uXXXX 转义，本来就是合法 JSON 片段，可复用）。
+static volatile long g_stackReady = 0;
+static std::string g_lastStackBody;
+static int g_lastStopLine0 = 0;   // 最近一次 stopped 的 0 基行号（兜底帧用）
+
 static bool JsonStrFieldDecoded(const std::string& line, const char* key,
                                  std::string& out);
 static std::string Quote(const std::string& s);
@@ -137,6 +144,7 @@ static DWORD WINAPI ReaderThread(LPVOID)
             std::string ln = JsonNumber(line, "line");
             int nLine0 = ln.empty() ? 0 : atoi(ln.c_str()) - 1;
             if (nLine0 < 0) nLine0 = 0;
+            g_lastStopLine0 = nLine0;
             // 第五十九轮：停因（"breakpoint"/"step"）原样透传给 DAP 客户端
             std::string reason = FindStringField(line, "reason");
             if (reason != "step") reason = "breakpoint";
@@ -150,6 +158,22 @@ static DWORD WINAPI ReaderThread(LPVOID)
         {
             Event("terminated", "");
             break;
+        }
+        else if (ev == "stack")
+        {
+            // 第五十九轮续：引擎回的真实调用栈 → 保存 frames 数组原文
+            //   {"event":"stack","frames":[{"name":"b()","line":5},...]}
+            // 名字是 \uXXXX 转义（纯 ASCII），原文即合法 JSON 片段。
+            size_t p = line.find("\"frames\":[");
+            if (p != std::string::npos)
+            {
+                size_t a = p + 9;                    // '[' 位置
+                size_t e = line.rfind(']');
+                if (e != std::string::npos && e > a)
+                    g_lastStackBody = line.substr(a + 1, e - a - 1);
+            }
+            else g_lastStackBody.clear();
+            InterlockedExchange(&g_stackReady, 1);
         }
         else if (ev == "eval")
         {
@@ -571,14 +595,89 @@ int main()
         }
         else if (command == "stackTrace")
         {
-            std::string name = g_sourcePath;
-            size_t slash = name.find_last_of("\\/");
-            if (slash != std::string::npos) name = name.substr(slash + 1);
+            // 第五十九轮续：向引擎要真实调用栈。请求前清标志，等
+            // ReaderThread 收 {"event":"stack",...}（引擎正停在
+            // DebugPipeStop 里，应答是即时的；最多等 2 秒）。
+            g_lastStackBody.clear();
+            InterlockedExchange(&g_stackReady, 0);
+            SendToEngine("{\"cmd\":\"stack\"}");
+            for (int i = 0; i < 400; i++)
+            {
+                if (InterlockedCompareExchange(&g_stackReady, 0, 0) == 1)
+                    break;
+                Sleep(5);
+            }
+            std::string fileName = g_sourcePath;
+            size_t slash = fileName.find_last_of("\\/");
+            if (slash != std::string::npos)
+                fileName = fileName.substr(slash + 1);
+            // 组 DAP stackFrames。引擎 frames：[0]=当前帧（停在停点行），
+            // 之后是调用方链，最后 main 帧。行号 1 基 → 0 基。
+            // main 帧（name=="main"）的 source 用脚本路径；其余帧
+            // 路径未知（用户模块），只给 name。
+            std::string frames = "[";
+            int id = 0;
+            if (!g_lastStackBody.empty())
+            {
+                size_t pos = 0;
+                while ((pos = g_lastStackBody.find('{', pos)) !=
+                       std::string::npos)
+                {
+                    size_t j = pos + 1;
+                    bool oStr = false;
+                    int oDepth = 1;
+                    while (j < g_lastStackBody.size() && oDepth > 0)
+                    {
+                        char c = g_lastStackBody[j];
+                        if (oStr)
+                        {
+                            if (c == '\\') j++;
+                            else if (c == '"') oStr = false;
+                        }
+                        else
+                        {
+                            if (c == '"') oStr = true;
+                            else if (c == '{') oDepth++;
+                            else if (c == '}') oDepth--;
+                        }
+                        j++;
+                    }
+                    if (j > g_lastStackBody.size()) j = g_lastStackBody.size();
+                    std::string obj = g_lastStackBody.substr(pos, j - pos);
+                    pos = j;
+                    std::string rawName;
+                    JsonStrFieldDecoded(obj, "name", rawName);
+                    std::string ln2 = JsonNumber(obj, "line");
+                    int nLine1 = ln2.empty() ? 0 : atoi(ln2.c_str());
+                    int dapLine = nLine1 > 0 ? nLine1 - 1 : 0;
+                    bool bMain = (rawName == "main");
+                    std::string dispName = bMain ? fileName : rawName;
+                    if (dispName.empty()) dispName = "(fn)";
+                    if (id++) frames += ",";
+                    frames += "{\"id\":" + std::to_string(id) +
+                              ",\"name\":" + Quote(dispName) +
+                              ",\"line\":" + std::to_string(dapLine) +
+                              ",\"column\":1,\"source\":{\"name\":" +
+                              Quote(dispName);
+                    if (bMain)
+                        frames += ",\"path\":" + Quote(g_sourcePath);
+                    frames += "}}";
+                }
+            }
+            if (id == 0)
+            {
+                // 引擎没应答（超时/管道断）——兜底单帧，行号用最近停点
+                frames += "{\"id\":1,\"name\":" + Quote(fileName) +
+                          ",\"line\":" + std::to_string(g_lastStopLine0) +
+                          ",\"column\":1,\"source\":{\"name\":" +
+                          Quote(fileName) + ",\"path\":" +
+                          Quote(g_sourcePath) + "}}";
+                id = 1;
+            }
+            frames += "]";
             Reply(seq, command,
-                  "{\"stackFrames\":[{\"id\":1,\"name\":" + Quote(name) +
-                  ",\"line\":1,\"column\":1,\"source\":{\"name\":" +
-                  Quote(name) + ",\"path\":" + Quote(g_sourcePath) +
-                  "}}],\"totalFrames\":1}");
+                  "{\"stackFrames\":" + frames + ",\"totalFrames\":" +
+                  std::to_string(id) + "}");
         }
         else if (command == "scopes")
         {

@@ -6234,3 +6234,30 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
 - `ide_debug_check` **41 项全绿**（eval 19 + 条件断点 22）。
 - ❌ 剩余（调试器）：真实多帧调用栈、变量结构化展开 + setVariable、
   独立监视窗（下一轮）；❌ 剩余（打印）：PrintDlgW 对话框、打印预览。
+
+---
+
+## 1.65 第五十九轮续：调试器之二——真实多帧调用栈
+
+- **引擎**（`engine/interp.h` / `runtime.cpp` / `debug.cpp`）：新增
+  `dbgStack`（`DbgFrame{funcName, callLine, env}`），在四处 VM 函数体
+  执行入口用 **RAII**（`DbgFrameScope`，构造函数体两条 return 路径的
+  构造体也覆盖）push/pop：`EvalCall`（调用点文本 + 调用行号）、
+  `CallThisOwner`（元方法/回调路径，帧名退化 `(method)`）、
+  `InstantiateClass` 构造体（`(ctor)`）、`CallVmFunc`（定时器/线程
+  等原生侧入口，`(callback)`）。仅 `bDebug` 时记录，零调试开销；
+  帧名取调用点表达式文本（`CalleeText`：`b()`、`t.f()`），脚本函数
+  的 `fnData->fname` 本就为空（仅 FFI 包装有），不动 parser。
+  fiber 交换不换栈（fiber 帧串主栈）是 v1 已知边界。
+- **DAP**（`apps/nodio-dap/main.cpp`）：`stackTrace` 从「伪造单帧」
+  改为向引擎发 `{"cmd":"stack"}`，引擎回
+  `{"event":"stack","frames":[{"name","line"},...]}`（1 基；frame[0]
+  = 停点行，后续是调用方链，末帧 main = 最外层调用点；超 64 帧
+  从外层截断）。适配器转 DAP `stackFrames`（0 基；main 帧带脚本
+  path）；引擎未应答时兜底单帧（行号 = 最近停点，不再固定 line 1）。
+- **IDE**：停止时的调用栈输出带帧名（`@ b() 行 5`；main 帧不重复
+  显示）。
+- **回归锁**：`dap_bp_check.py` 增场景 D（main→a()→b() 三帧的
+  名字/行号/序断言），合计 35 项；`ide_debug_check` 合计 54 项。
+- 验证：VM 98/0/1、IDE 冒烟 SMOKE OK、ide_debug 54 项全绿。
+- ❌ 剩余（调试器）：变量结构化展开 + setVariable、独立监视窗。
