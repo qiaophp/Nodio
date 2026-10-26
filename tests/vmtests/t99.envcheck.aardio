@@ -1,0 +1,13 @@
+// t99 环境门控：nodio.designer 在 x86 下需 NODIO_OVERLAY_LIBDIR
+//（32 位 overlay 无 exe 目录自动探测，见 import.cpp GetOverlayLibDir）；
+// IDE 会自己设该变量。探测不到则本机跳过而非误报失败。
+try
+{
+    import nodio.designer.registry;
+}
+catch (e)
+{
+    io.print("SKIP: designer overlay lib unavailable (set NODIO_OVERLAY_LIBDIR)");
+    return;
+}
+io.print("OK");

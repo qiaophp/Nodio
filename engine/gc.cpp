@@ -211,6 +211,12 @@ namespace NodioVM
         {
             std::vector<Value> v = std::move(p.slotsFree.back());
             p.slotsFree.pop_back();
+            // 第五十轮：取用必须归还预算——acquire 只取不扣，nBytes 单调
+            // 涨满 kBudget 后所有释放被拒、池排空，稳态每帧重新 malloc
+            //（第 46 轮回退判词里的「stock drains to zero」根因）。
+            // 历史记账可能有漂移（缓冲增长后容量变化），饱和减防下溢。
+            size_t capBytes = v.capacity() * sizeof(Value);
+            p.nBytes = (p.nBytes > capBytes) ? p.nBytes - capBytes : 0;
             return v;
         }
         return {};
@@ -264,8 +270,9 @@ namespace NodioVM
             std::lock_guard<std::recursive_mutex> lk(g_gcRegistryMutex);
             LiveEnvSet().erase(this);
         }
-        if (bSlots && !slots.empty())
+        if ((bSlots || bDense) && !slots.empty())
         {
+            // 稠密帧（第五十轮）也持有池化 8 槽缓冲，同样归还
             GcReleaseSlotBuf(std::move(slots));
             GcReleaseBoundBuf(std::move(slotBound));
         }

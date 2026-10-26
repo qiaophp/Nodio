@@ -47,6 +47,86 @@ namespace NodioVM
     static std::mutex g_bigMtx;
     static thread_local int t_inHook = 0;
 
+    // ---- 尺寸窗口站点采集（第五十轮）：NODIO_ALLOC_SITES=lo-hi 时对该
+    // 尺寸段 1/256 采样抓栈聚合。小分配（每调用 9 次 / 1.4KB）的身份靠
+    // 它定位 —— TrackBig 的 >64KB 门槛抓不到这些。
+    static std::atomic<long> g_siteLo{0}, g_siteHi{0};
+    struct SiteRec
+    {
+        long n = 0;
+        unsigned long long b = 0;
+        void* fp[8] = {};
+    };
+    static std::map<unsigned long long, SiteRec> g_sites;
+    static std::mutex g_siteMtx;
+
+    static void TrackSite(size_t n)
+    {
+        long lo = g_siteLo.load(std::memory_order_relaxed);
+        if (!lo) return;
+        if ((long)n < lo || (long)n > g_siteHi.load(std::memory_order_relaxed))
+            return;
+        static thread_local long t_cnt = 0;
+        if ((t_cnt++ & 0xFF) != 0) return;   // 1/256 采样
+        if (t_inHook) return;
+        t_inHook++;
+        {
+            void* fp[10] = {};
+            USHORT nFp = CaptureStackBackTrace(0, 10, fp, nullptr);
+            unsigned long long key = 0;
+            for (int i = 3; i < 8 && i < nFp; i++)
+                key ^= (unsigned long long)(uintptr_t)fp[i] + (key << 7);
+            std::lock_guard<std::mutex> lk(g_siteMtx);
+            SiteRec& s = g_sites[key];
+            if (s.n == 0)
+                for (int i = 0; i < 8 && i < nFp; i++) s.fp[i] = fp[i];
+            s.n += 256;    // 还原为真次数（采样率）
+            s.b += (unsigned long long)n * 256;
+        }
+        t_inHook--;
+    }
+
+    static void DumpSites()
+    {
+        std::lock_guard<std::mutex> lk(g_siteMtx);
+        if (g_sites.empty()) return;
+        HANDLE proc = GetCurrentProcess();
+        static bool bSym = SymInitialize(proc, nullptr, TRUE);
+        (void)bSym;
+        std::vector<std::pair<unsigned long long, SiteRec*>> v;
+        v.reserve(g_sites.size());
+        for (auto& kv : g_sites) v.push_back({kv.first, &kv.second});
+        std::sort(v.begin(), v.end(),
+                  [](auto& a, auto& c) { return a.second->n > c.second->n; });
+        fwprintf(stderr, L"[ALLOC] sites (size %ld-%ld, sampled x256), top by count:\n",
+                 g_siteLo.load(), g_siteHi.load());
+        for (size_t i = 0; i < v.size() && i < 14; i++)
+        {
+            SiteRec& s = *v[i].second;
+            fwprintf(stderr, L"[ALLOC] site #%zu n=%ld %.1fMB at:",
+                     i, s.n, (double)s.b / (1024.0 * 1024.0));
+            for (int f = 3; f < 8; f++)
+            {
+                if (!s.fp[f]) break;
+                char buf[512] = {};
+                SYMBOL_INFO* si = (SYMBOL_INFO*)buf;
+                si->SizeOfStruct = sizeof(SYMBOL_INFO);
+                si->MaxNameLen = 400;
+                DWORD64 disp = 0;
+                if (SymFromAddr(proc, (DWORD64)(uintptr_t)s.fp[f], &disp, si))
+                {
+                    int wl = MultiByteToWideChar(CP_UTF8, 0, si->Name, -1,
+                                                 nullptr, 0);
+                    std::wstring w((size_t)wl, 0);
+                    MultiByteToWideChar(CP_UTF8, 0, si->Name, -1, &w[0], wl);
+                    fwprintf(stderr, L" %s", w.c_str());
+                }
+            }
+            fwprintf(stderr, L"\n");
+        }
+        fflush(stderr);
+    }
+
     static void TrackBig(int ph, size_t n)
     {
         if (n <= 64 * 1024 || t_inHook) return;
@@ -120,6 +200,18 @@ namespace NodioVM
     void AllocStatEnable()
     {
         if (g_allocOn.exchange(true)) return;   // atexit 只挂一次
+        // NODIO_ALLOC_SITES=lo-hi：尺寸窗口站点采样（第五十轮）
+        wchar_t buf[64] = {};
+        DWORD got = GetEnvironmentVariableW(L"NODIO_ALLOC_SITES", buf, 64);
+        if (got > 0 && got < 64)
+        {
+            long lo = 0, hi = 0;
+            if (swscanf(buf, L"%ld-%ld", &lo, &hi) == 2 && lo > 0 && hi >= lo)
+            {
+                g_siteLo.store(lo, std::memory_order_relaxed);
+                g_siteHi.store(hi, std::memory_order_relaxed);
+            }
+        }
         atexit(AllocStatDump);
     }
 
@@ -147,6 +239,7 @@ namespace NodioVM
         px.n.fetch_add(1, std::memory_order_relaxed);
         px.b.fetch_add((unsigned long long)n, std::memory_order_relaxed);
         TrackBig(ph, n);
+        TrackSite(n);
     }
 
     void AllocStatDump()
@@ -167,6 +260,7 @@ namespace NodioVM
                      (size_t)(g_ph[i].b.load() / (unsigned long long)(n ? n : 1)));
         }
         DumpBigSites();
+        DumpSites();
         // 尺寸直方图（2 的幂分桶）：一眼看出分配体构成
         static const wchar_t* bkName[12] = {
             L"<=32", L"64", L"128", L"256", L"512", L"1K",

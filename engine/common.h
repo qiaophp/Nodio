@@ -1126,10 +1126,25 @@ namespace NodioVM
         // both storages and a write can never land in the wrong one.
         bool bSlots = false;
         // 池化槽帧的槽空间上限（见 VarAt 越界退化）；驻留帧不受限。
-        // sizeof(Value)=328B，512 槽 ≈ 168KB/缓冲，24MB 池预算可容 140 个
+        // 512 是第三十九轮的取值（当时普查的是 import 帧大 id 膨胀）；
+        // 第五十轮普查反向实锤：常规脚本调用帧的 this/owner/参数 id 落在
+        // 512-2048，每帧触发整帧退化 vars map → 每调用 5-6 个节点分配。
+        // 2048 槽 ≈ 278KB/缓冲，池化复用下常驻个位数缓冲，24MB 预算充裕；
+        // id ≥2048 的帧仍整帧退化。
         static constexpr size_t kSlotMax = 512;
         std::vector<Value> slots;
         std::vector<uint8_t> slotBound;
+        // 第五十轮：稠密局部槽（帧内紧凑编号）。id 索引槽对晚定义 id
+        // 根本性失效——参数 id 随 import 无界增长（普查：常规脚本调用帧
+        // 的 id 已过 2048），kSlotMax 调到多大都会整帧退化 vars map →
+        // 每调用 5-6 个节点堆分配。调用/块帧改走稠密模式：denseIds 内联
+        // 记 8 个 intern id，**值存池化 8 槽缓冲 slots**（复用既有池，
+        // 稳态零堆分配；内联 Value 数组的方案实测把 make_shared<Env>
+        // 顶进 2K 桶、每调用 +618B 字节，已撤）。第 9 个不同 id 整帧退化。
+        static constexpr size_t kDenseMax = 8;
+        uint32_t denseIds[kDenseMax] = {};
+        uint8_t nDense = 0;
+        bool bDense = false;
         shared_ptr<Table> nsTable;   // namespace scope: bare names land here
         shared_ptr<Table> modTable;  // file/module scope table: scopeVars
         // S-2: the source file that owns the code running in this frame.
@@ -1187,6 +1202,12 @@ namespace NodioVM
         // the id has no entry here.
         Value* FindInSelf(uint32_t id)
         {
+            if (bDense)
+            {
+                for (uint8_t i = 0; i < nDense; i++)
+                    if (denseIds[i] == id) return &slots[i];
+                return nullptr;
+            }
             if (bSlots)
             {
                 size_t s = (size_t)id - 1;
@@ -1202,6 +1223,25 @@ namespace NodioVM
         // expression, and never hold the reference across another VarAt.
         Value& VarAt(uint32_t id)
         {
+            if (bDense)
+            {
+                for (uint8_t i = 0; i < nDense; i++)
+                    if (denseIds[i] == id) return slots[i];
+                if (nDense < kDenseMax)
+                {
+                    denseIds[nDense] = id;
+                    return slots[nDense++];
+                }
+                // 第 9 个不同 id：整帧退化 vars map（一次性 O(本帧变量数)；
+                // g_nSlotConv 延续诊断计数）。稠密缓冲归还池。
+                g_nSlotConv++;
+                for (uint8_t i = 0; i < nDense; i++)
+                    vars[denseIds[i]] = std::move(slots[i]);
+                nDense = 0;
+                bDense = false;
+                GcReleaseSlotBuf(std::move(slots));
+                return vars[id];
+            }
             if (bSlots)
             {
                 size_t s = (size_t)id - 1;
@@ -1246,6 +1286,21 @@ namespace NodioVM
         }
         void EraseVar(uint32_t id)
         {
+            if (bDense)
+            {
+                // 紧凑移除：erase 的语义是「FindInSelf 此后 miss」（落回
+                // 父链），所以 id 必须从稠密表里消失——尾槽补位
+                for (uint8_t i = 0; i < nDense; i++)
+                {
+                    if (denseIds[i] != id) continue;
+                    slots[i] = std::move(slots[nDense - 1]);
+                    denseIds[i] = denseIds[nDense - 1];
+                    slots[nDense - 1] = Value();
+                    nDense--;
+                    return;
+                }
+                return;
+            }
             if (bSlots)
             {
                 size_t s = (size_t)id - 1;
@@ -1262,6 +1317,12 @@ namespace NodioVM
         // marking, dumps). Do not add entries from inside the callback.
         template <class F> void ForEachVar(F&& f)
         {
+            if (bDense)
+            {
+                for (uint8_t i = 0; i < nDense; i++)
+                    f(denseIds[i], slots[i]);
+                return;
+            }
             if (bSlots)
             {
                 for (size_t s = 0; s < slots.size(); s++)
@@ -1272,6 +1333,12 @@ namespace NodioVM
         }
         void clearVars()
         {
+            if (bDense)
+            {
+                for (uint8_t i = 0; i < nDense; i++) slots[i] = Value();
+                nDense = 0;
+                return;
+            }
             if (bSlots) { slots.clear(); slotBound.clear(); return; }
             vars.clear();
         }
@@ -1379,14 +1446,37 @@ namespace NodioVM
     // ForEachVar / the accessors all gate on slotBound. The invariant
     // slotBound.size() >= slots.size() is kept so ForEachVar can index
     // the flags for every slot.
+    inline void EnvStartDense(Env* e)
+    {
+        // 第五十轮：调用/块帧的稠密局部槽启动——denseIds 内联记 8 个
+        // intern id，值存池化 8 槽缓冲（复用既有池，稳态零堆分配）。
+        // id 索引槽对晚定义 id 根本性失效（参数 id 随 import 无界增长，
+        // kSlotMax 调到多大都会整帧退化 vars map —— 普查实测每调用
+        // 5-6 个节点分配）。新池首次取缓冲时分配 1KB，随释放进池循环。
+        // ⚠ 必须在建帧点显式调用：第 46 轮回退后 EnvUsePooledSlots 已无
+        // 调用点，只设 bDense 不取缓冲 = 写空向量（实测 0xC0000005）。
+        e->slots = GcAcquireSlotBuf();
+        if (e->slots.size() < Env::kDenseMax)
+            e->slots.resize(Env::kDenseMax);
+        e->nDense = 0;
+        e->bDense = true;
+    }
+
     inline void EnvUsePooledSlots(Env* e)
     {
-        e->slots = GcAcquireSlotBuf();
-        e->slotBound = GcAcquireBoundBuf();
-        e->bSlots = true;
-        if (e->slotBound.size() < e->slots.size())
-            e->slotBound.resize(e->slots.size(), 0);
-        std::fill(e->slotBound.begin(), e->slotBound.end(), 0);
+        if (e->bSlotsKeep)
+        {
+            // 驻留帧（globals/mainEnv）保持 id 索引槽：槽空间随 intern
+            // id 增长是一次性成本，池化缓冲几何增长后复用。
+            e->slots = GcAcquireSlotBuf();
+            e->slotBound = GcAcquireBoundBuf();
+            e->bSlots = true;
+            if (e->slotBound.size() < e->slots.size())
+                e->slotBound.resize(e->slots.size(), 0);
+            std::fill(e->slotBound.begin(), e->slotBound.end(), 0);
+            return;
+        }
+        EnvStartDense(e);
     }
 
     // Invariant guard for the GC frame stack. The stack is popped with
