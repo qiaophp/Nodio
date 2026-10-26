@@ -1961,15 +1961,51 @@ Value Interp::CreateDirectApiWrapper(HMODULE hMod, const wstring& funcName,
                 // fsys.mmap — MapViewOfFile / CreateFileMappingW /
                 // OpenFileMapping; process.* — LoadLibrary*; dotNet host —
                 // GetProcAddress / GetModuleHandleW).
+                // Policy (audit 2026-10, AUDIT-05): on x64 a bare dynamic-FFI
+                // call whose callee returns a REAL 64-bit POINTER must be
+                // upgraded to ARI64 — an ARInt default truncates the value
+                // and the crippled pointer AVs one call later (probe:
+                // GetProcessHeap returned a sign-extended low-32 value, the
+                // HeapAlloc on it faulted inside ntdll). HANDLE-style returns
+                // stay 32-bit-significant per the Win32 interop contract and
+                // keep the ARInt default (CreateThread/CreateEvent/
+                // OpenProcess ...). The list below is therefore pointer-valued
+                // families only; kernel-handle aliases already covered above
+                // (MapViewOfFile*/CreateFileMapping family, LoadLibrary*,
+                // GetProcAddress/GetModuleHandle, VirtualAlloc) keep their
+                // entries — their NumW/NumA and sibling variants ride along
+                // here so one family never splits across two policies.
                 if (checkName == "MapViewOfFile" ||
                     checkName == "MapViewOfFileEx" ||
                     checkName == "CreateFileMapping" ||
+                    checkName == "CreateFileMappingNum" ||
+                    checkName == "CreateFileMappingNumW" ||
+                    checkName == "CreateFileMappingNumA" ||
                     checkName == "OpenFileMapping" ||
                     checkName == "LoadLibrary" ||
                     checkName == "LoadLibraryEx" ||
+                    checkName == "LoadLibraryExW" ||
                     checkName == "GetProcAddress" ||
                     checkName == "GetModuleHandle" ||
-                    checkName == "VirtualAlloc")
+                    checkName == "VirtualAlloc" ||
+                    checkName == "VirtualAllocEx" ||
+                    // heap/alloc families returning live pointers or heap
+                    // handles whose value is a real address on x64
+                    // (HeapAlloc/HeapReAlloc → LPVOID; GlobalLock → LPVOID;
+                    // Global/LocalAlloc + ReAlloc → HGLOBAL/HLOCAL, an
+                    // address in practice — truncation breaks the paired
+                    // GlobalLock/LocalLock exactly like the GetProcessHeap
+                    // probe; GetProcessHeap → heap address)
+                    checkName == "HeapAlloc" ||
+                    checkName == "HeapReAlloc" ||
+                    checkName == "GetProcessHeap" ||
+                    checkName == "GlobalAlloc" ||
+                    checkName == "GlobalReAlloc" ||
+                    checkName == "GlobalLock" ||
+                    checkName == "LocalAlloc" ||
+                    checkName == "LocalReAlloc" ||
+                    checkName == "LocalLock" ||
+                    checkName == "CreateBoundaryDescriptor")
                 {
                     retType = ARI64;
                 }

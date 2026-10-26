@@ -261,6 +261,39 @@ namespace NodioVM
         return it != s_bufSizes.end() ? it->second : 0;
     }
 
+    // ---------------- AUDIT-11: dynbuf identity registry ----------------
+    // A dynbuf's script-visible pointer is the DATA area; its 16-byte
+    // header lives at (p - 16), i.e. OUTSIDE the pointer the script holds.
+    // The old IsDynBuffer probed that magic on every pointer it was given,
+    // so any non-dynbuf pointer (a plain raw.buffer, an FFI pointer, a
+    // stack address) caused a 4-byte read before the allocation — an
+    // ASAN heap-buffer-overflow (probe p6, reproduced on the pre-R2 build).
+    // The registry records which pointers really are dynbufs, so the magic
+    // probe only ever runs on a vouched pointer.
+    static std::mutex s_dynMutex;
+    static std::unordered_set<const void*> s_dynBufs;
+
+    void RegisterDynBuf(void* pData)
+    {
+        if (!pData) return;
+        std::lock_guard<std::mutex> lock(s_dynMutex);
+        s_dynBufs.insert(pData);
+    }
+
+    void UnregisterDynBuf(void* pData)
+    {
+        if (!pData) return;
+        std::lock_guard<std::mutex> lock(s_dynMutex);
+        s_dynBufs.erase(pData);
+    }
+
+    bool IsRegisteredDynBuf(const void* ptr)
+    {
+        if (!ptr) return false;
+        std::lock_guard<std::mutex> lock(s_dynMutex);
+        return s_dynBufs.find(ptr) != s_dynBufs.end();
+    }
+
     static NodioConfig s_config;
     static std::once_flag s_configOnce;
 

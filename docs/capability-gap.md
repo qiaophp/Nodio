@@ -6127,3 +6127,62 @@ Nodio 现状分两类：
 ❌ 剩余：图标方案落地；设计器侧还有窗体属性对话框、布局器、Tab 顺序、
 资源视图；拖拽时预览框刷新仍会整块重画底布（拖动过程中的轻微闪烁，
 与心跳那处不是一回事）。
+
+### 1.57 审计修复 R2——P1/P2 五项 + 新发现 AUDIT-11
+
+2026 年 10 月 VM 全面审计（docs/audit-2026-10-vm.md）分轮修复第二轮。
+基线 = R1 入库提交 1474538，补丁 .audit-r2-p1-fix.patch（5 文件 +181/−8），
+底稿 .audit-r2-p1-fix.md。与并行 IDE 线无冲突（apply --3way 8 文件 cleanly）。
+
+**AUDIT-04（P1）**：::LoadCursor/LoadIcon 签名 `addr(int id)` →
+`addr(addr hinst,int id)`（真实 LoadCursorW 两参契约，原一参把第 2 槽寄存器
+残留当 id）；GetCursor → `addr()`。官方契约见 lib/builtin/_.aardio:305
+「LoadCursor(hInstance,lpCursorName)…参数 @hInstance 一般指定为 null」。
+
+**AUDIT-05（P1）**：ffi 动态路径 64 位返回白名单补指针族（HeapAlloc/
+HeapReAlloc/GetProcessHeap/VirtualAllocEx/GlobalAlloc/GlobalReAlloc/
+GlobalLock/LocalAlloc/LocalReAlloc/LocalLock/CreateBoundaryDescriptor
++ CreateFileMappingNum*/LoadLibraryExW）。政策写进注释：HANDLE 型返回按
+WOW64 契约 32 位显著保持 ARInt 默认，只有真实 64 位指针族升级 ARI64；
+判定在包装创建时一次（checkName），热路径零成本。
+
+**AUDIT-06（P1）**：win.clip write 的 GlobalLock 未判空 → memcpy 必崩，
+改为 GlobalFree + CloseClipboard + 返回 null（官方静默失败语义）。
+
+**AUDIT-08（P2）**：GetClassInfoEx / RedrawWindow / GradientFill 三处签名
+标签对齐真实 Win32 契约（消除文档陷阱，非行为修复）。
+
+**AUDIT-10（P1）**：raw.concat/append 的 len 未钳制 → 巨值 memcpy。三处修：
+① 源侧 n = min(显式 len, 源实际尺寸)（Str/Num/Struct 精确；Pointer 在
+尺寸已知时钳制）；② dst 非 dynbuf 分支的第三参实为**写入偏移**（dst
+语义），负值/巨值 → memcpy(dst+(size_t)1e30) 越界 —— 改偏移域拒绝 +
+已知尺寸目标拒绝越界窗口；③ DynAlloc 失败路径放弃本次 append（原代码
+落回旧块继续 memcpy 巨值）。
+
+**AUDIT-11（P1，R2 轮新发现）**：IsDynBuffer 盲读 ptr-16 的 magic →
+对任何非 dynbuf 指针（普通 raw.buffer / FFI 指针 / 栈地址）越界读 4 字节。
+**在 R1 的 ASAN 构建（无 R2 改动）上复现**（探针 p6，heap-buffer-overflow
+@ common.h:353）——证明是既有缺陷而非 R2 引入；SEH __except 兜底在 ASAN
+插桩层无效（ASAN 先报毒不产生 SE 异常）。修法：dynbuf 身份改走**注册表**
+（util.cpp 新增 s_dynBufs + RegisterDynBuf/UnregisterDynBuf/
+IsRegisteredDynBuf），IsDynBuffer 先查注册表，未命中直接 false，magic 探测
+只对注册表背书的指针执行；DynAlloc 三条产生路径全部注册，realloc 注销旧
+指针+注册新指针，释放注销。伴随修：raw.free 原对 dynbuf 直接 free 数据区
+指针 = 内部指针 free（Windows 自身堆容忍故 ASAN 不报，块头悬垂）→ 改走
+DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
+
+#### 1.57.1 回归数字
+
+- 探针（ASAN）：p2 LoadCursor=65539（IDC_ARROW）✓、p3 GetProcessHeap/
+  HeapAlloc 返回完整 64 位值 ✓、p5 rawconcat 5 场景全过 exit=0 ✓、
+  p6 零报告 ✓（修复前 ASAN 必报）、p7 dynfree ✓ —— 五个探针 ASAN 零报告。
+- VM：ASAN **94 passed / 5 failed / 0 skipped**（5 失败 = 已定案帧膨胀伪红
+  族 t70/t94/t95/t97/t98；t23 剪贴板首跑 SKIP、复跑 PASS）；普通 **99/99
+  全绿**；主树（1474538+R2）**99/99 全绿 + 七套 CLI 全绿**。
+- A/B（perf_ab 7 轮中位，同基线唯一差异 = R2 补丁，TAIL_EQ 行为等价）：
+  loop5m 1.047 / call5m 1.006 / lenfn5m 0.989 / callv5m 1.004——三项在 ±1%
+  噪声带内，loop5m +4.7% 定性 MSVC 编译布局效应（§1.51 同类），R2 触及的
+  dynbuf 注册表 / raw.concat 不在四夹具 hot path 上，无语义回退。
+- **A/B 纪律留档**：首轮对照是脏的——old 用 1474538（含主树并行 perf 提交）、
+  new 用 3dd464e 基线+R1+R2（不含并行提交），call5m 报出 0.595 的假「提速」；
+  作废并改为同基线三方合并重跑。**对照与被测必须同基线。**

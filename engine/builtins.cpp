@@ -1303,6 +1303,7 @@ Value CreateSize64(uint64_t val)
                 {
                     DynBufHeader* h = GetDynBufHeader(pOld);
                     h->magic = 0;
+                    UnregisterDynBuf(pOld);
                     HeapFree(GetProcessHeap(), 0, h);
                 }
                 else
@@ -1326,6 +1327,9 @@ Value CreateSize64(uint64_t val)
             hNew->length = (uint32_t)min((size_t)hNew->capacity, oldLen);
             char* pData = (char*)hNew + sizeof(DynBufHeader);
             pData[n] = 0;
+            // the data pointer moved (realloc) — the registry must follow
+            UnregisterDynBuf(pOld);
+            RegisterDynBuf(pData);
             return pData;
         }
         else if (pOld)
@@ -1339,8 +1343,12 @@ Value CreateSize64(uint64_t val)
             hNew->length = 0;
             char* pData = (char*)hNew + sizeof(DynBufHeader);
             memcpy(pData, pOld, n);
+            // the old plain buffer is gone — drop its registry entry too
+            // (a stale entry would report a size for a freed pointer)
+            UnregisterBuffer(pOld);
             HeapFree(GetProcessHeap(), 0, pOld);
             pData[n] = 0;
+            RegisterDynBuf(pData);
             return pData;
         }
         else
@@ -1354,6 +1362,7 @@ Value CreateSize64(uint64_t val)
             hNew->length = 0;
             char* pData = (char*)hNew + sizeof(DynBufHeader);
             pData[n] = 0;
+            RegisterDynBuf(pData);
             return pData;
         }
     }
@@ -5708,6 +5717,15 @@ void Interp::InitBuiltins()
                         HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes + 2);
                         if (!h) { CloseClipboard(); return Value(); }
                         wchar_t* q = (wchar_t*)GlobalLock(h);
+                        if (!q)
+                        {
+                            // AUDIT-06: GlobalLock can fail (discarded
+                            // movable block under memory pressure) — a raw
+                            // memcpy through NULL was a guaranteed AV.
+                            GlobalFree(h);
+                            CloseClipboard();
+                            return Value();
+                        }
                         memcpy(q, text.c_str(), bytes);
                         q[text.size()] = 0;
                         GlobalUnlock(h);
@@ -7211,6 +7229,17 @@ void Interp::InitBuiltins()
                     if (a.empty()) return Value::Bool_(false);
                     void* p = BufPtr(a[0]);
                     if (!p) return Value::Bool_(true);
+                    // AUDIT-11: a dynbuf's script-visible pointer is the DATA
+                    // area; freeing it directly is an interior-pointer free
+                    // (heap corruption — Windows' own heap tolerates it, so
+                    // no ASAN report, but the block header is left dangling).
+                    // Route it through DynAlloc(0, p), which frees the whole
+                    // block (header + data) and drops the registry entry.
+                    if (IsDynBuffer(p))
+                    {
+                        DynAlloc(0, p);
+                        return Value::Bool_(true);
+                    }
                     UnregisterBuffer(p);
                     return Value::Bool_(
                         HeapFree(GetProcessHeap(), 0, p) != FALSE); });
@@ -7575,16 +7604,34 @@ void Interp::InitBuiltins()
                     std::string held;
                     void* pAllocStruct = nullptr;
                     const char* s = nullptr; size_t n = 0;
+                    // AUDIT-10: an explicit len used to pass straight
+                    // through as `n`; a negative or huge value (e.g. -1,
+                    // 1e30) made n enormous — an OOB read on the source
+                    // and, combined with a failed DynAlloc, a huge memcpy
+                    // through the old block. Clamp n to the source's real
+                    // extent wherever the extent is known; legal inputs
+                    // (len <= real size) are unaffected.
                     if (a[1].t == Value::Str)
                     {
                         held = RawBytesOf(BStr(a[1]));
                         s = held.data();
                         n = a.size() > 2 && a[2].t != Value::Null ? (size_t)BNum(a[2]) : held.size();
+                        n = min(n, held.size());
                     }
                     else if (a[1].t == Value::Pointer)
                     {
                         s = (const char*)a[1].ptr;
                         n = a.size() > 2 && a[2].t != Value::Null ? (size_t)BNum(a[2]) : 0;
+                        // bare pointers carry no size metadata — clamp only
+                        // when the extent is knowable (raw semantics kept:
+                        // script-owned pointers stay the caller's word)
+                        if (s && a[1].ptr)
+                        {
+                            size_t known = 0;
+                            if (IsBuffer(a[1].ptr)) known = GetBufferSize(a[1].ptr);
+                            else if (IsDynBuffer(a[1].ptr)) known = GetDynBufHeader(a[1].ptr)->length;
+                            if (known && n > known) n = known;
+                        }
                     }
                     else if (a[1].t == Value::TableT || a[1].t == Value::Class)
                     {
@@ -7592,12 +7639,14 @@ void Interp::InitBuiltins()
                         pAllocStruct = StructSerialize(a[1], &total);
                         s = (const char*)pAllocStruct;
                         n = a.size() > 2 && a[2].t != Value::Null ? (size_t)BNum(a[2]) : (size_t)total;
+                        n = min(n, (size_t)total);
                     }
                     else if (a[1].t == Value::Num)
                     {
                         held = std::to_string((long long)a[1].n);
                         s = held.data();
                         n = a.size() > 2 && a[2].t != Value::Null ? (size_t)BNum(a[2]) : held.size();
+                        n = min(n, held.size());
                     }
 
                     if (!s || n == 0)
@@ -7618,6 +7667,15 @@ void Interp::InitBuiltins()
                                 a[0].ptr = pNew;
                                 h = GetDynBufHeader(pNew);
                             }
+                            else
+                            {
+                                // AUDIT-10: allocation failed (huge n) — the
+                                // old code fell through and memcpy'd n bytes
+                                // through the undersized old block. Give up
+                                // this append; the dynbuf stays intact.
+                                if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
+                                return a[0];
+                            }
                         }
                         memcpy((char*)a[0].ptr + h->length, s, n);
                         h->length += (uint32_t)n;
@@ -7631,7 +7689,33 @@ void Interp::InitBuiltins()
                         void* dst = a[0].t == Value::Pointer ? a[0].ptr : (void*)(INT_PTR)(long long)a[0].n;
                         if (dst)
                         {
-                            size_t off = a.size() > 2 ? (size_t)BNum(a[2]) : 0;
+                            // AUDIT-10 (write side): here the 3rd arg is the
+                            // WRITE OFFSET (dst semantics), not a length —
+                            // a negative/huge value is UB on the size_t
+                            // conversion and memcpy(dst+off,...) crashed
+                            // (probe p5 case 1: off=1e30 → 0x8000...). Reject
+                            // out-of-domain offsets; for size-known buffers
+                            // also reject an overrunning window. Bare unknown
+                            // pointers inside the safe domain keep raw
+                            // semantics (caller owns the pointer).
+                            double dOff = a.size() > 2 ? BNum(a[2]) : 0;
+                            if (!(dOff >= 0 && dOff <= 0x7FFFFFFF))
+                            {
+                                if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
+                                return a[0];
+                            }
+                            size_t off = (size_t)dOff;
+                            if (a[0].t == Value::Pointer && a[0].ptr)
+                            {
+                                size_t known = 0;
+                                if (IsBuffer(a[0].ptr)) known = GetBufferSize(a[0].ptr);
+                                else if (IsDynBuffer(a[0].ptr)) known = GetDynBufHeader(a[0].ptr)->length;
+                                if (known && off + n > known)
+                                {
+                                    if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
+                                    return a[0];
+                                }
+                            }
                             memcpy((char*)dst + off, s, n);
                             if (pAllocStruct) HeapFree(GetProcessHeap(), 0, pAllocStruct);
                             return Value::Num_((double)(off + n));

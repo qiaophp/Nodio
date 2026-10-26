@@ -344,9 +344,25 @@ namespace NodioVM
     };
     static_assert(sizeof(DynBufHeader) == 16, "DynBufHeader must be 16 bytes");
 
+    // AUDIT-11: a dynbuf's data pointer is preceded by its header, but the
+    // header is NOT part of the pointer the script holds — the script gets
+    // the data area (header + 16). Probing the magic at (p - 16) therefore
+    // reads 16 bytes BEFORE the allocation for every pointer that is not a
+    // dynbuf (a plain raw.buffer, an FFI pointer, a stack address): a
+    // 4-byte out-of-bounds read that ASAN reports as
+    // heap-buffer-overflow (probe p6, reproduced on the pre-R2 build).
+    // The identity is therefore tracked in a registry (util.cpp), and the
+    // magic probe only runs on a pointer the registry vouches for.
+    void RegisterDynBuf(void* pData);
+    void UnregisterDynBuf(void* pData);
+    bool IsRegisteredDynBuf(const void* ptr);
+
     inline bool IsDynBuffer(const void* p)
     {
         if (!p) return false;
+        // registry check first: a registered plain buffer has no header at
+        // all, and an unregistered pointer must never be dereferenced.
+        if (!IsRegisteredDynBuf(p)) return false;
         __try
         {
             const DynBufHeader* h = (const DynBufHeader*)((const char*)p - 16);
@@ -1781,6 +1797,9 @@ namespace NodioVM
     void UnregisterBuffer(void* ptr);
     bool IsBuffer(const void* ptr);
     size_t GetBufferSize(const void* ptr);
+    // AUDIT-11: dynbuf identity registry (see IsDynBuffer above)
+    // (declared next to IsDynBuffer as well — this is the buffer-tracking
+    // block's view of the same API)
 
     // time.cpp / builtins.cpp
     Value MakeTimeObject(const SYSTEMTIME& st, const wstring& fmt = L"%Y/%m/%d %H:%M:%S");
