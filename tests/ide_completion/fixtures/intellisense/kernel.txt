@@ -1,0 +1,11 @@
+测试用内核词库（格式照官方 config/intellisense/kernel.txt）
+第 1 行到分隔线之前是官方那种「说明头」，解析器应当整段跳过
+^MAXFIXTURE = 36
+^IGNORECASE_FIXTURE_KEY = 1
+_FIXTURE_VERSION = 1
+fxns.wait(.(timeout) = 等待条件成立；超时则返回 null。
+fxns.open( = 打开一个文件并返回句柄。
+fxns.close = 关闭之前打开的句柄。
+fxns.value = 一个数值类型的成员。
+plainGlobal = 一个全局符号。
+snipTemplate = @fxns.open( = 打开文件的代码模板。

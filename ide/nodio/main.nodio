@@ -222,7 +222,18 @@ shell.editor.onComplete = function(line, col, prefix){
 //   组件侧已经做了两件事保证不卡：
 //   ① 只在鼠标**停住 350ms** 之后才问；
 //   ② 提问放到定时器里，不在窗口过程里做。
-shell.editor.onHover = function(line, col){
+shell.editor.onHover = function(line, col, qual, word){
+	// ① 官方词库优先（LSP 侧 hover 只回 "**词名** + 类型"，没有说明文字；
+	//    官方 API 的中文文档**只存在于词库**里）。
+	//    qual = 词的限定符（"winform."），用来在多个同名成员里定位那一条。
+	try{
+		var key = (qual : "") ++ (word : "");
+		if(#key){
+			var libTxt = nodio.intellisense.hover(key);
+			if(libTxt && #libTxt) return tostring(libTxt);
+		}
+	}catch(eLib){}
+	// ② LSP（用户自己写的符号，只有 LSP 知道它的类型）
 	if(!app.lspClient.isRunning()) return "";
 	var txt = app.lspClient.hover(line - 1, col - 1);
 	if(txt === null || txt === undefined) return "";

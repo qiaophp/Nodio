@@ -1,0 +1,137 @@
+// tests/ide_completion/comp.nodio — 补全链路的回归锁（第五十四轮）。
+//
+// 这条锁守的是「限定符补全」这条链路：
+//   敲 "fxns." → 词库给出该命名空间的成员
+//   敲 "fxns.wait" → 候选 + 悬停说明
+//
+// ── 为什么以前锁不住 ────────────────────────────────────────────
+// 旧实现只按**标签**（key 的最后一段）做前缀匹配：
+//   · 写 "fxns." 时标签是 "wait"/"open"，没有一条以 "fxns." 开头
+//     → 限定符场景**一条候选都出不来**
+//   · 而且 winform.txt **没有 "----" 分隔线**（官方实测），只认分隔线的
+//     解析器会把整份 winform.txt 跳过 → 窗体 API 全部补不出来
+// 这两条合起来 = 「自动补全不好用」的技术根因。
+//
+// ── 断言口径 ───────────────────────────────────────────────────
+// ① 词库解析：三种官方形态（带分隔线 / 无分隔线+注释头 / 重定向）
+// ② 限定符补全：成员命中、部分词过滤、命名空间前缀（"fxns." → "fxnsx"）
+// ③ 全局补全：普通词
+// ④ 重定向条目：alias → fxns 命名空间
+// ⑤ hover：限定符 + 词 → 官方说明
+// ⑥ 编辑器组件：算出的**完整前缀**含限定符（链路的最后一环）
+// ⑦ 官方真实词库冒烟（装了 aardio 才跑；没装就跳过，不算失败）
+import win.ui;
+import nodio.intellisense;
+import nodio.ui.editor;
+
+var fail = 0;
+var skip = 0;
+function chk(name, got, want){
+	if(got === want){ io.print("PASS ", name); return; }
+	fail++;
+	io.print("FAIL ", name, " got=", tostring(got), " want=", tostring(want));
+}
+function chkTrue(name, got, detail){
+	if(got){ io.print("PASS ", name); return; }
+	fail++;
+	io.print("FAIL ", name, "  ", tostring(detail));
+}
+
+// 夹具词库目录（相对本文件：tests\ide_completion\fixtures\intellisense）
+var fixDir = "D:\Nodio\tests\ide_completion\fixtures\intellisense";
+
+// ---------- ① 解析 ----------
+var n = nodio.intellisense.loadFrom(fixDir);
+chkTrue("fixtures/parse-count", n > 8, "条目数=", n);
+
+// ---------- ② 限定符补全 ----------
+// 注："fxns.wait" 在夹具里有**两个来源**（kernel 的带形参条目 + winform 的
+//     普通条目），所以是 2 条，不是一条。
+var a = nodio.intellisense.complete("fxns.wait");
+chkTrue("qualifier/exact-count", #a >= 1, "候选数=", #a);
+if(#a >= 1){ chk("qualifier/exact-label", a[1].label, "wait"); }
+
+var b = nodio.intellisense.complete("fxns.");
+chkTrue("qualifier/ns-count", #b >= 4, "候选数=", #b);
+
+// 命名空间前缀：qual 是某 ns 的前缀 → 该命名空间本身作为候选
+var c = nodio.intellisense.complete("fxnsx.");
+chk("qualifier/ns-prefix-count", #c, 0);   // 夹具里没有 fxnsx → 不该出东西
+
+// 部分词过滤："fxns.o" 只应出 open / withTemplate 之类
+var d = nodio.intellisense.complete("fxns.o");
+var labels = {};
+for(i=1;#d;1){ labels[d[i].label] = true; }
+chkTrue("qualifier/partial-filter", labels["open"] === true, "标签=", labels);
+
+// ---------- ③ 全局补全 ----------
+var e = nodio.intellisense.complete("plainG");
+chkTrue("global/count", #e >= 1, "候选数=", #e);
+if(#e >= 1){ chk("global/label", e[1].label, "plainGlobal"); }
+
+// ---------- ④ 重定向 ----------
+var f = nodio.intellisense.complete("alias");
+chk("redirect/count", #f, 1);
+if(#f == 1){
+	chkTrue("redirect/detail", ..string.indexOf(f[1].detail, "→") !== null, f[1].detail);
+	chkTrue("redirect/ns", ..string.indexOf(f[1].detail, "fxns") !== null, f[1].detail);
+}
+
+// ---------- ⑤ hover ----------
+var h1 = nodio.intellisense.hover("fxns.wait");
+chkTrue("hover/qualified", h1 && #h1 > 0 && ..string.indexOf(h1, "等待") !== null, h1);
+var h2 = nodio.intellisense.hover("wait");
+chkTrue("hover/label", h2 && #h2 > 0, h2);
+var h3 = nodio.intellisense.hover("完全不存在的词xyz");
+chk("hover/miss", h3, "");
+
+// ---------- ⑥ 编辑器组件：完整前缀 ----------
+var f2 = win.form(text="ide-completion";right=800;bottom=400);
+f2.add({ ed={cls="richedit";left=0;top=0;right=600;bottom=300;multiline=true} });
+f2.show();
+win.delay(500);
+
+var ed = nodio.ui.editor(f2, {ctrl=f2.ed; fontSize=11});
+win.delay(200);
+
+var gotPrefix = "";
+ed.onComplete = function(line, col, prefix){ gotPrefix = prefix; };
+
+var cases = {
+	{"fxns.wait"; 9; "fxns.wait"};
+	{"fxns."; 5; "fxns."};
+	{"wait"; 4; "wait"};
+	{"obj.method."; 10; "obj.method"};
+	{"foo()."; 6; ""};
+};
+for(i=1;#cases;1){
+	var cs = cases[i];
+	ed.setText(cs[1]);
+	ed.control().setSel(cs[2]);
+	win.delay(120);
+	gotPrefix = "";
+	ed.requestComplete();
+	win.delay(60);
+	chk("editor/prefix:" ++ cs[1], gotPrefix, cs[3]);
+}
+f2.close();
+
+// ---------- ⑦ 官方真实词库冒烟 ----------
+var offDir = "D:\aardio\config\intellisense";
+if( ..string.load(offDir ++ "\\kernel.txt") ){
+	var m = nodio.intellisense.loadFrom(offDir);
+	chkTrue("official/parse-count", m > 300, "条目数=", m);
+	var o1 = nodio.intellisense.complete("winform.w");
+	chkTrue("official/winform-members", #o1 >= 2, "候选数=", #o1);
+	var o2 = nodio.intellisense.complete("string.fo");
+	chkTrue("official/string-member", #o2 >= 1, "候选数=", #o2);
+	var o3 = nodio.intellisense.hover("winform.wait");
+	chkTrue("official/hover", o3 && #o3 > 0, "hover=", o3);
+}
+else{
+	skip = skip + 1;
+	io.print("SKIP official-lexicon (本机未装 aardio 的官方词库)");
+}
+
+if(fail){ io.print("== COMPLETION FAILED: ", fail); return 1; }
+io.print("== IDE COMPLETION OK (跳过 ", skip, " 项) ==");

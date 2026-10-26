@@ -1875,7 +1875,7 @@ server 自己则随父进程退出变成孤儿。两者互相喂养：下一次 
 | 快速打开文件（Ctrl+P） | ✅ 已通（工程文件模糊匹配 + 定位载入页签） | `shell.nodio:1064` |
 | **打印 / 打印预览 / 快速打印 / 打印设置** | ❌ **未做** —— 菜单无任何打印入口，`lib/nodio/` 全库无打印管线 | — |
 | 以 RTF / HTML 格式复制文档 | ✅ 已通（RTF=整篇 richedit 原生 copy + 全文着色补偿；HTML=token 流直出 CF_HTML + CF_UNICODETEXT 兜底；复制后选区还原） | `shell.nodio:1146-1152`；`app/editor.nodio:21-22`；`editor.nodio:195-239, 938-1095`；§1.52 |
-| **官方 intellisense 词库**（`config/intellisense/kernel.txt` 150KB + `winform.txt` 58KB） | ❌ **未接入** —— 补全靠 LSP 自产 | — |
+| **官方 intellisense 词库**（`config/intellisense/kernel.txt` 150KB + `winform.txt` 58KB + `unimportant.txt` 5KB） | ✅ 已接入并**可用**：三形态解析（带分隔线 / 无分隔线+注释头 / 重定向）941 词条；**限定符补全**（写 `winform.` → 234 条窗体成员；写 `string.` → 106 条）+ 悬停出官方中文说明 | `lib/nodio/intellisense.nodio`；`editor.nodio` 限定符前缀；§1.59 |
 
 ### 5.2 工程 / 窗口面
 
@@ -5715,3 +5715,84 @@ IDE 启动零错、SMOKE OK、全量 18/18。
 同一工作树的覆盖风险持续存在，提交粒度已压缩至「编辑完即提交」。
 
 ❌ 剩余：拆分窗口组、打印管线、LSP 九方法。
+
+## 1.59 第五十四轮：补全做深（限定符补全 + 官方说明 + 浮层说明区）——19/18
+
+用户反馈「自动补全不好用」。查下来：**自动触发机制本来就有**
+（`editor.nodio` 的 `__autoComplete`：'.' 必问、词 ≥3 字符才问），
+真正断掉的是**限定符场景**——写 `winform.` / `string.` 时一条候选都
+出不来，官方 API 根本补不出来。三个叠加的根因：
+
+### 1.59.1 根因一：标签取「末段」+ 只按标签前缀匹配
+
+词库条目形如 `winform.wait(.(等待函数,超时,延时间隔)`，旧实现把候选
+标签取成 key 的**最后一段**（"wait"），而 `complete(prefix)` 只做
+`startsWith(label, prefix)`。于是写 "winform." 时，没有一个标签以
+"winform." 开头 → **限定符场景必然为空**。
+
+修法：条目额外记 `ns`（命名空间 = key 点分路径第一段），`complete`
+按上下文分两路 —— prefix 不含 '.' 走全局标签匹配；prefix 含 '.' 则
+拆成「限定符 + 已输入部分」，按 `ns` 精确匹配，partial 做标签前缀过滤；
+限定符是某 ns 的前缀时（"win" 对 "win.ui"），该命名空间本身作为候选。
+
+### 1.59.2 根因二：winform.txt 没有分隔线，整份被跳过
+
+官方三份词库的**分隔规则不一样**（实测）：
+
+| 文件 | 头部 | 分隔线 |
+|---|---|---|
+| kernel.txt | 8 行官方格式说明 | 第 8 行 `----` |
+| winform.txt | 第 1 行 `/***intellisense() ` | **没有** |
+| unimportant.txt | 无 | **没有** |
+
+旧解析器只认 "----" → winform.txt 的 **234 条窗体成员一条都没进来**
+（只解析到 kernel 的 476 条）。修法：有分隔线就严格以分隔线为准；没有
+分隔线则跳过注释头行、从第一条含 " = " 的行开始当数据。
+
+### 1.59.3 根因三：值内重定向 + `lastIndexOf` 位置语义
+
+- 词库值里可能带命名空间重定向：`!fxns._form = 宿主窗口。\n!fxns.`
+  （末尾 `\n!ns.`）、`!winform.createEmbedEx() = !embedObjectForm.`
+  （纯重定向）。现在都解析出来：重定向目标成为该标识符的 `ns`
+  （敲 `nmhdr` → 跳 nmhdr 命名空间），并进 detail。
+- `..string.lastIndexOf(s, sub)` 返回的是**匹配点本身**的 1 基位置
+  （"type." 的 "." 在第 5 位 → 返回 5）。按 `slice(s,1,pos)` 取限定符
+  会把点也带进去（"type." ≠ "type"）→ ns 比对永远不相等。
+  实测钉死：**限定符要取 `slice(s,1,pos-1)`**。这条曾让「已修好」的
+  实现仍然一条候选都出不来，是本轮最隐蔽的一个坑。
+
+### 1.59.4 悬停出官方中文说明
+
+LSP 侧 hover 只回 `"**词名** + 类型"`（`apps/nodio-lsp/main.cpp:1027`），
+**没有任何说明文字**；而官方 API 的中文文档只存在于词库里。所以悬停
+改为**词库优先**、LSP 兜底（用户自己写的符号只有 LSP 知道类型）。
+编辑器侧新增 `__qualifierAtWord`（按词的字节起点往回扫），
+`__wordAtPos` 多返回一个 `bstart`（字节起点 —— 不能用 richedit 的
+UTF-16 位置，中文会错位）。hover 钩子签名扩为
+`function(line, col, qual, word)`。
+
+### 1.59.5 补全浮层底部说明区
+
+浮层原本只画「候选名 + 类型」，官方词库的中文说明看不见。现在底部
+留一行，显示**当前选中项**的说明（detail 里 " — " 之后的部分，按浮层
+宽度裁剪）。命中测试同步排除说明区（`y >= rowH*rows` 不算候选），
+候选绘制循环按可见行数截断（否则会盖住说明）。
+
+### 1.59.6 回归
+
+新增 `tests/ide_completion/comp.nodio` + `tests/ide_completion_check.ps1`
+（23 项断言），**自带夹具词库**：照官方三种形态各写一份
+（带分隔线的 kernel / 无分隔线+注释头的 winform / 重定向条目）——
+夹具驱动，任何机器都能跑，不依赖是否装了官方 aardio；官方真实词库
+只做冒烟（装了才跑，没装跳过）。断言覆盖三形态解析、限定符命中与
+部分词过滤、命名空间前缀、全局补全、重定向、悬停说明，以及编辑器
+算出的完整前缀（5 个场景：fxns.wait / fxns. / wait / obj.method. /
+foo().）。已挂进 `run_regression.ps1`（18 项 → **19 项**）。
+
+回归：全量 **19/18**（x64）——唯一红项 `winclip` 是本机剪贴板竞争
+假红（同轮 ide_ctx 明确报「剪贴板被其他进程占用」→ SKIP 门控生效），
+单跑 `WIN-CLIP OK`；x86 同批。编辑器 4 探针、IDE 冒烟（含 INTEL-ENTRY）
+全绿。
+
+❌ 剩余：拆分窗口组、打印管线、LSP 九方法（第五十三轮并行会话在做）、
+值侧 @ 模板的**插入**展开（`__` → 编辑器 $0 光标位，仍是挂账项）。

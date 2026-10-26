@@ -2403,16 +2403,89 @@ editor = function(winform, opt){
 		while(e <= blen && __isIdent(bytes[e])) e = e + 1;
 		var word = ..string.sub(lineText, s, e - 1);
 		var wcol = __colOfByte(bytes, blen, s);
-		return {word=word; line=line; col=wcol; start=ls + (wcol - 1)};
+		// 第五十四轮：多返回一个**字节起点**（bstart）——
+		//   限定符（"winform."）要靠它往回扫（词的起点前面那个字节是不是点）。
+		//   ⚠ 不能用 start（那是 richedit 的 UTF-16 位置），中文会错位。
+		return {word=word; line=line; col=wcol; start=ls + (wcol - 1); bstart=s};
+	}
+
+	// 光标前的**限定符**（"winform." 这样的「标识符 + 点」）
+	//
+	// 第五十四轮：限定符补全链路的第一环。
+	//   写 "winform.wait" 时，光标处的"词"是 "wait"，但限定符 "." 在**词的
+	//   前面**（第 8 位），紧邻光标前的是 "t" —— 所以不能只看光标前一个字符，
+	//   得从光标往前扫「标识符 + 点」的链，取**最近一个点之前**的那一段。
+	//
+	//   "winform.wait|" → "winform."      "winform.|" → "winform."
+	//   "wait|"         → ""（无限定符）    "foo().|"   → ""（点前不是标识符）
+	//   "obj.method.|"  → "obj."（取最近点前的一段；多级命名空间同理）
+	//
+	// 返回 "" = 没有限定符。
+	self.__qualifierAtCursor = function(){
+		var c0 = self.__caret0();
+		if(c0 < 1) return "";
+		var ln, line = self.__liveLine(c0);
+		var ls = self.__lineStart(line);
+		// 光标**前一个字符**的 1 基列号（与 __charBefore 同一套换算）
+		var col = c0 - ls + 1;
+		if(col < 1) return "";
+		var bytes = ..string.unpack(ln);
+		var blen = #ln;
+		var bo = __byteOfCol(bytes, blen, col);   // 光标前一个字符的字节位置
+		if(bo < 1 || bo > blen) return "";
+		// 往前扫「标识符 / 点」链，记下最后一个点
+		var p = bo;
+		var dotPos = 0;
+		while(p >= 1){
+			var b = bytes[p];
+			if(b == 46){ dotPos = p; p = p - 1; continue; }   // 46 = '.'
+			if(__isIdent(b)){ p = p - 1; continue; }
+			break;
+		}
+		if(dotPos == 0) return "";                 // 链里没有点 → 不是限定符
+		// 点前面必须是标识符（"foo()." 这种点前是右括号的 → 不算）
+		var q = dotPos - 1;
+		if(q < 1 || !__isIdent(bytes[q])) return "";
+		var s = q;
+		while(s >= 1 && __isIdent(bytes[s])) s = s - 1;
+		s = s + 1;
+		return ..string.sub(ln, s, dotPos);       // 含点："winform."
+	}
+
+	// 某个**词**前面的限定符（"winform.wait" → "winform."）
+	//
+	// 悬停提示用：鼠标不一定在光标处，所以限定符不能靠光标位置算，
+	// 得按「这个词的起点」往回扫。
+	self.__qualifierAtWord = function(w){
+		if(!w || #w.word == 0) return "";
+		var lines = ..string.split(self.text, '\n');
+		var lineText = self.__lineText(lines, w.line);
+		var bytes = ..string.unpack(lineText);
+		var s = w.bstart;               // 词首字节位置（1 基）
+		if(s < 2) return "";            // 前面至少要有一个字符
+		var q = s - 1;                  // 词前面那个字节
+		if(bytes[q] != 46) return "";    // 不是 '.' → 无限定符
+		if(q < 2 || !__isIdent(bytes[q-1])) return "";
+		var st = q - 1;
+		while(st >= 1 && __isIdent(bytes[st])) st = st - 1;
+		st = st + 1;
+		return ..string.sub(lineText, st, q);   // 含点："winform."
 	}
 
 	// 请求补全：算好前缀，交给 IDE 去问 LSP
+	//
+	// ⚠ 第五十四轮：传给 IDE 的 prefix 是**完整前缀**（含限定符）：
+	//   写 "winform.wait" → prefix = "winform.wait"；写 "wait" → prefix = "wait"。
+	//   IDE 侧靠它区分「全局补全」和「命名空间成员补全」。
+	//   但浮层过滤仍然用**成员名**（compPrefix = "wait"）——
+	//   候选的 label 就是成员名，用完整前缀去过滤会一条都不剩。
 	self.requestComplete = function(){
 		var w = self.__wordAtCursor();
+		var qual = self.__qualifierAtCursor();
 		self.compPrefix = w.word;
 		self.compStart = w.start;
 		self.compIndex = 0;
-		if(self.onComplete) self.onComplete(w.line, w.col, w.word);
+		if(self.onComplete) self.onComplete(w.line, w.col, qual ++ w.word);
 		return w.word;
 	}
 	// 把补全请求**推迟到下一个消息循环**再发
@@ -2537,6 +2610,8 @@ editor = function(winform, opt){
 	// 命中测试（画板本地坐标）
 	self.__hitCompletion = function(x, y){
 		var rowH = ..nodio.ui.px(20);
+		var rows = self.compRows : 8;
+		if(y >= rowH * rows) return null;     // 底部说明区不算候选
 		var i = self.compScroll + math.floor(y / rowH);
 		if(i < 1 || i > #self.compItems) return null;
 		return i;
@@ -2577,8 +2652,12 @@ editor = function(winform, opt){
 		if(first > n - rows + 1) first = n - rows + 1;
 		if(first < 1) first = 1;
 		self.compScroll = first;
+		// 第五十四轮：底部留一行「说明区」，显示**当前选中项**的说明
+		// （官方词库里的中文文档就靠它露出来）。
+		self.compRows = rows;
+		self.compDescH = ..nodio.ui.px(20);
 
-		var lh = rowH * rows + ..nodio.ui.px(4);
+		var lh = rowH * rows + self.compDescH + ..nodio.ui.px(4);
 		// ⚠ p 是**richedit 客户区**坐标，而 richedit 摆在导航栏下面 ——
 		//   绝对 y 要加上导航栏的高度，否则浮层会整体上移 navH 像素。
 		var navH = self.navBar ? self.navHeight() : 0;
@@ -2616,7 +2695,9 @@ editor = function(winform, opt){
 		var n = #self.compItems;
 		var first = self.compScroll;
 		if(first < 1) first = 1;
+		var rows = self.compRows : 8;
 		for(i=first;n;1){
+			if(i - first >= rows) break;       // 候选区只有 rows 行，下面是说明区
 			var it = self.compItems[i];
 			if(!it) break;
 			var y = rc.top + (i - first) * rowH;
@@ -2633,6 +2714,25 @@ editor = function(winform, opt){
 					::RECTF(rc.right - ..nodio.ui.px(72), y, ..nodio.ui.px(64), rowH), fmt, dim);
 			}
 		}
+		// ── 底部说明区（第五十四轮）───────────────────────────
+		// 显示**当前选中项**的说明。detail 的形态是「签名 — 说明」
+		// （词库条目由 nodio.intellisense 生成），这里只取说明部分。
+		var dh = self.compDescH : 0;
+		if(dh > 0){
+			var it2 = self.compItems[self.compIndex];
+			if(it2){
+				var dt = tostring(it2.detail : "");
+				var dp = ..string.indexOf(dt, " — ");
+				if(dp !== null) dt = ..string.slice(dt, dp + 3);
+				// 按浮层宽度裁剪（中文按整宽估，宁可少显示几个字也别溢出）
+				var maxCh = math.floor((w - pad*2) / ..nodio.ui.px(12));
+				if(maxCh < 4) maxCh = 4;
+				if(#dt > maxCh) dt = ..string.slice(dt, 1, maxCh) ++ "…";
+				var dy = rc.top + rowH * rows + ..nodio.ui.px(1);
+				graphics.drawString(dt, font,
+					::RECTF(rc.left + pad, dy, w - pad*2, dh), fmt, dim);
+			}
+		}
 		dim.delete();
 		txt.delete();
 		sel.delete();
@@ -2647,7 +2747,7 @@ editor = function(winform, opt){
 	// ⚠ 问 LSP 是**同步阻塞**的（最多 50ms），所以绝不能在窗口过程里直接问 ——
 	//   鼠标移动消息非常密集，卡一次窗口过程整个 IDE 都会顿一下。
 	//   所以只在「鼠标停住不动」时才问（延迟 350ms），并放到定时器里执行。
-	self.onHover = null;        // function(line, col) → 提示文本（IDE 去问 LSP）
+	self.onHover = null;        // function(line, col, qual, word) → 提示文本（IDE 去问 LSP/词库）
 	self.hoverText = "";
 	self.hoverOpen = false;
 	self.hoverBoard = null;
@@ -2691,7 +2791,11 @@ editor = function(winform, opt){
 		//   所以判空必须用 #word == 0，不能用 !word。
 		if(!w || #w.word == 0) return;
 		self.__hoverWord = w.word;
-		var text = self.onHover(w.line, w.col);
+		// 第五十四轮：把**限定符**和词一起交给 IDE ——
+		//   官方词库里 "wait" 这种成员名在多个命名空间都有（winform.wait /
+		//   thread.wait …），只有带上限定符才能定位到那一条的中文说明。
+		var qual = self.__qualifierAtWord(w);
+		var text = self.onHover(w.line, w.col, qual, w.word);
 		if(text && #text){
 			self.showHover(text, x, y);
 		}

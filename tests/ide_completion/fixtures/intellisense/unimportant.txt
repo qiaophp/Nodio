@@ -1,0 +1,3 @@
+alias = !fxns.
+plainAlias = 这个别名指向 fxns 命名空间。
+!fxns.

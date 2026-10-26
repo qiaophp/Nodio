@@ -24,6 +24,16 @@ $ErrorActionPreference = 'Continue'
 
 if (-not (Test-Path $Exe)) { "EXE NOT FOUND: $Exe"; exit 2 }
 
+# overlay 库目录（Nodio 自己的 lib/）。
+#
+# ⚠ **x86 必须显式设置**：engine/import.cpp:38-43 里 32 位进程只认
+#   NODIO_OVERLAY_LIBDIR 环境变量，**没有** 64 位那条 D:\Nodio\lib 硬编码
+#   回退（GetOverlayLibDir 的 else 分支只在 _WIN64 下编译）。
+#   不设 → vm 套件里依赖 overlay 的用例（designer 等）拿不到库，
+#   会报 "designer overlay lib unavailable" 并连带 2 项 failed ——
+#   看着像引擎回归，其实是环境没给。
+$env:NODIO_OVERLAY_LIBDIR = 'D:\Nodio\lib'
+
 $tests = @(
     @{ name = 'vm';          script = 'run_vm_tests.ps1';          args = @('-Exe', $Exe) },
     @{ name = 'ide_smoke';   script = 'ide_smoke.ps1';             args = @('-Exe', $Exe) },
@@ -34,6 +44,7 @@ $tests = @(
     @{ name = 'ide_settings';script = 'ide_settings_check.ps1';    args = @('-Exe', $Exe) },
     @{ name = 'ide_ai';      script = 'ide_ai_check.ps1';          args = @('-Exe', $Exe) },
     @{ name = 'ide_font';    script = 'ide_font_check.ps1';        args = @('-Exe', $Exe) },
+    @{ name = 'ide_complete';script = 'ide_completion_check.ps1';   args = @('-Exe', $Exe) },
     @{ name = 'ide_threadgc';script = 'ide_thread_gc_check.ps1';   args = @('-Exe', $Exe) },
     @{ name = 'editor';      script = 'run_editor_tests.ps1';      args = @('-Exe', $Exe) },
     @{ name = 'input';       script = 'run_input_tests.ps1';       args = @('-Exe', $Exe) },

@@ -1,17 +1,34 @@
-// nodio.intellisense — 官方 intellisense 词库接入（第五十一轮）。
+// nodio.intellisense — 官方 intellisense 词库接入（第五十一轮；第五十四轮做深）。
 //
 // 数据源：官方 config/intellisense/*.txt（kernel.txt 全局符号 659 行 +
-// winform.txt 窗体成员 251 行）。格式（文件头自带说明，`----` 分隔线
-// 之后才是数据）：
+// winform.txt 窗体成员 251 行 + unimportant.txt 全局标识符 109 行）。
+// 格式（文件头自带说明，`----` 分隔线之后才是数据）：
 //   key = 说明               普通条目（key 可含 . / :: 命名空间路径，
 //                            函数条目带 (.(形参) 形参提示）
 //   ^key = 说明              系统参数（照常补全，kind=常数）
 //   !key = @模板             模板条目（值以 @ 开头，__ 为光标插入位）
 // 说明里的 \n 是字面量（换行占位），detail 里折成「; 」并截断。
 //
-// 补全标签取 key 的**最后一段**（table.range / string.trimLeft 都以
-// range/trimLeft 呈现，detail 带全路径），大小写不敏感前缀匹配
-// （官方 ^IGNORECASE_NODE_KEY=1）。
+// ── 第五十四轮：限定符补全（此前完全失效）──────────────────────
+//
+// 旧实现只按**标签**（key 的最后一段）做前缀匹配，于是：
+//   · 写 "winform." → 标签是 "wait"/"sendMessage"… 没有一个以 "winform." 开头
+//     → **一条候选都出不来**（官方窗体 API 补不出来）
+//   · 写 "string.for" → 标签 "format" 不以 "string.for" 开头 → 同上
+// 也就是说：限定符场景（敲完 . 之后）**整条链路是断的**，
+// 而这正是「自动补全不好用」的主要来源。
+//
+// 现在条目额外记 ns（命名空间 = key 点分路径的第一段），complete(prefix)
+// 分两种上下文：
+//   · prefix **不含** '.' → 旧的全局前缀匹配（标签 startswith）
+//   · prefix **含** '.'   → 限定符上下文：
+//       qual   = 点前的限定符（"winform." / "string."）
+//       partial= 点后的已输入部分（"wait"）
+//     匹配 ns == qual（大小写不敏感）的条目；若 qual 是某 ns 的前缀
+//     （qual="win"，ns="win.ui"），则该命名空间本身作为候选（label="ui"）。
+//
+// 官方词库的命名空间是**单级**的（string / time / raw / io / table / math /
+// thread / type / winform …），所以限定符也按单级匹配即可。
 //
 // 用法：
 //   nodio.intellisense.complete(prefix)   → {label;kind;detail} 数组（惰性加载）
@@ -22,8 +39,9 @@
 // 模板条目只作候选呈现、插入的是函数名。
 namespace nodio.intellisense{
 
-var entries = null;      // 惰性加载后的词条表 {label;kind;detail;full}
+var entries = null;      // 惰性加载后的词条表 {label;kind;detail;full;ns}
 var kDescMax = 160;
+var kMaxItems = 60;
 
 // 说明清洗：字面量 \n 折行占位 → 「; 」；超长截断
 __cleanDesc = function(s){
@@ -33,9 +51,14 @@ __cleanDesc = function(s){
 	return s;
 }
 
-// key → {label; kind}。key 样本：
+// key → {label; kind; ns}。key 样本：
 //   table.range(.(tab) / winform.add(controlsPropertiesTable)
 //   _AARDIO_VERSION / ^MAXTIER / _IMPORTURL.?
+//
+// ns = key 点分路径的**第一段**（命名空间）：
+//   "table.range"  → ns="table"  label="range"
+//   "winform.wait" → ns="winform" label="wait"
+//   "_AARDIO_VERSION" → ns=""（全局）
 __classify = function(rawKey){
 	var key = ..string.trim(rawKey);
 	var kind = 5;                       // field/其他
@@ -47,31 +70,81 @@ __classify = function(rawKey){
 	var head = key;
 	var pc = ..string.indexOf(key, "(");
 	if(pc !== null) head = ..string.slice(key, 1, pc - 1);
-	// label = 最后一段（. / :: 分隔）
+	// ns = 点分路径第一段；label = 最后一段
+	var ns = "";
 	var label = head;
 	var pos = ..string.lastIndexOf(head, ".");
-	if(pos !== null) label = ..string.slice(head, pos + 1);
+	if(pos !== null){
+		ns = ..string.slice(head, 1, pos - 1);
+		// ns 只取第一段（"win.ui.ctrl" → "win"）
+		var nsp = ..string.indexOf(ns, ".");
+		if(nsp !== null) ns = ..string.slice(ns, 1, nsp - 1);
+		label = ..string.slice(head, pos + 1);
+	}
 	var pos2 = ..string.lastIndexOf(head, "::");
 	if(pos2 !== null) label = ..string.slice(head, pos2 + 2);
 	if(#label == 0) return null;
-	return { label = label; kind = kind; full = key };
+	return { label = label; kind = kind; full = key; ns = ns };
 }
 
-// 一个数据文件的解析：`----` 分隔线之后才是数据
+// 一个数据文件的解析。
+//
+// ── 三份官方词库的分隔规则**不一样**（实测）──────────────────
+//   kernel.txt      第 8 行是 "----" 分隔线，之前的 8 行是官方写的格式说明
+//   winform.txt     **没有分隔线**，第 1 行是 "/***intellisense() " 注释头，
+//                   第 2 行就开始是数据
+//   unimportant.txt 没有分隔线、没有注释头，全部是 "key = value"
+//
+// 旧实现只认 "----"，于是 winform.txt 整份被跳过 ——
+// 「窗体 API 补不出来」的直接原因。
+// 现在：有分隔线就严格以分隔线为准；没有分隔线则跳过注释头行，
+// 从第一条含 " = " 的行开始当数据。
+//
+// 数据行的三种形态：
+//   key = 说明                     普通条目
+//   !key = @模板                   代码模板（值以 @ 开头，__ 是光标位）
+//   key = !ns.  /  key = 说明\n!ns. 命名空间重定向（值里带 !ns.）
+//   !ns.（独占一行）               挂到上一条目上的重定向 / 独立命名空间声明
 __parseFile = function(text, out){
 	var lines = ..string.split(text, '\n');
 	var bData = false;
+	var bSep = false;
+	var last = null;
 	for(i=1;#lines;1){
 		var line = ..string.trim(lines[i]);
 		if(line == '') continue;
 		if(!bData){
-			if(..string.indexOf(line, "----") !== null) bData = true;
+			// 分隔线（只在还没进数据区时认）
+			if(..string.indexOf(line, "----") !== null){ bData = true; bSep = true; continue; }
+			if(bSep) continue;
+			// 注释头（"/***intellisense()" 这类）——跳过
+			if(..string.charAt(line, 1) == "/") continue;
+			// 没有分隔线：含 " = " 的行就是数据起点
+			if(..string.indexOf(line, " = ") === null) continue;
+			bData = true;
+		}
+		// ---- 数据区 ----
+		var eq = ..string.indexOf(line, " = ");
+		if(eq === null){
+			// 独占一行的 "!ns." → 重定向 / 命名空间声明
+			if(..string.charAt(line, 1) == "!"){
+				var tgt = __redirTarget(line);
+				if(tgt === null) continue;
+				if(last !== null){
+					last.detail = last.detail ++ " → " ++ tgt ++ " 命名空间";
+					if(#last.ns == 0) last.ns = tgt;
+				}
+				else{
+					..table.push(out, {
+						label = tgt; kind = 9;
+						detail = tgt ++ " 命名空间";
+						full = tgt; ns = tgt;
+					});
+				}
+			}
 			continue;
 		}
-		// key = desc（第一个 " = " 切分；值里可能还有等号）
-		var eq = ..string.indexOf(line, " = ");
-		if(eq === null) continue;
-		var rawKey = ..string.slice(line, 1, eq - 1);
+		var rawKey = ..string.trim(..string.slice(line, 1, eq - 1));
 		var desc = ..string.slice(line, eq + 3);
 		if(#rawKey == 0) continue;
 		// 值侧 @ = 代码模板（kind=snippet）
@@ -86,20 +159,118 @@ __parseFile = function(text, out){
 		if(#rawKey == 0) continue;
 		// 参数占位提示（_IMPORTURL.? 这类）不进补全
 		if(..string.indexOf(rawKey, ".?") !== null) continue;
+
+		// 值里的命名空间重定向：
+		//   "!ns."（纯重定向）或 "说明\n!ns."（说明 + 重定向）
+		var redir = null;
+		if(..string.charAt(desc, 1) == "!"){
+			redir = __redirTarget(desc);
+			if(redir !== null) desc = "";
+		}
+		else{
+			var rp = ..string.lastIndexOf(desc, "\n!");
+			if(rp !== null){
+				redir = __redirTarget(..string.slice(desc, rp + 3));
+				if(redir !== null) desc = ..string.slice(desc, 1, rp - 1);
+			}
+		}
+
 		var c = __classify(rawKey);
 		if(c === null) continue;
 		if(kindSnip) c.kind = kindSnip;
-		..table.push(out, {
+		// key 没有命名空间、但值里有重定向 → 这个标识符属于那个命名空间
+		if(#c.ns == 0 && redir !== null) c.ns = redir;
+		var detail = c.full;
+		if(#desc > 0) detail = detail ++ " — " ++ __cleanDesc(desc);
+		if(redir !== null) detail = detail ++ " → " ++ redir ++ " 命名空间";
+		last = {
 			label = c.label; kind = c.kind;
-			detail = c.full ++ " — " ++ __cleanDesc(desc);
+			detail = detail;
 			full = c.full;
-		});
+			ns = c.ns;
+		};
+		..table.push(out, last);
+	}
+}
+
+// 从 "!ns." 形态里取出命名空间名（去掉前缀 "!" 与结尾 "."）
+// 不是这个形态 → null
+__redirTarget = function(s){
+	s = ..string.trim(s);
+	if(..string.charAt(s, 1) != "!") return null;
+	var t = ..string.trim(..string.slice(s, 2));
+	if(#t == 0) return null;
+	if(..string.charAt(t, #t) == ".") t = ..string.slice(t, 1, #t - 1);
+	if(#t == 0) return null;
+	return t;
+}
+
+// unimportant.txt：全局标识符 → 说明 / 命名空间重定向
+//
+// 形态（实测 109 行）：
+//   nmhdr = !nmhdr.                    重定向到 nmhdr 命名空间
+//   graphics = !gdipgraphics.           重定向到 gdipgraphics 命名空间
+//   mainForm = main.aardio中创建的主窗口对象，…   普通说明
+//   !winform.                           命名空间声明（无 key）
+//   mainLayout = main.aardio创建的HTMLayout窗口\n!weblayout.
+//                                          说明 + 下一行是重定向
+//
+// 解析：含 " = " 的行开一个新条目；不含的行若以 "!" 开头，
+// 则挂到**上一个**条目上（重定向行）。
+__parseRedirect = function(text, out){
+	var lines = ..string.split(text, '\n');
+	var last = null;
+	for(i=1;#lines;1){
+		var line = ..string.trim(lines[i]);
+		if(line == '') continue;
+		var eq = ..string.indexOf(line, " = ");
+		if(eq !== null){
+			var key = ..string.trim(..string.slice(line, 1, eq - 1));
+			var val = ..string.trim(..string.slice(line, eq + 3));
+			if(#key == 0) continue;
+			// 值以 "!" 开头 → 纯重定向（"!nmhdr."）
+			if(..string.charAt(val, 1) == "!"){
+				var target = ..string.trim(..string.slice(val, 2));
+				target = ..string.replaceLiteral(target, ".", "");
+				..table.push(out, {
+					label = key; kind = 9;
+					detail = key ++ " → " ++ target ++ " 命名空间";
+					full = key; ns = target;
+				});
+				last = null;
+				continue;
+			}
+			..table.push(out, {
+				label = key; kind = 5;
+				detail = key ++ " — " ++ __cleanDesc(val);
+				full = key; ns = "";
+			});
+			last = out[#out];
+			continue;
+		}
+		// 无 " = " 的行：可能挂到上一个条目（重定向）或独立命名空间声明
+		if(..string.charAt(line, 1) == "!"){
+			var tgt = ..string.trim(..string.slice(line, 2));
+			tgt = ..string.replaceLiteral(tgt, ".", "");
+			if(last !== null){
+				last.detail = last.detail ++ " → " ++ tgt ++ " 命名空间";
+				last.ns = tgt;
+			}
+			else{
+				..table.push(out, {
+					label = tgt; kind = 9;
+					detail = tgt ++ " 命名空间";
+					full = tgt; ns = tgt;
+				});
+			}
+		}
 	}
 }
 
 loadFrom = function(dir){
 	entries = {};
-	var names = {"kernel.txt"; "winform.txt"};
+	// 三份词库统一用同一个解析器（分隔线/注释头/重定向都按行判据处理）
+	var names = {"kernel.txt"; "winform.txt"; "unimportant.txt"};
 	for(i=1;#names;1){
 		var p = dir ++ "\\" ++ names[i];
 		var text = ..string.load(p);
@@ -124,27 +295,79 @@ __ensure = function(){
 	return entries;
 }
 
-// 前缀补全：大小写不敏感 startswith，上限 40
+// 前缀补全：大小写不敏感，上限 kMaxItems
+//
+// 两种上下文（见文件头「第五十四轮」）：
+//   prefix 不含 '.' → 全局：标签 startswith
+//   prefix 含   '.' → 限定符：ns == qual 的条目（qual 是 ns 前缀时，
+//                    该命名空间本身作为候选）
 complete = function(prefix){
 	var es = __ensure();
 	var out = {};
-	prefix = ..string.lower(tostring(prefix : ""));
+	prefix = tostring(prefix : "");
 	if(#prefix == 0) return out;
+	var dot = ..string.lastIndexOf(prefix, ".");
+	if(dot !== null){
+		// ⚠ lastIndexOf 返回的是**匹配点本身**的 1 基位置
+		//   （"type." 的 "." 在第 5 位 → 返回 5），所以限定符要取到点**之前**：
+		//   slice(prefix,1,dot-1) = "type"；写成 slice(prefix,1,dot) 会把点
+		//   也带进去（"type."），于是 ns 比对永远不相等 —— 限定符补全一条都出不来。
+		var qual = ..string.slice(prefix, 1, dot - 1);        // "winform"（不含点）
+		var partial = ..string.lower(..string.slice(prefix, dot + 1));
+		var ql = ..string.lower(qual);
+		if(#ql == 0) return out;
+		for(i=1;#es;1){
+			var e = es[i];
+			if(!e.ns || #e.ns == 0) continue;
+			var ens = ..string.lower(e.ns);
+			var lb = "";
+			if(ens == ql){
+				lb = e.label;
+			}
+			elseif(..string.indexOf(ens, ql ++ ".") == 1){
+				// qual 是命名空间的前缀 → 该命名空间本身是候选
+				lb = ..string.slice(e.ns, #ql + 2);
+			}
+			else continue;
+			if(#partial){
+				if(..string.indexOf(..string.lower(lb), partial) !== 1) continue;
+			}
+			..table.push(out, {label = lb; kind = e.kind; detail = e.detail});
+			if(#out >= kMaxItems) break;
+		}
+		return out;
+	}
+	// 全局上下文
+	var lp = ..string.lower(prefix);
 	for(i=1;#es;1){
 		var e = es[i];
-		if(..string.indexOf(..string.lower(e.label), prefix) == 1){
+		if(..string.indexOf(..string.lower(e.label), lp) == 1){
 			..table.push(out, {label = e.label; kind = e.kind; detail = e.detail});
-			if(#out >= 40) break;
+			if(#out >= kMaxItems) break;
 		}
 	}
 	return out;
 }
 
 // 精确词悬停：命中的说明，未命中 ""
+//
+// 第五十四轮：先按**完整路径**精确匹配（"winform.wait"），
+// 再退化到标签匹配（"wait"）——限定符场景下标签重名很多
+// （多个命名空间都有 wait），只按标签会取错说明。
+//
+// ⚠ 词库里函数条目的 key 带形参段（"winform.wait(.(等待函数,超时,延时间隔)"），
+//   所以完整路径要用 ns ++ "." ++ label 复原后再比。
 hover = function(word){
 	var es = __ensure();
 	var w = ..string.lower(tostring(word : ""));
 	if(#w == 0) return "";
+	for(i=1;#es;1){
+		if(..string.lower(es[i].full) == w) return es[i].detail;
+	}
+	for(i=1;#es;1){
+		var e = es[i];
+		if(#e.ns > 0 && ..string.lower(e.ns ++ "." ++ e.label) == w) return e.detail;
+	}
 	for(i=1;#es;1){
 		if(..string.lower(es[i].label) == w) return es[i].detail;
 	}

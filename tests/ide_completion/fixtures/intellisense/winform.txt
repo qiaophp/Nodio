@@ -1,0 +1,5 @@
+/***intellisense() 
+!fxns.wait = 等待（窗体风格条目：首行是注释头，**没有分隔线**）。
+!fxns.open = 打开。
+!embedObject._form = 宿主窗口对象。\n!fxns.
+!fxns.withTemplate = @fxns.open( = 带模板的条目。
