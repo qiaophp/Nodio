@@ -309,6 +309,11 @@ canvas = function(winform, opt){
 			..win.setPos(item.ctrl.hwnd, l, t, r - l, b - t,
 				0/*_HWND_TOP*/, 0x10/*_SWP_NOACTIVATE*/);
 		}catch(e){}
+		// 锚定基线（第五十九轮续：布局器）——矩形一动，新矩形 + 当前
+		// 窗体尺寸就是新基线；窗体 resize 时的锚定重排以它为基准
+		//（官方设计器改完控件位置也同步更新 _defRect，同款语义）。
+		item.__ab = { x = item.x; y = item.y; w = item.w; h = item.h;
+			fw = self.form.w; fh = self.form.h };
 	}
 
 	// 几何变了 → 同步属性格里的 左/上/宽/高
@@ -1012,6 +1017,8 @@ canvas = function(winform, opt){
 	self.applyFormProps = function(props){
 		if(!props) return 0;
 		var n = 0;
+		var oldW = self.form.w, oldH = self.form.h;
+		var resized = false;
 		for(i=1;#props;1){
 			var p = props[i];
 			if(p.key == "text"){
@@ -1023,8 +1030,12 @@ canvas = function(winform, opt){
 				var nv = tonumber(p.value);
 				// 窗体太小就没有设计空间了（官方最小窗体也是百余像素）
 				if(nv !== null && nv >= 60){
-					if(p.key == "width" && nv != self.form.w){ self.form.w = nv; n = n + 1 }
-					elseif(p.key == "height" && nv != self.form.h){ self.form.h = nv; n = n + 1 }
+					if(p.key == "width" && nv != self.form.w){
+						self.form.w = nv; n = n + 1; resized = true;
+					}
+					elseif(p.key == "height" && nv != self.form.h){
+						self.form.h = nv; n = n + 1; resized = true;
+					}
 				}
 			}
 			elseif(p.key == "border"){
@@ -1050,8 +1061,75 @@ canvas = function(winform, opt){
 				}
 			}
 		}
+		if(resized) self.applyAnchors(oldW, oldH);
 		self.__refresh();
 		return n;
+	}
+
+	// ---------- 锚定（第五十九轮续：布局器） ----------
+	//
+	// 画布控件的**位置**永远由 __place 说了算（第四十九轮的结论不变）；
+	// 锚定唯一生效的场景 = **窗体尺寸变化**：按官方 adjustCtrl 语义把带
+	// anchors 的控件从基线重排到新尺寸下 —— 这就是布局器的「画布生效」。
+	// 基线在 __place 里刷新（矩形 + 当时的窗体尺寸）。
+	self.applyAnchors = function(oldW, oldH){
+		if(!oldW) oldW = self.form.w;
+		if(!oldH) oldH = self.form.h;
+		var n = 0;
+		for(i=1;#self.items;1){
+			var item = self.items[i];
+			var astr = null;
+			for(k=1;#item.props;1){
+				if(item.props[k].key == "anchors"){
+					astr = tostring(item.props[k].value : "");
+					break;
+				}
+			}
+			if(!astr || #astr == 0) continue;
+			var a = {
+				left = tonumber(..string.match(astr, 'left\s*=\s*([\d\.]+)'));
+				top = tonumber(..string.match(astr, 'top\s*=\s*([\d\.]+)'));
+				right = tonumber(..string.match(astr, 'right\s*=\s*([\d\.]+)'));
+				bottom = tonumber(..string.match(astr, 'bottom\s*=\s*([\d\.]+)'));
+			};
+			if(!a.left && !a.top && !a.right && !a.bottom) continue;
+			var b = item.__ab : { x = item.x; y = item.y; w = item.w; h = item.h;
+				fw = oldW; fh = oldH };
+			var nr = ..nodio.designer.dsg.anchorRect(
+				{ x = b.x; y = b.y; w = b.w; h = b.h }, b.fw, b.fh,
+				self.form.w, self.form.h, a);
+			if(nr.x != item.x || nr.y != item.y || nr.w != item.w || nr.h != item.h){
+				item.x = nr.x; item.y = nr.y; item.w = nr.w; item.h = nr.h;
+				self.__syncGeomProps(item);
+				self.__place(item);   // 新位置 + 新尺寸成为新基线
+				n = n + 1;
+			}
+		}
+		return n;
+	}
+
+	// 布局器写回 anchors（裸串 {left=1;top=1;..}；空串 = 整行移除——
+	// toDSG 对空值会写出 `anchors=;`，不能留）
+	self.setAnchors = function(item, str){
+		if(!item) return false;
+		str = tostring(str : "");
+		for(i=1;#item.props;1){
+			if(item.props[i].key == "anchors"){
+				if(#str == 0){
+					..table.remove(item.props, i);
+				}
+				else{
+					item.props[i].value = str;
+				}
+				self.__refresh();
+				return true;
+			}
+		}
+		if(#str == 0) return false;
+		..table.push(item.props, {key="anchors"; name="anchors";
+			value=str; type="string"; cat="样式"});
+		self.__refresh();
+		return true;
 	}
 
 	// 移除

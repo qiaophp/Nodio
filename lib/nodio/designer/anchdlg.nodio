@@ -1,0 +1,331 @@
+// nodio.designer.anchdlg — 布局器（锚定编辑，就地浮层，非真模态窗）。
+//
+// 官方 IDE 里每个控件的「锚定」是一个十字选择器；Nodio 上做成主窗体
+// 上的浮层（同 formdlg 的理由：不建第二顶层窗口）：
+//   标题栏 + 左/上/右/下四个开关 + **呼吸预览** + 确定/取消。
+//
+// 预览就是「画布生效」的缩影：小窗体的尺寸按三角波呼吸变化，控件按
+// 官方 adjustCtrl 语义（dsg.anchorRect）实时重排 —— 锚右的控件跟着
+// 右缘走、左+右都锚的控件宽度拉伸，一眼看懂当前配置的行为。
+//
+// 用法：
+//   dlg = nodio.designer.anchdlg(winform, {})
+//   dlg.show(item, function(str){ ... })  // item = 画布控件
+//                                       // str = anchors 裸串（空 = 清除）
+//   取消 / 确定 后自关。
+//
+// 锚值语义（官方 win/ui/_.aardio:1908）：1 = 该边边距固定，
+// 0<x<1 = 按比例；画布编辑只产出 1（官方设计器同款）。
+//
+// 坐标：物理像素（board 约定），常量按逻辑像素写、px() 换算。
+namespace nodio.designer{
+import nodio.ui.board;
+import nodio.ui.dpi;
+import nodio.ui.theme;
+import gdip;
+
+var __adSeq = 0;
+
+anchdlg = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	// 设计常量（逻辑像素）
+	var W = 372, H = 288;
+	var PAD = 14;
+	var TG_Y = 42, TG_H = 24, TG_GAP = 8;
+	var BTN_W = 72, BTN_H = 24, BTN_GAP = 10;
+
+	var self = {
+		winform = winform;
+		rect = opt.rect;
+		visible = false;
+		hover = 0;          // 0=无 1..4=开关 5=确定 6=取消
+		onApply = null;     // function(str) —— str = anchors 裸串
+		anc = { left = false; top = false; right = false; bottom = false };
+		__tick = 0;
+		__timer = 0;
+		__simW = 0; __simH = 0;   // 呼吸中的窗体尺寸（设计坐标）
+		__simRect = null;         // 预览里控件当前矩形（设计坐标）
+		__baseX = 0; __baseY = 0; __baseW0 = 0; __baseH0 = 0;
+		__baseFW = 0; __baseFH = 0;
+		itemName = "";
+	};
+
+	__adSeq = __adSeq + 1;
+	var seq = __adSeq;
+
+	// ---------- 控件 ----------
+	self.panel = nodio.ui.board(winform, {
+		left = 0; top = 0; right = ..nodio.ui.px(W); bottom = ..nodio.ui.px(H);
+		fontSize = 12; z = 80;
+	});
+
+	// ---------- 几何 ----------
+	// 四个开关（横排一行）+ 确定/取消（右下）
+	self.__tgRect = function(i){
+		var tw = ..math.floor((W - PAD * 2 - TG_GAP * 3) / 4);
+		var x = ..nodio.ui.px(PAD + (i - 1) * (tw + TG_GAP));
+		var y = ..nodio.ui.px(TG_Y);
+		var w2 = ..nodio.ui.px(tw), h2 = ..nodio.ui.px(TG_H);
+		return {left = x; top = y; right = x + w2; bottom = y + h2};
+	};
+	self.__btnRect = function(idx){   // 5=确定 6=取消（从右往左）
+		var bw = ..nodio.ui.px(BTN_W), bh = ..nodio.ui.px(BTN_H);
+		var x = ..nodio.ui.px(W - PAD)
+			- (idx == 5 ? bw : bw * 2 + ..nodio.ui.px(BTN_GAP));
+		var y = ..nodio.ui.px(H - PAD - BTN_H);
+		return {left = x; top = y; right = x + bw; bottom = y + bh};
+	};
+	self.__hit = function(x, y){
+		for(i=1; 4; 1){
+			var b = self.__tgRect(i);
+			if(x >= b.left && x < b.right && y >= b.top && y < b.bottom) return i;
+		}
+		for(i=5; 6; 1){
+			var b = self.__btnRect(i);
+			if(x >= b.left && x < b.right && y >= b.top && y < b.bottom) return i;
+		}
+		return 0;
+	};
+	// 预览区（面板客户区逻辑坐标）
+	var PREV = { x = PAD; y = TG_Y + TG_H + 10; w = W - PAD * 2; h = 128 };
+
+	// ---------- 呼吸预览 ----------
+	var __simStep = function(){
+		self.__tick = self.__tick + 1;
+		// 三角波 0→1→0（周期 72 帧 ≈ 4.3s），平滑缓动
+		var ph = (self.__tick % 72) / 72;
+		var tri = (ph <= 0.5) ? (ph * 2) : (2 - ph * 2);
+		tri = tri * tri * (3 - 2 * tri);
+		self.__simW = self.__baseFW + ..math.round(90 * tri);
+		self.__simH = self.__baseFH + ..math.round(70 * tri);
+		var a = {
+			left = self.anc.left ? 1 : null;
+			top = self.anc.top ? 1 : null;
+			right = self.anc.right ? 1 : null;
+			bottom = self.anc.bottom ? 1 : null;
+		};
+		self.__simRect = ..nodio.designer.dsg.anchorRect(
+			{ x = self.__baseX; y = self.__baseY;
+				w = self.__baseW0; h = self.__baseH0 },
+			self.__baseFW, self.__baseFH, self.__simW, self.__simH, a);
+		self.panel.invalidate();
+	};
+	var __startTimer = function(){
+		if(self.__timer) return;
+		self.__timer = winform.setInterval(function(){
+			if(!self.visible){ return null }
+			__simStep();
+			return null;
+		}, 60);
+	};
+	var __stopTimer = function(){
+		if(self.__timer){
+			try{ winform.killTimer(self.__timer) }catch(e){}
+			self.__timer = 0;
+		}
+	};
+
+	// ---------- 动作 ----------
+	var __curItem = null;
+
+	self.show = function(item, baseFW, baseFH, onApply){
+		if(!item) return;
+		__curItem = item;
+		self.onApply = onApply;
+		self.itemName = tostring(item.name : "");
+		// 读当前锚定（属性表里的裸串 {left=1;..}）
+		var astr = "";
+		for(i=1;#item.props;1){
+			if(item.props[i].key == "anchors"){
+				astr = tostring(item.props[i].value : "");
+				break;
+			}
+		}
+		self.anc.left = ..string.match(astr, 'left\s*=\s*([\d\.]+)') !== null;
+		self.anc.top = ..string.match(astr, 'top\s*=\s*([\d\.]+)') !== null;
+		self.anc.right = ..string.match(astr, 'right\s*=\s*([\d\.]+)') !== null;
+		self.anc.bottom = ..string.match(astr, 'bottom\s*=\s*([\d\.]+)') !== null;
+		// 预览基线：控件矩形 + 基线时刻的窗体尺寸（__place 维护；
+		// 没有就用当前矩形 + 当前窗体尺寸）
+		var b = item.__ab;
+		self.__baseX = b ? b.x : item.x;
+		self.__baseY = b ? b.y : item.y;
+		self.__baseW0 = b ? b.w : item.w;
+		self.__baseH0 = b ? b.h : item.h;
+		// 预览的窗体尺寸基线由调用方给（画布当前尺寸）；基线里存了的话
+		// 以基线为准（控件上次摆位时的窗体尺寸，语义最准）
+		self.__baseFW = (b && b.fw) ? b.fw : (baseFW : 0);
+		self.__baseFH = (b && b.fh) ? b.fh : (baseFH : 0);
+		if(!self.__baseFW) self.__baseFW = 600;
+		if(!self.__baseFH) self.__baseFH = 400;
+		self.__tick = 0;
+		// 面板居中于主窗体客户区
+		try{
+			var rc = winform.getClientRect();
+			var w = rc.width ? rc.width() : 0;
+			var h = rc.height ? rc.height() : 0;
+			if(w && h){
+				var px = ..nodio.ui.px(W), py = ..nodio.ui.px(H);
+				var ox = ..math.floor((w - px) / 2);
+				var oy = ..math.floor((h - py) / 3);
+				self.panel.layout(ox, oy, ox + px, oy + py);
+			}
+		}catch(eC){}
+		self.panel.show(true);
+		self.visible = true;
+		__simStep();
+		__startTimer();
+	};
+
+	self.close = function(){
+		self.visible = false;
+		__stopTimer();
+		self.panel.show(false);
+	};
+
+	self.__ok = function(){
+		if(!self.visible) return;
+		// 产出官方 DSG 同款裸串；全不锚 = 空串（setAnchors 清除）
+		var parts = {};
+		if(self.anc.left) ..table.push(parts, "left=1");
+		if(self.anc.top) ..table.push(parts, "top=1");
+		if(self.anc.right) ..table.push(parts, "right=1");
+		if(self.anc.bottom) ..table.push(parts, "bottom=1");
+		var str = "";
+		for(i=1;#parts;1){
+			str = str ++ (i > 1 ? ";" : "") ++ parts[i];
+		}
+		if(#parts) str = "{" ++ str ++ "}";
+		self.close();
+		if(self.onApply) self.onApply(str);
+	};
+
+	// ---------- 绘制 ----------
+	self.panel.onDraw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var w = rc.right - rc.left, h = rc.bottom - rc.top;
+		// 底 + 边框
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var pb = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(pb, rc.left, rc.top, w, h);
+		pb.delete();
+		// 标题
+		var tb = ..gdip.solidBrush(th.text);
+		graphics.drawString("布局器（锚定）— " ++ self.itemName, font,
+			::RECTF(rc.left + ..nodio.ui.px(PAD), rc.top + ..nodio.ui.px(8),
+				w, ..nodio.ui.px(22)), fmt, tb);
+		tb.delete();
+		var lp = ..gdip.pen(th.border, 1);
+		graphics.drawLine(lp, rc.left, rc.top + ..nodio.ui.px(34),
+			rc.right, rc.top + ..nodio.ui.px(34));
+		lp.delete();
+		// 四个开关
+		var tnames = { "左"; "上"; "右"; "下" };
+		var tkeys = { "left"; "top"; "right"; "bottom" };
+		for(i=1;4;1){
+			var b = self.__tgRect(i);
+			var on = self.anc[tkeys[i]];
+			var bb = ..gdip.solidBrush(on ? th.hoverBg : th.panel2);
+			graphics.fillRect(bb, b.left, b.top, b.right - b.left, b.bottom - b.top);
+			bb.delete();
+			var bp = ..gdip.pen(on ? th.text : th.border, 1);
+			graphics.drawRectangle(bp, b.left, b.top, b.right - b.left, b.bottom - b.top);
+			bp.delete();
+			var bt = ..gdip.solidBrush(on ? th.text : th.textDim);
+			graphics.drawString((on ? "● " : "") ++ tnames[i], font,
+				::RECTF(b.left, b.top + ..nodio.ui.px(3), b.right - b.left,
+					b.bottom - b.top), fmt, bt);
+			bt.delete();
+		}
+		// 呼吸预览：小窗体按当前锚定重排控件
+		var pvx = rc.left + ..nodio.ui.px(PREV.x);
+		var pvy = rc.top + ..nodio.ui.px(PREV.y);
+		var pvw = ..nodio.ui.px(PREV.w), pvh = ..nodio.ui.px(PREV.h);
+		var pb2 = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(pb2, pvx, pvy, pvw, pvh);
+		pb2.delete();
+		// 固定缩放：按「呼吸到最大的窗体」留边，避免小窗体忽大忽小
+		var scW = (pvw - ..nodio.ui.px(24)) / (self.__baseFW + 100);
+		var scH = (pvh - ..nodio.ui.px(24)) / (self.__baseFH + 80);
+		var sc = (scW < scH) ? scW : scH;
+		if(sc <= 0) sc = 0.2;
+		var fw2 = ..math.round(self.__simW * sc);
+		var fh2 = ..math.round(self.__simH * sc);
+		var fx = pvx + ..math.floor((pvw - fw2) / 2);
+		var fy = pvy + ..math.floor((pvh - fh2) / 2);
+		// 小窗体
+		var fb = ..gdip.solidBrush(th.panel2);
+		graphics.fillRect(fb, fx, fy, fw2, fh2);
+		fb.delete();
+		var fp = ..gdip.pen(th.textDim, 1);
+		graphics.drawRectangle(fp, fx, fy, fw2, fh2);
+		fp.delete();
+		// 控件（按锚定实时算出的位置）
+		if(self.__simRect){
+			var cx = fx + ..math.round(self.__simRect.x * sc);
+			var cy = fy + ..math.round(self.__simRect.y * sc);
+			var cw = ..math.round(self.__simRect.w * sc);
+			var ch = ..math.round(self.__simRect.h * sc);
+			var cb = ..gdip.solidBrush(0xFF3D6DB5);
+			graphics.fillRect(cb, cx, cy, cw, ch);
+			cb.delete();
+			var cp = ..gdip.pen(th.text, 1);
+			graphics.drawRectangle(cp, cx, cy, cw, ch);
+			cp.delete();
+			// 锚定的边 → 从控件边中点拉一条线到窗体边（直观显示「贴哪边」）
+			var lp2 = ..gdip.pen(th.textDim, 1);
+			if(self.anc.left) graphics.drawLine(lp2, fx, cy + ..math.floor(ch/2), cx, cy + ..math.floor(ch/2));
+			if(self.anc.right) graphics.drawLine(lp2, cx + cw, cy + ..math.floor(ch/2), fx + fw2, cy + ..math.floor(ch/2));
+			if(self.anc.top) graphics.drawLine(lp2, cx + ..math.floor(cw/2), fy, cx + ..math.floor(cw/2), cy);
+			if(self.anc.bottom) graphics.drawLine(lp2, cx + ..math.floor(cw/2), cy + ch, cx + ..math.floor(cw/2), fy + fh2);
+			lp2.delete();
+		}
+		// 提示行
+		var hb = ..gdip.solidBrush(th.textDim);
+		graphics.drawString("预览：窗体尺寸在呼吸变化，控件按锚定实时重排", font,
+			::RECTF(rc.left + ..nodio.ui.px(PAD), pvy + pvh + ..nodio.ui.px(4),
+				w, ..nodio.ui.px(18)), fmt, hb);
+		hb.delete();
+		// 按钮
+		var bnames = { ""; ""; ""; ""; "确定"; "取消" };
+		for(i=5;6;1){
+			var b = self.__btnRect(i);
+			var bb = ..gdip.solidBrush(self.hover == i ? th.hoverBg : th.panel2);
+			graphics.fillRect(bb, b.left, b.top, b.right - b.left, b.bottom - b.top);
+			bb.delete();
+			var bp = ..gdip.pen(th.border, 1);
+			graphics.drawRectangle(bp, b.left, b.top, b.right - b.left, b.bottom - b.top);
+			bp.delete();
+			var bt = ..gdip.solidBrush(th.text);
+			graphics.drawString(bnames[i], font,
+				::RECTF(b.left, b.top + ..nodio.ui.px(3), b.right - b.left,
+					b.bottom - b.top), fmt, bt);
+			bt.delete();
+		}
+	};
+	self.panel.onMouseMove = function(x, y, bd){
+		var hb = self.__hit(x, y);
+		if(hb != self.hover){
+			self.hover = hb;
+			self.panel.invalidate();
+		}
+	};
+	self.panel.onMouseClick = function(x, y, bd){
+		var hb = self.__hit(x, y);
+		if(hb >= 1 && hb <= 4){
+			var tkeys = { "left"; "top"; "right"; "bottom" };
+			self.anc[tkeys[hb]] = !self.anc[tkeys[hb]];
+			__simStep();
+		}
+		elseif(hb == 5) self.__ok();
+		elseif(hb == 6) self.close();
+	};
+
+	return self;
+}
+
+}

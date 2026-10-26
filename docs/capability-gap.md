@@ -6420,3 +6420,36 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
 - 验证：VM 98/0/1、IDE 冒烟 SMOKE OK（含新断言）、ide_debug 88 项全绿。
 - ❌ 剩余（设计器）：布局器（anchors 画布生效）、资源视图 + 控件
   分类自定义。
+
+## 1.71 第五十九轮续：设计器之四——布局器（anchors 画布生效）
+
+- **官方语义复刻**（`lib/nodio/designer/dsg.nodio`）：新增纯函数
+  `dsg.anchorRect(base, fw, fh, nw, nh, a)` —— win/ui/_.aardio:570
+  `adjustCtrl` 的设计坐标版（dpi=1）：1 = 该边边距固定、0<x<1 = 按比例；
+  锚 right 且不锚 left → 保宽平移（右缘跟着右边距走）；同时锚
+  left+right → 宽度拉伸；垂直同理。
+- **画布生效**（`canvas.nodio`）：§1.54 的「画布永不应用锚定」收窄为
+  「**窗体尺寸变化时**才应用」——
+  - `__place` 末尾刷**锚定基线**（矩形 + 当时窗体尺寸，官方设计器
+    改完位置同步更新 _defRect 的同款语义）；控件矩形一动基线就跟走，
+    画布摆位永远由 __place 说了算（旧结论不变）；
+  - `applyAnchors(oldW, oldH)`：按基线重排带 anchors 的控件
+    （解析裸串、syncGeomProps、__place）；`applyFormProps` 改宽度/
+    高度后自动调用 —— 属性格、窗体属性对话框两条路径都生效。
+  - `setAnchors(item, str)`：布局器写回（空串 = **整行移除**，
+    toDSG 对空值会写出 `anchors=;`，不能留）。
+- **布局器浮窗**（`lib/nodio/designer/anchdlg.nodio` 新文件）：左/上/
+  右/下四个开关 + **呼吸预览**——小窗体尺寸按三角波呼吸（60ms 步进，
+  关窗杀定时器），控件按 anchorRect 实时重排，锚定的边从控件拉线到
+  窗体边；确定 = 产出官方同款裸串 `{left=1;...}`（全不锚 = 空串清除）。
+  入口：设计菜单「布局器」→ `hooks.onDesignerLayout` →
+  `designer.showLayoutDialog()`（作用于画布选中控件）。
+- **回归锁**（`ide_smoke.ps1` 增 4 断言）：ANCHOR-RIGHT（只锚右：
+  600→700 加宽后 btn x=460→560、宽 120 不变）、ANCHOR-STRETCH（四边
+  全锚：edit 560×360 → 660×460、边距 20 不变）、ANCHOR-NONE（无锚
+  控件不动）、ANCHOR-DLG（对话框开「右」确定 → 属性表 + toDSG 出现
+  `anchors={right=1}`）。断言接在 TAB-ORDER 内层定时器尾部
+  （共享画布竞态纪律，见 §1.69）。
+- 验证：VM 98/0/1、IDE 冒烟 SMOKE OK（含新断言）、ide_debug 88 项全绿；
+  BOARD-DRAW-ERR 噪音维持 1 条（§1.70 抑制生效，新浮窗零新增）。
+- ❌ 剩余（设计器）：资源视图 + 控件分类自定义。

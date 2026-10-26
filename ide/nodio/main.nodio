@@ -1992,6 +1992,11 @@ shell.hooks.onDesignerTabOrder = function(){
 		? "Tab 顺序：按想要的顺序逐个点击控件，点空白退出"
 		: "Tab 顺序：已退出（顺序已保留，Ctrl+Z 可撤销）");
 };
+shell.hooks.onDesignerLayout = function(){
+	// 第五十九轮续：布局器——选中控件的锚定编辑（左/上/右/下）+
+	// 呼吸预览；应用后窗体 resize 时画布按官方 adjustCtrl 语义重排
+	designer.showLayoutDialog();
+};
 shell.hooks.onDesignerGrid = function(){
 	designer.canvas.showGrid = designer.canvas.showGrid ? false : true;
 	designer.canvas.__refresh();
@@ -3659,6 +3664,59 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 						app.designer.canvasRemove(__nm1);
 						app.designer.canvasRemove(__nm2);
 						io.print("TAB-ORDER:" ++ tostring(__ok2));
+						// —— 布局器（第五十九轮续）——
+						// ① 画布生效：带 anchors 的控件在窗体 resize 时按
+						//    官方 adjustCtrl 语义重排（基线 = 加载时的矩形+尺寸）：
+						//    只锚右 → 保宽平移（x 跟着右边距走）；
+						//    四边全锚 → 宽高拉伸、边距不变；无锚 → 不动。
+						if(app.designer.isActive()){
+							app.designer.fromDSG('/*DSG{{*/\r\nwinform = win.form(text="锚";right=600;bottom=400)\r\nwinform.add(\r\n\tbtn={cls="button";text="B";left=460;top=100;right=580;bottom=130;anchors={right=1}};\r\n\ted={cls="edit";left=20;top=20;right=580;bottom=380;anchors={left=1;top=1;right=1;bottom=1}};\r\n\tnone={cls="button";text="N";left=100;top=200;right=220;bottom=230}\r\n)\r\n/*}}*/');
+							designer.canvas.applyFormProps({
+								{ key = "width"; value = 700 };
+								{ key = "height"; value = 500 };
+							});
+							var __aBtn = null, __aEd = null, __aNone = null;
+							for(ai=1;#designer.canvas.items;1){
+								var __ait = designer.canvas.items[ai];
+								if(__ait.name == "btn") __aBtn = __ait;
+								elseif(__ait.name == "ed") __aEd = __ait;
+								elseif(__ait.name == "none") __aNone = __ait;
+							}
+							var __okR = (__aBtn && __aBtn.x == 560 && __aBtn.y == 100
+								&& __aBtn.w == 120) ? 1 : 0;
+							io.print("ANCHOR-RIGHT:" ++ tostring(__okR));
+							var __okS = (__aEd && __aEd.x == 20 && __aEd.y == 20
+								&& __aEd.w == 660 && __aEd.h == 460) ? 1 : 0;
+							io.print("ANCHOR-STRETCH:" ++ tostring(__okS));
+							var __okN = (__aNone && __aNone.x == 100
+								&& __aNone.y == 200) ? 1 : 0;
+							io.print("ANCHOR-NONE:" ++ tostring(__okN));
+							// ② 布局器对话框：打开 → 开「右」→ 确定 →
+							//    属性表出现 anchors 裸串，toDSG 裸写回
+							var __aDlg = 0;
+							var __dlgA = app.designer.layoutDialogRef();
+							if(__dlgA && __aNone){
+								designer.canvas.select("none");
+								if(shell.hooks.onDesignerLayout) shell.hooks.onDesignerLayout();
+								__dlgA.anc.right = true;
+								__dlgA.__ok();
+								var __astr = "";
+								for(aj=1;#__aNone.props;1){
+									if(__aNone.props[aj].key == "anchors"){
+										__astr = tostring(__aNone.props[aj].value : "");
+									}
+								}
+								var __dsgA = app.designer.toDSG();
+								__aDlg = ((..string.indexOf(__astr, "right=1") !== null)
+									&& (..string.indexOf(__dsgA, 'anchors={right=1}') !== null)) ? 1 : 0;
+							}
+							io.print("ANCHOR-DLG:" ++ tostring(__aDlg));
+							return null;
+						}
+						io.print("ANCHOR-RIGHT:0");
+						io.print("ANCHOR-STRETCH:0");
+						io.print("ANCHOR-NONE:0");
+						io.print("ANCHOR-DLG:0");
 						return null;
 					}, 200);
 				}

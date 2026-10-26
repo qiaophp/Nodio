@@ -21,6 +21,7 @@ import nodio.designer.registry;
 import nodio.designer.toolbox;
 import nodio.designer.propertyGrid;
 import nodio.designer.formdlg;
+import nodio.designer.anchdlg;
 import nodio.designer.canvas;
 import nodio.designer.dsg;
 import nodio.ui.list;
@@ -32,6 +33,7 @@ var propGrid = null;
 var canvas = null;
 var eventList = null;    // 事件一览（第五十六轮）
 var formDialog = null;   // 窗体属性对话框（第五十九轮续）
+var layoutDialog = null; // 布局器（第五十九轮续）
 var visible = false;
 var curItem = null;
 
@@ -84,6 +86,8 @@ create = function(sh){
 	});
 	// 窗体属性对话框（第五十九轮续）：就地浮层（非真模态窗）
 	formDialog = nodio.designer.formdlg(shell.winform, {});
+	// 布局器（第五十九轮续）：锚定编辑浮层
+	layoutDialog = nodio.designer.anchdlg(shell.winform, {});
 	layout();
 
 	// wiring
@@ -382,6 +386,30 @@ showFormDialog = function(){
 	});
 }
 
+// ---------- 布局器（第五十九轮续）----------
+//
+// 选中控件的锚定编辑：左/上/右/下开关 + 呼吸预览（官方 adjustCtrl
+// 语义实时重排）。应用 = canvas.setAnchors 写回属性表裸串，
+// toDSG 按官方裸表字面量带走；画布侧窗体 resize 时按锚定重排。
+showLayoutDialog = function(){
+	if(!canvas || !layoutDialog) return;
+	if(!visible) open();
+	var it = canvas.selected;
+	if(!it){
+		shell.setStatus("布局器：请先选中一个控件");
+		return;
+	}
+	canvas.select(it.name);
+	layoutDialog.show(it, canvas.form.w, canvas.form.h, function(str){
+		canvas.setAnchors(it, str);
+		// 属性格若正显示该控件，anchors 行跟着刷新
+		canvas.select(it.name);
+		var msg = "已设置 " ++ it.name ++ " 锚定 " ++ str;
+		if(str == "") msg = "已清除 " ++ it.name ++ " 的锚定";
+		shell.setStatus(msg);
+	});
+}
+
 // Discover user components under <projectDir>\components.
 discover = function(dir){
 	if(!dir) return 0;
@@ -459,6 +487,7 @@ isActive = lambda() visible;
 
 // 供回归：窗体属性对话框实例（无头测试直接驱动字段 + __ok）
 formDialogRef = function(){ return formDialog }
+layoutDialogRef = function(){ return layoutDialog }
 
 // ---------- Tab 顺序（第五十九轮续）----------
 //

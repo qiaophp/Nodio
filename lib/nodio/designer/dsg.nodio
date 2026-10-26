@@ -194,6 +194,54 @@ dsg = {
 		return sb;
 	}
 
+	// 锚定重排（第五十九轮续：布局器）——官方 win.ui 的 adjustCtrl
+	//（D:\aardio\lib\win\ui\_.aardio:570）在设计坐标下的复刻（dpi=1）：
+	//   base = 控件基线矩形 {x;y;w;h}；fw/fh = 基线时刻的窗体尺寸；
+	//   nw/nh = 新窗体尺寸；a = tonumber 后的锚值 {left;top;right;bottom}
+	//   （1 = 该边边距固定，0<x<1 = 按比例，null/0 = 不锚）。
+	// 语义：锚 right 且不锚 left → 保宽平移（右缘跟着右边距走）；
+	//   同时锚 left+right → 宽度拉伸；垂直同理。
+	anchorRect = function(base, fw, fh, nw, nh, a){
+		a = a : {};
+		var dl = tonumber(a.left), dt = tonumber(a.top),
+			dr = tonumber(a.right), db = tonumber(a.bottom);
+		var l = base.x, t = base.y, r, b;
+		if(dl){
+			l = (dl < 1) ? (nw * dl) : base.x;
+		}
+		if(dr){
+			if(dr < 1){
+				r = nw - nw * dr;
+			}
+			else{
+				r = nw - (fw - (base.x + base.w));   // 右边距保固定
+			}
+			if(!dl) l = r - base.w;   // 只锚右不锚左 → 保宽平移
+		}
+		else{
+			r = l + base.w;
+		}
+		if(dt){
+			t = (dt < 1) ? (nh * dt) : base.y;
+		}
+		if(db){
+			if(db < 1){
+				b = nh - nh * db;
+			}
+			else{
+				b = nh - (fh - (base.y + base.h));
+			}
+			if(!dt) t = b - base.h;
+		}
+		else{
+			b = t + base.h;
+		}
+		var w = ..math.round(r - l), h = ..math.round(b - t);
+		if(w < 1) w = 1;
+		if(h < 1) h = 1;
+		return { x = ..math.round(l); y = ..math.round(t); w = w; h = h };
+	}
+
 	// 从源码里**取出** DSG 块（没有就返回空串）
 	//
 	// 官方 aardio 的窗体源码里，设计标记就是这两个注释之间的一段：

@@ -384,6 +384,15 @@ if ($out -notmatch 'EVENT-STUB-EV:1')  { Write-Output 'FAIL: designer did not ge
 #   FORM-STUB:1      双击窗体事件 → 生成 winform.onclose = function(){...}（无控件段）
 if ($out -notmatch 'FORM-EVENTS:9/1')  { Write-Output 'FAIL: designer form-level event list is wrong'; exit 1 }
 if ($out -notmatch 'FORM-STUB:1')      { Write-Output 'FAIL: designer did not generate a form-level event stub'; exit 1 }
+# 布局器（第五十九轮续）
+#   ANCHOR-RIGHT:1   只锚右 → 窗体加宽时控件保宽平移（右边距不变）
+#   ANCHOR-STRETCH:1 四边全锚 → 窗体 resize 时宽高拉伸、边距不变
+#   ANCHOR-NONE:1    无锚控件 → 窗体 resize 不动
+#   ANCHOR-DLG:1     布局器对话框开「右」确定 → 属性表/DSG 出现 anchors={right=1}
+if ($out -notmatch 'ANCHOR-RIGHT:1')   { Write-Output 'FAIL: designer right-anchor does not keep width on form resize'; exit 1 }
+if ($out -notmatch 'ANCHOR-STRETCH:1') { Write-Output 'FAIL: designer 4-side anchor does not stretch on form resize'; exit 1 }
+if ($out -notmatch 'ANCHOR-NONE:1')    { Write-Output 'FAIL: unanchored control moved on form resize'; exit 1 }
+if ($out -notmatch 'ANCHOR-DLG:1')     { Write-Output 'FAIL: layout dialog did not write anchors back to DSG'; exit 1 }
 # SHOW-REDRAW:0  连续 show(true) 不再反复整块重画（第五十八轮修的闪烁）
 if ($out -notmatch 'SHOW-REDRAW:0')   { Write-Output 'FAIL: board.show keeps repainting on every call (flicker)'; exit 1 }
 
