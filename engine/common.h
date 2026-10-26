@@ -1141,9 +1141,9 @@ namespace NodioVM
         // 记 8 个 intern id，**值存池化 8 槽缓冲 slots**（复用既有池，
         // 稳态零堆分配；内联 Value 数组的方案实测把 make_shared<Env>
         // 顶进 2K 桶、每调用 +618B 字节，已撤）。第 9 个不同 id 整帧退化。
-        static constexpr size_t kDenseMax = 8;
+        static constexpr size_t kDenseMax = 16;
         uint32_t denseIds[kDenseMax] = {};
-        uint8_t nDense = 0;
+        uint16_t nDense = 0;
         bool bDense = false;
         shared_ptr<Table> nsTable;   // namespace scope: bare names land here
         shared_ptr<Table> modTable;  // file/module scope table: scopeVars
