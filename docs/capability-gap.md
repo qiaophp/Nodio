@@ -6610,7 +6610,31 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   - `TIMELINE-GIT:1`（验证真实 Git 仓库下的提交历史追踪）
   - `TIMELINE-DIFF:1`（验证选中历史版本的 diff 提取并上屏打开）
 - 验证：VM 99/0/0 全部通过，IDE 冒烟 SMOKE OK。
-- ❌ 剩余大项：无（7 批功能全部收口完成）。
+- ❌ 剩余大项：协议面收口（semanticTokens/codeAction/signatureHelp/DAP 三方法/4 条空壳命令）、主题 XML + 插件注册机制 + USR.CFG 键名沿用。
+
+## 1.76 第六十二轮：协议面收口（LSP 语义高亮/修复/形参 + DAP 异常/源码/跳转 + 4 条空壳命令实装）
+
+- **LSP 协议扩展**（`apps/nodio-lsp/main.cpp`）：
+  - 声明 Capabilities：`semanticTokensProvider`（含 comment/keyword/string/number/function/variable/type 等语义类型），`codeActionProvider: true`，`signatureHelpProvider: {triggerCharacters: ["(", ","]}`。
+  - `textDocument/semanticTokens/full` & `range`：基于 lexer 及单行/多行注释扫描，提取词法与高亮属性（区分函数调用、类型及普通标识符），按 (line, col) 排序后输出符合 LSP 规范的 5 元相对增量编码数组。
+  - `textDocument/codeAction`：在 `context.diagnostics` 非空时提供 `source.fixAll` 全文档格式化快速修复操作（符合协议，空 diagnostic 时回 `[]` 保持客户端不被挂起）。
+  - `textDocument/signatureHelp`：反向回溯括号与逗号深度，定位函数调用名并在全局符号表中匹配原型，输出当前参数索引与提示信息。
+- **DAP 协议扩展**（`apps/nodio-dap/main.cpp`）：
+  - 声明 Capabilities：`supportsExceptionInfoRequest: true`，`supportsLoadedSourcesRequest: true`，`supportsGotoTargetsRequest: true`。
+  - `exceptionInfo`：结构化回传当前未捕获运行时异常的详细 ID、摘要及栈轨迹。
+  - `loadedSources`：回传当前已加载的活动源码路径与文件名清单。
+  - `gotoTargets` / `goto`：提供目标行行号目标解析及跳转确认，消除前端单步/跳跃阻断。
+- **IDE 外部命令实装**（`ide/nodio/main.nodio`）：
+  - 彻底摆脱空壳返回，对接真实运行时能力：
+    - `processList`：枚举 IDE 与当前工作进程 `{pid, name, path}`；
+    - `createThread`：执行临时代码或指定脚本文件，启动子进程/独立线程并安全回传 PID；
+    - `updateVersion`：遵循 SemVer 规则递增 `projprop.version` 的修订号（补丁版本）或设置指定版本；
+    - `getProjectIcon`：依据工程结构优先级探测 `res/icon.ico`、`icon.ico` 或系统默认图标。
+- **回归锁**：
+  - `tests/lsp_smoke.py`：新增 `semanticTokens returns data` 协议回包断言，全部 22 项协议断言 100% 绿；
+  - `tests/ide_smoke.ps1`：新增 4 项外部命令断言 `CMD-PL:1`、`CMD-VER:1`、`CMD-ICO:1`、`CMD-THR:1`；
+  - VM 测试套件 99/0/0 全部通过。
+- ❌ 剩余大项：主题 XML + 插件注册机制 + USR.CFG 键名沿用。
 
 ## 1.77 第六十三轮：主题 XML + 插件注册机制 + USR.CFG 键名沿用
 
@@ -6639,29 +6663,5 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   - `CFG-ALIAS:1`（验证 USR.CFG 官方键名与内部键名双向无损读取与同步）
   - `PLUGIN-REG:1`（验证插件注册表纳管、查询与目录自动发现）
 - **验证**：VM 99/0/0 全部通过，IDE 冒烟 SMOKE OK，全量特性顺利合龙。
-
-
-## 1.76 第六十二轮：协议面收口（LSP 语义高亮/修复/形参 + DAP 异常/源码/跳转 + 4 条空壳命令实装）
-
-- **LSP 协议扩展**（`apps/nodio-lsp/main.cpp`）：
-  - 声明 Capabilities：`semanticTokensProvider`（含 comment/keyword/string/number/function/variable/type 等语义类型），`codeActionProvider: true`，`signatureHelpProvider: {triggerCharacters: ["(", ","]}`。
-  - `textDocument/semanticTokens/full` & `range`：基于 lexer 及单行/多行注释扫描，提取词法与高亮属性（区分函数调用、类型及普通标识符），按 (line, col) 排序后输出符合 LSP 规范的 5 元相对增量编码数组。
-  - `textDocument/codeAction`：在 `context.diagnostics` 非空时提供 `source.fixAll` 全文档格式化快速修复操作（符合协议，空 diagnostic 时回 `[]` 保持客户端不被挂起）。
-  - `textDocument/signatureHelp`：反向回溯括号与逗号深度，定位函数调用名并在全局符号表中匹配原型，输出当前参数索引与提示信息。
-- **DAP 协议扩展**（`apps/nodio-dap/main.cpp`）：
-  - 声明 Capabilities：`supportsExceptionInfoRequest: true`，`supportsLoadedSourcesRequest: true`，`supportsGotoTargetsRequest: true`。
-  - `exceptionInfo`：结构化回传当前未捕获运行时异常的详细 ID、摘要及栈轨迹。
-  - `loadedSources`：回传当前已加载的活动源码路径与文件名清单。
-  - `gotoTargets` / `goto`：提供目标行行号目标解析及跳转确认，消除前端单步/跳跃阻断。
-- **IDE 外部命令实装**（`ide/nodio/main.nodio`）：
-  - 彻底摆脱空壳返回，对接真实运行时能力：
-    - `processList`：枚举 IDE 与当前工作进程 `{pid, name, path}`；
-    - `createThread`：执行临时代码或指定脚本文件，启动子进程/独立线程并安全回传 PID；
-    - `updateVersion`：遵循 SemVer 规则递增 `projprop.version` 的修订号（补丁版本）或设置指定版本；
-    - `getProjectIcon`：依据工程结构优先级探测 `res/icon.ico`、`icon.ico` 或系统默认图标。
-- **回归锁**：
-  - `tests/lsp_smoke.py`：新增 `semanticTokens returns data` 协议回包断言，全部 22 项协议断言 100% 绿；
-  - `tests/ide_smoke.ps1`：新增 4 项外部命令断言 `CMD-PL:1`、`CMD-VER:1`、`CMD-ICO:1`、`CMD-THR:1`；
-  - VM 测试套件 99/0/0 全部通过。
-- ❌ 剩余大项：主题 XML + 插件注册机制 + USR.CFG 键名沿用。
+- ❌ 剩余大项：无（全部核心功能收口完成）。
 
