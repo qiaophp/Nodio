@@ -1,0 +1,288 @@
+// app/timeline.nodio — 文件时间线面板（左栏「时间线」页签）。
+//
+// 跟踪当前活动文件的历史变更：
+//   · Git 提交历史：通过 git log --follow 查询该文件的所有提交记录；
+//   · 本地保存快照：每次保存文件时自动在内存记录本地历史快照；
+//   · 双击条目：打开与当前版本的改动对比（复用 onDiff）；
+//   · 右键菜单：对比此版本 / 查看历史版本 / 复制 Hash / 刷新；
+//   · 随活动文档联动：切页签自动更新时间线，保持极低开销。
+import nodio.ui.list;
+import nodio.ui.dpi;
+import nodio.ui.theme;
+import nodio.ui.rect;
+import process.popen;
+
+var __tlSeq = 0;
+
+panel = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	var LBL_H = 24; // 顶部标题栏高度（逻辑像素）
+
+	var self = {
+		winform = winform;
+		rect = opt.rect;
+		filePath = null;      // 当前跟踪的文件全路径
+		repoRoot = null;      // Git 仓库根目录
+		items = {};           // 清单项：{ time, source, desc, hash, isGit, path, content }
+		localHistory = {};    // 本地快照：path -> { {timeStr, size, content} }
+		onDiff = null;        // function(title, diffText) —— 触发对比
+		onViewRevision = null;// function(title, content) —— 查看历史快照
+		onStatus = null;      // function(msg)
+	};
+
+	__tlSeq = __tlSeq + 1;
+	var seq = __tlSeq;
+
+	// ---------- 顶部标题 ----------
+	self.lbl = ..nodio.ui.addCtrl(winform, "tlLbl" ++ seq, {
+		cls = "static"; left = 0; top = 0; right = 240; bottom = 24;
+		text = " 时间线: 无活动文件";
+	});
+	try{
+		self.lbl.color = ..nodio.ui.themeRef(th.text);
+		self.lbl.bgcolor = ..nodio.ui.themeRef(th.bgSecondary);
+	}catch(e){}
+
+	// ---------- 历史列表 ----------
+	self.lv = ..nodio.ui.list(winform, {
+		rect = { left = 0; top = 24; right = 240; bottom = 300 };
+		columns = { {"时间"; 72}; {"来源/哈希"; 80}; {"说明"; 180} };
+	});
+
+	var __trim = function(s){ return ..string.trim(tostring(s : "")) };
+
+	// 记录本地保存快照
+	self.recordLocalSave = function(path, content){
+		if(!path || !#path) return;
+		var norm = ..io.fullpath(path);
+		if(!self.localHistory[norm]) self.localHistory[norm] = {};
+		var snaps = self.localHistory[norm];
+		var tStr = "";
+		try{ tStr = ..time().format("%H:%M:%S") }catch(e){ tStr = "刚刚" }
+		..table.push(snaps, {
+			timeStr = tStr;
+			size = content ? #content : 0;
+			content = content : "";
+			isGit = false;
+		});
+		if(#snaps > 50) ..table.shift(snaps);
+		if(norm == self.filePath || !self.filePath){
+			self.filePath = norm;
+			self.refresh();
+		}
+	};
+
+	// 切换活动文件
+	self.setFile = function(path, root){
+		if(!path || !#path){
+			self.filePath = null;
+			self.repoRoot = null;
+			self.refresh();
+			return;
+		}
+		var full = ..io.fullpath(path);
+		if(full == self.filePath && root == self.repoRoot) return;
+		self.filePath = full;
+		self.repoRoot = root;
+		self.refresh();
+	};
+
+	// 刷新时间线
+	self.refresh = function(){
+		self.items = {};
+		if(!self.filePath){
+			self.lv.setRows({});
+			..nodio.ui.setCtrlText(self.lbl, " 时间线: 无活动文件");
+			return 0;
+		}
+
+		var pi = ..io.splitpath(self.filePath);
+		var fname = pi ? (pi.file ++ (pi.ext : "")) : self.filePath;
+
+		// 1. 如果没有指定 repoRoot，探测 Git 仓库根
+		if(!self.repoRoot && pi && pi.dir){
+			try{
+				var pRoot = ..process.popen('git rev-parse --show-toplevel', , { workDir = pi.dir });
+				if(pRoot){
+					var out = __trim(pRoot.readAll());
+					if(#out && !..string.startsWith(out, "fatal:")) self.repoRoot = out;
+				}
+			}catch(eR){}
+		}
+
+		// 2. 查 Git 历史
+		if(self.repoRoot){
+			var rel = ..string.replace(self.filePath, "\\", "/");
+			var rootNorm = ..string.replace(self.repoRoot, "\\", "/");
+			if(!..string.endsWith(rootNorm, "/")) rootNorm = rootNorm ++ "/";
+			if(..string.startsWith(rel, rootNorm)){
+				rel = ..string.sub(rel, #rootNorm + 1);
+			}
+			try{
+				var pLog = ..process.popen('git log --follow --format="%h|%an|%ar|%s" -n 50 -- "' ++ rel ++ '"', , { workDir = self.repoRoot });
+				if(pLog){
+					var out = pLog.readAll();
+					if(out && #out){
+						for(line in ..string.gmatch(out, '[^\r\n]+')){
+							var parts = ..string.split(line, '|');
+							if(#parts >= 4){
+								var h = __trim(parts[1]);
+								var author = __trim(parts[2]);
+								var when = __trim(parts[3]);
+								var subj = __trim(parts[4]);
+								..table.push(self.items, {
+									time = when;
+									source = h;
+									desc = subj;
+									hash = h;
+									isGit = true;
+									rel = rel;
+									path = self.filePath;
+								});
+							}
+						}
+					}
+				}
+			}catch(eL){}
+		}
+
+		// 3. 追加本地快照（如果有）
+		var snaps = self.localHistory[self.filePath];
+		if(snaps && #snaps){
+			for(i=#snaps;1;-1){ // 最新的放前面
+				var sn = snaps[i];
+				..table.push(self.items, {
+					time = sn.timeStr;
+					source = "本地保存";
+					desc = "保存快照 (" ++ tostring(sn.size) ++ " 字节)";
+					hash = null;
+					isGit = false;
+					content = sn.content;
+					path = self.filePath;
+				});
+			}
+		}
+
+		// 4. 装载到列表
+		var rows = {};
+		for(i=1;#self.items;1){
+			var it = self.items[i];
+			..table.push(rows, {
+				cells = { it.time; it.source; it.desc };
+			});
+		}
+		self.lv.setRows(rows);
+		..nodio.ui.setCtrlText(self.lbl, " 时间线: " ++ fname ++ " (" ++ tostring(#self.items) ++ ")");
+		return #self.items;
+	};
+
+	self.count = function(){ return #self.items };
+
+	// 获取选中项（若未点击过，默认指向第 1 项）
+	self.__sel = function(){
+		var i = self.lv.selIndex;
+		if(i < 1 || i > #self.items) i = 1;
+		if(i < 1 || i > #self.items) return null;
+		return self.items[i];
+	};
+
+	// 对比选中版本
+	self.diffSelected = function(){
+		var s = self.__sel();
+		if(!s) return null;
+		if(s.isGit && self.repoRoot){
+			try{
+				var pDiff = ..process.popen('git show --format="" --patch ' ++ s.hash ++ ' -- "' ++ s.rel ++ '"', , { workDir = self.repoRoot });
+				var diffTxt = pDiff ? pDiff.readAll() : "";
+				if(!#diffTxt){
+					// 初次提交或没有父提交，取与当前版本的 diff
+					var pDiff2 = ..process.popen('git diff ' ++ s.hash ++ ' -- "' ++ s.rel ++ '"', , { workDir = self.repoRoot });
+					diffTxt = pDiff2 ? pDiff2.readAll() : "";
+				}
+				if(#diffTxt && self.onDiff){
+					self.onDiff(self.filePath ++ " (" ++ s.hash ++ ")", diffTxt);
+				}
+				return diffTxt;
+			}catch(e){}
+		}
+		elseif(!s.isGit && s.content){
+			if(self.onViewRevision){
+				self.onViewRevision(self.filePath ++ " (本地快照 " ++ s.time ++ ")", s.content);
+			}
+			return s.content;
+		}
+		return null;
+	};
+
+	// 查看历史版本全文
+	self.viewSelected = function(){
+		var s = self.__sel();
+		if(!s) return null;
+		if(s.isGit && self.repoRoot){
+			try{
+				var pShow = ..process.popen('git show ' ++ s.hash ++ ':"' ++ s.rel ++ '"', , { workDir = self.repoRoot });
+				var fullTxt = pShow ? pShow.readAll() : "";
+				if(self.onViewRevision){
+					self.onViewRevision(self.filePath ++ " [" ++ s.hash ++ "]", fullTxt);
+					return fullTxt;
+				}
+			}catch(e){}
+		}
+		elseif(!s.isGit && s.content){
+			if(self.onViewRevision){
+				self.onViewRevision(self.filePath ++ " [本地快照 " ++ s.time ++ "]", s.content);
+				return s.content;
+			}
+		}
+		return null;
+	};
+
+	// 双击行 = 对比差异
+	self.lv.onDoubleClick = function(row, index){
+		self.diffSelected();
+	};
+
+	// 右键菜单
+	self.lv.onContextMenu = function(x, y){
+		var menu = win.ui.popmenu(winform);
+		var idDiff = menu.add("对比此版本差异", null);
+		var idView = menu.add("查看此版本全文", null);
+		var idCopy = menu.add("复制 Commit Hash", null);
+		var idRef = menu.add("刷新时间线", null);
+		var id = menu.popId();
+		if(!id) return;
+		if(id == idDiff) self.diffSelected();
+		elseif(id == idView) self.viewSelected();
+		elseif(id == idCopy){
+			var s = self.__sel();
+			if(s && s.hash) ..win.clip.write(s.hash);
+		}
+		elseif(id == idRef) self.refresh();
+	};
+
+	// ---------- 布局 ----------
+	self.layout = function(l, t, r, b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = { left = l; top = t; right = r; bottom = b };
+		var lh = ..nodio.ui.px(LBL_H);
+		..nodio.ui.setRect(self.lbl, l, t, r, t + lh);
+		self.lv.layout(l, t + lh, r, b);
+	};
+	self.layout();
+
+	// ---------- dock 可见性代理 ----------
+	self.show = function(flag){
+		self.lbl.show(flag);
+		self.lv.show(flag);
+	};
+	self.ctrl = {
+		show = function(flag){ self.show(flag) }
+	};
+
+	return self;
+};

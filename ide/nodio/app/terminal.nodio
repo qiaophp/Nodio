@@ -1,0 +1,282 @@
+// app/terminal.nodio — 嵌入式交互终端（底栏「终端」页签）。
+//
+// 替代旧版的只读静态 termEd，提供真正可交互的终端：
+//   · 上半部输出区：多行深色 richedit，显示命令输出与历史回显；
+//   · 下半部输入行：单行深色 richedit，按回车执行命令；
+//   · 历史导航：方向键 ↑ / ↓ 在历史输入记录间切换；
+//   · 内置命令：cd / pwd / cls / clear / help / exit；
+//   · 外部命令：cmd.exe /c 通过 process.popen 异步拉起执行；
+//   · 外部输出：保持 shell.termAppend() 兼容，任何模块均可继续追加日志。
+import nodio.ui.richedit;
+import nodio.ui.dpi;
+import nodio.ui.theme;
+import nodio.ui.rect;
+import nodio.ui.subclass;
+import process.popen;
+
+var __termSeq = 0;
+
+panel = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	var IN_H = 26; // 输入行高度（逻辑像素）
+
+	var self = {
+		winform = winform;
+		rect = opt.rect;
+		cwd = opt.cwd : ..io.fullpath(".");
+		history = {};     // 历史命令列表
+		histIndex = 0;    // 当前浏览的历史下标
+		running = false;  // 是否有子进程在跑
+	};
+
+	__termSeq = __termSeq + 1;
+	var seq = __termSeq;
+
+	// ---------- 输出区（多行 richedit，只读）----------
+	self.edOut = ..nodio.ui.addCtrl(winform, "termOut" ++ seq, {
+		cls = "richedit"; left = 0; top = 0; right = 300; bottom = 200;
+		multiline = true; vscroll = true; readonly = true;
+	});
+	..nodio.ui.richedit.darken(self.edOut, th);
+
+	// ---------- 输入行（单行 richedit）----------
+	self.edIn = ..nodio.ui.addCtrl(winform, "termIn" ++ seq, {
+		cls = "richedit"; left = 0; top = 200; right = 300; bottom = 226;
+		multiline = false; vscroll = false;
+	});
+	..nodio.ui.richedit.darken(self.edIn, th);
+
+	// 追加文本到输出区
+	self.append = function(s){
+		if(!s || !#s) return;
+		try{
+			self.edOut.appendText(s);
+		}catch(e){
+			var old = ..nodio.ui.getCtrlText(self.edOut) : "";
+			..nodio.ui.setCtrlText(self.edOut, old ++ s);
+		}
+	};
+
+	// 清屏
+	self.clear = function(){
+		..nodio.ui.setCtrlText(self.edOut, "");
+	};
+
+	// 聚焦输入行
+	self.focus = function(){
+		try{ self.edIn.setFocus() }catch(e){}
+	};
+
+	// 设置工作目录
+	self.setCwd = function(dir){
+		if(!dir || !#dir) return;
+		var full = ..io.fullpath(dir);
+		if(full && ..io.exist(full)){
+			self.cwd = full;
+		}
+	};
+
+	var __trim = function(s){ return ..string.trim(tostring(s : "")) };
+
+	// 执行命令
+	self.execute = function(cmdText){
+		var raw = __trim(cmdText);
+		if(!#raw) return;
+
+		// 记录历史
+		..table.push(self.history, raw);
+		if(#self.history > 100) ..table.shift(self.history);
+		self.histIndex = 0;
+
+		// 回显命令行
+		self.append("[" ++ self.cwd ++ "] $ " ++ raw ++ '\r\n');
+
+		// 处理内置命令
+		var lower = ..string.lower(raw);
+		if(lower == "cls" || lower == "clear"){
+			self.clear();
+			return;
+		}
+		if(lower == "pwd"){
+			self.append(self.cwd ++ '\r\n');
+			return;
+		}
+		if(lower == "help"){
+			self.append("内置命令:\r\n  cd [目录]    切换工作目录\r\n  pwd         显示当前工作目录\r\n  cls / clear 清空屏幕\r\n  exit        重置终端\r\n  help        显示帮助信息\r\n外部命令:\r\n  直接输入任意命令行（通过 cmd.exe 执行）\r\n");
+			return;
+		}
+		if(lower == "exit"){
+			self.clear();
+			self.append("[终端已重置]\r\n[" ++ self.cwd ++ "] $\r\n");
+			return;
+		}
+		if(lower == "cd" || ..string.indexOf(lower, "cd ") == 1){
+			var target = "";
+			if(#raw > 3) target = __trim(..string.sub(raw, 4));
+			if(!#target){
+				self.append(self.cwd ++ '\r\n');
+				return;
+			}
+			// 盘符切换（如 d:）
+			if(#target == 2 && ..string.sub(target, 2, 2) == ":"){
+				var dPath = target ++ "\\";
+				if(..io.exist(dPath)){
+					self.cwd = ..io.fullpath(dPath);
+					self.append(self.cwd ++ '\r\n');
+				}
+				else{
+					self.append("系统找不到指定的驱动器: " ++ target ++ '\r\n');
+				}
+				return;
+			}
+			var newPath = ..io.joinpath(self.cwd, target);
+			if(..io.exist(newPath)){
+				self.cwd = ..io.fullpath(newPath);
+				self.append(self.cwd ++ '\r\n');
+			}
+			else{
+				self.append("系统找不到指定的路径: " ++ target ++ '\r\n');
+			}
+			return;
+		}
+
+		// 外部命令：通过 cmd.exe /c 启动
+		self.running = true;
+		var p = null;
+		try{
+			p = ..process.popen('cmd.exe /c ' ++ raw, , { workDir = self.cwd });
+		}catch(eP){
+			self.append("启动命令失败: " ++ tostring(eP) ++ '\r\n');
+			self.running = false;
+			return;
+		}
+		if(!p){
+			self.append("无法启动子进程\r\n");
+			self.running = false;
+			return;
+		}
+
+		// 读取输出（带 6 秒超时防卡死）
+		var t0 = ..time.tick();
+		var code = 0;
+		while(true){
+			var o, e = p.peek(20);
+			if(o && #o) self.append(o);
+			if(e && #e) self.append(e);
+			if(p.process){
+				var exited, ecode = p.process.waitOne(0);
+				if(exited){
+					var o2, e2 = p.peek(0);
+					if(o2 && #o2) self.append(o2);
+					if(e2 && #e2) self.append(e2);
+					code = tonumber(ecode) : 0;
+					break;
+				}
+			}
+			if(..time.tick() - t0 > 6000){
+				self.append("\r\n[命令执行超时 6 秒]\r\n");
+				break;
+			}
+		}
+		try{ p.close() }catch(eC){}
+		self.running = false;
+		if(code != 0){
+			self.append("[进程退出码: " ++ tostring(code) ++ "]\r\n");
+		}
+	};
+
+	// ---------- 子类化：处理回车和历史翻阅 ----------
+	..nodio.ui.subclass(self.edIn.hwnd, function(hwnd, msg, wp, lp){
+		if(msg == 0x100){ // WM_KEYDOWN
+			var vk = tonumber(wp);
+			if(vk == 0x0D){ // VK_RETURN
+				var txt = ..nodio.ui.getCtrlText(self.edIn);
+				..nodio.ui.setCtrlText(self.edIn, "");
+				if(#txt){
+					winform.setTimeout(function(){
+						self.execute(txt);
+						return null;
+					}, 1);
+				}
+				return 1; // 吃掉回车
+			}
+			if(vk == 0x26){ // VK_UP (上一条历史)
+				if(#self.history > 0){
+					if(self.histIndex == 0) self.histIndex = #self.history;
+					elseif(self.histIndex > 1) self.histIndex = self.histIndex - 1;
+					var h = self.history[self.histIndex] : "";
+					..nodio.ui.setCtrlText(self.edIn, h);
+				}
+				return 1;
+			}
+			if(vk == 0x28){ // VK_DOWN (下一条历史)
+				if(self.histIndex > 0){
+					self.histIndex = self.histIndex + 1;
+					if(self.histIndex > #self.history){
+						self.histIndex = 0;
+						..nodio.ui.setCtrlText(self.edIn, "");
+					}
+					else{
+						var h = self.history[self.histIndex] : "";
+						..nodio.ui.setCtrlText(self.edIn, h);
+					}
+				}
+				return 1;
+			}
+		}
+		// ⚠ 未处理消息必须 return null，不能 return 0（否则字符被吞无法输入）
+		return null;
+	});
+
+	// 右键菜单
+	self.edOut.wndproc = {
+		[0x205/*_WM_RBUTTONUP*/] = function(hwnd, msg, wp, lp){
+			var menu = win.ui.popmenu(winform);
+			var idCls = menu.add("清空终端", null);
+			var idCopy = menu.add("复制选中内容", null);
+			var idReset = menu.add("重置终端", null);
+			var id = menu.popId();
+			if(!id) return;
+			if(id == idCls) self.clear();
+			elseif(id == idCopy){
+				try{
+					var sel = self.edOut.selText;
+					if(sel && #sel) ..win.clip.write(sel);
+				}catch(e){}
+			}
+			elseif(id == idReset){
+				self.clear();
+				self.append("[终端已重置]\r\n[" ++ self.cwd ++ "] $\r\n");
+			}
+		}
+	};
+
+	// ---------- 布局 ----------
+	self.layout = function(l, t, r, b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		var ih = ..nodio.ui.px(IN_H);
+		..nodio.ui.setRect(self.edOut, l, t, r, b - ih);
+		..nodio.ui.setRect(self.edIn, l, b - ih, r, b);
+	};
+	self.layout();
+
+	// ---------- dock 可见性代理 ----------
+	self.show = function(flag){
+		self.edOut.show(flag);
+		self.edIn.show(flag);
+	};
+	self.ctrl = {
+		show = function(flag){ self.show(flag) }
+	};
+
+	// 初始欢迎语
+	self.append("Nodio Terminal (内置交互终端)\r\n工作目录: " ++ self.cwd ++ "\r\n输入 help 查看内置命令\r\n\r\n");
+
+	return self;
+};

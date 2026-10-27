@@ -446,6 +446,20 @@ if ($out -notmatch 'GIT-DIRTY:1')      { Write-Output 'FAIL: git panel did not l
 if ($out -notmatch 'GIT-DIFF:1')       { Write-Output 'FAIL: git diff did not show the change'; exit 1 }
 if ($out -notmatch 'GIT-COMMIT:1')     { Write-Output 'FAIL: git panel commit chain failed'; exit 1 }
 if ($out -notmatch 'GIT-LOG:1')        { Write-Output 'FAIL: committed message not found in git log'; exit 1 }
+
+# 嵌入式交互终端 + 文件时间线（第六十一轮）
+#   TERM-EXEC:1      终端执行 echo 命令并捕获输出
+#   TERM-CD:1        内置 cd 切换目录生效
+#   TERM-HIST:1      命令历史正确记录入队
+#   TIMELINE-LOCAL:1 本地保存快照记录
+#   TIMELINE-GIT:1   Git 历史记录追溯
+#   TIMELINE-DIFF:1  时间线差异对比执行
+if ($out -notmatch 'TERM-EXEC:1')       { Write-Output 'FAIL: terminal execution failed'; exit 1 }
+if ($out -notmatch 'TERM-CD:1')         { Write-Output 'FAIL: terminal cd command failed'; exit 1 }
+if ($out -notmatch 'TERM-HIST:1')       { Write-Output 'FAIL: terminal history recording failed'; exit 1 }
+if ($out -notmatch 'TIMELINE-LOCAL:1')   { Write-Output 'FAIL: timeline local snapshot failed'; exit 1 }
+if ($out -notmatch 'TIMELINE-GIT:1')     { Write-Output 'FAIL: timeline git history failed'; exit 1 }
+if ($out -notmatch 'TIMELINE-DIFF:1')    { Write-Output 'FAIL: timeline diff execution failed'; exit 1 }
 # WATCH-TYPE:OK  监视窗输入行打字不被 subclass 吞掉（return 0 vs null 的教训）
 if ($out -notmatch 'WATCH-TYPE:OK')    { Write-Output 'FAIL: watch input swallows text (subclass must return null)'; exit 1 }
 # SHOW-REDRAW:0  连续 show(true) 不再反复整块重画（第五十八轮修的闪烁）

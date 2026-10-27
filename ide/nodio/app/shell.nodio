@@ -44,6 +44,8 @@ import app.settings;   // 主题 / 编辑器字号 / 外部工具（持久化在
 import app.ai;        // 右栏「AI」页：AI 聊天面板（app.ai.panel）
 import app.watch;     // 底部「监视」「变量」页：调试监视窗（app.watch.panel / varsPanel）
 import app.gitpanel;  // 底部「Git」页：分支/改动/对比/提交（app.gitpanel.panel）
+import app.terminal;  // 底部「终端」页：交互式终端（app.terminal.panel）
+import app.timeline;  // 左栏「时间线」页：文件变更历史（app.timeline.panel）
 import nodio.gui.designerExt;   // nodio.gui 控件 → 设计器工具箱组件（不是展厅）
 import gdip;
 
@@ -387,6 +389,9 @@ leftDock.addTab("类视图", classTree, {icon="list"});
 // 列成树，双击窗体 = 开文件 + 进设计器（main.nodio 填充）
 var resTree = nodio.ui.tree(winform, {left=0;top=0;right=LEFT_W;bottom=600});
 leftDock.addTab("资源", resTree, {icon="list"});
+// 文件时间线（第六十一轮）：当前活动文件的 Git 提交历史 + 本地保存快照
+timelinePanel = app.timeline.panel(winform, {});
+leftDock.addTab("时间线", timelinePanel, {icon="clock"});
 // 「属性」页留给设计器的属性格（main.nodio 接入）
 
 // ---------- 右栏: 控件 / 语法 / 标准库 / 范例 / 工具 / AI ----------
@@ -440,7 +445,9 @@ var probList = nodio.ui.list(winform, {columns={{"行";40};{"级别";60};{"说�
 var probLv = bottomDock.addTab("问题", probList, {icon="warning"});
 var outEd  = bottomDock.addTab("输出", "richedit", {multiline=true;vscroll=true;readonly=true; icon="comment"});
 var dbgEd  = bottomDock.addTab("调试", "richedit", {multiline=true;vscroll=true;readonly=true; icon="bug"});
-var termEd = bottomDock.addTab("终端", "richedit", {multiline=true;vscroll=true; icon="terminal"});
+// 交互式终端（第六十一轮）：多行输出 + 单行输入 + 历史翻阅 + 内置/外部命令
+terminalPanel = app.terminal.panel(winform, {});
+bottomDock.addTab("终端", terminalPanel, {icon="terminal"});
 // 引用面板：Shift+F12「查找引用」的结果列表（跨文件）
 var refList = nodio.ui.list(winform, {columns={{"文件";240};{"行";50};{"说明";260}}});
 var refLv = bottomDock.addTab("引用", refList, {icon="search"});
@@ -476,7 +483,6 @@ dockHasTab = function(caption){
 }
 darkenRichEdit(outEd);
 darkenRichEdit(dbgEd);
-darkenRichEdit(termEd);
 darkenRichEdit(imEd);
 // 回车求值：子类化吃回车，并**推迟到消息循环**再问——
 //   DAP 求值是同步阻塞的（最长 4 秒），在窗口过程里做会卡住整个 IDE。
@@ -521,7 +527,7 @@ var toolbar = nodio.ui.toolbar(winform, {
 		{text="设计器";name="designer";icon="desktop";command=function(){ if(hooks.onDesigner) hooks.onDesigner() }};
 		{sep=true};
 		{text="输出";name="output";icon="tasks";command=function(){ bottomDock.setSelIndex(2) }};
-		{text="终端";name="terminal";icon="terminal";command=function(){ bottomDock.setSelIndex(4) }};
+		{text="终端";name="terminal";icon="terminal";command=function(){ bottomDock.selectCaption("终端"); try{ terminalPanel.focus() }catch(e){} }};
 		{text="设置";name="settings";icon="settings";command=function(){}};
 	};
 });
@@ -570,7 +576,7 @@ statusIdleAllowed = function(){
 outAppend = function(s){ outEd.text = outEd.text ++ s ++ '\r\n' }
 dbgAppend = function(s){ dbgEd.text = dbgEd.text ++ s ++ '\r\n' }
 dbgClear = function(){ dbgEd.text = "" }
-termAppend = function(s){ termEd.text = termEd.text ++ s ++ '\r\n' }
+termAppend = function(s){ if(terminalPanel) terminalPanel.append(s ++ '\r\n') }
 outClear = function(){ outEd.text = "" }
 
 // ---------- document tab strip ----------
@@ -1261,6 +1267,7 @@ install = function(){
 			{ "工程树"; function(id){ leftDock.setSelIndex(1) } };
 			{ "属性"; function(id){ leftDock.setSelIndex(2) } };
 			{ "大纲"; function(id){ leftDock.setSelIndex(4) } };
+			{ "时间线"; function(id){ leftDock.selectCaption("时间线") } };
 		} };
 		{ "格式";{
 			{ "格式化代码  Shift+Alt+F"; function(id){
@@ -1337,10 +1344,11 @@ install = function(){
 			{ "问题"; function(id){ bottomDock.setSelIndex(1) } };
 			{ "输出"; function(id){ bottomDock.setSelIndex(2) } };
 			{ "调试"; function(id){ bottomDock.setSelIndex(3) } };
-			{ "终端"; function(id){ bottomDock.setSelIndex(4) } };
+			{ "终端"; function(id){ bottomDock.selectCaption("终端"); try{ terminalPanel.focus() }catch(e){} } };
 			{ "立即窗口"; function(id){ bottomDock.selectCaption("立即") } };
 			{ "监视窗口  Ctrl+Shift+W"; function(id){ bottomDock.selectCaption("监视") } };
 			{ "变量窗口"; function(id){ bottomDock.selectCaption("变量") } };
+			{ "时间线"; function(id){ leftDock.selectCaption("时间线") } };
 			{ "-"; null };
 			{ "双栏对比"; function(id){ toggleSplitDiff() } };
 			{ "下一个差异"; function(id){ if(hooks.onNextDiff) hooks.onNextDiff() } };
@@ -1525,14 +1533,22 @@ install = function(){
 	}
 
 	// page switches
-	leftDock.onSelChange   = function(i, page){ setStatus("工程面板: " ++ i) }
+	leftDock.onSelChange   = function(i, page){
+		setStatus("工程面板: " ++ i);
+		if(page && page.ctrl == timelinePanel){
+			try{ timelinePanel.refresh() }catch(eTl){}
+		}
+	}
 	rightDock.onSelChange  = function(i, page){ setStatus("工具面板: " ++ i) }
 	bottomDock.onSelChange = function(i, page){
 		setStatus("输出面板: " ++ i);
-		// 切到「立即」页签时自动聚焦输入框：
+		// 切到「立即」或「终端」页签时自动聚焦输入框：
 		// 否则用户点了页签还得再点一下输入框才能打字，白白多一步。
 		if(page && page.ctrl == imEd){
 			try{ imEd.setFocus() }catch(eFocus){}
+		}
+		elseif(page && page.ctrl == terminalPanel){
+			try{ terminalPanel.focus() }catch(eFocus2){}
 		}
 	}
 

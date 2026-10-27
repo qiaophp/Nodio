@@ -6576,3 +6576,38 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   - `PRINT-PREV-UI:OK(1)`（验证浮层预览组件创建、绘制与退出闭环）
 - 验证：VM 99/0/0 全部通过，IDE 冒烟 SMOKE OK。
 - ❌ 剩余大项：嵌入式交互终端 + 文件时间线、协议面收口、主题 XML + 插件注册 + USR.CFG 键名。
+
+## 1.75 第六十一轮：嵌入式交互终端 + 文件时间线
+
+- **嵌入式交互终端（`ide/nodio/app/terminal.nodio` 新组件）**：
+  - 彻底替换旧版的只读静态 `termEd` 文本框，成为底栏第 4 个标准交互页。
+  - 上半部输出区：多行深色 richedit，自动滚动、只读保护，支持右键（清屏/复制/重置），同时通过 `shell.termAppend` 保持向下兼容；
+  - 下半部输入行：单行深色 richedit，回车（`VK_RETURN` 0x0D）推迟到消息循环触发异步子进程（不卡窗口过程），方向键 `VK_UP`/`VK_DOWN` 支持最近 100 条历史命令来回浏览切换；
+  - 命令处理：
+    - 内置命令：`cd [路径]`（支持跨盘符、相对路径及当前目录定位）、`pwd`、`cls`/`clear`、`help`、`exit`；
+    - 外部命令：`cmd.exe /c <command>` 通过 `process.popen`（指定当前 `cwd` 为工作目录）异步执行并以 20ms 非阻塞 peek 流式上屏，6 秒兜底防卡死，并在非 0 退出时显示退出码。
+  - 目录联动：`terminalSyncCwd()` 随工程打开、活动文档切换自动同步当前工作目录。
+- **文件时间线（`ide/nodio/app/timeline.nodio` 新组件）**：
+  - 新增左栏第 7 个页签「时间线」，专责跟踪当前活动文档的变更轨迹。
+  - 顶部状态标签（显示活动文件名及历史版本总数）+ 自绘三列表单（时间 / 来源哈希 / 说明）；
+  - 数据双轨制：
+    - Git 提交历史：自动探测当前文件所在 Git 仓库根目录，执行 `git log --follow --format="%h|%an|%ar|%s" -n 50 -- "<rel>"` 获取版本轨迹；
+    - 本地快照历史：在 `savePath` 文档保存时自动截取本地快照并存入内存字典（`recordLocalSave`），即使在无 Git 仓库环境中仍可追踪本地历史保存；
+  - 交互与版本比对：
+    - 双击或右键菜单：调用 `git show --format="" --patch <hash> -- "<rel>"` 提取单次提交的精简 diff，无任何 shell 特殊转义字符风险；
+    - 查看历史全文：调用 `git show <hash>:"<rel>"` 还原旧版源码，并在 TEMP 只读页签中打开；
+    - 支持复制 Commit Hash 与手动刷新。
+- **接线与菜单收口**：
+  - `ide/nodio/app/shell.nodio`：
+    - 工具栏「终端」按钮与菜单「视图 › 终端」统一切换至底栏「终端」页签并自动获得焦点；
+    - 菜单「选择 › 时间线」与「视图 › 时间线」联动切至左栏「时间线」；
+    - 顺手修复：`dock.onSelChange` 第二参数实为 `page` 对象表，先前部分代码以字符串比较失效且丢失了 `imEd` 的聚焦逻辑，现改为串联原回调并通过 `page.caption` 正确派发。
+- **回归锁**（`ide_smoke.ps1` 增 6 断言）：
+  - `TERM-EXEC:1`（验证终端异步拉起子进程 echo 并成功捕获输出上屏）
+  - `TERM-CD:1`（验证终端内置 cd 命令切换工作目录有效）
+  - `TERM-HIST:1`（验证方向键历史命令记录与回溯队列）
+  - `TIMELINE-LOCAL:1`（验证文件保存触发的本地快照增加与计数）
+  - `TIMELINE-GIT:1`（验证真实 Git 仓库下的提交历史追踪）
+  - `TIMELINE-DIFF:1`（验证选中历史版本的 diff 提取并上屏打开）
+- 验证：VM 99/0/0 全部通过，IDE 冒烟 SMOKE OK。
+- ❌ 剩余大项：协议面收口（semanticTokens/codeAction/signatureHelp/DAP 三方法/4 条空壳命令）、主题 XML + 插件注册 + USR.CFG 键名。

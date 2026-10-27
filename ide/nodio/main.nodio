@@ -1244,6 +1244,8 @@ openProject = function(){
 	fillResView();
 	// Git 根 = 工程根（setRoot 相同根短路，不同根才重跑 git）
 	gitSyncRoot();
+	terminalSyncCwd();
+	timelineSyncFile();
 }
 
 // 打开文件：path 为空 → 弹系统「打开文件」对话框
@@ -1546,6 +1548,7 @@ savePath = function(path){
 	shell.tabMarkSaved(path);
 	shell.setStatus("已保存: " ++ path);
 	lspSync();
+	if(shell.timelinePanel) shell.timelinePanel.recordLocalSave(path, text);
 	return true;
 }
 
@@ -2328,9 +2331,67 @@ if(shell.gitPanel){
 	// 首次定位：启动时当前文档 / 打开工程时工程根
 	gitSyncRoot();
 }
-// 底部切到「Git」页 = 顺手对一次根（工程/文档可能换过了）
-shell.bottomDock.onSelChange = function(idx, name){
-	if(name == "Git") gitSyncRoot();
+
+// ---------- 终端目录同步（第六十一轮）----------
+var terminalSyncCwd = function(){
+	if(!shell.terminalPanel) return;
+	var dir = null;
+	if(proj && proj.root){
+		dir = proj.root;
+	}
+	else{
+		var p = shell.tabCurPath();
+		if(p){
+			var pi = ..io.splitpath(p);
+			if(pi && pi.dir) dir = pi.dir;
+		}
+	}
+	if(dir) shell.terminalPanel.setCwd(dir);
+};
+if(shell.terminalPanel){
+	terminalSyncCwd();
+}
+
+// ---------- 文件时间线（第六十一轮）----------
+var timelineSyncFile = function(){
+	if(!shell.timelinePanel) return;
+	var p = shell.tabCurPath();
+	var root = (proj && proj.root) ? proj.root : null;
+	shell.timelinePanel.setFile(p, root);
+};
+if(shell.timelinePanel){
+	shell.timelinePanel.onStatus = function(s){ shell.setStatus(s) };
+	shell.timelinePanel.onDiff = function(title, txt){
+		var dp = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_timeline_diff.diff");
+		..string.save(dp, txt);
+		openTab(dp);
+		shell.setStatus("时间线对比: " ++ title);
+	};
+	shell.timelinePanel.onViewRevision = function(title, txt){
+		var pi = ..io.splitpath(title);
+		var ext = pi ? (pi.ext : ".nodio") : ".nodio";
+		var vp = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_rev_" ++ ..time.tick() ++ ext);
+		..string.save(vp, txt);
+		openTab(vp);
+		shell.setStatus("历史版本: " ++ title);
+	};
+	timelineSyncFile();
+}
+
+// 底部切页签：串联原先的 focus 以及根同步
+var __origBottomSel = shell.bottomDock.onSelChange;
+shell.bottomDock.onSelChange = function(idx, page){
+	if(__origBottomSel) __origBottomSel(idx, page);
+	var cap = page ? page.caption : "";
+	if(cap == "Git") gitSyncRoot();
+	elseif(cap == "终端") terminalSyncCwd();
+};
+
+var __origLeftSel = shell.leftDock.onSelChange;
+shell.leftDock.onSelChange = function(idx, page){
+	if(__origLeftSel) __origLeftSel(idx, page);
+	var cap = page ? page.caption : "";
+	if(cap == "时间线") timelineSyncFile();
 };
 
 shell.hooks.onAddWatch = function(){
@@ -2470,11 +2531,19 @@ shell.hooks.onOpenTerminal = function(){
 		var pi = ..io.splitpath(cur);
 		if(pi && pi.dir) dir = pi.dir;
 	}
-	try{
-		::Shell32.ShellExecute(0, "open", "cmd.exe", null, dir, 1);
-		shell.setStatus("已在目录打开终端: " ++ dir);
-	}catch(e){
-		shell.setStatus("打开终端失败: " ++ tostring(e));
+	if(shell.terminalPanel && shell.bottomDock){
+		shell.bottomDock.selectCaption("终端");
+		shell.terminalPanel.setCwd(dir);
+		shell.terminalPanel.focus();
+		shell.setStatus("已切到终端: " ++ dir);
+	}
+	else{
+		try{
+			::Shell32.ShellExecute(0, "open", "cmd.exe", null, dir, 1);
+			shell.setStatus("已在目录打开终端: " ++ dir);
+		}catch(e){
+			shell.setStatus("打开终端失败: " ++ tostring(e));
+		}
 	}
 };
 
@@ -2635,6 +2704,8 @@ shell.hooks.onTabChange   = function(path){
 	resViewMode = "";
 	// Git 根跟着文档走（同目录 = 同根，setRoot 短路不重跑 git）
 	gitSyncRoot();
+	terminalSyncCwd();
+	timelineSyncFile();
 	// LSP 跟着当前文档走（多文档：切 uri，不用重开服务）
 	if(app.lspClient.isRunning() && path && ..io.exist(path)){
 		app.lspClient.openDoc(path, shell.tabGetText(path));
@@ -3525,6 +3596,49 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 	var __gL = (__gp.git(__gDir, "log --oneline").out : "");
 	io.print("GIT-LOG:" ++ tostring(
 		..string.indexOf(__gL, "smoke-commit") !== null ? 1 : 0));
+
+	// ---------- 嵌入式交互终端 + 文件时间线（第六十一轮）----------
+	// ① 交互终端：执行 echo 命令 + 捕获输出 + 验证文本上屏
+	var __tp = shell.terminalPanel;
+	var __tOk = 0;
+	if(__tp){
+		__tp.execute("echo TERM_SMOKE_ECHO");
+		var __outTxt = ..nodio.ui.getCtrlText(__tp.edOut) : "";
+		if(..string.indexOf(__outTxt, "TERM_SMOKE_ECHO") !== null) __tOk = 1;
+	}
+	io.print("TERM-EXEC:" ++ tostring(__tOk));
+
+	// ② 交互终端：内置 cd 切换目录 + 路径生效 + 历史记录入队
+	var __tCdOk = 0;
+	var __tHistOk = 0;
+	if(__tp){
+		var __oldCwd = __tp.cwd;
+		__tp.execute("cd ..");
+		if(__tp.cwd != __oldCwd && ..io.exist(__tp.cwd)) __tCdOk = 1;
+		__tp.setCwd(__oldCwd);
+		if(#__tp.history >= 2) __tHistOk = 1;
+	}
+	io.print("TERM-CD:" ++ tostring(__tCdOk));
+	io.print("TERM-HIST:" ++ tostring(__tHistOk));
+
+	// ③ 文件时间线：设置活动文件 + Git 历史追溯 + 本地保存快照 + 差异对比
+	var __tl = shell.timelinePanel;
+	var __tlGitOk = 0;
+	var __tlLocOk = 0;
+	var __tlDiffOk = 0;
+	if(__tl && __gDir){
+		__tl.setFile(__gDir ++ "\\a.txt", __gDir);
+		var __c1 = __tl.count();
+		if(__c1 >= 2) __tlGitOk = 1;
+		__tl.recordLocalSave(__gDir ++ "\\a.txt", "v2-snapshot-content");
+		var __c2 = __tl.count();
+		if(__c2 > __c1) __tlLocOk = 1;
+		var __dTxt = __tl.diffSelected();
+		if(__dTxt && #__dTxt > 0) __tlDiffOk = 1;
+	}
+	io.print("TIMELINE-LOCAL:" ++ tostring(__tlLocOk));
+	io.print("TIMELINE-GIT:" ++ tostring(__tlGitOk));
+	io.print("TIMELINE-DIFF:" ++ tostring(__tlDiffOk));
 
 	// ---------- 设计 ↔ 源码同步（switchActiveForm 语义） ----------
 	//
