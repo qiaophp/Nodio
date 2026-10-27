@@ -1898,3 +1898,20 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 > 没有现成资源可抄；Nodio 的工具条/页签图标是 FontAwesome **字体**
 > 字形（工具箱里的控件缩略图已经是 GDI+ 手绘）。改法三条路
 > （自绘矢量 / 系统 Segoe MDL2 图标字体 / 位图资源）待用户拍板。
+>
+> **体积线 S1（编译开关轮——/GL+/LTCG+/GR- 全程序优化）**。目标：VM 本体
+> （nodio-stub）从 2.36MB 逐步压向 500KB，**功能零削减**。本轮只动
+> CMakeLists：Release/MinSizeRel 加 `/GL /Gy /Gw /GR-` + `/LTCG /OPT:REF
+> /OPT:ICF`（全仓 0 处 dynamic_cast/typeid 已核实）。实测 23f1124 基线：
+> stub 2,361,856 → 2,108,928 B（-10.7%）、nodio.exe -10.6%；含第五十九轮
+> 代码的最新基线 stub 2,133,504 B。门禁：VM 套件 **99/99/0 全绿**；CLI
+> 六套 iofile/builtin/stdlib/import 绿，winclip/publish 红项用**原版 exe
+> 同场对照同红**定性为既存环境假红（winclip 剪贴板竞争；publish 的
+> want==got 打印一致仍 FAIL，比较假红）。A/B 性能门禁等安静窗口补测。
+> 两条负结果记档：①**去内联是死路**——14 个冷路径 helper 从 common.h
+> 抽到 util.cpp、全量重编后 stub 仅 -512 B，/GL+LTCG 已在链接期折叠
+> 相同内联副本（builtins 816KB 是各 lambda 真不相同的代码）；②entry.obj
+> 的 126KB 是 parser.h 内联实现的 COMDAT 记账归属，非肥肉。后续路径：
+> S3 模块外移（COM/regex/GDI 延迟加载 DLL，-300KB）→ S4 内建家族装配器
+> 改造（-400KB 级战役）→ S5 rdata/杂项。/O1 变体已量出 stub 1,869,312 B
+> （-21%），等 A/B 数据定夺是否切换。UPX 维持否决。

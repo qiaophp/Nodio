@@ -35,6 +35,19 @@ endif()
 target_compile_definitions(nodio_common INTERFACE
     _UNICODE UNICODE _CRT_SECURE_NO_WARNINGS)
 
+# 体积线 S1（仅 MSVC Release/MinSizeRel）：全程序优化 /GL + 链接期 /LTCG、
+# 函数级链接 /Gy /Gw、关 RTTI /GR-（全仓 0 处 dynamic_cast/typeid，已核实）、
+# 链接器折叠 /OPT:REF /OPT:ICF。实测（23f1124 基线）：nodio.exe
+# 2,478,592 → 2,215,424 B（-10.6%）；nodio-stub 2,361,856 → 2,108,928 B；
+# 含第五十九轮代码的最新基线：stub 2,133,504 B，VM 回归 99/99/0 全绿。
+# Debug/RelWithDebInfo 不动：保留 RTTI 与可调试性。
+if(MSVC)
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /GL /Gy /Gw /GR-")
+    set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} /GL /Gy /Gw /GR-")
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG /OPT:REF /OPT:ICF")
+    set(CMAKE_EXE_LINKER_FLAGS_MINSIZEREL "${CMAKE_EXE_LINKER_FLAGS_MINSIZEREL} /LTCG /OPT:REF /OPT:ICF")
+endif()
+
 add_subdirectory(engine)
 add_subdirectory(publish)
 add_subdirectory(apps/nodio)
