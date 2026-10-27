@@ -393,6 +393,13 @@ if ($out -notmatch 'ANCHOR-RIGHT:1')   { Write-Output 'FAIL: designer right-anch
 if ($out -notmatch 'ANCHOR-STRETCH:1') { Write-Output 'FAIL: designer 4-side anchor does not stretch on form resize'; exit 1 }
 if ($out -notmatch 'ANCHOR-NONE:1')    { Write-Output 'FAIL: unanchored control moved on form resize'; exit 1 }
 if ($out -notmatch 'ANCHOR-DLG:1')     { Write-Output 'FAIL: layout dialog did not write anchors back to DSG'; exit 1 }
+# 资源视图（第五十九轮续）
+#   RES-DOC:1   无工程 → 当前文档兜底：带 DSG 的文档列出「标题（1 控件）」
+#   RES-OPEN:1  双击窗体节点 = 开文件 + 进设计器
+#   RES-PROJ:1/1 有工程 → 只列含 DSG 的工程文件（无 DSG 的 plain.nodio 不列）
+if ($out -notmatch 'RES-DOC:1')        { Write-Output 'FAIL: resource view current-doc fallback failed'; exit 1 }
+if ($out -notmatch 'RES-OPEN:1')       { Write-Output 'FAIL: resource view double-click did not open designer'; exit 1 }
+if ($out -notmatch 'RES-PROJ:1/1')     { Write-Output 'FAIL: resource view project scan missed or over-listed forms'; exit 1 }
 # SHOW-REDRAW:0  连续 show(true) 不再反复整块重画（第五十八轮修的闪烁）
 if ($out -notmatch 'SHOW-REDRAW:0')   { Write-Output 'FAIL: board.show keeps repainting on every call (flicker)'; exit 1 }
 

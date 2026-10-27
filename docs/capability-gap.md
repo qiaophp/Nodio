@@ -6453,3 +6453,34 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
 - 验证：VM 98/0/1、IDE 冒烟 SMOKE OK（含新断言）、ide_debug 88 项全绿；
   BOARD-DRAW-ERR 噪音维持 1 条（§1.70 抑制生效，新浮窗零新增）。
 - ❌ 剩余（设计器）：资源视图 + 控件分类自定义。
+
+## 1.72 第五十九轮续：设计器之五——资源视图（控件分类自定义已在）
+
+- **资源视图**（`app/shell.nodio` + `main.nodio`）：左栏新增「资源」页
+  （自绘树）——工程里所有「窗体资源」的树。aardio 的窗体就是
+  「含 `/*DSG{{*/` 块的源文件」，所以扫描 = 逐个工程文件找 DSG 头：
+  文件节点（icon=folder）下挂窗体节点 `标题（N 控件）`（控件数 =
+  `={cls=` 出现次数）。行为对齐官方：选中 = 开文件；**双击窗体节点 =
+  开文件 + 进设计器**。
+  - 无工程 → 当前文档兜底（只列当前文档，类视图同款降级）；
+  - 触发：左栏切到「资源」页（`onSelChange`，模式位防重扫）/
+    `openProject`（工程一换立刻重扫）/ 换文档置脏（`resViewMode=""`，
+    下次切页重扫——无工程时它列的就是当前文档）。
+- **控件分类自定义——查实已在，本轮补锁**：官方 `ide/customCtrl.aardio`
+  的替身映射（textbox→edit 等十条）在 `registry.customCtrl` 原文照抄、
+  `__findSpec` 精确匹配失败后查表（DSG 保留真实类名、按替身类建控件），
+  已有回归锁 CUSTOMCTRL-MAP / CUSTOMCTRL-DRAW；用户组件目录
+  `<工程>\components` 的 `discover()` 也已接工程打开流程（第五十一轮）。
+  本轮无需新代码。
+- **回归锁**（`ide_smoke.ps1` 增 3 断言）：RES-DOC（无工程 → 当前文档
+  列出「资源窗体（1 控件）」）、RES-OPEN（双击 → 文件打开 + 设计器
+  激活）、RES-PROJ:1/1（工程模式只列含 DSG 的文件，plain.nodio 不列）。
+  ⚠ RES 块必须放在事件各断言**之后**——onDoubleClick 会把设计器开到
+  临时文档上（designer.open 重载画布，事件断言依赖的 button1 画布
+  状态会被砸）；清理时先 designer.close() 再关页签（close 要把设计
+  写回当前文档）。
+- 验证：VM **99**/0/0（t100 的 intellisense 词库 fixture 此前在环境
+  门控下跳过，本轮起固定写入 appData 侧不再跳）、IDE 冒烟 SMOKE OK
+  （337 项断言）、ide_debug 88 项全绿。
+- ❌ 剩余（设计器）：无——设计器六项全部收口。剩余大项：Git 可视化、
+  打印补完、交互终端、协议面收口、主题/插件。

@@ -905,6 +905,64 @@ shell.classTree.onSelect = function(node){
 // 左栏切到「类视图」页 → 工程级扫描（第五十二轮）
 shell.leftDock.onSelChange = function(idx, name){
 	if(name == "类视图" and classViewMode != "project") fillClassViewProject();
+	if(name == "资源" and resViewMode != "project") fillResView();
+};
+
+// ---------- 资源视图（第五十九轮续）----------
+//
+// 官方 IDE 的资源视图 = 工程里所有「窗体资源」的树。aardio 的窗体就是
+// 「含 DSG 块的源文件」，所以扫描 = 找含 /*DSG{{*/ 的工程文件：
+// 文件节点下挂窗体节点（标题 + 控件数）。双击窗体 = 开文件 + 进设计器；
+// 没开工程时退回当前文档（类视图同款降级）。
+var resViewMode = "";
+var fillResView = function(){
+	resViewMode = "project";
+	shell.resTree.clear();
+	if(!proj || !proj.files){
+		// 当前文档兜底：只有当前文档里有 DSG 块才列
+		var path = shell.tabCurPath();
+		var text = path ? shell.tabGetText(path) : null;
+		if(!text || ..string.indexOf(text, '/*DSG{{*/') === null) return 0;
+		var fnode = shell.resTree.addNode(shell.tabTitle(path), path, null);
+		if(fnode) fnode.icon = "folder";
+		var ft = ..string.match(text, 'win\.form\(text="([^"]*)"');
+		var nCtl = 0;
+		for(c in ..string.gmatch(text, '=\{cls=')) nCtl = nCtl + 1;
+		shell.resTree.addNode((ft : "窗体") ++ "（" ++ nCtl ++ " 控件）", path, fnode);
+		return 1;
+	}
+	var count = 0;
+	for(i=1;#proj.files;1){
+		if(proj.files[i].ignored) continue;
+		var rel = proj.files[i].path;
+		var full = proj.root ++ rel;
+		var text = ..string.load(full);
+		if(!text) continue;
+		if(..string.indexOf(text, '/*DSG{{*/') === null) continue;
+		var fnode = shell.resTree.addNode(rel, full, null);
+		if(fnode) fnode.icon = "folder";
+		var ft2 = ..string.match(text, 'win\.form\(text="([^"]*)"');
+		var nCtl2 = 0;
+		for(c2 in ..string.gmatch(text, '=\{cls=')) nCtl2 = nCtl2 + 1;
+		shell.resTree.addNode((ft2 : "窗体") ++ "（" ++ nCtl2 ++ " 控件）", full, fnode);
+		count = count + 1;
+	}
+	return count;
+};
+// 选中 = 开文件（与类视图同款）；双击窗体节点 = 开文件 + 进设计器
+// （官方资源视图的双击行为）
+shell.resTree.onSelect = function(node){
+	if(!node) return;
+	if(node.path && node.path != shell.tabCurPath()){
+		if(shell.hooks.onOpenFile) shell.hooks.onOpenFile(node.path);
+	}
+};
+shell.resTree.onDoubleClick = function(node){
+	if(!node || !node.path) return;
+	if(node.path != shell.tabCurPath()){
+		if(shell.hooks.onOpenFile) shell.hooks.onOpenFile(node.path);
+	}
+	if(shell.hooks.onDesigner) shell.hooks.onDesigner();
 };
 
 // ---------- right dock data: 标准库 / 范例 ----------
@@ -1180,6 +1238,8 @@ openProject = function(){
 	// user components join the designer from <project>\components
 	var n = designer.discover(m.root ++ "components");
 	if(n) shell.setStatus("已加载自定义组件: " ++ n ++ " 个");
+	// 资源视图跟着工程走：已在「资源」页就立刻重扫，否则下次切页重扫
+	fillResView();
 }
 
 // 打开文件：path 为空 → 弹系统「打开文件」对话框
@@ -2483,6 +2543,9 @@ shell.hooks.onTabChange   = function(path){
 	// 换文档：槽内标记先清掉（下一个心跳会用新文档的诊断补上）
 	editorDiags = {};
 	shell.editor.setDiagnostics(editorDiags);
+	// 资源视图置脏：无工程时它列的是「当前文档」的窗体资源，
+	// 下次切到「资源」页要重扫（有工程时重扫结果一致，代价可忽略）
+	resViewMode = "";
 	// LSP 跟着当前文档走（多文档：切 uri，不用重开服务）
 	if(app.lspClient.isRunning() && path && ..io.exist(path)){
 		app.lspClient.openDoc(path, shell.tabGetText(path));
@@ -3229,6 +3292,52 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		io.print("FORM-STUB:" ++ tostring(
 			..string.indexOf(shell.tabGetText(target), 'winform.onclose = function()') !== null ? 1 : 0));
 	}
+
+	// 资源视图（第五十九轮续）
+	//
+	// ⚠ 放在事件各断言之后：本块 onDoubleClick 会把设计器开到临时文档上
+	//   （designer.open 重载画布，事件断言依赖的 button1 画布状态会被砸）。
+	// ① 无工程 → 当前文档兜底：开一个带 DSG 的临时文档 →
+	//    树 = 文件节点 + 窗体节点（标题 + 控件数）
+	var resPath = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_res.nodio");
+	var resDsg = '/*DSG{{*/\r\nwinform = win.form(text="资源窗体";right=400;bottom=300)\r\nwinform.add(\r\n\tbtn={cls="button";text="B";left=10;top=10;right=110;bottom=40}\r\n)\r\n/*}}*/\r\nio.print("res-ok");\r\n';
+	..string.save(resPath, resDsg);
+	shell.tabAdd(resPath, resDsg);
+	fillResView();
+	var __resRoots = shell.resTree.nodes;
+	var __resOK = 0;
+	var __resNode = null;
+	if(#__resRoots >= 1 && #__resRoots[1].children == 1){
+		__resNode = __resRoots[1].children[1];
+		var __nt = tostring(__resNode.text : "");
+		__resOK = ((..string.indexOf(__nt, "资源窗体") !== null)
+			&& (..string.indexOf(__nt, "1 控件") !== null)) ? 1 : 0;
+	}
+	io.print("RES-DOC:" ++ tostring(__resOK));
+	// ② 双击窗体节点 = 开文件 + 进设计器（官方资源视图的行为）
+	shell.resTree.onDoubleClick(__resNode);
+	io.print("RES-OPEN:" ++ tostring((shell.tabCurPath() == resPath
+		&& designer.isActive()) ? 1 : 0));
+	// ③ 有工程 → 工程级扫描：只列含 DSG 的文件（手工造工程模型）
+	var __resDir = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_resproj");
+	if(!..io.exist(__resDir)) ..io.createDir(__resDir);
+	..string.save(__resDir ++ "\frm_a.nodio", resDsg);
+	..string.save(__resDir ++ "\plain.nodio", 'io.print("x");\r\n');
+	var __oldProj = proj;
+	proj = { root = __resDir ++ "\\"; path = __resDir;
+		files = { {path="frm_a.nodio"}; {path="plain.nodio"} } };
+	fillResView();
+	var __resP = 0;
+	for(rk=1;#shell.resTree.nodes;1){
+		if(shell.resTree.nodes[rk].text == "frm_a.nodio") __resP = 1;
+	}
+	io.print("RES-PROJ:" ++ tostring(__resP) ++ "/" ++ #shell.resTree.nodes);
+	proj = __oldProj;
+	// 清理：设计器先关（close 会把设计写回当前文档），再关临时页签
+	designer.close();
+	shell.tabClose(resPath);
+	app.editor.setText(shell.editor, `io.print("ide-smoke-echo")`);
+	fillClassView();
 
 	// ---------- 设计 ↔ 源码同步（switchActiveForm 语义） ----------
 	//
