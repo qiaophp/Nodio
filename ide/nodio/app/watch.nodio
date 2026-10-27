@@ -15,6 +15,10 @@ import nodio.ui.tree;
 import nodio.ui.richedit;
 import nodio.ui.dpi;
 import nodio.ui.subclass;
+// 右键菜单用官方 win.ui.popmenu（app/editor.nodio 同一套）。
+// ⚠ 不 import 的话 win.ui 命名空间在**本模块**不可见——原来 watch.nodio
+//   里的 win.ui.popmenu 是「借了调用方的全局导入」，单独跑会炸。
+import win.ui.menu;
 
 var __wseq = 0;
 
@@ -193,6 +197,8 @@ panel = function(winform, opt){
 //   opt.setStatus = function(text)   可选
 // main 侧注入：setProvider(function() -> [{name;value;type;ref}]|null)
 //              setChildren(function(ref) -> [{name;value;type;ref}])
+//              setSetter(function(ref,name,value) -> {ok;value;type}|{ok=false;error})
+//              onEditValue = function(node, onOk)   输入框宿主（main 接 prompt）
 varsPanel = function(winform, opt){
 	opt = opt : {};
 
@@ -200,6 +206,8 @@ varsPanel = function(winform, opt){
 		winform = winform;
 		rect = opt.rect;
 		onStatus = null;
+		// 输入宿主：function(node, onOk) —— onOk(text) 返回 false = 不关输入框
+		onEditValue = null;
 	};
 
 	self.tr = ..nodio.ui.tree(winform, {
@@ -208,9 +216,11 @@ varsPanel = function(winform, opt){
 
 	var provider = null;   // 停点快照（getVars）
 	var children = null;   // 表/数组子级（getVarChildren）
+	var setter = null;     // DAP setVariable 通道（main 侧注入）
 
 	self.setProvider = function(fn){ provider = fn };
 	self.setChildren = function(fn){ children = fn };
+	self.setSetter = function(fn){ setter = fn };
 
 	var __addEntry = function(e, parent){
 		// 树没有第二列：类型缀在文本后面
@@ -220,6 +230,13 @@ varsPanel = function(winform, opt){
 		var n = self.tr.addNode(txt, null, parent);
 		var ref = tonumber(e.ref : 0) : 0;
 		n.ref = ref;
+		// DAP setVariable 的入参是「容器 ref + 变量名」——树节点上光有
+		// 自己的 ref（那是**展开子级**用的）不够用，得把变量名和
+		// **所在容器的 ref** 一起挂上：顶层变量属于当前帧作用域（ref=100），
+		// 表成员属于父表自己的 ref。
+		n.varName = tostring(e.name : "");
+		n.valueText = tostring(e.value : "");
+		n.parentRef = parent ? (tonumber(parent.ref : 0) : 0) : 100;
 		n.__loaded = (ref <= 0);      // 没引用的（数字/字符串）没有子级可拉
 		n.hasChildren = (ref > 0);    // 有引用 → 先画箭头，展开时再拉
 		// ⚠ addNode 默认 expanded=true；懒节点必须**初始收起**——
@@ -250,6 +267,63 @@ varsPanel = function(winform, opt){
 			for(i=1;#kids;1){ __addEntry(kids[i], node) }
 		}
 		return true;
+	};
+
+	// ---------- 修改变量（DAP setVariable 的 IDE 端消费）----------
+	//
+	// 协议面早就有了（nodio-dap supportsSetVariable，dapClient.setVariable），
+	// 但 IDE 里没人调它——变量树只能看不能改。这里把链路接上：
+	//   节点 → (容器 ref, 变量名, 新值表达式) → setVariable → 回写引擎。
+	// ⚠ 引擎每个停点都会重建 varRefs，所以 ref 只在**当前停点**有效；
+	//   改完必须整树刷新（setVarValue 内部做）。
+	self.setVarValue = function(node, expr){
+		if(!node || node.varName === null) return { ok = false; error = "没有选中变量" };
+		if(!setter) return { ok = false; error = "调试器未就绪" };
+		var ref = tonumber(node.parentRef : 100) : 100;
+		var r = null;
+		try{ r = setter(ref, tostring(node.varName : ""), tostring(expr : "")) }
+		catch(eSet){ r = { ok = false; error = tostring(eSet) } }
+		if(!r) r = { ok = false; error = "调试器没有响应" };
+		if(r.ok) self.refresh();
+		return r;
+	};
+
+	// 弹输入框改值：输入宿主由 main 侧接 prompt（onEditValue），
+	// onOk(text) 返回 false = 保持输入框打开（改错了可以接着改）。
+	self.editValue = function(node){
+		if(!node || node.varName === null) return false;
+		if(!self.onEditValue) return false;
+		self.onEditValue(node, function(text){
+			var r = self.setVarValue(node, text);
+			if(r && r.ok === false){
+				if(self.onStatus) self.onStatus("修改变量失败: " ++ tostring(r.error : ""));
+				return false;
+			}
+			if(self.onStatus) self.onStatus("已修改变量 " ++ node.varName ++ " = " ++ tostring(text : ""));
+			return true;
+		});
+		return true;
+	};
+
+	var __copyText = function(txt){
+		try{ ..win.clip.write(tostring(txt : "")); }catch(eClip){}
+	};
+
+	// 变量树右键：修改变量 / 复制变量值 / 复制变量名
+	// （tree 组件把 board 的 WM_CONTEXTMENU 转发成 onContextMenu(x,y)，
+	//   x,y 是**屏幕**坐标，命中用 nodeAtScreen。）
+	self.tr.onContextMenu = function(x, y){
+		var node = self.tr.nodeAtScreen(x, y);
+		if(!node) return;
+		var menu = win.ui.popmenu(winform);
+		var idEdit = menu.add("修改变量...", null);
+		var idCopyV = menu.add("复制变量值", null);
+		var idCopyN = menu.add("复制变量名", null);
+		var id = menu.popId();
+		if(!id) return;
+		if(id == idEdit) self.editValue(node);
+		elseif(id == idCopyV) __copyText(node.valueText);
+		elseif(id == idCopyN) __copyText(node.varName);
 	};
 
 	// ---------- 布局 ----------

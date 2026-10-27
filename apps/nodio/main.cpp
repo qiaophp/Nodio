@@ -382,7 +382,7 @@ int wmain(int argc, wchar_t** argv)
         EnsureConsole(false);
         if (argc < 3)
         {
-            WriteStderrUtf8(L"用法: nodio [--publish|-p|publish] <entry_script> [-o <out.exe>] [--gui] [--icon <icon.ico>] [--proj <manifest.aproj|.nproj>] [--ver <v>] [--lib <dir>]");
+            WriteStderrUtf8(L"用法: nodio [--publish|-p|publish] <entry_script> [-o <out.exe>] [--gui] [--icon <icon.ico>] [--proj <manifest.aproj|.nproj>] [--ver <v>] [--lib <dir>] [--company <s>] [--product <s>] [--desc <s>] [--copyright <s>] [--uac <level>] [--nodpi] [--resources]");
             return 1;
         }
 
@@ -415,6 +415,36 @@ int wmain(int argc, wchar_t** argv)
             else if (wcscmp(argv[i], L"--proj") == 0 && i + 1 < argc)
             {
                 opt.strProj = argv[++i];
+            }
+            // 第六十七轮：发布向导的高级设置（版本资源 / UAC / 图标之外的元数据）
+            else if (wcscmp(argv[i], L"--company") == 0 && i + 1 < argc)
+            {
+                opt.strCompany = argv[++i];
+            }
+            else if (wcscmp(argv[i], L"--product") == 0 && i + 1 < argc)
+            {
+                opt.strProduct = argv[++i];
+            }
+            else if (wcscmp(argv[i], L"--desc") == 0 && i + 1 < argc)
+            {
+                opt.strDescription = argv[++i];
+            }
+            else if (wcscmp(argv[i], L"--copyright") == 0 && i + 1 < argc)
+            {
+                opt.strCopyright = argv[++i];
+            }
+            else if (wcscmp(argv[i], L"--uac") == 0 && i + 1 < argc)
+            {
+                opt.strUacLevel = argv[++i];
+            }
+            else if (wcscmp(argv[i], L"--nodpi") == 0)
+            {
+                opt.bDpiAware = false;
+            }
+            else if (wcscmp(argv[i], L"--resources") == 0)
+            {
+                // 写入 PE 版本资源 + 应用程序清单（UAC / DPI 感知）
+                opt.bPatchManifest = true;
             }
         }
 

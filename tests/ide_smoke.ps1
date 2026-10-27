@@ -386,6 +386,8 @@ if ($out -notmatch 'WATCH-MENU:OK') { Write-Output 'FAIL: watch window menu entr
 if ($out -notmatch 'WATCH-ADD:OK')  { Write-Output 'FAIL: watch panel add/eval chain broken'; exit 1 }
 if ($out -notmatch 'VARS-TREE:OK')  { Write-Output 'FAIL: variables tree rebuild broken'; exit 1 }
 if ($out -notmatch 'VARS-LAZY:OK')  { Write-Output 'FAIL: variables tree lazy expand broken'; exit 1 }
+# VARS-SETVAR:OK  变量树右键「修改变量」链路（容器ref + 变量名 → setVariable）
+if ($out -notmatch 'VARS-SETVAR:OK') { Write-Output 'FAIL: variables tree set-value (DAP setVariable) not wired'; exit 1 }
 
 # 窗体属性对话框（第五十九轮续）：DSG 头 border/bgcolor 往返 + 对话框全链
 if ($out -notmatch 'FORM-DSG-RT:1') { Write-Output 'FAIL: form DSG border/bgcolor round-trip broken'; exit 1 }
@@ -419,6 +421,13 @@ if ($out -notmatch 'EVENT-STUB-EV:1')  { Write-Output 'FAIL: designer did not ge
 #   FORM-STUB:1      双击窗体事件 → 生成 winform.onclose = function(){...}（无控件段）
 if ($out -notmatch 'FORM-EVENTS:9/1')  { Write-Output 'FAIL: designer form-level event list is wrong'; exit 1 }
 if ($out -notmatch 'FORM-STUB:1')      { Write-Output 'FAIL: designer did not generate a form-level event stub'; exit 1 }
+# 代码片段 @ 模板展开（第六十七轮）：@ 前缀识别 → 候选 → 模板落地 + Tab 展开
+if ($out -notmatch 'SNIP-EXPAND:1')   { Write-Output 'FAIL: @ snippet expansion chain broken'; exit 1 }
+# 双文档拆分（第六十七轮）：左右/上下分栏，两个视图各挂文档
+if ($out -notmatch 'SPLIT-DOC:1')     { Write-Output 'FAIL: dual-document split view chain broken'; exit 1 }
+# 发布向导（第六十七轮）：buildArgs 装配（版本/公司/UAC/资源/路径归一）+ 浮层开关
+if ($out -notmatch 'PUB-WIZARD:1')    { Write-Output 'FAIL: publish wizard buildArgs assembly broken'; exit 1 }
+if ($out -notmatch 'PUB-WIZARD-UI:1') { Write-Output 'FAIL: publish wizard overlay open/close broken'; exit 1 }
 # 布局器（第五十九轮续）
 #   ANCHOR-RIGHT:1   只锚右 → 窗体加宽时控件保宽平移（右边距不变）
 #   ANCHOR-STRETCH:1 四边全锚 → 窗体 resize 时宽高拉伸、边距不变

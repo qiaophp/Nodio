@@ -6665,3 +6665,28 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
 - **验证**：VM 99/0/0 全部通过，IDE 冒烟 SMOKE OK，全量特性顺利合龙。
 - ❌ 剩余大项：无（全部核心功能收口完成）。
 
+## 1.81 第六十七轮：调试变量改值 + @ 片段展开 + 双文档拆分 + 发布向导 + 引用重命名协议锁
+
+- **调试器变量树右键「修改变量」**（`ide/nodio/app/watch.nodio` + `main.nodio`）：
+  - 变量树右键菜单：修改变量... / 复制变量值 / 复制变量名（`win.ui.popmenu` + `nodeAtScreen`）；
+  - `setSetter/setVarValue/editValue` 链路接通 DAP `setVariable`（协议面早已实装，IDE 端无人消费——本轮接上）；
+  - 每个停点引擎重建 varRefs，非暂停状态直接拒写（`{ok=false;error}`）；改值成功即刷新子树。
+- **代码片段 @ 模板展开**（`lib/nodio/ui/editor.nodio` + `lib/nodio/intellisense.nodio`）：
+  - 修死代码：`__expandSnippet` 原引用已不存在的 `self.selStart/selEnd`，重写为 `__selSnapshot` 口径 + 缩进继承 + `$0`/`__` 锚点定位；
+  - `@` 前缀浮层：输入 `@for` 即弹候选（内置片段表 + 官方词库 `@` 模板，kind=15），接受即按模板落地；
+  - Tab 展开与 `@` 浮层走同一 `__insertTemplate`，richedit 单位锚点换算含 CRLF 修正。
+- **双文档拆分（左右/上下）**（`ide/nodio/app/shell.nodio`）：
+  - `splitMode`（none/doc/diff）+ `viewPath/viewActive` 双视图模型：两套页签条 + 双编辑器共享同一文档池；
+  - 视图菜单新增 拆分视图（左右）/（上下）/关闭拆分视图/另一视图打开当前文档；layout 双栏分支 + 活动视图焦点跟随。
+- **工程发布向导（高级设置）**（`ide/nodio/app/publishWizard.nodio` 新模块 + `apps/nodio/main.cpp` + `publish/publish.*`）：
+  - 就地浮层：输出程序/版本号/公司/产品/文件说明/版权/图标 + UAC 三选一 + 写入版本资源勾选；预填工程清单（.aproj）元数据；
+  - `buildArgs` 纯函数装配 CLI（路径归一正斜杠，避开单引号串 `\t` 转义陷阱）；
+  - 实机端到端验证中补全并修复发布器 4 项：
+    ① `--company/--product/--desc/--copyright/--uac/--nodpi/--resources` CLI 开关补全；
+    ② 输出目录不存在时逐级自建（`-o` 到新目录/向导默认 `<工程>/dist/`）；
+    ③ VS_VERSIONINFO blob 三处结构错误（FIXEDFILEINFO 用 2 字节写 4 字节字段、漏 StringTable 层、文本 wValueLength 误按字节）——修复后 Explorer 版本页完整显示；
+    ④ 清单补丁误带结尾 NUL 导致「并行配置不正确」——激活上下文 XML 只容忍根元素后的空白，去 NUL 后补丁可加载。
+- **引用查找/重命名协议锁**（`tests/lsp_smoke.py`）：
+  - 新增 `textDocument/references`（Location 数组≥2 处）、`textDocument/rename`（WorkspaceEdit 双编辑）、非法新名拒绝（null）三项协议断言；IDE 端跨文件链路由 `tests/ide_nav_smoke.ps1` 既有覆盖（NAV SMOKE OK）。
+- **回归**：VM 套件 99/99/0 全绿，IDE 冒烟 `SMOKE OK`（新增 VARS-SETVAR/SNIP-EXPAND/SPLIT-DOC/PUB-WIZARD/PUB-WIZARD-UI），LSP 冒烟 27 项全绿，NAV 冒烟 `NAV SMOKE OK`；发布器端到端实测（版本资源可读 + 补丁清单可启动 + UAC 写入）。
+- 🏁 剩余大项：无。

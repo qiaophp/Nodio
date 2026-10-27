@@ -20,6 +20,7 @@ import app.library;
 import app.lspClient;
 import app.dapClient;
 import app.plugin;
+import app.publishWizard;
 import nodio.designer.registry;
 import nodio.intellisense;   // 第五十一轮：官方 intellisense 词库（补全并入）
 import nodio.ui.dpi;
@@ -219,6 +220,33 @@ shell.editor.onComplete = function(line, col, prefix){
 		return;
 	}
 	shell.editor.showCompletion(items);
+};
+// 代码片段候选（第六十七轮）：编辑器识别到 @ 前缀 → 这里汇总候选
+//
+// 两处来源：
+//   ① 编辑器内置片段表（for/if/try/winform/thread…，Tab 触发用的是同一批模板）
+//   ② 官方词库里值侧以 @ 开头的代码模板（intellisense.snippets）
+// 候选条目统一带 template 字段 → 编辑器接受时按模板展开（$0 / __ 锚点）。
+shell.editor.onSnippet = function(prefix, line, col){
+	var items = {};
+	try{
+		var built = shell.editor.snippetCandidates(prefix);
+		for(i=1;#built;1){ ..table.push(items, built[i]) }
+	}catch(eB){}
+	try{
+		// 官方词库的模板标签不带 '@' → 这里补上，前缀过滤才对得上
+		var lib = nodio.intellisense.snippets(..string.slice(prefix : "@", 2));
+		for(i=1;#lib;1){
+			var it = lib[i];
+			it.label = "@" ++ it.label;
+			..table.push(items, it);
+		}
+	}catch(eL){}
+	if(!#items){
+		shell.editor.hideCompletion();
+		return;
+	}
+	shell.editor.showSnippets(items);
 };
 // 悬停提示：编辑器算出鼠标下的词 → 这里问 LSP → 交回编辑器弹浮层
 //
@@ -1691,6 +1719,71 @@ publishExe = function(bGui){
 	publishRun(f, out, proj ? proj.path : null, bGui);
 }
 
+// ---------- 发布向导（第六十七轮）----------
+//
+// 工程菜单「发布向导...」：预填工程清单（.aproj）元数据，就地浮层收集
+// 版本号/公司/产品/说明/版权/图标/UAC/输出目录 → app.publishWizard.buildArgs
+// 装配完整命令行 → 走 runner.runArgs 同一条发布链路（输出面板流式）。
+publishWizardRun = function(res, bGui){
+	var f = proj ? proj.start : curFile;
+	if(!f){ shell.setStatus("没有工程/启动文件"); return }
+	if(!..io.exist(f)){
+		// 草稿文档：先落盘（与 F5 的临时运行文件同一份），再发布
+		var text = shell.tabTextForSave(curFile);
+		f = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_scratch_run.aardio");
+		..string.save(f, text);
+	}
+	else{
+		saveFile();
+	}
+	var pi = ..io.splitpath(f);
+	if(shell.bottomDock) shell.bottomDock.setSelIndex(2);   // 切到「输出」页
+	runner.runArgs(app.publishWizard.buildArgs(f, res.out,
+		proj ? proj.path : null, bGui, res), pi.dir, "发布");
+}
+
+publishWizardOpen = function(){
+	var f = proj ? proj.start : curFile;
+	if(!f){ shell.setStatus("没有工程/启动文件"); return }
+	var pi = ..io.splitpath(f);
+	// 预填：输出 <工程目录>/dist/<名>.exe；版本资源元数据取自清单（若有）
+	var def = {
+		out = pi.dir ++ "dist/" ++ pi.name ++ ".exe";
+		version = "1.0.0.0";
+	};
+	var manPath = proj ? proj.path : (pi.dir ++ "default.aproj");
+	var meta = (manPath && ..io.exist(manPath)) ? app.publishWizard.readProjMeta(manPath) : null;
+	if(meta){
+		if(#meta.version) def.version = meta.version;
+		if(#meta.company) def.company = meta.company;
+		if(#meta.product) def.product = meta.product;
+		if(#meta.desc) def.desc = meta.desc;
+		if(#meta.copyright) def.copyright = meta.copyright;
+		if(#meta.icon) def.icon = meta.icon;
+		// 官方清单 output="请修改文件名.exe" 是占位——仅认真名
+		if(#meta.output && ..string.indexOf(meta.output, "请修改") == null){
+			def.out = pi.dir ++ (#meta.publishDir ? meta.publishDir : "dist/") ++ meta.output;
+		}
+	}
+	else{
+		def.product = pi.name;
+	}
+	// 程序类型：清单 ui="win" 优先，否则看入口源码是否含 win.form(
+	var bGui = false;
+	if(meta && meta.ui == "win"){
+		bGui = true;
+	}
+	else{
+		var text = null;
+		try{ text = shell.tabTextForSave(f) }catch(eT){}
+		if(text == null) text = ..string.load(f);
+		if(text && ..string.indexOf(text, "win.form(") !== null) bGui = true;
+	}
+	app.publishWizard.openWizard(shell.winform, function(res){
+		publishWizardRun(res, bGui);
+	}, def);
+}
+
 
 // ---------- debugging (F10) ----------
 //
@@ -2021,6 +2114,7 @@ shell.hooks.onRun         = runScript;
 // 发布为独立 exe（工程 → 发布）：控制台 / 界面程序两条入口
 shell.hooks.onPublishConsole = function(){ publishExe(false) };
 shell.hooks.onPublishGui     = function(){ publishExe(true) };
+shell.hooks.onPublishWizard  = function(){ publishWizardOpen() };
 // F10 = 调试：没有会话 → 开始调试；已经停住了 → **继续**（resume）
 //
 // ⚠ 以前这里停住之后走的是 next()（单步跳过），resume() 从来没被调用过 ——
@@ -2293,6 +2387,24 @@ if(shell.varsPanel){
 	shell.varsPanel.setChildren(function(ref){
 		return app.dapClient.getVarChildren(ref);
 	});
+	// 第六十七轮：变量树右键「修改变量」——DAP setVariable 的 IDE 端消费。
+	//   协议面（nodio-dap supportsSetVariable + dapClient.setVariable）早就
+	//   有了，但 IDE 里没人调——变量树只能看不能改，这里把链路接上。
+	// ⚠ 引擎每个停点重建 varRefs：不在暂停状态时 ref 已失效，直接拒写。
+	shell.varsPanel.setSetter(function(ref, name, value){
+		if(!dbgSession || !app.dapClient.ready() || !app.dapClient.isStopped()){
+			return { ok = false; error = "没有处于暂停状态" };
+		}
+		return app.dapClient.setVariable(ref, name, value);
+	});
+	shell.varsPanel.onEditValue = function(node, onOk){
+		shell.showPrompt("修改变量: " ++ tostring(node.varName : ""),
+			tostring(node.valueText : ""),
+			function(text){
+				if(text === null || text === undefined) return false;
+				return onOk(text);
+			});
+	};
 }
 var refreshWatchList = function(){
 	if(shell.watchPanel) shell.watchPanel.refresh();
@@ -3219,6 +3331,34 @@ if( ..string.getenv("NODIO_IDE_SMOKE") ){
 		shell.varsPanel.tr.toggle(__t2);
 		var __ok = __t2.expanded && #__t2.children == 1;
 		io.print("VARS-LAZY:" ++ (__ok ? "OK" : "FAIL"));
+		// 变量树「修改变量」链路自检（第六十七轮）：没有真调试会话 →
+		//   注入假 setter，锁「节点 → (容器ref,变量名,新值) → 回写」整条链。
+		//   顶层变量的容器 ref 必须是 100（当前帧作用域），名字取自节点。
+		var __svCalled = {};
+		shell.varsPanel.setSetter(function(ref, name, value){
+			..table.push(__svCalled, { ref = ref; name = name; value = value });
+			return { ok = true; value = value; type = "number" };
+		});
+		shell.varsPanel.onEditValue = function(node, onOk){ return onOk("42") };
+		shell.varsPanel.setProvider(function(){
+			return {
+				{ name = "x"; value = "7"; type = "number"; ref = 0 };
+				{ name = "t"; value = "table"; type = "table"; ref = 101 };
+			};
+		});
+		shell.varsPanel.refresh();
+		var __svOk = false;
+		try{
+			var __n1 = shell.varsPanel.tr.nodes[1];
+			shell.varsPanel.editValue(__n1);
+			__svOk = (#__svCalled == 1
+				&& __svCalled[1].ref == 100
+				&& __svCalled[1].name == "x"
+				&& __svCalled[1].value == "42");
+		}catch(__svErr){
+			io.print("VARS-SETVAR-ERR:" ++ tostring(__svErr));
+		}
+		io.print("VARS-SETVAR:" ++ (__svOk ? "OK" : "FAIL"));
 	}
 	var __ml = shell.menuLabels ? shell.menuLabels() : {};
 	var __imMenu = false;
@@ -3559,11 +3699,125 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		if(__fd == "") __fDesc = 0;
 	}
 	io.print("FORM-EVENTS:" ++ __fCnt ++ "/" ++ tostring(__fDesc));
-	if(item){
-		designer.hooks.onEventCode({isForm=true; name="窗体"}, "onclose");
-		io.print("FORM-STUB:" ++ tostring(
-			..string.indexOf(shell.tabGetText(target), 'winform.onclose = function()') !== null ? 1 : 0));
+		if(item){
+			designer.hooks.onEventCode({isForm=true; name="窗体"}, "onclose");
+			io.print("FORM-STUB:" ++ tostring(
+				..string.indexOf(shell.tabGetText(target), 'winform.onclose = function()') !== null ? 1 : 0));
+		}
+
+		// ⑤ 属性面板模式切换与事件联动（方案 A：顶部属性 🔧 / 事件 ⚡ 切换）
+		var __propEventsOk = 0;
+		try{
+			var pg = app.designer.getPropGrid();
+			if(pg && item){
+				var mInit = pg.getMode();
+				pg.setMode("events");
+				var mEv = pg.getMode();
+				var evs = pg.getEvents();
+				var hasEvs = (evs && #evs >= 2);
+				// 触发属性面板中的事件代码生成
+				pg.triggerEventCode(1);
+				pg.setMode("props");
+				var mBack = pg.getMode();
+				if(mInit == "props" && mEv == "events" && hasEvs && mBack == "props"){
+					__propEventsOk = 1;
+				}
+			}
+		}catch(ePE){
+			io.print("PROP-EVENTS-ERR:" ++ tostring(ePE));
+		}
+		io.print("PROP-EVENTS:" ++ tostring(__propEventsOk));
+
+	// 代码片段 @ 模板展开（第六十七轮）：@ 前缀识别 → 候选 → 模板落地
+	//   ① 候选表里有 "@for"；② 光标处能认出 "@for" 前缀；
+	//   ③ 接受候选后文本变成 for 循环骨架；④ Tab 展开路径（以前是死代码）。
+	var __snipOk = 0;
+	try{
+		var __sn = shell.editor.snippetCandidates("@for");
+		var __snHas = false;
+		for(__i=1;#__sn;1){
+			if(__sn[__i].label == "@for" && __sn[__i].template){ __snHas = true; break }
+		}
+		app.editor.setText(shell.editor, "@for");
+		shell.editor.control().setSel(4);          // 0-based 光标：词尾
+		var __at = shell.editor.snippetPrefixAtCursor();
+		var __pfx = __at ? __at.prefix : "";
+		// 走 IDE 真实链路：onSnippet → 候选 → 浮层 → 接受
+		shell.editor.requestComplete();
+		shell.editor.completionAccept();
+		var __txt = app.editor.text(shell.editor);
+		var __expanded = (..string.indexOf(__txt, "for(i=1;10;1)") !== null) ? 1 : 0;
+		// Tab 展开路径
+		app.editor.setText(shell.editor, "for");
+		shell.editor.control().setSel(3);
+		var __tabOk = shell.editor.expandSnippet() ? 1 : 0;
+		var __txt2 = app.editor.text(shell.editor);
+		if(..string.indexOf(__txt2, "for(i=1;10;1)") !== null) __tabOk = 1;
+		__snipOk = (__snHas && __pfx == "@for" && __expanded && __tabOk) ? 1 : 0;
+	}catch(__snErr){
+		io.print("SNIP-ERR:" ++ tostring(__snErr));
 	}
+	io.print("SNIP-EXPAND:" ++ tostring(__snipOk));
+
+	// 双文档拆分（第六十七轮）：开拆分 → 两视图各挂文档 → 切活动视图 → 关拆分
+	var __splitOk = 0;
+	try{
+		shell.toggleSplitDoc("v");
+		var __on = (shell.splitMode == "doc") ? 1 : 0;
+		// 右视图默认显示当前文档（同文档双栏，VS 的「拆分视图」语义）
+		var __same = (shell.viewPath[2] !== null && shell.viewPath[2] == shell.viewPath[1]) ? 1 : 0;
+		// 第 2 条页签条与文档数一致
+		var __strip2 = (shell.docStrip2 && shell.docStrip2.count() == #shell.tabOrder) ? 1 : 0;
+		// 活动视图可切换
+		shell.setViewActive(2);
+		var __act = (shell.viewActive == 2 && shell.viewPath[2] !== null) ? 1 : 0;
+		shell.setViewActive(1);
+		shell.toggleSplitDoc("none");
+		var __off = (shell.splitMode == "none") ? 1 : 0;
+		__splitOk = (__on && __same && __strip2 && __act && __off) ? 1 : 0;
+	}catch(__spErr){
+		io.print("SPLIT-ERR:" ++ tostring(__spErr));
+	}
+	io.print("SPLIT-DOC:" ++ tostring(__splitOk));
+
+	// 发布向导（第六十七轮）：buildArgs 装配 + 向导浮层开关
+	// ⚠ 单引号串按 C 规则转义：'D:\\t\\x' 才是 D:\t\x（反斜杠归一的保险丝）
+	var __pubOk = 0;
+	try{
+		var __pubArgs = app.publishWizard.buildArgs("D:/t/main.aardio", "D:/t/dist/app.exe",
+			"D:/t/default.aproj", false,
+			{ version = "1.2.3.4"; company = "ACME"; product = "App"; desc = "演示";
+				copyright = "(C) 2026"; uac = "requireAdministrator";
+				icon = "D:/t/app.ico"; resources = true });
+		__pubOk = ((..string.indexOf(__pubArgs, '--ver "1.2.3.4"') !== null)
+			&& (..string.indexOf(__pubArgs, '--company "ACME"') !== null)
+			&& (..string.indexOf(__pubArgs, '--uac "requireAdministrator"') !== null)
+			&& (..string.indexOf(__pubArgs, "--resources") !== null)
+			&& (..string.indexOf(__pubArgs, "D:/t/dist/app.exe") !== null)) ? 1 : 0;
+		// 反斜杠路径归一成正斜杠（\t 不会变制表符）
+		var __pubNorm = app.publishWizard.buildArgs('D:\\t\\main.aardio', 'D:\\t\\dist\\app.exe',
+			null, true, { uac = "highestAvailable" });
+		if((..string.indexOf(__pubNorm, "D:/t/main.aardio") === null)
+			|| (..string.indexOf(__pubNorm, "--gui") === null)) __pubOk = 0;
+	}catch(__pubErr){
+		io.print("PUB-ERR:" ++ tostring(__pubErr));
+		__pubOk = 0;
+	}
+	io.print("PUB-WIZARD:" ++ tostring(__pubOk));
+
+	var __wizUi = 0;
+	try{
+		var __wz = app.publishWizard.wizard(shell.winform, {});
+		__wz.show(null, { out = "D:/t/dist/x.exe"; version = "2.0.0.1" });
+		__wizUi = (__wz.visible
+			&& (..string.indexOf(..nodio.ui.getCtrlText(__wz.edOut), "D:/t/dist/x.exe") !== null)
+			&& (..string.indexOf(..nodio.ui.getCtrlText(__wz.edVer), "2.0.0.1") !== null)) ? 1 : 0;
+		__wz.close();
+		if(__wz.visible) __wizUi = 0;
+	}catch(__wizErr){
+		io.print("PUBWIZ-ERR:" ++ tostring(__wizErr));
+	}
+	io.print("PUB-WIZARD-UI:" ++ tostring(__wizUi));
 
 	// 资源视图（第五十九轮续）
 	//

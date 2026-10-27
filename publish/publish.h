@@ -32,6 +32,15 @@ namespace NodioPublish
         // "asInvoker" / "requireAdministrator" / "highestAvailable".
         bool bDpiAware = true;
         std::wstring strUacLevel;
+
+        // Rewrite the manifest + PE version resource in the produced exe.
+        // Off by default: rewriting the manifest resource in place is
+        // rejected by the Windows loader in some configurations (the exe
+        // then fails with "side-by-side configuration is incorrect"), so
+        // the default keeps the manifest the host was built with — which
+        // already declares DPI awareness. The IDE's publish wizard turns
+        // this on explicitly (it enables the version resource too).
+        bool bPatchManifest = false;
     };
 
     // Full publish pipeline: .aproj rules, syntax gate, import closure,

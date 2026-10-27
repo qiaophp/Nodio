@@ -595,6 +595,13 @@ namespace NodioPublish
         const char* p = (const char*)&w;
         b.insert(b.end(), p, p + sizeof(w));
     }
+    // VS_FIXEDFILEINFO / Translation 的字段是 4 字节 DWORD——PutWord 只写
+    // 2 字节，会把整个 VERSIONINFO 结构截断成 Windows 读不懂的垃圾。
+    static void PutDword(std::vector<char>& b, DWORD v)
+    {
+        const char* p = (const char*)&v;
+        b.insert(b.end(), p, p + sizeof(v));
+    }
     // Writes a NUL-terminated wide key. The key starts immediately after
     // the 6-byte block header and is itself padded to a 4-byte boundary —
     // padding BEFORE the key would shift it and desync the whole tree.
@@ -618,7 +625,11 @@ namespace NodioPublish
         std::vector<char> b;
         size_t lenPos = b.size();
         PutWord(b, 0);            // wLength — patched at the end
-        PutWord(b, value && !value->empty() ? (WORD)value->size() : 0);
+        // wValueLength：二进制值按字节，文本值按「字」（含结尾 NUL 的字符数，
+        // 与 RC 实际产出一致；Explorer 按 wType 换算回字节数）
+        PutWord(b, value && !value->empty()
+            ? (bText ? (WORD)(value->size() / 2) : (WORD)value->size())
+            : 0);
         PutWord(b, bText ? 1 : 0);
         PutWStr(b, key);             // key + NUL, 4-byte aligned
         if (value && !value->empty())
@@ -667,23 +678,28 @@ namespace NodioPublish
             ? L"" : opt.strCopyright;
         std::wstring strCompany = opt.strCompany;
 
-        // VS_FIXEDFILEINFO: dwSignature then version fields
+        // VS_FIXEDFILEINFO: 13 个 4 字节 DWORD（签名/结构版本/四个版本号/
+        // 掩码/OS/类型/日期），全部走 PutDword
         std::vector<char> ffi;
-        PutWord(ffi, 0xFEEF04BD);           // dwSignature
-        PutWord(ffi, 0x00010000);           // dwStrucVersion
-        for (int i = 1; i >= 0; i--) PutWord(ffi, (WORD)v[i]);  // fileVerMS
-        for (int i = 3; i >= 2; i--) PutWord(ffi, (WORD)v[i]);  // fileVerLS
-        for (int i = 1; i >= 0; i--) PutWord(ffi, (WORD)v[i]);  // prodVerMS
-        for (int i = 3; i >= 2; i--) PutWord(ffi, (WORD)v[i]);  // prodVerLS
-        PutWord(ffi, 0x3F);                 // dwFileFlagsMask
-        PutWord(ffi, 0);                    // dwFileFlags
-        PutWord(ffi, 0x040904B0);           // dwFileOS (NT 32-bit)
-        PutWord(ffi, 1);                    // dwFileType (app)
-        PutWord(ffi, 0);                    // dwFileSubtype
-        PutWord(ffi, 0);                    // dwFileDateMS
-        PutWord(ffi, 0);                    // dwFileDateLS
+        PutDword(ffi, 0xFEEF04BD);                       // dwSignature
+        PutDword(ffi, 0x00010000);                       // dwStrucVersion
+        PutDword(ffi, ((DWORD)v[1] << 16) | v[0]);       // dwFileVersionMS  major.minor
+        PutDword(ffi, ((DWORD)v[3] << 16) | v[2]);       // dwFileVersionLS  build.revision
+        PutDword(ffi, ((DWORD)v[1] << 16) | v[0]);       // dwProductVersionMS
+        PutDword(ffi, ((DWORD)v[3] << 16) | v[2]);       // dwProductVersionLS
+        PutDword(ffi, 0x0000003F);                       // dwFileFlagsMask
+        PutDword(ffi, 0);                                // dwFileFlags
+        PutDword(ffi, 0x040904B0);                       // dwFileOS (VOS_NT_WINDOWS32)
+        PutDword(ffi, 1);                                // dwFileType (app)
+        PutDword(ffi, 0);                                // dwFileSubtype
+        PutDword(ffi, 0);                                // dwFileDateMS
+        PutDword(ffi, 0);                                // dwFileDateLS
 
-        // StringFileInfo / 040904B0 (U.S. English, Unicode)
+        // StringFileInfo / StringTable / 040904B0（U.S. English, Unicode）
+        //
+        // 层级必须是 StringFileInfo → StringTable → String 三层（资源编译器
+        // 的规范结构）：中间的 StringTable（szKey = 语言+代码页）以前被漏掉，
+        // Explorer/VerQueryValue 找不到任何字符串条目。
         std::vector<std::vector<char>> strings;
         strings.push_back(StringEntry(L"CompanyName", strCompany));
         strings.push_back(StringEntry(L"FileDescription", strDesc));
@@ -694,7 +710,10 @@ namespace NodioPublish
                                       strDefaultName + L".exe"));
         strings.push_back(StringEntry(L"ProductName", strProd));
         strings.push_back(StringEntry(L"ProductVersion", strVer));
-        std::vector<char> sfi = VerBlock(L"StringFileInfo", nullptr, false, &strings);
+        std::vector<std::vector<char>> tables;
+        tables.push_back(VerBlock(L"040904B0", nullptr, true, &strings));
+        std::vector<char> sfi = VerBlock(L"StringFileInfo", nullptr, true,
+                                         &tables);
 
         // VarFileInfo / Translation
         std::vector<char> varVal;
@@ -702,7 +721,7 @@ namespace NodioPublish
         PutWord(varVal, 0x04B0);            // codepage 1200
         std::vector<std::vector<char>> varKids;
         varKids.push_back(VerBlock(L"Translation", &varVal, false, nullptr));
-        std::vector<char> vfi = VerBlock(L"VarFileInfo", nullptr, false, &varKids);
+        std::vector<char> vfi = VerBlock(L"VarFileInfo", nullptr, true, &varKids);
 
         // root: VS_VERSION_INFO holding the FIXEDFILEINFO then both children
         std::vector<std::vector<char>> kids;
@@ -919,16 +938,20 @@ namespace NodioPublish
         // the Windows loader in some configurations (the exe then fails
         // with "side-by-side configuration is incorrect"), so the default
         // keeps the manifest the host was built with — which already
-        // declares DPI awareness. NODIO_PUBMANIFEST=1 opts into the
-        // rewrite for UAC level changes.
-        bool bPatchManifest =
+        // declares DPI awareness. NODIO_PUBMANIFEST=1 or the caller's
+        // opt.bPatchManifest (IDE 发布向导) opts into the rewrite for UAC
+        // level changes.
+        bool bPatchManifest = opt.bPatchManifest ||
             GetEnvironmentVariableW(L"NODIO_PUBMANIFEST", nullptr, 0) != 0;
         if (bPatchManifest)
         {
             std::string xml = BuildManifestXml(opt);
             RsrcLoc loc;
             if (FindRsrcLeaf(exe, (WORD)RT_MANIFEST, 1, &loc))
-                PatchRsrcData(exe, loc, xml.c_str(), xml.size() + 1, 4096,
+                // ⚠ 不能带结尾 NUL（原 +1 会写进 0 字节）：激活上下文的 XML
+                // 解析只容忍根元素之后出现空白，NUL 直接报「无效的 Xml 语法」。
+                // 槽位余量由 PatchRsrcData 用空格填满（原清单同样以 \n 收尾）。
+                PatchRsrcData(exe, loc, xml.c_str(), xml.size(), 4096,
                               ' ');   // XML: pad with spaces
         }
 
@@ -953,6 +976,27 @@ namespace NodioPublish
         PatchSubsystemBuf(exe, opt.bConsole);
 
         // 4d) Write base PE to destination file
+        //     输出目录不存在时逐级先建（显式 -o 到新目录 / 向导默认
+        //     <工程>/dist/ 都可能落进尚不存在的目录）
+        {
+            std::wstring outDir = DirOf(opt.strOut);
+            if (!outDir.empty() &&
+                GetFileAttributesW(outDir.c_str()) == INVALID_FILE_ATTRIBUTES)
+            {
+                for (size_t pos = 0; pos < outDir.size(); pos++)
+                {
+                    if (outDir[pos] == L'\\' || outDir[pos] == L'/')
+                    {
+                        // 逐级创建（CreateDirectoryW 对盘符根/已存在项无害）
+                        std::wstring acc = outDir.substr(0, pos);
+                        if (acc.size() > 2 &&
+                            GetFileAttributesW(acc.c_str()) == INVALID_FILE_ATTRIBUTES)
+                            CreateDirectoryW(acc.c_str(), nullptr);
+                    }
+                }
+                CreateDirectoryW(outDir.c_str(), nullptr);
+            }
+        }
         if (!WriteWholeFile(opt.strOut, exe))
         {
             strErr = L"写入输出程序失败: " + opt.strOut;

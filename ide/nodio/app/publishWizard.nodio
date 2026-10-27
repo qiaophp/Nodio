@@ -1,0 +1,481 @@
+// app/publishWizard.nodio — 发布向导（版本资源 / 图标 / UAC / 输出目录）。
+//
+// 官方 aardio 的工程发布除了产出独立 exe，还能设定 PE 版本资源（版本号 /
+// 公司 / 产品 / 文件说明 / 版权）与应用程序清单（UAC 权限级别、DPI 感知）。
+// 发布器侧由 --ver / --company / --product / --desc / --copyright /
+// --uac / --nodpi / --resources 一组开关承载（publish/publish.cpp +
+// apps/nodio/main.cpp）。本向导把这些高级设置聚到一个就地浮层：
+//   预填工程清单（.aproj）根标签元数据 → 用户调整 → buildArgs 装配完整
+//   命令行 → main.nodio 的 publishWizardRun 交给 runner.runArgs 走「输出」
+//   面板流式执行（与直接发布同一条链路）。
+namespace app.publishWizard{
+import nodio.ui.board;
+import nodio.ui.dpi;
+import nodio.ui.theme;
+import nodio.ui.subclass;
+import gdip;
+import fsys.dlg;
+
+var __pwSeq = 0;
+
+// ---------- 参数装配（纯函数，冒烟可测） ----------
+
+// ⚠ 单引号串按 C 规则转义，路径里的 \t \n 会变控制字符——路径一律先
+//   归一成正斜杠再进参数行（CreateProcess 与发布器都认正斜杠）。
+var __normPath = function(p){
+	return ..string.replaceLiteral(tostring(p : ""), '\\', "/");
+}
+
+// opt = { out; version; company; product; desc; copyright; icon;
+//         uac; resources; nodpi }
+// 返回与 apps/nodio/main.cpp 发布 CLI 一一对应的参数行（不含 exe 本身）。
+buildArgs = function(entry, out, manifest, bGui, opt){
+	opt = opt : {};
+	var args = '--publish "' ++ __normPath(entry) ++ '" -o "' ++ __normPath(out) ++ '"';
+	if(manifest && #manifest) args = args ++ ' --proj "' ++ __normPath(manifest) ++ '"';
+	if(bGui) args = args ++ " --gui";
+	var ver = ..string.trim(tostring(opt.version : ""));
+	if(#ver) args = args ++ ' --ver "' ++ ver ++ '"';
+	var company = ..string.trim(tostring(opt.company : ""));
+	if(#company) args = args ++ ' --company "' ++ company ++ '"';
+	var product = ..string.trim(tostring(opt.product : ""));
+	if(#product) args = args ++ ' --product "' ++ product ++ '"';
+	var desc = ..string.trim(tostring(opt.desc : ""));
+	if(#desc) args = args ++ ' --desc "' ++ desc ++ '"';
+	var cp = ..string.trim(tostring(opt.copyright : ""));
+	if(#cp) args = args ++ ' --copyright "' ++ cp ++ '"';
+	var icon = ..string.trim(tostring(opt.icon : ""));
+	if(#icon) args = args ++ ' --icon "' ++ __normPath(icon) ++ '"';
+	var uac = ..string.trim(tostring(opt.uac : ""));
+	if(#uac) args = args ++ ' --uac "' ++ uac ++ '"';
+	if(opt.resources) args = args ++ " --resources";
+	if(opt.nodpi) args = args ++ " --nodpi";
+	return args;
+}
+
+// 读工程清单（.aproj）根标签的元数据，用于向导预填。官方模板根形如：
+//   <project ver="10" name="x" icon="..." CompanyName="..."
+//     FileDescription="..." LegalCopyright="..." ProductName="..."
+//     FileVersion="0.0.1.001" publishDir="/dist/" ui="win"
+//     output="x.exe" ...>
+readProjMeta = function(path){
+	var t = "";
+	try{ t = ..string.load(path) : "" }catch(e){ }
+	if(!#t) return null;
+	var get = function(name){
+		var v = ..string.match(t, name ++ '="([^"]*)"');
+		return v : "";
+	};
+	return {
+		version    = get("FileVersion");
+		company    = get("CompanyName");
+		product    = get("ProductName");
+		desc       = get("FileDescription");
+		copyright  = get("LegalCopyright");
+		icon       = get("icon");
+		output     = get("output");
+		publishDir = get("publishDir");
+		ui         = get("ui");
+	};
+}
+
+// ---------- 向导浮层 ----------
+
+wizard = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	// 设计常量（逻辑像素）
+	var W = 560, H = 474;
+	var PAD = 14;
+	var ED_X = 96, ED_W = 300, BR_W = 70;
+	var ROWS = { 46; 80; 114; 148; 182; 216; 250 };   // 输出/版本/公司/产品/说明/版权/图标
+
+	var self = {
+		winform = winform;
+		visible = false;
+		hover = 0;           // 0=无 1=发布 2=取消 3=浏览输出 4=浏览图标 5..7=UAC 8=勾选
+		uac = "asInvoker";   // asInvoker | requireAdministrator | highestAvailable
+		resources = true;    // 写 PE 版本资源 + 应用程序清单
+		onPublish = null;    // function(res)
+	};
+
+	__pwSeq = __pwSeq + 1;
+	var seq = __pwSeq;
+
+	// 底板 board (z=85)
+	self.panel = nodio.ui.board(winform, {
+		left = 0; top = 0; right = ..nodio.ui.px(W); bottom = ..nodio.ui.px(H);
+		fontSize = 12; z = 85;
+	});
+
+	// 输入框 (z=87)：输出程序/版本号/公司/产品/说明/版权/图标
+	var mkEd = function(name){
+		return ..nodio.ui.addCtrl(winform, name ++ seq, {
+			cls="edit"; left=0; top=0; right=ED_W; bottom=22; z=87 });
+	};
+	self.edOut = mkEd("pwOut");
+	self.edVer = mkEd("pwVer");
+	self.edCompany = mkEd("pwCompany");
+	self.edProduct = mkEd("pwProduct");
+	self.edDesc = mkEd("pwDesc");
+	self.edCopyright = mkEd("pwCopy");
+	self.edIcon = mkEd("pwIcon");
+	self.edits = { self.edOut; self.edVer; self.edCompany; self.edProduct;
+		self.edDesc; self.edCopyright; self.edIcon };
+
+	var __btnRects = function(){
+		var br = { left = 0; top = 0 };
+		try{
+			var pr = self.panel.ctrl.getRect();
+			if(pr && pr.left !== null){ br.left = pr.left; br.top = pr.top }
+		}catch(eR){}
+		var pxW = ..nodio.ui.px(W);
+		var pxH = ..nodio.ui.px(H);
+		var xEd = br.left + ..nodio.ui.px(ED_X);
+		var xBr = br.left + ..nodio.ui.px(ED_X + ED_W + 8);
+		var xBr2 = xBr + ..nodio.ui.px(BR_W);
+		var yU = br.top + ..nodio.ui.px(288);
+		var yC = br.top + ..nodio.ui.px(326);
+		return {
+			browseOut  = ::RECT(xBr, br.top + ..nodio.ui.px(46), xBr2, br.top + ..nodio.ui.px(70));
+			browseIcon = ::RECT(xBr, br.top + ..nodio.ui.px(250), xBr2, br.top + ..nodio.ui.px(274));
+			uac1 = ::RECT(xEd, yU, br.left + ..nodio.ui.px(186), yU + ..nodio.ui.px(24));
+			uac2 = ::RECT(br.left + ..nodio.ui.px(196), yU, br.left + ..nodio.ui.px(346), yU + ..nodio.ui.px(24));
+			uac3 = ::RECT(br.left + ..nodio.ui.px(356), yU, br.left + ..nodio.ui.px(506), yU + ..nodio.ui.px(24));
+			chk  = ::RECT(xEd, yC, br.left + ..nodio.ui.px(500), yC + ..nodio.ui.px(24));
+			ok = ::RECT(br.left + pxW - ..nodio.ui.px(PAD) - ..nodio.ui.px(110),
+				br.top + pxH - ..nodio.ui.px(38),
+				br.left + pxW - ..nodio.ui.px(PAD),
+				br.top + pxH - ..nodio.ui.px(10));
+			cancel = ::RECT(br.left + pxW - ..nodio.ui.px(PAD) - ..nodio.ui.px(210),
+				br.top + pxH - ..nodio.ui.px(38),
+				br.left + pxW - ..nodio.ui.px(PAD) - ..nodio.ui.px(120),
+				br.top + pxH - ..nodio.ui.px(10));
+		};
+	};
+
+	// ---------- 打开与关闭 ----------
+	self.show = function(onPublish, def){
+		self.onPublish = onPublish;
+		def = def : {};
+		..nodio.ui.setCtrlText(self.edOut, def.out : "");
+		..nodio.ui.setCtrlText(self.edVer, def.version : "1.0.0.0");
+		..nodio.ui.setCtrlText(self.edCompany, def.company : "");
+		..nodio.ui.setCtrlText(self.edProduct, def.product : "");
+		..nodio.ui.setCtrlText(self.edDesc, def.desc : "");
+		..nodio.ui.setCtrlText(self.edCopyright, def.copyright : "");
+		..nodio.ui.setCtrlText(self.edIcon, def.icon : "");
+		if(def.uac) self.uac = def.uac;
+		self.resources = (def.resources === null) ? true : def.resources;
+
+		// 面板居中
+		var ox = 40, oy = 40;
+		try{
+			var rc = winform.getClientRect();
+			var w = rc.width ? rc.width() : 0;
+			var h = rc.height ? rc.height() : 0;
+			if(w && h){
+				var px = ..nodio.ui.px(W), py = ..nodio.ui.px(H);
+				ox = ..math.floor((w - px) / 2);
+				oy = ..math.floor((h - py) / 3);
+				if(ox < 10) ox = 10;
+				if(oy < 10) oy = 10;
+				self.panel.layout(ox, oy, ox + px, oy + py);
+			}
+		}catch(eC){}
+
+		var br = { left = ox; top = oy };
+		try{
+			var pr = self.panel.ctrl.getRect();
+			if(pr && pr.left !== null){ br.left = pr.left; br.top = pr.top }
+		}catch(eR){}
+
+		for(i=1;#self.edits;1){
+			var y = ROWS[i];
+			..nodio.ui.setRect(self.edits[i],
+				br.left + ..nodio.ui.px(ED_X),
+				br.top + ..nodio.ui.px(y),
+				br.left + ..nodio.ui.px(ED_X + ED_W),
+				br.top + ..nodio.ui.px(y + 24));
+		}
+
+		self.panel.show(true);
+		for(i=1;#self.edits;1){ self.edits[i].show(true) }
+		self.visible = true;
+
+		try{ self.edOut.setFocus() }catch(eF){}
+	};
+
+	self.close = function(){
+		self.visible = false;
+		self.panel.show(false);
+		for(i=1;#self.edits;1){
+			try{ self.edits[i].show(false) }catch(e1){}
+		}
+	};
+
+	self.__ok = function(){
+		if(!self.visible) return;
+		var out = ..string.trim(tostring(..nodio.ui.getCtrlText(self.edOut) : ""));
+		if(!#out){
+			try{ winform.msgboxErr("请填写输出程序路径!", "发布向导") }catch(e){}
+			return;
+		}
+		var res = {
+			out = out;
+			version = ..string.trim(tostring(..nodio.ui.getCtrlText(self.edVer) : ""));
+			company = ..string.trim(tostring(..nodio.ui.getCtrlText(self.edCompany) : ""));
+			product = ..string.trim(tostring(..nodio.ui.getCtrlText(self.edProduct) : ""));
+			desc = ..string.trim(tostring(..nodio.ui.getCtrlText(self.edDesc) : ""));
+			copyright = ..string.trim(tostring(..nodio.ui.getCtrlText(self.edCopyright) : ""));
+			icon = ..string.trim(tostring(..nodio.ui.getCtrlText(self.edIcon) : ""));
+			uac = self.uac;
+			resources = self.resources;
+		};
+		self.close();
+		if(self.onPublish) self.onPublish(res);
+	};
+
+	// ---------- 绘制 ----------
+	var __rowLabel = function(graphics, fmt, font, brush, text, y){
+		graphics.drawString(text, font,
+			::RECTF(..nodio.ui.px(PAD), ..nodio.ui.px(y), ..nodio.ui.px(80), ..nodio.ui.px(22)),
+			fmt, brush);
+	};
+
+	self.panel.onDraw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var w = rc.right - rc.left, h = rc.bottom - rc.top;
+
+		// 1. 底色与外框
+		var bg = ..gdip.solidBrush(th.panel);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var pb = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(pb, rc.left, rc.top, w, h);
+		pb.delete();
+
+		// 2. 顶栏标题与分割线
+		var tb = ..gdip.solidBrush(th.text);
+		graphics.drawString("发布向导", font,
+			::RECTF(rc.left + ..nodio.ui.px(PAD), rc.top + ..nodio.ui.px(10),
+				w, ..nodio.ui.px(22)), fmt, tb);
+		tb.delete();
+		var lp = ..gdip.pen(th.border, 1);
+		graphics.drawLine(lp, rc.left, rc.top + ..nodio.ui.px(36),
+			rc.right, rc.top + ..nodio.ui.px(36));
+		lp.delete();
+
+		// 3. 行标签
+		var lb = ..gdip.solidBrush(th.textDim);
+		__rowLabel(graphics, fmt, font, lb, "输出程序:", 48);
+		__rowLabel(graphics, fmt, font, lb, "版本号:", 82);
+		__rowLabel(graphics, fmt, font, lb, "公司名称:", 116);
+		__rowLabel(graphics, fmt, font, lb, "产品名称:", 150);
+		__rowLabel(graphics, fmt, font, lb, "文件说明:", 184);
+		__rowLabel(graphics, fmt, font, lb, "版权信息:", 218);
+		__rowLabel(graphics, fmt, font, lb, "程序图标:", 252);
+		__rowLabel(graphics, fmt, font, lb, "权限级别:", 290);
+
+		// 4. 浏览按钮 ×2
+		var brR = __btnRects();
+		var txtB = ..gdip.solidBrush(th.text);
+		var __drawBtn = function(r, hoverId, caption, brush){
+			var bb = ..gdip.solidBrush((self.hover == hoverId) ? th.hover : th.bg);
+			graphics.fillRect(bb, r.left, r.top, r.right - r.left, r.bottom - r.top);
+			bb.delete();
+			var bp = ..gdip.pen(th.border, 1);
+			graphics.drawRectangle(bp, r.left, r.top, r.right - r.left, r.bottom - r.top);
+			bp.delete();
+			graphics.drawString(caption, font,
+				::RECTF(r.left, r.top, r.right - r.left, r.bottom - r.top), fmt, brush);
+		};
+		__drawBtn(brR.browseOut, 3, "浏览...", txtB);
+		__drawBtn(brR.browseIcon, 4, "浏览...", txtB);
+
+		// 5. UAC 三选一（单选圆点）
+		var uacs = {
+			{ r = brR.uac1; val = "asInvoker"; cap = "默认权限" };
+			{ r = brR.uac2; val = "requireAdministrator"; cap = "管理员权限" };
+			{ r = brR.uac3; val = "highestAvailable"; cap = "最高可用" };
+		};
+		for(i=1;#uacs;1){
+			var u = uacs[i];
+			var cy = u.r.top + (u.r.bottom - u.r.top) / 2 - ..nodio.ui.px(6);
+			var ring = ..gdip.pen((self.uac == u.val) ? th.accent : th.border, 1);
+			graphics.drawEllipse(ring, u.r.left, cy, ..nodio.ui.px(12), ..nodio.ui.px(12));
+			ring.delete();
+			if(self.uac == u.val){
+				var dot = ..gdip.solidBrush(th.accent);
+				graphics.fillEllipse(dot, u.r.left + ..nodio.ui.px(3), cy + ..nodio.ui.px(3),
+					..nodio.ui.px(6), ..nodio.ui.px(6));
+				dot.delete();
+			}
+			graphics.drawString(u.cap, font,
+				::RECTF(u.r.left + ..nodio.ui.px(18), u.r.top + ..nodio.ui.px(2),
+					u.r.right - u.r.left - ..nodio.ui.px(18), ..nodio.ui.px(20)), fmt, lb);
+		}
+
+		// 6. 写入版本资源与清单（勾选框）
+		var cbx = brR.chk.left, cby = brR.chk.top + ..nodio.ui.px(4);
+		var cbp = ..gdip.pen(self.resources ? th.accent : th.border, 1);
+		graphics.drawRectangle(cbp, cbx, cby, ..nodio.ui.px(14), ..nodio.ui.px(14));
+		cbp.delete();
+		if(self.resources){
+			var cbf = ..gdip.solidBrush(th.accent);
+			graphics.fillRect(cbf, cbx + ..nodio.ui.px(3), cby + ..nodio.ui.px(3),
+				..nodio.ui.px(8), ..nodio.ui.px(8));
+			cbf.delete();
+		}
+		graphics.drawString("写入版本资源与应用程序清单（UAC / DPI 感知）", font,
+			::RECTF(cbx + ..nodio.ui.px(20), brR.chk.top, ..nodio.ui.px(400), ..nodio.ui.px(22)),
+			fmt, lb);
+		lb.delete();
+		txtB.delete();
+
+		// 7. 分割线 + 底部按钮
+		var blp = ..gdip.pen(th.border, 1);
+		graphics.drawLine(blp, rc.left, brR.ok.top - ..nodio.ui.px(10),
+			rc.right, brR.ok.top - ..nodio.ui.px(10));
+		blp.delete();
+
+		var okB = ..gdip.solidBrush((self.hover == 1) ? th.hover : th.accent);
+		graphics.fillRect(okB, brR.ok.left, brR.ok.top,
+			brR.ok.right - brR.ok.left, brR.ok.bottom - brR.ok.top);
+		okB.delete();
+		var okP = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(okP, brR.ok.left, brR.ok.top,
+			brR.ok.right - brR.ok.left, brR.ok.bottom - brR.ok.top);
+		okP.delete();
+		var okTb = ..gdip.solidBrush(0xFFFFFF);
+		graphics.drawString("发布", font,
+			::RECTF(brR.ok.left, brR.ok.top,
+				brR.ok.right - brR.ok.left, brR.ok.bottom - brR.ok.top), fmt, okTb);
+		okTb.delete();
+
+		var canB = ..gdip.solidBrush((self.hover == 2) ? th.hover : th.bg);
+		graphics.fillRect(canB, brR.cancel.left, brR.cancel.top,
+			brR.cancel.right - brR.cancel.left, brR.cancel.bottom - brR.cancel.top);
+		canB.delete();
+		var canP = ..gdip.pen(th.border, 1);
+		graphics.drawRectangle(canP, brR.cancel.left, brR.cancel.top,
+			brR.cancel.right - brR.cancel.left, brR.cancel.bottom - brR.cancel.top);
+		canP.delete();
+		var canTb = ..gdip.solidBrush(th.text);
+		graphics.drawString("取消", font,
+			::RECTF(brR.cancel.left, brR.cancel.top,
+				brR.cancel.right - brR.cancel.left, brR.cancel.bottom - brR.cancel.top),
+			fmt, canTb);
+		canTb.delete();
+	};
+
+	// ---------- 交互与事件 ----------
+	var __ptInRect = function(rc, x, y){
+		return x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom;
+	};
+
+	self.panel.onMouseMove = function(x, y){
+		var bR = __btnRects();
+		var h = 0;
+		if(__ptInRect(bR.ok, x, y)) h = 1;
+		elseif(__ptInRect(bR.cancel, x, y)) h = 2;
+		elseif(__ptInRect(bR.browseOut, x, y)) h = 3;
+		elseif(__ptInRect(bR.browseIcon, x, y)) h = 4;
+		elseif(__ptInRect(bR.uac1, x, y)) h = 5;
+		elseif(__ptInRect(bR.uac2, x, y)) h = 6;
+		elseif(__ptInRect(bR.uac3, x, y)) h = 7;
+		elseif(__ptInRect(bR.chk, x, y)) h = 8;
+		if(h != self.hover){
+			self.hover = h;
+			self.panel.redraw();
+		}
+	};
+
+	self.panel.onMouseDown = function(x, y){
+		var bR = __btnRects();
+		if(__ptInRect(bR.ok, x, y)){
+			self.__ok();
+		}
+		elseif(__ptInRect(bR.cancel, x, y)){
+			self.close();
+		}
+		elseif(__ptInRect(bR.browseOut, x, y)){
+			try{
+				var f = fsys.dlg.save("可执行文件|*.exe|所有文件|*.*|",
+					"选择输出程序", null, winform.hwnd);
+				if(f && #f) ..nodio.ui.setCtrlText(self.edOut, f);
+			}catch(eB){}
+		}
+		elseif(__ptInRect(bR.browseIcon, x, y)){
+			try{
+				var f2 = fsys.dlg.open("图标文件|*.ico|所有文件|*.*|",
+					"选择程序图标", null, winform.hwnd);
+				if(f2 && #f2) ..nodio.ui.setCtrlText(self.edIcon, f2);
+			}catch(eB2){}
+		}
+		elseif(__ptInRect(bR.uac1, x, y)){
+			self.uac = "asInvoker";
+			self.panel.redraw();
+		}
+		elseif(__ptInRect(bR.uac2, x, y)){
+			self.uac = "requireAdministrator";
+			self.panel.redraw();
+		}
+		elseif(__ptInRect(bR.uac3, x, y)){
+			self.uac = "highestAvailable";
+			self.panel.redraw();
+		}
+		elseif(__ptInRect(bR.chk, x, y)){
+			self.resources = !self.resources;
+			self.panel.redraw();
+		}
+	};
+
+	self.panel.onKeyDown = function(vk){
+		if(vk == 0x0D/*_VK_RETURN*/){
+			self.__ok();
+			return true;
+		}
+		elseif(vk == 0x1B/*_VK_ESCAPE*/){
+			self.close();
+			return true;
+		}
+	};
+
+	// 文本框回车提交 / Esc 取消
+	var subEd = function(ed){
+		..nodio.ui.subclass(ed.hwnd, function(hwnd, msg, wParam, lParam){
+			if(msg == 0x100/*_WM_KEYDOWN*/){
+				if(wParam == 0x0D/*_VK_RETURN*/){
+					self.__ok();
+					return 0;
+				}
+				elseif(wParam == 0x1B/*_VK_ESCAPE*/){
+					self.close();
+					return 0;
+				}
+			}
+			return null;
+		});
+	};
+	for(i=1;#self.edits;1){ subEd(self.edits[i]) }
+
+	return self;
+};
+
+// 模块级单例实例
+var __inst = null;
+openWizard = function(winform, onPublish, defaults){
+	if(!__inst){
+		__inst = wizard(winform, {});
+	}
+	__inst.show(onPublish, defaults);
+	return __inst;
+};
+
+getWizardRef = function(){
+	return __inst;
+};
+
+}

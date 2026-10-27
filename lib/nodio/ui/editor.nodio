@@ -334,9 +334,13 @@ editor = function(winform, opt){
 		// ---------- 差异对比行标记 ----------
 		diffLines = {};              // {行号 = "add"|"del"|"mod"}
 		// ---------- 代码片段 (Snippets) ----------
+		// 第六十七轮：内置片段表（Tab 触发用裸名，@ 浮层用 "@" ++ 名）。
+		//   $0 = 光标锚点（插入后光标停这儿）；官方词库的模板用 __ 作锚点，
+		//   展开时两者都认。
 		snippets = {
 			["for"] = 'for(i=1;10;1){\r\n\t$0\r\n}';
 			["forin"] = 'for(k,v in table){\r\n\t$0\r\n}';
+			["while"] = 'while(cond){\r\n\t$0\r\n}';
 			["func"] = 'var myFunc = function(){\r\n\t$0\r\n};';
 			["function"] = 'function(){\r\n\t$0\r\n}';
 			["try"] = 'try{\r\n\t$0\r\n}\r\ncatch(e){\r\n\t\r\n}';
@@ -344,6 +348,9 @@ editor = function(winform, opt){
 			["if"] = 'if(  ){\r\n\t$0\r\n}';
 			["ife"] = 'if(  ){\r\n\t$0\r\n}\r\nelse{\r\n\t\r\n}';
 			["winform"] = 'var winform = win.form(text="窗体";right=600;bottom=400);\r\n$0\r\nwinform.show();\r\nwin.loopMessage();';
+			["thread"] = 'var th = thread.create(function(){\r\n\t$0\r\n});\r\nth.wait();';
+			["table"] = 'var t = {};\r\n$0\r\n';
+			["io"] = 'io.print($0);';
 		};
 		// ---------- 参数信息 (Signature Help) ----------
 		sigHelpBoard = null;
@@ -2276,6 +2283,11 @@ editor = function(winform, opt){
 	self.compOpen = false;
 	self.compBoard = null;
 	self.onComplete = null;     // function(line, col) —— IDE 去问 LSP
+	// 第六十七轮：@ 片段候选
+	//   onSnippet = function(prefix, line, col) —— IDE 去问片段（内置表 + 官方词库）
+	//   候选条目形如 {label="@for"; kind=15; detail="片段"; template="..."}
+	self.onSnippet = null;
+	self.snipMode = false;      // 当前浮层是不是片段模式（只影响显示）
 
 	// ---------- 导航：转到定义 / 查找引用 / 重命名 ----------
 	//
@@ -2363,6 +2375,34 @@ editor = function(winform, opt){
 		// ⚠ string.sub(s,start,end) 的第三个参数是**结束位置**（含），不是长度
 		if(bo > start) word = ..string.sub(lineText, start, bo - 1);
 		return {word=word; line=line; col=col; start=ls + (col - 1) - ..string.len(word)};
+	}
+
+	// 光标处的 **@ 片段前缀**（第六十七轮）
+	//
+	// 官方 aardio 的代码片段用 @ 触发：敲 "@for" 弹候选，选中即展开模板。
+	// 标识符扫描只认 ASCII 字母/数字/下划线，'@' 不在其中 —— 所以这里
+	// 先按普通词扫一遍，再看词**前面紧挨着**的那个字节是不是 '@'。
+	//
+	// 返回 {prefix; line; col; start}
+	//   prefix = "@" ++ 词（没有词就是 "@"）
+	//   start  = '@' 的 1-based richedit 位置
+	self.__atPrefix = function(){
+		var w = self.__wordAtCursor();
+		if(!w) return null;
+		var lines = ..string.split(self.text, '\n');
+		var lineText = self.__lineText(lines, w.line);
+		var bytes = ..string.unpack(lineText);
+		var bo = __byteOfCol(bytes, #lineText, w.col);
+		var s = bo - 1;
+		while(s >= 1 && __isIdent(bytes[s])) s = s - 1;
+		if(s < 1) return null;
+		if(bytes[s] != 64) return null;       // 64 = '@'
+		return {
+			prefix = "@" ++ w.word;
+			line = w.line;
+			col = w.col;
+			start = w.start - 1;               // '@' 紧挨在词前面一个字符
+		};
 	}
 
 	// 某个**字符位置**上的单词（Ctrl+点击用）
@@ -2481,6 +2521,15 @@ editor = function(winform, opt){
 	//   但浮层过滤仍然用**成员名**（compPrefix = "wait"）——
 	//   候选的 label 就是成员名，用完整前缀去过滤会一条都不剩。
 	self.requestComplete = function(){
+		// 第六十七轮：@ 前缀 = 片段候选（先于普通补全判断）
+		var at = self.__atPrefix();
+		if(at){
+			self.compPrefix = at.prefix;
+			self.compStart = at.start;
+			self.compIndex = 0;
+			if(self.onSnippet) self.onSnippet(at.prefix, at.line, at.col);
+			return at.prefix;
+		}
 		var w = self.__wordAtCursor();
 		var qual = self.__qualifierAtCursor();
 		self.compPrefix = w.word;
@@ -2536,18 +2585,105 @@ editor = function(winform, opt){
 		self.compIndex = 1;
 		self.compScroll = 1;
 		self.compOpen = true;
+		self.snipMode = false;
 		self.__createCompletion();
 		self.__layoutCompletion();
 		try{ self.compBoard.show(true) }catch(e){}
 		return #list;
 	}
+	// 显示**片段**候选（第六十七轮）
+	//
+	// 与普通补全共用同一个浮层：候选条目带 template 字段，接受时按模板
+	// 展开（$0 / __ 锚点）。label 一律带 "@" 前缀 —— 与用户敲的 "@for"
+	// 对得上，前缀过滤也就自然生效。
+	self.showSnippets = function(items){
+		var n = self.showCompletion(items);
+		self.snipMode = true;
+		return n;
+	}
+	// 内置片段表 → 候选条目（IDE 再合并官方词库的 @ 模板，一起 showSnippets）
+	self.snippetCandidates = function(prefix){
+		var out = {};
+		var pfx = tostring(prefix : "@");
+		if(#pfx == 0) pfx = "@";
+		for(k,v in self.snippets){
+			var lb = "@" ++ k;
+			if(..string.startsWith(lb, pfx, true)){
+				..table.push(out, {
+					label = lb; kind = 15; detail = "代码片段";
+					template = v;
+				});
+			}
+		}
+		return out;
+	}
 	self.hideCompletion = function(){
 		self.compOpen = false;
 		self.compItems = {};
 		self.compIndex = 0;
+		self.snipMode = false;
 		if(self.compBoard){
 			try{ self.compBoard.show(false) }catch(e){}
 		}
+		return true;
+	}
+	// 插入片段模板：$0 / __ 是**光标锚点**（插完把光标放那儿）
+	//
+	// basePos0 = 插入起点的 0-based 位置（用于把光标算回去）。
+	// 返回真正插进去的文本。
+	self.__insertTemplate = function(tmpl, basePos0){
+		var text = tostring(tmpl : "");
+		var mark = "$0";
+		var p = ..string.indexOf(text, mark);
+		if(p === null){
+			mark = "__";
+			p = ..string.indexOf(text, mark);
+		}
+		var anchor = -1;
+		if(p !== null){
+			// 锚点在插入文本里的位置（按 **richedit 的字符单位**算：
+			// richedit 把 CRLF 记 1 个单位，编辑框记 2 个 —— 差一个字符单位
+			// 光标就会偏一列）。
+			var before = ..string.left(text, p - 1);
+			var nlines = #..string.split(before, "\r\n") - 1;
+			anchor = ..string.len(before) - nlines;
+			text = ..string.replaceLiteral(text, mark, "");
+		}
+		ctrl.selText = text;
+		if(anchor >= 0){
+			try{ ctrl.setSel(basePos0 + anchor) }catch(e){}
+		}
+		return text;
+	}
+	// 插入选中的候选（替换掉触发时的前缀）
+	//
+	// 第六十七轮：候选带 template 字段（代码片段）→ 按模板展开，
+	// 而不是插入函数名；$0 / __ 锚点定位光标。
+	self.completionAccept = function(){
+		if(!self.compOpen || !#self.compItems) return false;
+		var it = self.compItems[self.compIndex];
+		if(!it) return false;
+		var label = it.label;
+		var prefix = self.compPrefix;
+		var tmpl = it.template;
+		self.hideCompletion();
+		self.__beginEdit();
+		try{
+			var a = self.compStart;                       // 1-based 前缀起始
+			var plen = ..string.len(prefix);
+			if(plen > 0){
+				ctrl.setSel(a, a + plen - 1);              // 1-based 闭区间：选中整段前缀
+			}else{
+				ctrl.setSel(a - 1);                        // 没有前缀：纯插入（0-based 插入点）
+			}
+			if(tmpl && #tostring(tmpl : "") > 0){
+				self.__insertTemplate(tmpl, a - 1);
+			}
+			else{
+				ctrl.selText = label;
+			}
+		}catch(e){}
+		self.__syncFromCtrl();
 		return true;
 	}
 	self.completionVisible = function(){
@@ -2567,27 +2703,8 @@ editor = function(winform, opt){
 		return true;
 	}
 	// 插入选中的候选（替换掉触发时的前缀）
-	self.completionAccept = function(){
-		if(!self.compOpen || !#self.compItems) return false;
-		var it = self.compItems[self.compIndex];
-		if(!it) return false;
-		var label = it.label;
-		var prefix = self.compPrefix;
-		self.hideCompletion();
-		self.__beginEdit();
-		try{
-			var a = self.compStart;                       // 1-based 前缀起始
-			var plen = ..string.len(prefix);
-			if(plen > 0){
-				ctrl.setSel(a, a + plen - 1);              // 1-based 闭区间：选中整段前缀
-			}else{
-				ctrl.setSel(a - 1);                        // 没有前缀：纯插入（0-based 插入点）
-			}
-			ctrl.selText = label;
-		}catch(e){}
-		self.__syncFromCtrl();
-		return true;
-	}
+	// ⚠ 第六十七轮：模板展开版已挪到 hideCompletion 之后（见上），
+	//   这里保留的旧实现会被后定义覆盖 —— 删掉，避免两套行为打架。
 
 	// 浮层画板
 	self.__createCompletion = function(){
@@ -2930,47 +3047,53 @@ editor = function(winform, opt){
 	}
 
 	// ---------- 代码片段展开 (Snippet Expansion) ----------
+	//
+	// 第六十七轮：这段以前是**死代码** —— 它调 self.setSel / self.replaceSel
+	// （全仓库都没有这两个方法），而且读的是 sel.cpMin/cpMax（快照里的字段
+	// 其实是 a/b）——异常被 catch 吞掉，Tab 永远退回普通缩进，文档里
+	// 「Tab 片段自动展开」是假的。现在按官方 richedit 范式重写：
+	// setSel 选区 + selText 写入，$0 锚点由 __insertTemplate 处理。
 	self.__expandSnippet = function(){
 		var sel = self.__selSnapshot();
-		if(sel.cpMin != sel.cpMax) return false;
-		var pos = sel.cpMin;
-		if(pos <= 0) return false;
-		var ln = self.curLine : 1;
-		var lineStart = self.__lineStart(ln);
-		if(!lineStart) lineStart = 1;
+		if(sel.a !== sel.b) return false;      // 有选区 → 不展开
+		var w = self.__wordAtCursor();
+		if(!w || !w.word) return false;
+		var trig = w.word;
+		if(!self.snippets || !self.snippets[trig]) return false;
+		var tmpl = self.snippets[trig];
+		// 继承当前行缩进
+		var lines = ..string.split(self.text, '\n');
+		var lineText = self.__lineText(lines, w.line);
+		var indent = ..string.match(lineText, "^([\t ]*)");
+		indent = indent : "";
+		var tlines = ..string.split(tmpl, '\n');
+		var expanded = "";
+		for(k=1;#tlines;1){
+			var l = ..string.trimright(tlines[k]);
+			if(k > 1) expanded = expanded ++ indent;
+			expanded = expanded ++ l;
+			if(k < #tlines) expanded = expanded ++ '\r\n';
+		}
+		self.__beginEdit();
 		try{
-			var fullText = self.text;
-			if(fullText){
-				var lineSub = ..string.sub(fullText, lineStart, pos);
-				var trigger = ..string.match(lineSub, "([a-zA-Z0-9_]+)$");
-				if(trigger && self.snippets && self.snippets[trigger]){
-					var tmpl = self.snippets[trigger];
-					var indent = ..string.match(lineSub, "^([\t ]*)") : "";
-					var lines = ..string.split(tmpl, '\n');
-					var expanded = "";
-					for(k=1;#lines;1){
-						var l = ..string.trimright(lines[k]);
-						if(k > 1) expanded = expanded ++ indent;
-						expanded = expanded ++ l;
-						if(k < #lines) expanded = expanded ++ '\r\n';
-					}
-					var pMarker = ..string.indexOf(expanded, "$0");
-					if(pMarker !== null){
-						expanded = ..string.replaceLiteral(expanded, "$0", "");
-					}
-					var trigLen = #trigger;
-					var delFrom = pos - trigLen;
-					self.setSel(delFrom, pos);
-					self.replaceSel(expanded);
-					if(pMarker !== null){
-						var targetPos = delFrom + pMarker - 1;
-						self.setSel(targetPos, targetPos);
-					}
-					return true;
-				}
-			}
-		}catch(e){}
-		return false;
+			// 选中触发词（1-based 闭区间），再插入展开后的模板
+			var a = w.start;
+			var plen = ..string.len(trig);
+			ctrl.setSel(a, a + plen - 1);
+			self.__insertTemplate(expanded, a - 1);
+		}catch(e){
+			return false;
+		}
+		self.__syncFromCtrl();
+		return true;
+	}
+	// 对外：按 Tab 展开当前词处的片段（IDE 菜单/命令也能用）
+	self.expandSnippet = function(){
+		return self.__expandSnippet();
+	}
+	// 对外：光标处的 @ 片段前缀（IDE/测试用）
+	self.snippetPrefixAtCursor = function(){
+		return self.__atPrefix();
 	}
 
 	// ---------- 参数信息提示 (Signature Help) ----------
@@ -4103,6 +4226,11 @@ editor = function(winform, opt){
 	self.__autoComplete = function(){
 		// 模型可能比控件慢一拍（同步发生在轮询里）→ 先对齐再算前缀
 		try{ self.__syncFromCtrl() }catch(e){}
+		// 第六十七轮：@ 前缀 → 片段候选（不受「词长 ≥ 3」门槛限制）
+		if(self.__atPrefix()){
+			self.requestComplete();
+			return;
+		}
 		if(self.__charBefore() == "."){
 			self.requestComplete();
 			return;
@@ -4274,7 +4402,8 @@ editor = function(winform, opt){
 			// ④ 自动补全：字母和 '.' 之后弹候选。
 			//   真正的判断（词长够不够、前面是不是 '.'）放在下一轮消息循环里做 ——
 			//   那时刚敲的字符已经进了控件，前缀才算得准。
-			if(wc == 0x2E || (wc >= 0x41 && wc <= 0x5A) || (wc >= 0x61 && wc <= 0x7A)){
+			if(wc == 0x2E || wc == 0x40 || (wc >= 0x30 && wc <= 0x39)
+				|| (wc >= 0x41 && wc <= 0x5A) || (wc >= 0x61 && wc <= 0x7A)){
 				self.__scheduleAutoComplete();
 			}
 		}

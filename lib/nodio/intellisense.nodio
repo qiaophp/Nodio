@@ -148,10 +148,14 @@ __parseFile = function(text, out){
 		var desc = ..string.slice(line, eq + 3);
 		if(#rawKey == 0) continue;
 		// 值侧 @ = 代码模板（kind=snippet）
+		// 第六十七轮：模板正文**单独存一份**（template 字段）——
+		//   以前它只混在 detail 里，编辑器拿到后没法展开（v2 挂账）。
 		var kindSnip = 0;
+		var tmplText = "";
 		if(..string.charAt(desc, 1) == "@"){
 			kindSnip = 15;
-			desc = ..string.slice(desc, 2);
+			tmplText = ..string.slice(desc, 2);
+			desc = tmplText;
 		}
 		// key 侧 ^ / ! 前缀：系统参数/标记——剥掉
 		var c1 = ..string.charAt(rawKey, 1);
@@ -189,6 +193,8 @@ __parseFile = function(text, out){
 			full = c.full;
 			ns = c.ns;
 		};
+		// 模板条目带上正文（编辑器据此展开，而不是插入函数名）
+		if(kindSnip && #tmplText > 0) last.template = tmplText;
 		..table.push(out, last);
 	}
 }
@@ -332,8 +338,11 @@ complete = function(prefix){
 			if(#partial){
 				if(..string.indexOf(..string.lower(lb), partial) !== 1) continue;
 			}
-			..table.push(out, {label = lb; kind = e.kind; detail = e.detail});
-			if(#out >= kMaxItems) break;
+				var it = {label = lb; kind = e.kind; detail = e.detail};
+				if(e.template) it.template = e.template;
+				..table.push(out, it);
+				if(#out >= kMaxItems) break;
+
 		}
 		return out;
 	}
@@ -342,9 +351,31 @@ complete = function(prefix){
 	for(i=1;#es;1){
 		var e = es[i];
 		if(..string.indexOf(..string.lower(e.label), lp) == 1){
-			..table.push(out, {label = e.label; kind = e.kind; detail = e.detail});
+			var it = {label = e.label; kind = e.kind; detail = e.detail};
+			if(e.template) it.template = e.template;
+			..table.push(out, it);
 			if(#out >= kMaxItems) break;
 		}
+	}
+	return out;
+}
+
+// 片段候选（第六十七轮）：词库里值侧以 @ 开头的代码模板
+//
+// 返回 {label; kind=15; detail; template} —— template 是模板正文，
+// 编辑器接受候选时按它展开（官方模板用 __ 作光标位）。
+snippets = function(prefix){
+	var es = __ensure();
+	var out = {};
+	var lp = ..string.lower(tostring(prefix : ""));
+	for(i=1;#es;1){
+		var e = es[i];
+		if(e.kind != 15 || !e.template) continue;
+		if(#lp > 0 && ..string.indexOf(..string.lower(e.label), lp) != 1) continue;
+		..table.push(out, {
+			label = e.label; kind = 15; detail = e.detail;
+			template = e.template;
+		});
 	}
 	return out;
 }

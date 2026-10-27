@@ -117,6 +117,36 @@ pr = read()
 check("prepareRename range+placeholder",
       pr is not None and '"placeholder"' in pr and '"range"' in pr)
 
+# references：参数 x（line 1 char 13）在本行出现两次（形参 + return x），
+# 返回 Location 数组（uri + range），且两处都要报到
+send({"jsonrpc": "2.0", "method": "textDocument/references", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"},
+    "position": {"line": 1, "character": 13},
+    "context": {"includeDeclaration": True}}, "id": 37})
+refs = read()
+check("references returns locations",
+      refs is not None and '"uri"' in refs and refs.count('"range"') >= 2)
+
+# rename：x -> y 返回 WorkspaceEdit，changes 里同一文档两条 textEdit
+send({"jsonrpc": "2.0", "method": "textDocument/rename", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"},
+    "position": {"line": 1, "character": 13},
+    "newName": "y"}, "id": 38})
+ren = read()
+check("rename returns WorkspaceEdit",
+      ren is not None and '"changes"' in ren)
+check("rename edits every occurrence",
+      ren is not None and ren.count('"newText":"y"') == 2)
+
+# 非法新名（带点）必须拒绝：null，不许产出会破坏源码的编辑
+send({"jsonrpc": "2.0", "method": "textDocument/rename", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"},
+    "position": {"line": 1, "character": 13},
+    "newName": "a.b"}, "id": 39})
+renbad = read()
+check("rename rejects non-identifier name",
+      renbad is not None and '"result":null' in renbad)
+
 # selectionRange：词范围单层
 send({"jsonrpc": "2.0", "method": "textDocument/selectionRange", "params": {
     "textDocument": {"uri": "file:///d:/probe.nodio"},

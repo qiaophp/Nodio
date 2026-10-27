@@ -175,9 +175,22 @@ var editor = nodio.ui.editor(winform, {
 	fontName = "Consolas";
 });
 
-// ---------- 双栏对比编辑器 ----------
+// ---------- 双栏对比 / 双文档拆分 ----------
+//
+// 编辑区三种形态（互斥）：
+//   "none" 单栏
+//   "diff" 双栏**对比**（Git / 时间线差异，右栏没有页签条，只看差异）
+//   "doc"  双**文档**拆分（左右或上下，两边各带自己的页签条，
+//          可以同时看两个不同文件，互不影响）
+//
+// splitDiff 是给 IDE 用的布尔兼容位（main.nodio 靠它决定走不走差异导航）。
 splitDiff = false;
+splitMode = "none";      // "none" | "diff" | "doc"
+splitDir = "v";          // "doc" 模式的方向：v=左右，h=上下
 editor2 = null;
+docStrip2 = null;        // 第 2 个页签条（doc 拆分模式才有）
+viewPath = {1 = null; 2 = null};   // 每个视图当前显示的文档
+viewActive = 1;          // 活动视图（保存/运行/跳转针对它）
 
 getEditor2 = function(){
 	if(!editor2){
@@ -188,18 +201,127 @@ getEditor2 = function(){
 			fontName = "Consolas";
 		});
 		editor2.show(false);
+		// 第 2 个视图的回调：普通双栏时它是一个**真正的文档视图**
+		//（改动要落到自己的文档上，脏标记/标题也得刷新）。
+		editor2.onChange = function(text){
+			var p = viewPath[2];
+			if(p === null) return;
+			tabFiles[p] = text;
+			if(hooks.onDocChange) hooks.onDocChange(p, text);
+			// 在右栏打字 → 右栏成为活动视图
+			if(viewActive != 2){ viewActive = 2; curTab = p; updateTitle() }
+		}
+		editor2.onCursor = function(line, col){
+			setPosStatus("行 " ++ line ++ ", 列 " ++ col);
+		}
+		editor2.onDirty = function(dirty){
+			var p = viewPath[2];
+			if(p === null) return;
+			tabRefresh(p);
+		}
 	}
 	return editor2;
 };
 
+// 视图 ↔ 编辑器 / 页签条
+viewEditor = function(v){ return v == 2 ? editor2 : editor };
+viewStrip = function(v){ return v == 2 ? docStrip2 : docStrip };
+
+// 切换活动视图（点哪边的页签/在那边打字，就是哪边）
+setViewActive = function(v){
+	if(v != 1 && v != 2) return;
+	viewActive = v;
+	curTab = viewPath[v];
+	updateTitle();
+}
+
+// 某个视图显示某个文档（文档模型是**共享**的：两边看到同一批页签）
+viewSel = function(v, path){
+	var i = tabFind(path);
+	if(i === null) return false;
+	var ed = viewEditor(v);
+	if(!ed) return false;
+	var strip = viewStrip(v);
+	if(strip) strip.setSelIndex(i);
+	viewPath[v] = path;
+	ed.setText(tabFiles[path] : "");
+	ed.setEOL(tabEOL[path] : '\r\n');
+	ed.setSavedText(tabSaved[path] : "");
+	if(v == viewActive){
+		curTab = path;
+		updateTitle();
+	}
+	return true;
+}
+
+// 普通文档双栏拆分（左右 / 上下）
+//
+// ⚠ 与「双栏对比」互斥：右栏那块地方只能有一个用途。
+toggleSplitDoc = function(dir){
+	if(dir === null || dir === undefined){
+		dir = (splitMode == "doc") ? "none" : "v";
+	}
+	if(dir == "none"){
+		splitMode = "none";
+		splitDiff = false;
+		if(docStrip2) docStrip2.show(false);
+		if(editor2) editor2.show(false);
+		layout();
+		setStatus("双栏拆分: 已关闭");
+		return false;
+	}
+	splitDir = (dir == "h") ? "h" : "v";
+	splitMode = "doc";
+	splitDiff = false;
+	var ed2 = getEditor2();
+	if(!docStrip2){
+		docStrip2 = nodio.ui.tabstrip(winform, {
+			left = S(LEFT_W); top = S(TOP0); right = 900; bottom = S(TOP0 + DOCTAB_H);
+			closable = true;
+		});
+		docStrip2.onSelect = function(idx){
+			if(idx >= 1 && idx <= #tabOrder){
+				viewSel(2, tabOrder[idx]);
+				setViewActive(2);
+			}
+		}
+		docStrip2.onClick = function(idx, closeHit){
+			if(closeHit && idx >= 1 && idx <= #tabOrder){
+				if(hooks.onCloseTab) hooks.onCloseTab(tabOrder[idx]);
+				else tabClose(tabOrder[idx]);
+			}
+		}
+		// 已经开着的文档同步到第 2 条页签
+		for(i=1;#tabOrder;1){
+			docStrip2.addTab(tabTitle(tabOrder[i]), tabIcon(tabOrder[i]));
+		}
+	}
+	docStrip2.show(true);
+	ed2.show(true);
+	// 右栏默认显示当前文档（VS「拆分视图」的语义：同一文档拆成两栏）
+	var p = curTab;
+	if(p === null && #tabOrder > 0) p = tabOrder[1];
+	if(p !== null){
+		var i2 = tabFind(p);
+		viewPath[2] = p;
+		ed2.setText(tabFiles[p] : "");
+		ed2.setEOL(tabEOL[p] : '\r\n');
+		ed2.setSavedText(tabSaved[p] : "");
+		if(i2) docStrip2.setSelIndex(i2);
+	}
+	layout();
+	setStatus("双栏拆分: 已开启（" ++ (splitDir == "h" ? "上下" : "左右") ++ "）");
+	return true;
+};
+
 toggleSplitDiff = function(flag){
 	if(flag === null || flag === undefined){
-		splitDiff = !splitDiff;
+		flag = !(splitMode == "diff");
 	}
-	else{
-		splitDiff = flag ? true : false;
-	}
-	if(splitDiff){
+	if(flag){
+		splitMode = "diff";
+		splitDiff = true;
+		if(docStrip2) docStrip2.show(false);
 		var ed2 = getEditor2();
 		ed2.show(true);
 		var t2 = ed2.getText();
@@ -208,6 +330,8 @@ toggleSplitDiff = function(flag){
 		}
 	}
 	else{
+		splitMode = "none";
+		splitDiff = false;
 		if(editor2) editor2.show(false);
 	}
 	layout();
@@ -616,10 +740,13 @@ tabCaption = function(path){
 	return t;
 }
 
-// 脏标记变了 → 刷新页签标题
+// 脏标记变了 → 刷新页签标题（两个页签条都要刷）
 tabRefresh = function(path){
 	var i = tabFind(path);
-	if(i) docStrip.setCaption(i, tabCaption(path));
+	if(i){
+		docStrip.setCaption(i, tabCaption(path));
+		if(docStrip2) docStrip2.setCaption(i, tabCaption(path));
+	}
 	updateTitle();
 }
 
@@ -644,6 +771,8 @@ tabAdd = function(path, text){
 		..table.push(tabOrder, path);
 		i = #tabOrder;
 		docStrip.addTab(tabTitle(path), tabIcon(path));
+		// 双文档拆分时，第 2 条页签条要同步（两边共享同一批文档）
+		if(docStrip2) docStrip2.addTab(tabTitle(path), tabIcon(path));
 	}
 	// 文档文本统一用控件内部的形式（CRLF）：
 	// 脏标记是「当前文本 vs 保存时文本」逐字比较，两边必须同形，
@@ -666,17 +795,9 @@ tabAdd = function(path, text){
 	}
 }
 
-// 切换当前文档：把文本推进编辑器，脏标记跟着切换
+// 切换当前文档：把文本推进**活动视图**的编辑器，脏标记跟着切换
 tabSel = function(path){
-	var i = tabFind(path);
-	if(i === null) return;
-	docStrip.setSelIndex(i);
-	curTab = path;
-	editor.setText(tabFiles[path] : "");
-	editor.setEOL(tabEOL[path] : '\r\n');
-	// 脏标记是**推导**出来的：当前文本 vs 这个文档上次保存时的文本
-	editor.setSavedText(tabSaved[path] : "");
-	updateTitle();
+	return viewSel(viewActive, path);
 }
 
 tabClose = function(path){
@@ -687,9 +808,19 @@ tabClose = function(path){
 	tabSaved[path] = null;
 	tabEOL[path] = null;
 	docStrip.removeTab(i);
+	if(docStrip2) docStrip2.removeTab(i);
+	// 这个文档正挂在某个视图上 → 那个视图清空
+	if(viewPath[1] == path) viewPath[1] = null;
+	if(viewPath[2] == path){
+		viewPath[2] = null;
+		if(editor2) editor2.setText("");
+	}
 	if(#tabOrder == 0){
 		curTab = null;
+		viewPath[1] = null;
+		viewPath[2] = null;
 		editor.setText("");
+		if(editor2) editor2.setText("");
 	}
 	elseif(curTab == path){
 		tabSel(tabOrder[#tabOrder]);
@@ -746,18 +877,22 @@ tabCurPath = function(){
 tabSetText = function(path, text){
 	if(path === null) return;
 	tabFiles[path] = text;
-	if(curTab == path) editor.setText(text);
+	if(path == viewPath[1]) editor.setText(text);
+	if(path == viewPath[2] && editor2) editor2.setText(text);
 }
 
+// 某个文档的当前文本：它在哪个视图里，就问那个视图的编辑器
 tabGetText = function(path){
 	if(path === null) return editor.getText();
-	if(path == curTab) return editor.getText();
+	if(path == viewPath[1]) return editor.getText();
+	if(path == viewPath[2] && editor2) return editor2.getText();
 	return tabFiles[path] : "";
 }
 
 // 保存用的文本：按该文档自己的换行符还原
 tabTextForSave = function(path){
-	if(path == curTab) return editor.getTextForSave();
+	if(path == viewPath[1]) return editor.getTextForSave();
+	if(path == viewPath[2] && editor2) return editor2.getTextForSave();
 	var t = tabFiles[path] : "";
 	if((tabEOL[path] : '\r\n') == '\n'){
 		return ..string.replaceLiteral(t, '\r\n', '\n');
@@ -767,19 +902,23 @@ tabTextForSave = function(path){
 
 tabIsDirty = function(path){
 	// 当前文档问编辑器（它有「上次保存的文本」基准），其它页签自己比
-	if(path == curTab) return editor.isDirty();
+	if(path == viewPath[1]) return editor.isDirty();
+	if(path == viewPath[2] && editor2) return editor2.isDirty();
 	return (tabFiles[path] : "") != (tabSaved[path] : "");
 }
 
 // 记为已保存（保存后调用）
 tabMarkSaved = function(path){
 	if(path === null) return;
-	// 当前页签的权威文本在编辑器控件里（轮询最多有 250ms 延迟，
+	// 视图里的文档，权威文本在编辑器控件里（轮询最多有 250ms 延迟，
 	// 刚打完字就保存时 tabFiles 可能是旧的）
-	var t = (path == curTab) ? editor.getText() : (tabFiles[path] : "");
+	var t = tabFiles[path] : "";
+	if(path == viewPath[1]) t = editor.getText();
+	elseif(path == viewPath[2] && editor2) t = editor2.getText();
 	tabFiles[path] = t;
 	tabSaved[path] = t;
-	if(path == curTab) editor.markSaved();
+	if(path == viewPath[1]) editor.markSaved();
+	if(path == viewPath[2] && editor2) editor2.markSaved();
 	tabRefresh(path);
 }
 
@@ -792,7 +931,8 @@ tabSetDirty = function(path, dirty){
 	else{
 		tabSaved[path] = tabFiles[path] : "";
 	}
-	if(path == curTab) editor.setSavedText(tabSaved[path] : "");
+	if(path == viewPath[1]) editor.setSavedText(tabSaved[path] : "");
+	if(path == viewPath[2] && editor2) editor2.setSavedText(tabSaved[path] : "");
 	tabRefresh(path);
 }
 
@@ -810,9 +950,13 @@ tabRename = function(oldPath, newPath){
 	tabEOL[oldPath] = null;
 	tabOrder[i] = newPath;
 	docStrip.setCaption(i, tabCaption(newPath));
+	if(docStrip2) docStrip2.setCaption(i, tabCaption(newPath));
+	if(viewPath[1] == oldPath) viewPath[1] = newPath;
+	if(viewPath[2] == oldPath) viewPath[2] = newPath;
 	if(curTab == oldPath){
 		curTab = newPath;
-		editor.setEOL(tabEOL[newPath] : '\r\n');
+		var ed = viewEditor(viewActive);
+		if(ed) ed.setEOL(tabEOL[newPath] : '\r\n');
 	}
 	updateTitle();
 	return true;
@@ -841,15 +985,17 @@ editor.onCursor = function(line, col){
 	if(hooks.onCursorMove) hooks.onCursorMove(line, col);
 }
 editor.onChange = function(text){
-	var p = curTab;
+	var p = viewPath[1];
 	if(p === null) return;
 	tabFiles[p] = text;
+	// 在左栏打字 → 左栏成为活动视图
+	if(viewActive != 1){ viewActive = 1; curTab = p; updateTitle() }
 	if(hooks.onDocChange) hooks.onDocChange(p, text);
 }
 // 脏标记是推导出来的（当前文本 vs 上次保存的文本），
 // 这里只需要把页签标题刷新一下
 editor.onDirty = function(dirty){
-	var p = curTab;
+	var p = viewPath[1];
 	if(p === null) return;
 	tabRefresh(p);
 }
@@ -1011,8 +1157,28 @@ layout = function(w,h){
 
 	// document tabs + editor
 	docStrip.layout(er.left, er.top, er.right, er.top + S(DOCTAB_H));
-	// 编辑器组件（支持双栏对比拆分）
-	if(splitDiff && editor2){
+	// 编辑器组件（支持双栏对比拆分 / 双文档拆分）
+	if(splitMode == "doc" && editor2 && docStrip2){
+		// 双文档拆分：两边各带一条页签条 + 一个编辑器
+		var tabH = S(DOCTAB_H);
+		if(splitDir == "h"){
+			// 上下分栏
+			var midY = er.top + math.round((er.bottom - er.top) / 2);
+			docStrip.layout(er.left, er.top, er.right, er.top + tabH);
+			editor.layout(er.left, er.top + tabH + 2, er.right, midY - 2);
+			docStrip2.layout(er.left, midY + 2, er.right, midY + 2 + tabH);
+			editor2.layout(er.left, midY + 2 + tabH + 2, er.right, er.bottom);
+		}
+		else{
+			// 左右分栏
+			var midX = er.left + math.round((er.right - er.left) / 2);
+			docStrip.layout(er.left, er.top, midX - 2, er.top + tabH);
+			editor.layout(er.left, er.top + tabH + 2, midX - 2, er.bottom);
+			docStrip2.layout(midX + 2, er.top, er.right, er.top + tabH);
+			editor2.layout(midX + 2, er.top + tabH + 2, er.right, er.bottom);
+		}
+	}
+	elseif(splitDiff && editor2){
 		var mid = er.left + math.round((er.right - er.left) / 2);
 		editor.layout(er.left, er.top + S(DOCTAB_H) + 2, mid - 2, er.bottom);
 		editor2.layout(mid + 2, er.top + S(DOCTAB_H) + 2, er.right, er.bottom);
@@ -1227,6 +1393,7 @@ install = function(){
 			{ "-"; null };
 			{ "发布为独立 exe（控制台）..."; function(id){ if(hooks.onPublishConsole) hooks.onPublishConsole() } };
 			{ "发布为独立 exe（界面程序）..."; function(id){ if(hooks.onPublishGui) hooks.onPublishGui() } };
+			{ "发布向导（版本/图标/UAC）..."; function(id){ if(hooks.onPublishWizard) hooks.onPublishWizard() } };
 			{ "-"; null };
 			{ "打开设计器"; function(id){ if(hooks.onDesigner) hooks.onDesigner() } };
 		} };
@@ -1349,10 +1516,21 @@ install = function(){
 			{ "监视窗口  Ctrl+Shift+W"; function(id){ bottomDock.selectCaption("监视") } };
 			{ "变量窗口"; function(id){ bottomDock.selectCaption("变量") } };
 			{ "时间线"; function(id){ leftDock.selectCaption("时间线") } };
-			{ "-"; null };
-			{ "双栏对比"; function(id){ toggleSplitDiff() } };
-			{ "下一个差异"; function(id){ if(hooks.onNextDiff) hooks.onNextDiff() } };
-			{ "上一个差异"; function(id){ if(hooks.onPrevDiff) hooks.onPrevDiff() } };
+		{ "-"; null };
+		{ "拆分视图（左右）"; function(id){ toggleSplitDoc("v") } };
+		{ "拆分视图（上下）"; function(id){ toggleSplitDoc("h") } };
+		{ "关闭拆分视图"; function(id){ toggleSplitDoc("none") } };
+		{ "另一视图打开当前文档"; function(id){
+			if(splitMode != "doc"){ toggleSplitDoc("v"); return }
+			var other = (viewActive == 1) ? 2 : 1;
+			var p = curTab;
+			if(p !== null) viewSel(other, p);
+		} };
+		{ "-"; null };
+		{ "双栏对比"; function(id){ toggleSplitDiff() } };
+		{ "下一个差异"; function(id){ if(hooks.onNextDiff) hooks.onNextDiff() } };
+		{ "上一个差异"; function(id){ if(hooks.onPrevDiff) hooks.onPrevDiff() } };
+
 			{ "-"; null };
 			{ "显示行号"; function(id){
 				var v = editor.toggleGutter();
@@ -1555,6 +1733,8 @@ install = function(){
 	// the editor tab strip drives the document model
 	docStrip.onSelect = function(idx){
 		if(idx >= 1 && idx <= #tabOrder){
+			// 点左边的页签 → 左视图成为活动视图
+			setViewActive(1);
 			tabSel(tabOrder[idx]);
 			// 大纲等派生视图跟着换文档
 			if(hooks.onTabChange) hooks.onTabChange(curTab);
