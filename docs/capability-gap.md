@@ -6484,3 +6484,40 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   （337 项断言）、ide_debug 88 项全绿。
 - ❌ 剩余（设计器）：无——设计器六项全部收口。剩余大项：Git 可视化、
   打印补完、交互终端、协议面收口、主题/插件。
+
+## 1.73 第五十九轮续：Git 可视化（分支状态栏 + 改动对比 + 提交）
+
+- **Git 面板**（`ide/nodio/app/gitpanel.nodio` 新文件，布局套路同
+  app/watch）：底部「Git」页 = 改动清单（状态/文件，`git status
+  --porcelain` 解析，重命名行取新名）+ 提交说明输入行（回车 = 提交，
+  推迟到消息循环——commit 是同步子进程）+ 右键菜单（对比/提交/刷新）
+  + 双击行开文件。
+  - `self.git(root, args)`：git 走 `process.popen` 真子进程（workDir
+    指定仓库根），peek 轮询到 waitOne 为止，8 秒兜底防 remote 卡死；
+    ⚠ 退出码从 `waitOne()` 的**第二个返回值**拿——process 对象没有
+    `.exitCode` 成员（点号取恒 null → 一切 git 都判失败，实测坑）；
+  - `refresh()`：分支（rev-parse，无提交时退 symbolic-ref）→ 状态栏；
+    `setRoot(dir)` 相同根直接短路——切页签/切文档随口调零开销；
+  - `commit()`：add -A + `commit -m "说明"`（说明含双引号拒收），
+    提交后自动刷新；
+  - `diffSelected()`：`git diff --` 空输出退 `--cached`（已暂存），
+    未跟踪文件明说没有对比；diff 文本经 onDiff → main 落 TEMP
+    只读页签打开。
+- **接线**（shell/main）：状态栏加「分支」面板
+  （`setBranchStatus`）；仓库根 = 工程根 → 当前文档目录（openProject/
+  onTabChange/底部切到 Git 页三处 `gitSyncRoot`，短路兜底）。
+- **顺手修（真 bug，三处）**：subclass 回调的「未处理消息」返回值——
+  约定是 **null = 交回原窗口过程**，返回 0 = 吞掉整条消息。监视窗、
+  立即窗口的输入行 handler 一直 `return 0`——**实际打不进字**
+  （WM_CHAR/WM_SETTEXT 全被吞）；新 Git 面板首版同款写法在冒烟里
+  当场暴露（setCtrlText 写提交说明读回为空 → 提交链挂死）。三处
+  统一改 `return null`。
+- **回归锁**（`ide_smoke.ps1` 增 6 断言）：一次性 TEMP 仓库端到端
+  （真 git 子进程）——GIT-BRANCH（init -b gitsmoke 后读到分支）/
+  GIT-DIRTY（改 a.txt 后清单 1 行）/GIT-DIFF（-v1/+v2）/GIT-COMMIT
+  （输入行说明 → add -A → commit → 清单归零）/GIT-LOG（log 有
+  smoke-commit）/WATCH-TYPE（输入行 set→原样读回，锁 subclass
+  吞消息的教训）。
+- 验证：VM 99/0/0、IDE 冒烟 SMOKE OK、ide_debug 88 项全绿。
+- ❌ 剩余大项：打印补完（PrintDlgW + 预览）、交互终端 + 文件时间线、
+  协议面收口、主题 XML + 插件注册 + USR.CFG 键名。

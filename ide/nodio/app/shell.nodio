@@ -43,6 +43,7 @@ import nodio.ui.richedit;
 import app.settings;   // 主题 / 编辑器字号 / 外部工具（持久化在 %APPDATA%\Nodio\ide.cfg）
 import app.ai;        // 右栏「AI」页：AI 聊天面板（app.ai.panel）
 import app.watch;     // 底部「监视」「变量」页：调试监视窗（app.watch.panel / varsPanel）
+import app.gitpanel;  // 底部「Git」页：分支/改动/对比/提交（app.gitpanel.panel）
 import nodio.gui.designerExt;   // nodio.gui 控件 → 设计器工具箱组件（不是展厅）
 import gdip;
 
@@ -454,6 +455,10 @@ watchPanel = app.watch.panel(winform, {});
 bottomDock.addTab("监视", watchPanel, {icon="eye"});
 varsPanel = app.watch.varsPanel(winform, {});
 bottomDock.addTab("变量", varsPanel, {icon="list"});
+// Git 面板（第五十九轮续）：分支状态栏 + 改动清单 + 对比 + 提交。
+// 钩子（onBranch/onDiff/onOpen）由 main.nodio 接 —— git 根随工程/文档走。
+gitPanel = app.gitpanel.panel(winform, {});
+bottomDock.addTab("Git", gitPanel, {icon="list"});
 // 供回归：底部面板里有没有某个页签（按页签名查）。
 // 「立即」页签是第五十五轮新增的，但它默认排在最后、很容易被当成不存在 ——
 // 用这条查询把它锁进冒烟自检。
@@ -497,8 +502,8 @@ var __imSub = nodio.ui.subclass(imEd.hwnd, function(hwnd, msg, wp, lp){
 		}
 		return 1;      // 吃掉回车（单行 richedit 本来也不插换行）
 	}
-	return 0;
-});
+	return null;     // ⚠ 返回 0 = 吞消息（subclass 约定 null = 交回原过程；
+});                    // 写 0 会让立即窗口打不进字，watch 同款教训）
 // 「AI」页不是原生 richedit 了（是 app.ai 面板），染色由面板自己做
 // 问题列表已改成自绘（nodio.ui.list），不再受原生 listview 的配色限制
 
@@ -527,7 +532,7 @@ toolbar.onHover = function(name, text){
 // ---------- status bar ----------
 var statusbar = nodio.ui.statusbar(winform, {
 	height = STATUS_H;
-	panels = { {"就绪";280}; {"行,列";90}; {"工程";240}; {"UTF-8";80}; {"CRLF";80} };
+	panels = { {"就绪";280}; {"行,列";90}; {"工程";240}; {"UTF-8";80}; {"CRLF";80}; {"分支";110} };
 });
 
 // ---------- status ----------
@@ -550,6 +555,8 @@ setStatus = function(s){
 }
 setPosStatus = function(s){ statusbar.setText("行,列",s) }
 setProjectStatus = function(s){ statusbar.setText("工程",s) }
+// Git 当前分支（第五十九续轮：Git 可视化；gitPanel.onBranch 上报）
+setBranchStatus = function(s){ statusbar.setText("分支",s) }
 // 心跳用：返回 true 表示这一拍允许写「就绪」之类的空闲态
 statusIdleAllowed = function(){
 	if(statusHold > 0){

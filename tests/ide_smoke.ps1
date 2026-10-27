@@ -400,6 +400,19 @@ if ($out -notmatch 'ANCHOR-DLG:1')     { Write-Output 'FAIL: layout dialog did n
 if ($out -notmatch 'RES-DOC:1')        { Write-Output 'FAIL: resource view current-doc fallback failed'; exit 1 }
 if ($out -notmatch 'RES-OPEN:1')       { Write-Output 'FAIL: resource view double-click did not open designer'; exit 1 }
 if ($out -notmatch 'RES-PROJ:1/1')     { Write-Output 'FAIL: resource view project scan missed or over-listed forms'; exit 1 }
+# Git 可视化（第五十九轮续）—— 一次性 TEMP 仓库端到端（真 git 子进程）
+#   GIT-BRANCH:1    init -b gitsmoke 后面板读到分支 gitsmoke
+#   GIT-DIRTY:1     改 a.txt 后 porcelain 清单 1 行（M a.txt）
+#   GIT-DIFF:1      git diff 含 -v1/+v2
+#   GIT-COMMIT:1    面板提交链（输入行说明 → add -A → commit → 清单归零）
+#   GIT-LOG:1       log 里有 smoke-commit
+if ($out -notmatch 'GIT-BRANCH:1')     { Write-Output 'FAIL: git panel did not read the branch'; exit 1 }
+if ($out -notmatch 'GIT-DIRTY:1')      { Write-Output 'FAIL: git panel did not list the modified file'; exit 1 }
+if ($out -notmatch 'GIT-DIFF:1')       { Write-Output 'FAIL: git diff did not show the change'; exit 1 }
+if ($out -notmatch 'GIT-COMMIT:1')     { Write-Output 'FAIL: git panel commit chain failed'; exit 1 }
+if ($out -notmatch 'GIT-LOG:1')        { Write-Output 'FAIL: committed message not found in git log'; exit 1 }
+# WATCH-TYPE:OK  监视窗输入行打字不被 subclass 吞掉（return 0 vs null 的教训）
+if ($out -notmatch 'WATCH-TYPE:OK')    { Write-Output 'FAIL: watch input swallows text (subclass must return null)'; exit 1 }
 # SHOW-REDRAW:0  连续 show(true) 不再反复整块重画（第五十八轮修的闪烁）
 if ($out -notmatch 'SHOW-REDRAW:0')   { Write-Output 'FAIL: board.show keeps repainting on every call (flicker)'; exit 1 }
 

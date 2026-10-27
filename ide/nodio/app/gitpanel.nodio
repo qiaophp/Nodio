@@ -1,0 +1,275 @@
+// app/gitpanel.nodio — 底部「Git」页（第五十九轮续：Git 可视化）。
+//
+// 分支状态 + 改动清单 + 对比 + 提交。git 走 process.popen 真子进程
+// （工作目录用 popen 的 workDir），仓库根 = 工程根 / 当前文档所在目录。
+//   setRoot(dir)     换仓库根（根没变就不重跑 git，切页签零开销）
+//   refresh()        分支 + porcelain 改动清单 → 列表；onBranch 上状态栏
+//   commit()         输入行的说明 → git add -A + git commit -m（回车同）
+//   diffSelected()   选中行的 git diff（--cached 兜底）→ onDiff 开对比页签
+//   双击行 = onOpen(完整路径)（main 侧开文件）
+//
+// 布局套路与 app/watch.nodio 一致：dock 只认一个 ctrl，多控件面板用
+// 「可见性代理」让面板里的控件一起显隐，layout() 自己摆内部坐标。
+import nodio.ui.list;
+import nodio.ui.richedit;
+import nodio.ui.dpi;
+import nodio.ui.subclass;
+import process.popen;   // ⚠ ..process.popen 必须显式 import（探针实测：不 import 直接报「尝试调用非函数值」）
+
+var __gseq = 0;
+
+panel = function(winform, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+	var IN_H = 26;    // 提交说明输入行高（逻辑像素）
+
+	var self = {
+		winform = winform;
+		rect = opt.rect;
+		onStatus = null;
+		onBranch = null;   // function(branch) —— 状态栏「分支」面板
+		onDiff = null;     // function(fullPath, diffText) —— main 侧开对比
+		onOpen = null;     // function(fullPath) —— 双击行开文件
+		root = null;
+		branch = "";
+		files = {};        // {status; path}（列表序 = porcelain 序）
+	};
+
+	__gseq = __gseq + 1;
+	var seq = __gseq;
+
+	// ---------- git 子进程 ----------
+	// git <args> 在 root 下同步跑完（popen workDir），返回 {ok; out}。
+	// 8 秒兜底：git 卡死（网络 remote 之类）也不能把 IDE 拖住。
+	// ⚠ 退出码从 process.waitOne() 的**第二个返回值**拿（process 对象
+	//   没有 .exitCode 成员，写点号取会拿到 null —— 实测过的坑）。
+	self.git = function(root, args){
+		if(!root) return { ok = false; out = "" };
+		var p = null;
+		try{ p = ..process.popen('git ' ++ args, , { workDir = root }) }
+		catch(e){ return { ok = false; out = "git 启动失败" } }
+		if(!p) return { ok = false; out = "git 启动失败" };
+		var out = "";
+		var t0 = ..time.tick();
+		var code = 1;
+		while(true){
+			var o,e = p.peek(20);
+			if(o && #o) out = out ++ o;
+			if(e && #e) out = out ++ e;
+			if(p.process){
+				var exited, ecode = p.process.waitOne(0);
+				if(exited){
+					var o2,e2 = p.peek(0);
+					if(o2 && #o2) out = out ++ o2;
+					if(e2 && #e2) out = out ++ e2;
+					code = tonumber(ecode) : 0;
+					break;
+				}
+			}
+			if(..time.tick() - t0 > 8000) break;
+		}
+		try{ p.close() }catch(eC){ }
+		return { ok = (code == 0); out = out };
+	};
+
+	var __trim = function(s){ return ..string.trim(tostring(s : "")) };
+
+	// ---------- 列表 / 提交说明输入行 ----------
+	self.lv = ..nodio.ui.list(winform, {
+		rect = {left=0; top=0; right=240; bottom=300};
+		columns = { {"状态";56}; {"文件";320} };
+	});
+	self.ed = ..nodio.ui.addCtrl(winform, "gitMsg" ++ seq, {
+		cls="richedit"; left=0; top=0; right=200; bottom=24;
+		multiline=false; vscroll=false;
+	});
+	..nodio.ui.richedit.darken(self.ed, th);
+
+	var __rebuild = function(){
+		var rows = {};
+		for(i=1;#self.files;1){
+			..table.push(rows, {
+				cells = { self.files[i].status; self.files[i].path };
+			});
+		}
+		self.lv.setRows(rows);
+	};
+
+	// 换仓库根（自动补尾部反斜杠；根没变就不动 —— 切页签/切文档零开销）
+	self.setRoot = function(dir){
+		dir = __trim(dir);
+		if(!#dir){ return }
+		var tail = ..string.sub(dir, #dir, #dir);
+		if(tail != "\\" && tail != "/") dir = dir ++ "\\";
+		if(dir == self.root) return;
+		self.root = dir;
+		self.refresh();
+	};
+
+	self.refresh = function(){
+		self.files = {};
+		self.branch = "";
+		__rebuild();
+		if(self.onBranch) self.onBranch("");
+		if(!self.root){
+			if(self.onStatus) self.onStatus("Git: 没有仓库根（打开工程或文件后自动定位）");
+			return 0;
+		}
+		var rb = self.git(self.root, "rev-parse --abbrev-ref HEAD");
+		var br = __trim(rb.out);
+		if(!rb.ok || !#br){
+			// 还没有任何提交：rev-parse 会失败，取未出生分支名
+			var rb2 = self.git(self.root, "symbolic-ref --short -q HEAD");
+			br = __trim(rb2.out);
+		}
+		self.branch = br;
+		if(self.onBranch) self.onBranch(#br ? br : "（无）");
+		var rs = self.git(self.root, "status --porcelain");
+		if(!rs.ok){
+			if(self.onStatus) self.onStatus("Git: " ++ (__trim(rs.out) : "不是 Git 仓库"));
+			return 0;
+		}
+		// porcelain 每行 "XY 路径"（X=暂存区 Y=工作区；?? = 未跟踪）
+		for(line in ..string.gmatch(rs.out, '[^\r\n]+')){
+			if(#line < 4) continue;
+			var st = ..string.trim(..string.sub(line, 1, 2));
+			var fpath = ..string.sub(line, 4);
+			// 重命名行是 "R  旧 -> 新"，取新名
+			var arrow = ..string.indexOf(fpath, " -> ");
+			if(arrow !== null) fpath = ..string.mid(fpath, arrow + 4);
+			..table.push(self.files, { status = st; path = fpath });
+		}
+		__rebuild();
+		if(self.onStatus) self.onStatus("Git: " ++ (#br ? br : "?")
+			++ "，" ++ #self.files ++ " 处改动");
+		return #self.files;
+	};
+
+	self.count = function(){ return #self.files };
+
+	// 提交：输入行的说明。无说明 / 无改动都不动 git。
+	// ⚠ 输入行的读写走 setCtrlText/getCtrlText（richedit 的 .text 属性
+	//   实测只读不写 —— formdlg 早就踩过这坑，这里不再踩一遍）。
+	self.commit = function(){
+		if(!self.root) return false;
+		var msg = __trim(tostring(..nodio.ui.getCtrlText(self.ed) : ""));
+		if(!#msg){
+			if(self.onStatus) self.onStatus("Git: 先在输入行写提交说明");
+			return false;
+		}
+		if(..string.indexOf(msg, '"') !== null){
+			if(self.onStatus) self.onStatus("Git: 提交说明里别用双引号");
+			return false;
+		}
+		if(!#self.files){
+			if(self.onStatus) self.onStatus("Git: 没有可提交的改动");
+			return false;
+		}
+		var ra = self.git(self.root, "add -A");
+		if(!ra.ok){
+			if(self.onStatus) self.onStatus("Git add 失败: " ++ __trim(ra.out));
+			return false;
+		}
+		var rc = self.git(self.root, 'commit -m "' ++ msg ++ '"');
+		if(!rc.ok){
+			if(self.onStatus) self.onStatus("Git commit 失败: " ++ __trim(rc.out));
+			return false;
+		}
+		..nodio.ui.setCtrlText(self.ed, "");
+		self.refresh();
+		if(self.onStatus) self.onStatus("Git: 已提交（" ++ self.branch ++ "）");
+		return true;
+	};
+
+	// ---------- 对比 / 打开 ----------
+	self.__sel = function(){
+		var i = self.lv.selIndex;
+		if(i < 1 || i > #self.files) return null;
+		return { status = self.files[i].status; path = self.files[i].path };
+	};
+	self.diffSelected = function(){
+		if(!self.root){ return null }
+		var s = self.__sel();
+		if(!s){
+			if(self.onStatus) self.onStatus("Git: 先选中一个文件");
+			return null;
+		}
+		if(s.status == "??"){
+			if(self.onStatus) self.onStatus("Git: 未跟踪文件没有对比（" ++ s.path ++ "）");
+			return null;
+		}
+		var rd = self.git(self.root, 'diff -- "' ++ s.path ++ '"');
+		var txt = rd.out;
+		if(!#txt){
+			// 改动已暂存：工作区 diff 是空的，看 --cached
+			rd = self.git(self.root, 'diff --cached -- "' ++ s.path ++ '"');
+			txt = rd.out;
+		}
+		if(!#txt){
+			if(self.onStatus) self.onStatus("Git: 没有可显示的差异");
+			return null;
+		}
+		if(self.onDiff) self.onDiff(self.root ++ s.path, txt);
+		return txt;
+	};
+
+	// 输入行回车 = 提交。commit 是同步子进程（几十毫秒），但照 watch 的
+	//   纪律推迟到消息循环，别在窗口过程里等子进程。
+	// ⚠ 未处理的消息必须 return **null**（返回 0 = 吞掉，WM_SETTEXT 都进
+	//   不来 —— watch/立即窗口当年就栽在这上面，输入行打不进字）。
+	..nodio.ui.subclass(self.ed.hwnd, function(hwnd, msg, wp, lp){
+		if(msg == 0x100 && tonumber(wp) == 0x0D){    // WM_KEYDOWN + VK_RETURN
+			try{
+				winform.setTimeout(function(){
+					try{ self.commit() }catch(eC){ }
+					return null;
+				}, 1);
+			}catch(eS){ }
+			return 1;
+		}
+		return null;
+	});
+
+	// 右键菜单：对比选中 / 提交 / 刷新
+	self.lv.onContextMenu = function(x, y){
+		var menu = win.ui.popmenu(winform);
+		var idDiff = menu.add("对比选中", null);
+		var idCmt = menu.add("提交（说明写在输入行）", null);
+		var idRef = menu.add("刷新", null);
+		var id = menu.popId();
+		if(!id) return;
+		if(id == idDiff) self.diffSelected();
+		elseif(id == idCmt) self.commit();
+		elseif(id == idRef) self.refresh();
+	};
+
+	// 双击行 = 打开那个文件（编辑器里改完回来自动看到新状态）
+	self.lv.onDoubleClick = function(row, index){
+		if(index < 1 || index > #self.files || !self.root) return;
+		if(self.onOpen) self.onOpen(self.root ++ self.files[index].path);
+	};
+
+	// ---------- 布局 ----------
+	self.layout = function(l,t,r,b){
+		if(l === null || l === undefined){
+			var rc = self.rect;
+			if(!rc) return;
+			l = rc.left; t = rc.top; r = rc.right; b = rc.bottom;
+		}
+		self.rect = {left=l; top=t; right=r; bottom=b};
+		var ih = ..nodio.ui.px(IN_H);
+		self.lv.layout(l, t, r, b - ih);
+		..nodio.ui.setRect(self.ed, l, b - ih, r, b);
+	};
+	self.layout();
+
+	// dock 可见性代理（与 app/ai.nodio 同一个套路）
+	self.show = function(flag){
+		self.lv.show(flag);
+		self.ed.show(flag);
+	};
+	self.ctrl = {
+		show = function(flag){ self.show(flag) }
+	};
+	return self;
+}
