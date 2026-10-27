@@ -6521,3 +6521,58 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
 - 验证：VM 99/0/0、IDE 冒烟 SMOKE OK、ide_debug 88 项全绿。
 - ❌ 剩余大项：打印补完（PrintDlgW + 预览）、交互终端 + 文件时间线、
   协议面收口、主题 XML + 插件注册 + USR.CFG 键名。
+
+## 1.74 第六十轮：打印补完（PrintDlgW 对话框 + 打印预览 + 范围打印）
+
+- **真因定位（历史大 bug 终结）**：第五十四轮至第五十六轮的打印管线中，
+  `engine/builtins.cpp` 和 `lib/nodio/ui/printdc.nodio` 发送 `EM_FORMATRANGE`
+  时误用了消息号 `0x43D`。在 Win32 / RichEdit 规范中，`0x43D` 实际为
+  `EM_GETPARAFORMAT`，真正的 `EM_FORMATRANGE` 是 **`0x439`**（查证自官方
+  `D:\aardio\lib\win\#DEFINE.aardio:1428`）。误用 `0x43D` 导致每次调用
+  richedit 均静默返回 0，引擎误判文档页数为 0（返回 `-hwnd` 诊断码）。
+  更正为 `0x439` 后，分页与测量管线立即打通（实测 200 行文档测出真实 4 页）。
+- **WYSIWYG 打印预览与各向异性映射（MM_ANISOTROPIC）**：
+  - 若单纯使用屏幕 DC 并将 `hdcTarget` 设为打印机，RichEdit 会按屏幕 DPI/宽
+    折行，导致 200 行文档被排成 147 页（完全失真）。
+  - 正确解法：创建与打印机兼容的内存 DC（`CreateCompatibleDC(hdcPrinter)`），
+    配合预览尺寸位图（如 560×801），设置映射模式为 `MM_ANISOTROPIC`，
+    `SetWindowExtEx(pageW, pageH)`（打印机高分辨率）及
+    `SetViewportExtEx(prevW, prevH)`（预览像素）。RichEdit 按照打印机度量排版，
+    GDI 视口变换自动等比缩放出图，单页渲染时间仅需 ~62ms（相比全分辨率 600 DPI
+    栅格化的 2.9 秒缩短了 98%）。
+  - FORMATRANGE 的 `rc` 与 `rcPage` 必须填入**渲染 DC 的逻辑单位**（即打印页面像素
+    `{0, 0, pageW, pageH}`），绝不能直接传预览像素，否则文本会按 1/8 缩小缩到不可见。
+- **PrintDlgW 对话框 x64 内存布局**：
+  - 官方 `win.dlg.print` 声明的 `structSize = 66` 属于 32 位 x86 结构。在 x64 Windows
+    上，`PRINTDLGW` 的实际长度为 **120 字节**，字段偏移：`lStructSize(0)`,
+    `_pad0(4)`, `hwndOwner(8)`, `hDevMode(16)`, `hDevNames(24)`, `hDC(32)`,
+    `Flags(40)`, `nFromPage(44)`, `nToPage(46)`, `nMinPage(48)`, `nMaxPage(50)`,
+    `nCopies(52)`, `_pad1(54)`, `hInstance(56)`, `lCustData(64)`, `lpfnPrintHook(72)`,
+    `lpfnSetupHook(80)`, `lpPrintTemplateName(88)`, `lpSetupTemplateName(96)`,
+    `hPrintTemplate(104)`, `hSetupTemplate(112)`。
+  - 提供 `printerPrintDlg`（交互模式，带页码、份数与打印机选择）以及
+    `printerPrintDlgDefault`（利用 `PD_RETURNDEFAULT | PD_RETURNDC | PD_NOWARNING`
+    在无人值守/冒烟环境下获取默认打印机 DC 并验证结构体排布）。对话框返回的
+    `hDevMode` 与 `hDevNames` 统一按 Windows 规范通过 `GlobalFree` 释放；设备名称
+    通过 `GlobalLock` 读取。
+- **C++ 内建扩展与范围打印**：
+  - `raw.printPreviewCount(hwndEdit, hdcPrinter, prevW, prevH)`：在各向异性预览
+    DC 下进行排版测量，确保预览与真打印页数严格一致；
+  - `raw.printPreviewPaint(hwndEdit, hwndDst, hdcPrinter, pageNo, prevW, prevH, mode)`：
+    将目标页渲染至窗口客户区，带暗色背景、页面白底与边框，并抽样返回着墨像素数
+    （>0 确认页面有字符渲染，防白屏回归）；
+  - `raw.printRange(hwndEdit, hdcPrinter, from, to)`：先测量总页数进行范围截断，
+    范围内调用 `StartPage`/`EndPage`，范围外仅推进格式化偏移，避免产生空白废纸。
+- **UI 浮层组件与交互串联**：
+  - `lib/nodio/ui/printprev.nodio`：实现浮层预览 `nodio.ui.printprev(winform)`，
+    含暗色顶栏、导航（上一页/下一页/打印/关闭）、鼠标滚轮翻页（`WM_MOUSEWHEEL` /
+    `onMouseWheel`）以及 `WM_PAINT` 劫持直连 C++ 出图；防 0 尺寸客户区 GDI+ 异常。
+  - `ide/nodio/app/shell.nodio` 与 `ide/nodio/main.nodio`：在「文件」菜单挂接「打印预览」，
+    并将「打印...」替换为调起真实 `PrintDlgW`，状态栏实时汇报打印机及页码范围。
+- **回归锁**（`ide_smoke.ps1` 增 4 断言）：
+  - `PRINT-DLG:OK`（验证 120 字节 x64 PRINTDLGW 结构体取 DC 正常）
+  - `PRINT-PREVIEW:OK`（验证预览页数与真打印页数完全一致）
+  - `PRINT-INK:OK(3693)`（验证第 1 页着墨像素 > 0，杜绝纯白空白渲染）
+  - `PRINT-PREV-UI:OK(1)`（验证浮层预览组件创建、绘制与退出闭环）
+- 验证：VM 99/0/0 全部通过，IDE 冒烟 SMOKE OK。
+- ❌ 剩余大项：嵌入式交互终端 + 文件时间线、协议面收口、主题 XML + 插件注册 + USR.CFG 键名。

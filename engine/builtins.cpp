@@ -6121,22 +6121,331 @@ void Interp::InitBuiltins()
                         {
                             StartPage(hdc);
                             next = (LONG)SendMessageW(hwndEdit,
-                                0x43D /*EM_FORMATRANGE*/, 1, (LPARAM)&fr);
+                                0x439 /*EM_FORMATRANGE*/, 1, (LPARAM)&fr);
                             EndPage(hdc);
                         }
                         else
                         {
                             next = (LONG)SendMessageW(hwndEdit,
-                                0x43D /*EM_FORMATRANGE*/, 0, (LPARAM)&fr);
+                                0x439 /*EM_FORMATRANGE*/, 0, (LPARAM)&fr);
                         }
                         if (next <= last) break;
                         pages++;
                         last = next;
                     }
-                    SendMessageW(hwndEdit, 0x43D, 0, 0);
+                    SendMessageW(hwndEdit, 0x439, 0, 0);
                     // 诊断：pages==0 时回传 -hwnd（非 0 = 句柄已到位、消息真返回 0）
                     if (pages == 0) return Value::Num_(-(double)(INT_PTR)hwndEdit);
                     return Value::Num_(pages);
+                });
+                // 第五十九轮续：打印补完（对话框 + 预览 + 页码范围）。
+                // 与 printRichedit 同一条 EM_FORMATRANGE 链的三个变体：
+                //
+                // printPageCount2(hwndEdit, hdc, hdcTarget, w, h)：
+                //   **渲染 DC 与排版目标分离**的页数测量（FORMATRANGE 的
+                //   hdc/hdcTarget 本来就是两个字段——官方 WordPad 打印预览
+                //   即此用法：dc=屏幕、hdcTarget=打印机，richedit 按
+                //   目标设备排版、按渲染 DC 缩放出图）。w/h 是渲染 DC 上的
+                //   页面像素（预览窗里就是缩小的页）。返回页数。
+                //
+                // printPagePaint(hwndEdit, hwndDst, hdcPrinter, pageNo, mode)：
+                //   把第 pageNo 页渲染进 hwndDst 的客户区（打印预览画面）。
+                //   mode 0 = 屏幕 DC + 96dpi 缩小页（hdcTarget=打印机）；
+                //   mode 1 = 打印机 DC 兼容内存 DC 满分辨率渲染再拉伸贴回
+                //   （两种都保留，探针定胜负，实测哪条 WYSIWYG 用哪条）。
+                //   内部 GetDC + 白底 + StretchBlt(HALFTONE) + ValidateRect，
+                //   不经过 BeginPaint（PAINTSTRUCT 编组绕开）。
+                //
+                // printRange(hwndEdit, hdcPrinter, from, to)：
+                //   真打印，带页码范围（1 基闭区间；先测量总页数钳边界，
+                //   范围外只推进不 StartPage——不出空白页）。返回实打印页数。
+                // 打印预览：按**打印机版面**排版、按**预览尺寸**出图。
+                //
+                // ��� 条踩过的坑（都是实测，不是推测）：
+                //  ① EM_FORMATRANGE 是 **0x439**，不是 0x43D（0x43D 是
+                //     EM_GETPARAFORMAT）——消息发错 → 永远返回 0 → 页数恒 0、
+                //     预览恒空白。官方 win/#DEFINE.aardio:1428 就是 0x439。
+                //  ② 预览 DC 必须是**打印机兼容 DC**（CreateCompatibleDC
+                //     (printerDC)）：它的 LOGPIXELS 与打印机一致，排版才
+                //     与真打印一致；再叠 MM_ANISOTROPIC（窗口范围=打印页面
+                //     像素、视口范围=预览像素），600dpi 版面就缩到了屏幕尺寸。
+                //     踩坑记录：拿屏幕 DC 当渲染 DC（hdcTarget=打印机）时，
+                //     200 行短文能排出 **147 页**（排版按屏幕宽度折行）。
+                //  ③ 预览页码与真打印页码必须一致，否则预览是骗人的——
+                //     printPreviewCount 与 printRichedit(false) 的页数
+                //     不一致时，调用方应回退到全分辨率模式。
+                //
+                // printPreviewCount(hwndEdit, hdcPrinter, previewW, previewH)
+                //   → 预览版面下的页数。
+                // printPreviewPaint(hwndEdit, hwndDst, hdcPrinter, pageNo,
+                //                   previewW, previewH, mode)
+                //   → 把第 pageNo 页画进 hwndDst 客户区（居中 + 深灰底 +
+                //     页边框），返回 1/0。mode 0 = 预览缩放，mode 1 = 全分辨率。
+                tb->map[L"printPreviewCount"] = NF([](vector<Value>& a)
+                    -> Value {
+                    if (a.size() < 4) return Value::Num_(0);
+                    auto resolveH = [](const Value& v) -> void* {
+                        if (v.t == Value::Pointer)
+                        {
+                            if (v.ptr) return (void*)v.ptr;
+                            return nullptr;
+                        }
+                        return (void*)(INT_PTR)BNum(v);
+                    };
+                    HWND hwndEdit = (HWND)resolveH(a[0]);
+                    HDC hdcPrinter = (HDC)resolveH(a[1]);
+                    int prevW = (int)BNum(a[2]);
+                    int prevH = (int)BNum(a[3]);
+                    if (!hwndEdit || !hdcPrinter || prevW <= 0 || prevH <= 0)
+                        return Value::Num_(0);
+                    int pageW = GetDeviceCaps(hdcPrinter, 8 /*HORZRES*/);
+                    int pageH = GetDeviceCaps(hdcPrinter, 10 /*VERTRES*/);
+                    if (pageW <= 0 || pageH <= 0) return Value::Num_(0);
+                    HDC hdcMem = CreateCompatibleDC(hdcPrinter);
+                    HBITMAP hbmp = CreateCompatibleBitmap(hdcPrinter,
+                        prevW, prevH);
+                    if (!hdcMem || !hbmp)
+                    {
+                        if (hbmp) DeleteObject(hbmp);
+                        if (hdcMem) DeleteDC(hdcMem);
+                        return Value::Num_(0);
+                    }
+                    HBITMAP old = (HBITMAP)SelectObject(hdcMem, hbmp);
+                    SetMapMode(hdcMem, MM_ANISOTROPIC);
+                    SetWindowExtEx(hdcMem, pageW, pageH, nullptr);
+                    SetViewportExtEx(hdcMem, prevW, prevH, nullptr);
+                    struct CHARRANGE_T { LONG cpMin; LONG cpMax; };
+                    struct FORMATRANGE_T
+                    {
+                        HDC hdc;
+                        HDC hdcTarget;
+                        RECT rc;
+                        RECT rcPage;
+                        CHARRANGE_T chrg;
+                    };
+                    LONG last = 0;
+                    int pages = 0;
+                    while (pages < 9999)
+                    {
+                        FORMATRANGE_T fr = {};
+                        fr.hdc = hdcMem;
+                        fr.hdcTarget = hdcPrinter;
+                        fr.rc = {0, 0, pageW, pageH};
+                        fr.rcPage = fr.rc;
+                        fr.chrg.cpMin = last;
+                        fr.chrg.cpMax = -1;
+                        LONG next = (LONG)SendMessageW(hwndEdit,
+                            0x439 /*EM_FORMATRANGE*/, 0, (LPARAM)&fr);
+                        if (next <= last) break;
+                        pages++;
+                        last = next;
+                    }
+                    SendMessageW(hwndEdit, 0x439, 0, 0);
+                    SetMapMode(hdcMem, MM_TEXT);
+                    SelectObject(hdcMem, old);
+                    DeleteObject(hbmp);
+                    DeleteDC(hdcMem);
+                    return Value::Num_(pages);
+                });
+                tb->map[L"printPreviewPaint"] = NF([](vector<Value>& a)
+                    -> Value {
+                    if (a.size() < 6) return Value::Num_(0);
+                    auto resolveH = [](const Value& v) -> void* {
+                        if (v.t == Value::Pointer)
+                        {
+                            if (v.ptr) return (void*)v.ptr;
+                            return nullptr;
+                        }
+                        return (void*)(INT_PTR)BNum(v);
+                    };
+                    HWND hwndEdit = (HWND)resolveH(a[0]);
+                    HWND hwndDst = (HWND)resolveH(a[1]);
+                    HDC hdcPrinter = (HDC)resolveH(a[2]);
+                    int pageNo = (int)BNum(a[3]);
+                    int prevW = (int)BNum(a[4]);
+                    int prevH = (int)BNum(a[5]);
+                    int mode = a.size() >= 7 ? (int)BNum(a[6]) : 0;
+                    if (!hwndEdit || !hwndDst || !hdcPrinter || pageNo < 1 ||
+                        prevW <= 0 || prevH <= 0)
+                        return Value::Num_(0);
+                    int pageW = GetDeviceCaps(hdcPrinter, 8 /*HORZRES*/);
+                    int pageH = GetDeviceCaps(hdcPrinter, 10 /*VERTRES*/);
+                    if (pageW <= 0 || pageH <= 0) return Value::Num_(0);
+                    HDC hdcDraw = GetDC(hwndDst);
+                    if (!hdcDraw) return Value::Num_(0);
+                    RECT rcClient = {};
+                    GetClientRect(hwndDst, &rcClient);
+                    // mode 0 = 预览缩放（打印机版面 → 预览位图）
+                    // mode 1 = 全分辨率（打印机版面原尺寸渲染再拉伸）
+                    int renderW = (mode == 1) ? pageW : prevW;
+                    int renderH = (mode == 1) ? pageH : prevH;
+                    HDC hdcMem = CreateCompatibleDC(hdcPrinter);
+                    HBITMAP hbmp = CreateCompatibleBitmap(hdcPrinter,
+                        renderW, renderH);
+                    if (!hdcMem || !hbmp)
+                    {
+                        if (hbmp) DeleteObject(hbmp);
+                        if (hdcMem) DeleteDC(hdcMem);
+                        ReleaseDC(hwndDst, hdcDraw);
+                        return Value::Num_(0);
+                    }
+                    HBITMAP old = (HBITMAP)SelectObject(hdcMem, hbmp);
+                    if (mode != 1)
+                    {
+                        SetMapMode(hdcMem, MM_ANISOTROPIC);
+                        SetWindowExtEx(hdcMem, pageW, pageH, nullptr);
+                        SetViewportExtEx(hdcMem, renderW, renderH, nullptr);
+                    }
+                    RECT rcAll = {0, 0, renderW, renderH};
+                    FillRect(hdcMem, &rcAll,
+                        (HBRUSH)GetStockObject(WHITE_BRUSH));
+                    struct CHARRANGE_T { LONG cpMin; LONG cpMax; };
+                    struct FORMATRANGE_T
+                    {
+                        HDC hdc;
+                        HDC hdcTarget;
+                        RECT rc;
+                        RECT rcPage;
+                        CHARRANGE_T chrg;
+                    };
+                    LONG last = 0;
+                    bool rendered = false;
+                    for (int i = 1; i <= pageNo && i < 9999; i++)
+                    {
+                        FORMATRANGE_T fr = {};
+                        fr.hdc = hdcMem;
+                        fr.hdcTarget = hdcPrinter;
+                        // ⚠ rc 用**打印页面像素**（渲染 DC 的逻辑单位），
+                        //   不是预览位图尺寸：MM_ANISOTROPIC 下 logical
+                        //   4760×6814 → device 560×801，缩放由映射模式做。
+                        //   写错成预览尺寸 → 页面被缩到 1/8、文字小到看不见
+                        //   （实测：整页纯白、0 个深色像素）。
+                        fr.rc = {0, 0, pageW, pageH};
+                        fr.rcPage = fr.rc;
+                        fr.chrg.cpMin = last;
+                        fr.chrg.cpMax = -1;
+                        LONG next = (LONG)SendMessageW(hwndEdit,
+                            0x439 /*EM_FORMATRANGE*/,
+                            i == pageNo ? 1 : 0, (LPARAM)&fr);
+                        if (next <= last) break;
+                        last = next;
+                        if (i == pageNo) rendered = true;
+                    }
+                    SendMessageW(hwndEdit, 0x439, 0, 0);
+                    int ink = 0;
+                    if (rendered)
+                    {
+                        // 着墨像素统计（抽样）：页面真的是空的就返回 0，
+                        // 调用方（预览窗/冒烟）据此判「预览有内容」。
+                        for (int yy = 0; yy < renderH; yy += 4)
+                        {
+                            for (int xx = 0; xx < renderW; xx += 4)
+                            {
+                                COLORREF c = GetPixel(hdcMem, xx, yy);
+                                if (c != RGB(0xFF, 0xFF, 0xFF)) ink++;
+                            }
+                        }
+                        HBRUSH bg = CreateSolidBrush(RGB(0x3a, 0x3e, 0x42));
+                        FillRect(hdcDraw, &rcClient, bg);
+                        DeleteObject(bg);
+                        double scW = rcClient.right / (double)renderW;
+                        double scH = rcClient.bottom / (double)renderH;
+                        double sc = scW < scH ? scW : scH;
+                        if (sc > 1.0) sc = 1.0;
+                        int dw = (int)(renderW * sc), dh = (int)(renderH * sc);
+                        int dx = (rcClient.right - dw) / 2;
+                        int dy = (rcClient.bottom - dh) / 2;
+                        SetStretchBltMode(hdcDraw, HALFTONE);
+                        SetBrushOrgEx(hdcDraw, 0, 0, nullptr);
+                        StretchBlt(hdcDraw, dx, dy, dw, dh,
+                            hdcMem, 0, 0, renderW, renderH, SRCCOPY);
+                        RECT rcFrame = {dx, dy, dx + dw, dy + dh};
+                        HBRUSH fb = CreateSolidBrush(RGB(0x1c, 0x1e, 0x22));
+                        FrameRect(hdcDraw, &rcFrame, fb);
+                        DeleteObject(fb);
+                        ValidateRect(hwndDst, nullptr);
+                    }
+                    SetMapMode(hdcMem, MM_TEXT);
+                    SelectObject(hdcMem, old);
+                    DeleteObject(hbmp);
+                    DeleteDC(hdcMem);
+                    ReleaseDC(hwndDst, hdcDraw);
+                    return Value::Num_(rendered ? ink : -1);
+                });
+                tb->map[L"printRange"] = NF([](vector<Value>& a)
+                    -> Value {
+                    if (a.size() < 4) return Value::Num_(0);
+                    auto resolveH = [](const Value& v) -> void* {
+                        if (v.t == Value::Pointer)
+                        {
+                            if (v.ptr) return (void*)v.ptr;
+                            return nullptr;
+                        }
+                        return (void*)(INT_PTR)BNum(v);
+                    };
+                    HWND hwndEdit = (HWND)resolveH(a[0]);
+                    HDC hdc = (HDC)resolveH(a[1]);
+                    int from = (int)BNum(a[2]);
+                    int to = (int)BNum(a[3]);
+                    if (!hwndEdit || !hdc) return Value::Num_(0);
+                    struct CHARRANGE_T { LONG cpMin; LONG cpMax; };
+                    struct FORMATRANGE_T
+                    {
+                        HDC hdc;
+                        HDC hdcTarget;
+                        RECT rc;
+                        RECT rcPage;
+                        CHARRANGE_T chrg;
+                    };
+                    RECT rcFull = {0, 0,
+                        GetDeviceCaps(hdc, 8 /*HORZRES*/),
+                        GetDeviceCaps(hdc, 10 /*VERTRES*/)};
+                    // 先量总页数（钳 from/to 边界，防越界请求）
+                    LONG last = 0;
+                    int total = 0;
+                    while (total < 9999)
+                    {
+                        FORMATRANGE_T fr = {};
+                        fr.hdc = hdc;
+                        fr.hdcTarget = hdc;
+                        fr.rc = rcFull;
+                        fr.rcPage = rcFull;
+                        fr.chrg.cpMin = last;
+                        fr.chrg.cpMax = -1;
+                        LONG next = (LONG)SendMessageW(hwndEdit,
+                            0x439, 0, (LPARAM)&fr);
+                        if (next <= last) break;
+                        total++;
+                        last = next;
+                    }
+                    SendMessageW(hwndEdit, 0x439, 0, 0);
+                    if (from < 1) from = 1;
+                    if (to > total || to <= 0) to = total;
+                    if (from > to) return Value::Num_(0);
+                    // 再渲染：范围内 StartPage/EndPage，范围外只推进
+                    int printed = 0;
+                    last = 0;
+                    for (int p = 1; p <= to && p < 9999; p++)
+                    {
+                        FORMATRANGE_T fr = {};
+                        fr.hdc = hdc;
+                        fr.hdcTarget = hdc;
+                        fr.rc = rcFull;
+                        fr.rcPage = rcFull;
+                        fr.chrg.cpMin = last;
+                        fr.chrg.cpMax = -1;
+                        bool inRange = (p >= from);
+                        if (inRange) StartPage(hdc);
+                        LONG next = (LONG)SendMessageW(hwndEdit,
+                            0x439, inRange ? 1 : 0, (LPARAM)&fr);
+                        if (inRange) EndPage(hdc);
+                        if (next <= last) break;
+                        last = next;
+                        if (inRange) printed++;
+                        if (p >= to) break;
+                    }
+                    SendMessageW(hwndEdit, 0x439, 0, 0);
+                    return Value::Num_(printed);
                 });
                 tb->map[L"loadDll"] = NF([this](vector<Value>& a)
                     -> Value {

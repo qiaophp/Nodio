@@ -25,6 +25,8 @@ import nodio.ui.dpi;
 import nodio.ui.board;   // nodio.ui.redrawAll（窗口显示后统一强制重画）
 import nodio.ui.startPane;   // 第五十三轮：开始页（无文档时的落地页）
 import nodio.ui.rect;    // nodio.ui.setCtrlText（AI 面板冒烟要往输入框写字）
+import nodio.ui.printdc;   // 打印：打印机 DC / PrintDlgW（第五十九轮续）
+import nodio.ui.printprev; // 打印预览浮层（第五十九轮续）
 import nodio.ai.cred;    // AI 面板冒烟：隔离凭据名 + 写/删测试 Key
 import app.ideCommand;   // 官方 ide.command 37 命令外部命令面
 import raw;
@@ -1875,19 +1877,63 @@ shell.hooks.onSave        = saveFile;
 shell.hooks.onSaveAs      = function(){ return saveFileAs() };
 shell.hooks.onSaveAll     = saveAllFiles;
 // 打印（第五十六轮）：页数测量 → 确认 prompt → EM_FORMATRANGE 渲染
+// 第五十九轮续：换成**系统打印对话框**（PrintDlgW）——选打印机、页码
+// 范围、份数，然后按范围出到对话框给的 DC（不再默认打印机）。
 var printDocument = function(){
 	var pages = shell.editor.pageCount();
 	if(pages == 0){
-		shell.setStatus("打印：未找到默认打印机");
+		shell.setStatus("打印：未找到打印机");
 		return;
 	}
-	shell.showPrompt("打印确认", "共 " ++ pages ++ " 页（回车打印，Esc 取消）", function(t){
-		var n = shell.editor.print();
-		shell.setStatus("已打印 " ++ tostring(n) ++ " 页到默认打印机");
-		return true;
-	});
+	var r = shell.editor.printDlg(shell.winform);
+	if(!r){
+		shell.setStatus("打印：已取消");
+		return;
+	}
+	var msg = "已打印 " ++ tostring(r.pages) ++ " 页（第 " ++ tostring(r.from)
+		++ "-" ++ tostring(r.to) ++ " 页）";
+	if(r.deviceName) msg = msg ++ " → " ++ r.deviceName;
+	shell.setStatus(msg);
 };
 shell.hooks.onPrint       = printDocument;
+
+// 打印预览（第五十九轮续）：浮层 + 打印机 DC。
+// 预览期间的 DC 由本模块持有（浮层关闭时释放）——浮层只管画，不管命。
+var printPrev = null;
+var printPrevDC = null;
+var printPreview = function(){
+	if(!shell.editor || !shell.editor.ctrl){
+		shell.setStatus("打印预览：没有可预览的文档");
+		return;
+	}
+	var pr = ..nodio.ui.printerGetDC();
+	if(!pr){
+		shell.setStatus("打印预览：未找到打印机");
+		return;
+	}
+	if(!printPrev){
+		printPrev = ..nodio.ui.printprev(shell.winform, {});
+		printPrev.onPrint = function(from, to){
+			// 预览里按「打印」= 打当前页
+			if(!printPrevDC || !shell.editor) return;
+			var n = ..nodio.ui.printerPrintRange(printPrevDC,
+				shell.editor.ctrl.hwnd, from, to);
+			shell.setStatus("已打印第 " ++ tostring(from) ++ " 页（" ++ tostring(n) ++ " 页）");
+		};
+		printPrev.onClose = function(){
+			if(printPrevDC){
+				..nodio.ui.printerDeleteDC(printPrevDC);
+				printPrevDC = null;
+			}
+		};
+	}
+	if(printPrevDC) ..nodio.ui.printerDeleteDC(printPrevDC);
+	printPrevDC = pr.hdc;
+	printPrev.deviceName = pr.name;
+	printPrev.show(shell.editor.ctrl.hwnd, pr.hdc);
+	shell.setStatus("打印预览：" ++ pr.name);
+};
+shell.hooks.onPrintPreview = printPreview;
 shell.hooks.onCloseTab    = closeTab;
 shell.hooks.onCloseOtherTabs = function(keepPath){
 	keepPath = keepPath : shell.curTab;
@@ -3242,7 +3288,60 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 
 	// 打印管线（第五十六轮）：页数测量走默认打印机 DC 的
 	// EM_FORMATRANGE 测量遍历（无打印机/无法取 DC → 0，断言只验链路）
-	io.print("PRINT-PAGES:" ++ tostring(shell.editor.pageCount()));
+	var printPages = shell.editor.pageCount();
+	io.print("PRINT-PAGES:" ++ tostring(printPages));
+
+	// 打印补完（第五十九轮续）：PrintDlgW 结构体 + 预览出图 + 页数一致。
+	// 三条断言：
+	//  ① PRINT-DLG —— PrintDlgW 的**不弹框**分支（PD_RETURNDEFAULT）能
+	//     拿到默认打印机 DC（结构体布局对不对，只有真调一次才知道）；
+	//  ② PRINT-PREVIEW —— 预览页数必须与真打印页数一致（WYSIWYG）；
+	//  ③ PRINT-INK —— 预览真的画出了字（着墨像素 > 0；空白页 = 回归）。
+	// 无打印机的机器上这三条打 SKIP（链路仍验 ① 的结构体不崩）。
+	var __pd = ..nodio.ui.printerPrintDlgDefault();
+	if(__pd){
+		io.print("PRINT-DLG:OK");
+		if(__pd.hdc) ..nodio.ui.printerDeleteDC(__pd.hdc);
+	}
+	else{
+		io.print("PRINT-DLG:SKIP");
+	}
+	var __pr = ..nodio.ui.printerGetDC();
+	if(__pr && printPages > 0){
+		var __ps = ..nodio.ui.printerPreviewSize(__pr.hdc, 900);
+		var __pc = ..nodio.ui.printerPreviewCount(__pr.hdc, shell.editor.ctrl.hwnd,
+			__ps.w, __ps.h);
+		io.print("PRINT-PREVIEW:" ++ ((__pc == printPages) ? "OK" : "FAIL"));
+		// 预览出图：画进一块临时 static（用现成的设计器画布底板当靶子，
+		// 不额外开窗），着墨像素必须 > 0
+		var __ink = -1;
+		try{
+			var __vs = ..nodio.ui.addCtrl(shell.winform, "__printProbe", {
+				cls = "static"; left = 0; top = 0; right = 400; bottom = 600;
+			});
+			__ink = ..nodio.ui.printerPreviewPaint(__pr.hdc, shell.editor.ctrl.hwnd,
+				__vs.hwnd, 1, __ps.w, __ps.h);
+			try{ __vs.show(false) }catch(e){}
+		}catch(e2){}
+		io.print("PRINT-INK:" ++ ((__ink > 0) ? "OK" : "FAIL") ++ "(" ++ tostring(__ink) ++ ")");
+		// 预览**浮层组件**也要冒烟：只测 C++ 管线的话，浮层本身挂掉
+		//（板子/视口/子类化任一处出错）没人知道。
+		try{
+			var __pv = ..nodio.ui.printprev(shell.winform, {});
+			var __pvOk = __pv.show(shell.editor.ctrl.hwnd, __pr.hdc);
+			io.print("PRINT-PREV-UI:" ++ ((__pvOk && __pv.pages > 0) ? "OK" : "FAIL")
+				++ "(" ++ tostring(__pv.pages) ++ ")");
+			__pv.close();
+		}catch(e3){
+			io.print("PRINT-PREV-UI:FAIL(" ++ tostring(e3) ++ ")");
+		}
+		..nodio.ui.printerDeleteDC(__pr.hdc);
+	}
+	else{
+		io.print("PRINT-PREVIEW:SKIP");
+		io.print("PRINT-INK:SKIP");
+		io.print("PRINT-PREV-UI:SKIP");
+	}
 
 	// 类视图（第五十一轮）：class → 成员函数 + 顶层变量的层级扫描。
 	// 测完恢复编辑器原文，别让后面的段落读到夹具。

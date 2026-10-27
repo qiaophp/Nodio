@@ -1,0 +1,293 @@
+// nodio.ui.printprev — 打印预览（浮层，盖在主窗体客户区上）。
+//
+// 为什么是浮层而不是第二个顶层窗口：官方 IDE 的预览是独立窗口，
+// 但 Nodio 的窗体体系是官方 win.form 源码跑在 VM 上，另起顶层窗体
+// 要处理模态循环/焦点/关闭顺序（一堆坑）。预览本质是「盖住编辑区
+// 的一张纸 + 一排按钮」，浮层（board + static 子窗）足够，
+// 代价是关掉后回到编辑区——这正是用户要的。
+//
+// 结构：
+//   · 底层 board：深灰底 + 顶部工具条（上一页/下一页/打印/关闭）
+//     + 页码标签（board 自绘，gdip）。
+//   · 上层 static 子窗：**页面视口**。它的 WM_PAINT 被子类化吞掉，
+//     由 raw.printPreviewPaint 直接把渲染好的页面画进客户区
+//     （C++ 侧 GetDC → 画 → ValidateRect，不走 BeginPaint，
+//      绕开 PAINTSTRUCT 的 FFI 编组问题）。
+//
+// 预览是**真版面**：渲染 DC = 打印机兼容 DC + MM_ANISOTROPIC，
+// 排版按打印机度量、出图按预览尺寸（见 engine/builtins.cpp 的
+// printPreviewPaint 头注）。页数与真打印页数一致时才算 WYSIWYG，
+// 不一致时本组件把页数改用真打印页数（宁可少翻页也不骗人）。
+namespace nodio.ui{
+import nodio.ui.board;
+import nodio.ui.dpi;
+import nodio.ui.theme;
+import nodio.ui.rect;
+import nodio.ui.printdc;
+
+var __ppSeq = 0;
+
+printprev = function(form, opt){
+	opt = opt : {};
+	var th = ..nodio.ui.theme();
+
+	var self = {
+		form = form;
+		visible = false;
+		page = 1;          // 当前页（1 基）
+		pages = 0;         // 总页数
+		hdc = null;        // 预览期间的打印机 DC
+		hwndEdit = 0;      // 被预览的 richedit 句柄
+		prevW = 560;       // 预览位图宽（页面像素）
+		prevH = 800;       // 预览位图高
+		hover = 0;         // 悬停按钮（0=无 1=上一页 2=下一页 3=打印 4=关闭）
+		deviceName = "";
+		onPrint = null;    // function(from,to) —— 打印按钮回调
+		onClose = null;    // function() —— 关闭回调
+	};
+
+	__ppSeq = __ppSeq + 1;
+	var seq = __ppSeq;
+
+	// ---------- 覆盖层 ----------
+	self.panel = nodio.ui.board(form, {
+		left = 0; top = 0; right = 800; bottom = 600;
+		fontSize = 12; z = 90;
+	});
+
+	// ---------- 页面视口（static 子窗，页面由 C++ 直接画）----------
+	self.view = ..nodio.ui.addCtrl(form, "printprevView" ++ seq, {
+		cls = "static"; left = 0; top = 0; right = 100; bottom = 100;
+	});
+	// WM_PAINT 我们自己画（吞掉），WM_ERASEBKGND 吞掉（防闪）
+	self.sub = ..nodio.ui.subclass(self.view.hwnd, function(hwnd,msg,wp,lp){
+		if(msg == 0x000F/*WM_PAINT*/){
+			self.__paint();
+			return 1;
+		}
+		if(msg == 0x0014/*WM_ERASEBKGND*/){
+			return 1;
+		}
+		if(msg == 0x020A/*WM_MOUSEWHEEL*/){
+			var delta = (tonumber(wp) >> 16);
+			self.__goto(self.page + (delta > 0 ? -1 : 1));
+			return 1;
+		}
+		return null;
+	});
+
+	// ---------- 几何 ----------
+	var TOOL_H = 44;     // 工具条高（逻辑像素）
+	var MARGIN = 18;
+	var BTN_W = 76, BTN_H = 26, BTN_GAP = 8;
+
+	// 按钮从右往左：关闭(4) 打印(3) 下一页(2) 上一页(1)
+	self.__btnRect = function(idx){
+		var bw = ..nodio.ui.px(BTN_W), bh = ..nodio.ui.px(BTN_H);
+		var gap = ..nodio.ui.px(BTN_GAP);
+		var x = self.__panelW - ..nodio.ui.px(MARGIN) - bw * (5 - idx) - gap * (4 - idx);
+		var y = ..nodio.ui.px(9);
+		return { left = x; top = y; right = x + bw; bottom = y + bh };
+	};
+	self.__hit = function(x, y){
+		for(i=1;4;1){
+			var b = self.__btnRect(i);
+			if(x >= b.left && x < b.right && y >= b.top && y < b.bottom) return i;
+		}
+		return 0;
+	};
+
+	self.__panelW = 0;
+	self.__panelH = 0;
+	self.__layoutTimer = 0;
+
+	// 覆盖层几何：跟着主窗体客户区走。
+	// ⚠ 窗体**还没显示**时客户区是 0×0 —— 此时摆位会得到 0 面积，
+	//   GDI+ 的 fillRect(0 宽) 直接报 InvalidParameter（画板回调抛错，
+	//   整块预览区变空白）。所以摆位失败就**推迟重试**，并且画的时候
+	//   对 0 面积直接跳过。
+	self.__ensureLayout = function(){
+		var w = 0, h = 0;
+		try{
+			var rc = form.getClientRect();
+			w = rc.width ? rc.width() : 0;
+			h = rc.height ? rc.height() : 0;
+		}catch(e){}
+		if(!w || !h) return false;
+		if(w == self.__panelW && h == self.__panelH) return true;
+		self.__panelW = w;
+		self.__panelH = h;
+		self.panel.layout(0, 0, w, h);
+		// 视口矩形：工具条下方居中
+		try{
+			var vw = ..math.min(self.prevW, self.__panelW - ..nodio.ui.px(MARGIN * 2));
+			if(vw < 120) vw = 120;
+			var vh = ..math.floor(vw * self.prevH / self.prevW);
+			var availH = self.__panelH - ..nodio.ui.px(TOOL_H) - ..nodio.ui.px(MARGIN * 2);
+			if(vh > availH){
+				vh = availH;
+				vw = ..math.floor(vh * self.prevW / self.prevH);
+			}
+			var vx = ..math.floor((self.__panelW - vw) / 2);
+			var vy = ..nodio.ui.px(TOOL_H) + ..nodio.ui.px(MARGIN);
+			self.view.setPos(vx, vy, vx + vw, vy + vh);
+		}catch(e2){}
+		return true;
+	};
+
+	// ---------- 页面渲染 ----------
+	self.__paint = function(){
+		if(!self.visible || !self.hdc || !self.hwndEdit) return;
+		..nodio.ui.printerPreviewPaint(self.hdc, self.hwndEdit,
+			self.view.hwnd, self.page, self.prevW, self.prevH);
+	};
+
+	// 翻页
+	self.__goto = function(n){
+		if(!self.pages) return;
+		if(n < 1) n = 1;
+		if(n > self.pages) n = self.pages;
+		if(n == self.page) return;
+		self.page = n;
+		self.__paint();
+		self.panel.invalidate();
+	};
+
+	// ---------- 显示 / 关闭 ----------
+	// hwndEdit：被预览的 richedit 句柄；hdc：打印机 DC（**本组件不接管
+	// 所有权**，关闭时不删——调用方持有）。
+	self.show = function(hwndEdit, hdc, pageCount){
+		if(!hwndEdit || !hdc) return false;
+		self.hwndEdit = hwndEdit;
+		self.hdc = hdc;
+		// 预览位图尺寸（保持页面纵横比）
+		var ps = ..nodio.ui.printerPreviewSize(hdc, 900);
+		if(ps){
+			self.prevW = ps.w;
+			self.prevH = ps.h;
+		}
+		// 覆盖层摆位（窗体没显示时推迟重试）
+		self.__ensureLayout();
+		// 页数：预览版面与真打印版面必须一致，否则预览不可信
+		var pPrev = ..nodio.ui.printerPreviewCount(hdc, hwndEdit, self.prevW, self.prevH);
+		var pReal = ..nodio.ui.printerPageCount(hdc, hwndEdit);
+		self.pages = pPrev;
+		if(pReal && pPrev && pReal != pPrev){
+			// 排版不一致 → 用真打印页数（宁可翻到空白也不给错页数）
+			self.pages = pReal;
+		}
+		if(!self.pages) self.pages = pageCount;
+		self.page = 1;
+		self.visible = true;
+		self.panel.show(true);
+		self.view.show(true);
+		self.__paint();
+		self.panel.invalidate();
+		// 窗体还没显示 → 定时重试摆位（最多 20 次 × 300ms）
+		if(!self.__panelW){
+			var tries = 0;
+			self.__layoutTimer = form.setTimeout(function(){
+				tries = tries + 1;
+				if(!self.visible) return;
+				if(self.__ensureLayout()){
+					self.__paint();
+					self.panel.invalidate();
+					return;
+				}
+				if(tries >= 20) return;
+				return 300;
+			}, 300);
+		}
+		return true;
+	};
+
+	self.close = function(){
+		self.visible = false;
+		if(self.__layoutTimer){
+			try{ form.killTimer(self.__layoutTimer) }catch(e){}
+			self.__layoutTimer = 0;
+		}
+		try{ self.view.show(false) }catch(e){}
+		try{ self.panel.show(false) }catch(e){}
+		self.hwndEdit = 0;
+		self.hdc = null;
+		if(self.onClose) self.onClose();
+	};
+
+	// ---------- 绘制（工具条 + 页码标签）----------
+	self.panel.onDraw = function(graphics, rc, bd){
+		var font = bd.font;
+		var fmt = bd.format;
+		var w = rc.right - rc.left, h = rc.bottom - rc.top;
+		// 0 面积 = 窗体还没显示（或已销毁）→ 不画（GDI+ 会抛
+		// InvalidParameter，画板回调一抛，这块就废了）
+		if(w <= 0 || h <= 0) return;
+		self.__ensureLayout();
+		// 底色（深灰）+ 顶部分隔线
+		var bg = ..gdip.solidBrush(0xFF232629);
+		graphics.fillRect(bg, rc.left, rc.top, w, h);
+		bg.delete();
+		var lp = ..gdip.pen(th.border, 1);
+		graphics.drawLine(lp, rc.left, rc.top + ..nodio.ui.px(TOOL_H),
+			rc.right, rc.top + ..nodio.ui.px(TOOL_H));
+		lp.delete();
+		// 标题
+		var tb = ..gdip.solidBrush(th.text);
+		graphics.drawString("打印预览", font,
+			::RECTF(rc.left + ..nodio.ui.px(MARGIN), rc.top + ..nodio.ui.px(12),
+				..nodio.ui.px(120), ..nodio.ui.px(22)), fmt, tb);
+		tb.delete();
+		// 页码标签
+		var pageTxt = "第 " ++ tostring(self.page) ++ " / " ++ tostring(self.pages) ++ " 页";
+		if(self.deviceName) pageTxt = pageTxt ++ "    " ++ self.deviceName;
+		var pb = ..gdip.solidBrush(th.textDim);
+		graphics.drawString(pageTxt, font,
+			::RECTF(rc.left + ..nodio.ui.px(MARGIN + 110), rc.top + ..nodio.ui.px(12),
+				..nodio.ui.px(360), ..nodio.ui.px(22)), fmt, pb);
+		pb.delete();
+		// 按钮
+		var bnames = {"上一页"; "下一页"; "打印"; "关闭"};
+		for(i=1;4;1){
+			var b = self.__btnRect(i);
+			var enabled = true;
+			if(i == 1 && self.page <= 1) enabled = false;
+			if(i == 2 && self.page >= self.pages) enabled = false;
+			var bb = ..gdip.solidBrush(self.hover == i ? th.hoverBg : th.panel2);
+			graphics.fillRect(bb, b.left, b.top, b.right - b.left, b.bottom - b.top);
+			bb.delete();
+			var bp = ..gdip.pen(th.border, 1);
+			graphics.drawRectangle(bp, b.left, b.top, b.right - b.left, b.bottom - b.top);
+			bp.delete();
+			var bt = ..gdip.solidBrush(enabled ? th.text : th.textDim);
+			graphics.drawString(bnames[i], font,
+				::RECTF(b.left, b.top + ..nodio.ui.px(4), b.right - b.left,
+					b.bottom - b.top), fmt, bt);
+			bt.delete();
+		}
+	};
+
+	self.panel.onMouseMove = function(x, y, bd){
+		var hb = self.__hit(x, y);
+		if(hb != self.hover){
+			self.hover = hb;
+			self.panel.invalidate();
+		}
+	};
+	self.panel.onMouseClick = function(x, y, bd){
+		var hb = self.__hit(x, y);
+		if(hb == 1){ self.__goto(self.page - 1); return; }
+		if(hb == 2){ self.__goto(self.page + 1); return; }
+		if(hb == 3){
+			if(self.onPrint) self.onPrint(self.page, self.pages);
+			return;
+		}
+		if(hb == 4){ self.close(); return; }
+	};
+	self.panel.onMouseWheel = function(delta, x, y, bd){
+		self.__goto(self.page + (delta > 0 ? -1 : 1));
+	};
+
+	return self;
+}
+
+}

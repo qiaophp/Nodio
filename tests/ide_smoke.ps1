@@ -273,6 +273,41 @@ if ($out -notmatch 'PRINT-PAGES:\d+') {
     exit 1
 }
 
+# 打印补完（第五十九轮续）：PrintDlgW 结构体 / 预览页数一致 / 预览有内容。
+# 无打印机的机器走 SKIP 分支（结构体仍必须调得动，不能崩）。
+if ($out -notmatch 'PRINT-DLG:(OK|SKIP)') {
+    Write-Output 'FAIL: PrintDlgW struct plumbing did not run'
+    exit 1
+}
+if ($out -match 'PRINT-DLG:FAIL') {
+    Write-Output 'FAIL: PrintDlgW struct plumbing failed'
+    exit 1
+}
+if ($out -notmatch 'PRINT-PREVIEW:(OK|SKIP)') {
+    Write-Output 'FAIL: print preview page-count check did not run'
+    exit 1
+}
+if ($out -match 'PRINT-PREVIEW:FAIL') {
+    Write-Output 'FAIL: preview pagination differs from real print'
+    exit 1
+}
+if ($out -notmatch 'PRINT-INK:(OK|SKIP)') {
+    Write-Output 'FAIL: print preview ink check did not run'
+    exit 1
+}
+if ($out -match 'PRINT-INK:FAIL') {
+    Write-Output 'FAIL: print preview rendered a blank page'
+    exit 1
+}
+if ($out -notmatch 'PRINT-PREV-UI:(OK|SKIP)') {
+    Write-Output 'FAIL: print preview overlay component did not run'
+    exit 1
+}
+if ($out -match 'PRINT-PREV-UI:FAIL') {
+    Write-Output 'FAIL: print preview overlay component failed'
+    exit 1
+}
+
 # 类视图：class → 成员函数层级 + 顶层变量（第五十一轮）
 if ($out -notmatch 'CLASSVIEW:truetruetrue') {
     Write-Output 'FAIL: class view hierarchy scan broken'

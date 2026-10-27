@@ -1,16 +1,22 @@
-// nodio.ui.printdc — 打印管线（第五十四轮/第五十六轮）。
+// nodio.ui.printdc — 打印管线（第五十四轮/第五十六轮/第五十九轮续）。
 //
 // ── 打印路径 ────────────────────────────────
-// richedit 的 EM_FORMATRANGE（0x43D）全链在 **C++ 侧**
-// （raw.printRichedit，engine/builtins.cpp）：结构体编组在 aardio FFI
-// 不可靠——实测动态 ::User32.SendMessageW 连 EM_GETTEXTLENGTH 都回 0、
-// 显式 pointer 形参也收不到 class 实例的地址（两次实测留档）。
-// C++ 内建：wParam=1 逐页渲染（StartPage/EndPage）、wParam=0 测量、
-// 收尾释放 richedit 缓存的设备信息。
+// richedit 的 EM_FORMATRANGE（**0x439**）全链在 **C++ 侧**
+// （raw.printRichedit / raw.printPreviewPaint / raw.printRange，
+//  engine/builtins.cpp）：结构体编组在 aardio FFI 不可靠——实测动态
+// ::User32.SendMessageW 连 EM_GETLINECOUNT 都回 0、显式 pointer 形参
+// 也收不到 class 实例的地址（两次实测留档）。
+//
+// ⚠⚠ EM_FORMATRANGE 的消息号是 **0x439**，不是 0x43D！
+//   0x43D 是 EM_GETPARAFORMAT（官方 win/#DEFINE.aardio:1428 写的就是
+//   0x439）。发错消息 → richedit 返回 0 → 页数恒 0、预览恒空白，
+//   而且**看不出任何报错**（这就是第五十四轮那版打印管线一直"通"、
+//   却永远打不出东西的真正原因）。
 //
 // ── aardio 侧职责 ────────────────────────────────
 // 默认打印机名（winspool GetDefaultPrinterW）+ 打印机 DC
-// （gdi32 CreateDCW）的获取与 DeleteDC 收尾。
+// （gdi32 CreateDCW）的获取与 DeleteDC 收尾；PrintDlgW 打印对话框
+// （x64 结构体手写，见下）；预览页数/预览出图的参数换算。
 //
 // ⚠ NUL 必须用 '\u0000'（filedlg 头注同款教训：'\0' 是字节转义，
 // 会把整串降级成字节串，raw.readW 读回的名称里 NUL 之后全是垃圾）。
@@ -18,6 +24,47 @@ namespace nodio.ui{
 import nodio.ui.rect;
 
 var NUL2 = '\u0000';
+
+// PRINTDLGW（x64 真实布局，120 字节）。
+// 为什么手写结构体：官方 win/dlg/print.aardio 的 structSize=66 是
+// **32 位**尺寸；x64 上 PRINTDLGW 是 120 字节、字段偏移全不一样
+// （hwndOwner 在 8、hDC 在 32、5 个 WORD 在 44..52、hInstance 在 56）。
+// 照抄官方的 66 → PrintDlgW 直接失败。
+var PRINTDLG = class{
+	INT lStructSize;         // 0
+	INT _pad0;               // 4
+	pointer hwndOwner;       // 8   (HWND)
+	pointer hDevMode;        // 16  (HGLOBAL)
+	pointer hDevNames;       // 24  (HGLOBAL)
+	pointer hDC;             // 32  (HDC)
+	INT Flags;               // 40
+	WORD nFromPage;          // 44
+	WORD nToPage;            // 46
+	WORD nMinPage;           // 48
+	WORD nMaxPage;           // 50
+	WORD nCopies;            // 52
+	INT _pad1;               // 54
+	pointer hInstance;       // 56
+	pointer lCustData;       // 64
+	pointer lpfnPrintHook;   // 72
+	pointer lpfnSetupHook;   // 80
+	pointer lpPrintTemplateName; // 88
+	pointer lpSetupTemplateName; // 96
+	pointer hPrintTemplate;  // 104
+	pointer hSetupTemplate;  // 112
+}
+
+// PrintDlgW 标志位
+var PD_SELECTION      = 0x1;
+var PD_PAGENUMS       = 0x2;
+var PD_NOSELECTION    = 0x4;
+var PD_NOPAGENUMS     = 0x8;
+var PD_NOWARNING      = 0x80;
+var PD_RETURNDC       = 0x100;
+var PD_RETURNDEFAULT  = 0x400;
+
+// 兜底打印机（装了但没设默认时的虚拟打印机）
+var __printerFallback = {"Microsoft Print to PDF"; "Microsoft XPS Document Writer"};
 
 // 默认打印机名（无打印机 → ""；缓冲区残留用 NUL 截断 + trim）
 printerGetDefault = function(){
@@ -33,15 +80,72 @@ printerGetDefault = function(){
 	return ..string.trim(s);
 }
 
-// 默认打印机的 DC（无打印机 → null）。调用方负责 printerDeleteDC。
-printerGetDC = function(){
-	var name = printerGetDefault();
-	if(#name == 0) return null;
+// 兜底打印机名（第一个能建出 DC 的虚拟打印机；没有 → ""）
+printerFallbackName = function(){
 	var gdi = ..raw.loadDll("gdi32.dll");
 	var createDC = gdi.api("CreateDCW", "pointer(ustring driver, ustring device, null, null)");
-	var hdc = createDC("WINSPOOL", name, null, null);
+	for(i=1;#__printerFallback;1){
+		var hdc = createDC("WINSPOOL", __printerFallback[i], null, null);
+		if(hdc){
+			..nodio.ui.printerDeleteDC(hdc);
+			return __printerFallback[i];
+		}
+	}
+	return "";
+}
+
+// 打印机的 DC（无打印机 → null）。调用方负责 printerDeleteDC。
+// name 不传 = 默认打印机；默认没有时退到虚拟打印机（CI 机常无默认打印机）。
+printerGetDC = function(name){
+	var nm = name : "";
+	if(#nm == 0) nm = printerGetDefault();
+	if(#nm == 0) nm = printerFallbackName();
+	if(#nm == 0) return null;
+	var gdi = ..raw.loadDll("gdi32.dll");
+	var createDC = gdi.api("CreateDCW", "pointer(ustring driver, ustring device, null, null)");
+	var hdc = createDC("WINSPOOL", nm, null, null);
+	if(!hdc){
+		// 名字建不出 DC → 退兜底
+		var fb = printerFallbackName();
+		if(#fb && fb != nm){
+			hdc = createDC("WINSPOOL", fb, null, null);
+			if(hdc) nm = fb;
+		}
+	}
 	if(!hdc) return null;
-	return { hdc = hdc; name = name };
+	return { hdc = hdc; name = nm };
+}
+
+// 页面信息（像素尺寸 + 物理分辨率）
+printerPageInfo = function(hdc){
+	if(!hdc) return null;
+	var gdi = ..raw.loadDll("gdi32.dll");
+	var getCaps = gdi.api("GetDeviceCaps", "int(pointer hdc, int idx)");
+	var w = getCaps(hdc, 8 /*HORZRES*/);
+	var h = getCaps(hdc, 10 /*VERTRES*/);
+	if(w <= 0 || h <= 0) return null;
+	return {
+		w = w;
+		h = h;
+		dpiX = getCaps(hdc, 88 /*LOGPIXELSX*/);
+		dpiY = getCaps(hdc, 90 /*LOGPIXELSY*/);
+	};
+}
+
+// 预览位图尺寸：保持页面纵横比，宽度按 96dpi 折算（600dpi A4 → 794px），
+// 再按 maxW 收口（maxW<=0 = 不收口）。
+printerPreviewSize = function(hdc, maxW){
+	var info = printerPageInfo(hdc);
+	if(!info) return null;
+	var dpiX = info.dpiX ? info.dpiX : 96;
+	var w = ..math.floor(info.w * 96 / dpiX);
+	var h = ..math.floor(info.h * 96 / dpiX);
+	if(w <= 0 || h <= 0) return null;
+	if(maxW && maxW > 0 && w > maxW){
+		h = ..math.floor(h * maxW / w);
+		w = maxW;
+	}
+	return { w = w; h = h; };
 }
 
 // 页数测量（render=false 的 raw.printRichedit；无打印机 → 0）
@@ -58,6 +162,82 @@ printerPrint = function(hdc, hwndEdit){
 	if(!hdc || !hwndEdit) return 0;
 	var n = ..raw.printRichedit(hwndEdit, hdc, true);
 	return (tonumber(n) : 0) > 0 ? n : 0;
+}
+
+// 渲染打印（页码范围，1 基闭区间）→ 实际打印页数
+printerPrintRange = function(hdc, hwndEdit, from, to){
+	if(!hdc || !hwndEdit) return 0;
+	var n = ..raw.printRange(hwndEdit, hdc, from, to);
+	return (tonumber(n) : 0) > 0 ? n : 0;
+}
+
+// 预览页数（预览版面下的页数；与真打印页数一致才说明 WYSIWYG）
+printerPreviewCount = function(hdc, hwndEdit, prevW, prevH){
+	if(!hdc || !hwndEdit) return 0;
+	var n = ..raw.printPreviewCount(hwndEdit, hdc, prevW, prevH);
+	return (tonumber(n) : 0) > 0 ? n : 0;
+}
+
+// 预览出图：把第 pageNo 页画进 hwndDst 客户区。
+// 返回**着墨像素数**（>0 = 页面真有内容；-1 = 渲染失败）。
+printerPreviewPaint = function(hdc, hwndEdit, hwndDst, pageNo, prevW, prevH){
+	if(!hdc || !hwndEdit || !hwndDst) return -1;
+	return ..raw.printPreviewPaint(hwndEdit, hwndDst, hdc, pageNo, prevW, prevH, 0);
+}
+
+// 打印对话框（PrintDlgW）：弹框选打印机/页码范围/份数。
+// 返回 {hdc;from;to;copies;deviceName} 或 null（取消）。
+// ⚠ 返回的 hdc 由**调用方** DeleteDC（官方 win/dlg/print.aardio 同款约定）。
+printerPrintDlg = function(winform, pageCount){
+	return __printDlg(winform, pageCount, PD_RETURNDC | PD_NOWARNING);
+}
+
+// 打印对话框的**不弹框**分支（PD_RETURNDEFAULT）：直接拿默认打印机的
+// DC/DEVMODE/DEVNAMES——自动化与冒烟用（真弹框没法在无人值守下测）。
+printerPrintDlgDefault = function(){
+	return __printDlg(null, 0, PD_RETURNDEFAULT | PD_RETURNDC | PD_NOWARNING);
+}
+
+var __printDlg = function(winform, pageCount, flags){
+	var pd = PRINTDLG();
+	pd.lStructSize = 120;
+	pd.hwndOwner = 0;
+	try{ if(winform) pd.hwndOwner = winform.hwnd }catch(e){}
+	pd.Flags = flags;
+	pd.nMinPage = 1;
+	pd.nMaxPage = (pageCount > 0) ? pageCount : 1;
+	pd.nFromPage = 1;
+	pd.nToPage = (pageCount > 0) ? pageCount : 1;
+	var ok = ::Comdlg32.PrintDlgW(pd);
+	if(!ok) return null;
+	// 设备名从 DEVMODE 读（dmDeviceName 是 WCHAR[32]）
+	var devName = "";
+	try{
+		if(pd.hDevMode){
+			var p = ::GlobalLock(pd.hDevMode);
+			if(p){
+				var s = ..raw.readW(p, 32);
+				if(s){
+					var parts = ..string.split(s, NUL2);
+					devName = parts[1] : "";
+				}
+				var k32 = ..raw.loadDll("kernel32.dll");
+				var unlock = k32.api("GlobalUnlock", "int(pointer hmem)");
+				unlock(pd.hDevMode);
+			}
+		}
+	}catch(e){}
+	// DEVMODE / DEVNAMES 由对话框分配 → 用完必须 GlobalFree
+	// （官方 win/dlg/print.aardio 的 free() 同款）
+	try{ if(pd.hDevMode) ::GlobalFree(pd.hDevMode) }catch(e){}
+	try{ if(pd.hDevNames) ::GlobalFree(pd.hDevNames) }catch(e){}
+	return {
+		hdc = pd.hDC;
+		from = pd.nFromPage;
+		to = pd.nToPage;
+		copies = pd.nCopies;
+		deviceName = devName;
+	};
 }
 
 // DC 收尾

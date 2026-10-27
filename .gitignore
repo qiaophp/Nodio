@@ -5,6 +5,9 @@ out/
 *.user
 *.aps
 
+# 审计/开发 worktree 承载目录（放在仓库内部，避免污染盘根）
+.worktrees/
+
 # editor/scratch
 *.log
 Thumbs.db

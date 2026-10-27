@@ -4423,6 +4423,32 @@ editor = function(winform, opt){
 		..nodio.ui.printerDeleteDC(pr.hdc);
 		return n;
 	};
+	// 打印对话框（第五十九轮续）：PrintDlgW 选打印机 + 页码范围 + 份数，
+	// 打完直接出到对话框给的 DC（**不是**默认打印机）。
+	// 返回 {pages;from;to;copies;deviceName} 或 null（无打印机/取消）。
+	self.printDlg = function(winform){
+		var pr = ..nodio.ui.printerGetDC();
+		if(!pr) return null;
+		var pages = ..nodio.ui.printerPageCount(pr.hdc, ctrl.hwnd);
+		..nodio.ui.printerDeleteDC(pr.hdc);
+		if(pages == 0) return null;
+		var pd = ..nodio.ui.printerPrintDlg(winform, pages);
+		if(!pd || !pd.hdc) return null;
+		var n = ..nodio.ui.printerPrintRange(pd.hdc, ctrl.hwnd, pd.from, pd.to);
+		..nodio.ui.printerDeleteDC(pd.hdc);
+		return {
+			pages = n;
+			from = pd.from;
+			to = pd.to;
+			copies = pd.copies;
+			deviceName = pd.deviceName;
+		};
+	};
+	// 打印预览入口：返回 {hwnd;pages}（hwnd = richedit 句柄）。
+	// 预览浮层自己拿 printerGetDC 的 DC（预览期间持有）。
+	self.previewInfo = function(){
+		return { hwnd = ctrl.hwnd; pages = self.pageCount() };
+	};
 
 	// ---------- 启动 ----------
 	// 查找条必须**最后**建：它是本函数体内对 self 成员的调用，
