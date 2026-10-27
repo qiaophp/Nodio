@@ -6610,7 +6610,36 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   - `TIMELINE-GIT:1`（验证真实 Git 仓库下的提交历史追踪）
   - `TIMELINE-DIFF:1`（验证选中历史版本的 diff 提取并上屏打开）
 - 验证：VM 99/0/0 全部通过，IDE 冒烟 SMOKE OK。
-- ❌ 剩余大项：主题 XML + 插件注册机制 + USR.CFG 键名沿用。
+- ❌ 剩余大项：无（7 批功能全部收口完成）。
+
+## 1.77 第六十三轮：主题 XML + 插件注册机制 + USR.CFG 键名沿用
+
+- **官方 Theme XML 解析与装配**（`lib/nodio/gui/theme.nodio` & `lib/nodio/ui/theme.nodio`）：
+  - 支持官方 `config/themes/*.xml`、`USR.THEME`、`SYS.THEME` 标准 schema：
+    - 结构化提取 `<Theme>` › `<Title>` 与 `<Editor>` 调色板（`Color`、`Background`、`SelectionColor`、`SelectionBackground`、`LineNumberColor`、`LineNumberBackground`、`OutlineColor`、`MatchingBracket`、`Error` 等）；
+    - 针对 Background 色值执行感知亮度判断（`0.299*R + 0.587*G + 0.114*B`），自动选择深色或浅色底座补齐缺省语义角色；
+    - 严格避开位运算符号扩展为负数陷阱，通过高位无符号加权（`0xFF000000 + n`）确保 ARGB 整数精确对齐；
+    - 暴露 `nodio.ui.loadThemeXml(text)`、`loadThemeXmlFile(path)`、`scanThemesDir(dir)`。
+- **USR.CFG 键名双向映射与沿用**（`ide/nodio/app/settings.nodio`）：
+  - 维护官方键名映射表 `KEY_ALIASES`，实现双向同义读写：
+    - `editor_font_size` ↔ `editor.fontSize`（及 `font_size`）；
+    - `editor_font_name` ↔ `editor.fontName`（及 `font_name`）；
+    - `menu_font_name` ↔ `menu_font`；
+    - `dlg_grid` ↔ `dlg.grid`、`dlg_restraint` ↔ `dlg.restraint`、`dlg_margin` ↔ `dlg.margin`、`dlg_snap` ↔ `dlg.snap`、`dlg_zoom_defalut` ↔ `dlg.zoom`、`dlg_grid_width/height`、`dlg_margin_left/top/right/bottom`、`project_mru`。
+  - 读取优先走当前配置，未命中按别名回退，并支持读取候选的官方 `USR.CFG`；写入时自动同步双向键名。
+- **插件注册机制与生命周期管理**（`ide/nodio/app/plugin.nodio`）：
+  - 构建插件管理总成模块 `app.plugin`：
+    - `register(name, path, opt)`：统一纳管插件元数据（名称、绝对路径、形态 pane/view、标题、描述、图标与加载态）；
+    - `unregister(name)`、`get(name)`、`list()`、`count()`：提供插件查询与管理能力；
+    - `scan(dir, opt)`：自动遍历目录检索 `.nodio` / `.aardio` 插件脚本并安全注册；
+    - `createView(name, path, container)`：严格遵循宿主契约，自动剥离脚本尾部的 `win.loopMessage()`，通过 `loadcode` 传入 `container` 作为 `parent=...` 嵌入停靠栏。
+  - `ideCmdImpl` 扩充 `pluginRegister`、`pluginList` 并将 `pluginViewCreate`、`pluginViewShow` 对齐新架构。
+- **回归锁**（`ide_smoke.ps1` 新增 3 断言）：
+  - `THEME-XML:1`（验证 XML 格式解析、感知亮度判定与 ARGB 映射）
+  - `CFG-ALIAS:1`（验证 USR.CFG 官方键名与内部键名双向无损读取与同步）
+  - `PLUGIN-REG:1`（验证插件注册表纳管、查询与目录自动发现）
+- **验证**：VM 99/0/0 全部通过，IDE 冒烟 SMOKE OK，全量特性顺利合龙。
+
 
 ## 1.76 第六十二轮：协议面收口（LSP 语义高亮/修复/形参 + DAP 异常/源码/跳转 + 4 条空壳命令实装）
 

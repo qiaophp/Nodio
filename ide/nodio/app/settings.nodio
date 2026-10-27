@@ -15,7 +15,7 @@
 import nodio.ui.theme;
 import process.popen;
 
-// ---------- 配置存取（%APPDATA%\Nodio\ide.cfg）----------
+// ---------- 配置存取（%APPDATA%\Nodio\ide.cfg 与 官方 USR.CFG 键名沿用）----------
 // NODIO_IDE_CFG 可覆盖路径（无头回归测试用，避免动用户的真实配置）；
 // 不设就是 %APPDATA%\Nodio\ide.cfg。
 var CFG_PATH = function(){
@@ -24,9 +24,44 @@ var CFG_PATH = function(){
 	return ..string.getenv("APPDATA") ++ "\Nodio\ide.cfg";
 }
 
-cfgRead = function(key){
-	if(!key) return null;
-	var text = ..string.load(CFG_PATH());
+// 官方 USR.CFG 键名与内部键名双向映射（第七十轮沿用）
+var KEY_ALIASES = {
+	["editor.fontSize"] = "editor_font_size";
+	editor_font_size = "editor.fontSize";
+	["editor.fontName"] = "editor_font_name";
+	editor_font_name = "editor.fontName";
+	font_size = "editor_font_size";
+	font_name = "editor_font_name";
+	menu_font = "menu_font_name";
+	menu_font_name = "menu_font";
+	["dlg.grid"] = "dlg_grid";
+	dlg_grid = "dlg.grid";
+	["dlg.restraint"] = "dlg_restraint";
+	dlg_restraint = "dlg.restraint";
+	["dlg.margin"] = "dlg_margin";
+	dlg_margin = "dlg.margin";
+	["dlg.snap"] = "dlg_snap";
+	dlg_snap = "dlg.snap";
+	["dlg.zoom"] = "dlg_zoom_defalut";
+	dlg_zoom_defalut = "dlg.zoom";
+	["dlg.grid_width"] = "dlg_grid_width";
+	dlg_grid_width = "dlg.grid_width";
+	["dlg.grid_height"] = "dlg_grid_height";
+	dlg_grid_height = "dlg.grid_height";
+	["dlg.margin_left"] = "dlg_margin_left";
+	dlg_margin_left = "dlg.margin_left";
+	["dlg.margin_top"] = "dlg_margin_top";
+	dlg_margin_top = "dlg.margin_top";
+	["dlg.margin_right"] = "dlg_margin_right";
+	dlg_margin_right = "dlg.margin_right";
+	["dlg.margin_bottom"] = "dlg_margin_bottom";
+	dlg_margin_bottom = "dlg.margin_bottom";
+	project_mru = "project_mru";
+};
+
+var __readRaw = function(path, key){
+	if(!path || !..io.exist(path)) return null;
+	var text = ..string.load(path);
 	if(!text) return null;
 	for(line in ..string.lines(text)){
 		var s = ..string.trim(line);
@@ -38,6 +73,35 @@ cfgRead = function(key){
 		if(k == key) return v;
 	}
 	return null;
+};
+
+cfgRead = function(key){
+	if(!key) return null;
+	var mainPath = CFG_PATH();
+	var v = __readRaw(mainPath, key);
+	if(v !== null) return v;
+
+	var alias = KEY_ALIASES[key];
+	if(alias){
+		v = __readRaw(mainPath, alias);
+		if(v !== null) return v;
+	}
+
+	// 回退检查官方 USR.CFG
+	var usrCfg = ..string.getenv("APPDATA") ++ "\Nodio\USR.CFG";
+	if(!..io.exist(usrCfg)){
+		var cand = "D:\aardio\config\USR.CFG";
+		if(..io.exist(cand)) usrCfg = cand;
+	}
+	if(..io.exist(usrCfg)){
+		v = __readRaw(usrCfg, key);
+		if(v !== null) return v;
+		if(alias){
+			v = __readRaw(usrCfg, alias);
+			if(v !== null) return v;
+		}
+	}
+	return null;
 }
 
 cfgWrite = function(key, val){
@@ -45,10 +109,9 @@ cfgWrite = function(key, val){
 	var path = CFG_PATH();
 	var dir = ..io.splitpath(path).dir;
 	if(dir && !..io.exist(dir)) ..io.createDir(dir);
-	// val === null → **删除**这个键（不写回）。
-	// 写空串不算删除：空串在 aardio 里是真值，读回来还会挡住
-	// 「这个槽位有没有配过」的判断。
 	var bDel = (val === null);
+	var alias = KEY_ALIASES[key];
+
 	var text = "";
 	var old = ..string.load(path);
 	if(old){
@@ -58,38 +121,88 @@ cfgWrite = function(key, val){
 			var p = ..string.indexOf(s, "=");
 			if(p){
 				var k = ..string.trim(..string.left(s, p - 1));
-				if(k == key) continue;
+				if(k == key || (alias && k == alias)) continue;
 			}
 			text = text ++ s ++ '\r\n';
 		}
 	}
 	if(!bDel){
 		text = text ++ key ++ "=" ++ (val : "") ++ '\r\n';
+		if(alias && alias != key){
+			text = text ++ alias ++ "=" ++ (val : "") ++ '\r\n';
+		}
 	}
 	..string.save(path, text);
 	return true;
 }
 
 // ---------- 主题 ----------
-// 合法值只有 "dark" / "light"，其余一律当 dark（配置被手改过也不炸）。
 themeGet = function(){
 	var t = cfgRead("theme");
-	if(t == "light") return "light";
+	if(t && #t) return t;
 	return "dark";
 }
 
-// 只存偏好 —— 真正的应用在 IDE 启动时（main.nodio：app.settings.themeApply()
-// 必须在 import app.shell **之前**调，因为各 chrome 组件是构造期读配色）
 themeSet = function(name){
-	if(name != "light" && name != "dark") return false;
+	if(!name || !#name) return false;
 	return cfgWrite("theme", name);
 }
 
 // 启动时调用：把偏好落到主题系统
 themeApply = function(){
+	// 1. 优先检查 USR.THEME（官方选主题后落盘的文件）
+	var usrTheme = ..string.getenv("APPDATA") ++ "\Nodio\USR.THEME";
+	if(!..io.exist(usrTheme)){
+		var cand = "D:\aardio\config\USR.THEME";
+		if(..io.exist(cand)) usrTheme = cand;
+	}
+	if(..io.exist(usrTheme)){
+		try{
+			var th = nodio.ui.loadThemeXmlFile(usrTheme, "usrTheme");
+			if(th){
+				nodio.ui.themeSet("usrTheme");
+				return "usrTheme";
+			}
+		}catch(e){}
+	}
+
+	// 2. 检查配置里的主题项（可能是主题名、或 xml 文件路径）
 	var t = themeGet();
-	try{ nodio.ui.themeSet(t) }catch(e){}
-	return t;
+	if(t && #t){
+		if(..string.endsWith(t, ".xml", true) && ..io.exist(t)){
+			try{
+				var th = nodio.ui.loadThemeXmlFile(t);
+				if(th){
+					nodio.ui.themeSet(th.name);
+					return th.name;
+				}
+			}catch(e){}
+		}
+		try{
+			nodio.ui.themeSet(t);
+			return t;
+		}catch(e){}
+	}
+
+	// 3. 兜底深色主题
+	try{ nodio.ui.themeSet("dark") }catch(e){}
+	return "dark";
+}
+
+// 罗列所有可用主题清单（深色、浅色 + 官方 themes/*.xml）
+themeList = function(){
+	var list = {"dark"; "light"};
+	var themesDir = "D:\aardio\config\themes";
+	if(..io.exist(themesDir)){
+		try{
+			var xmlThemes = nodio.ui.scanThemesDir(themesDir);
+			for(i=1; #xmlThemes; 1){
+				var th = xmlThemes[i];
+				if(th && th.name) ..table.push(list, th.name);
+			}
+		}catch(e){}
+	}
+	return list;
 }
 
 // ---------- 编辑器字号 ----------

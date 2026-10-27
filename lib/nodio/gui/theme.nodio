@@ -239,4 +239,146 @@ themeRef = function(argb){
 	return (b << 16) | (g << 8) | r;
 }
 
+// ---------- 官方 Theme XML 解析与装配 ----------
+//
+// 官方 config/themes/*.xml 以及 USR.THEME / SYS.THEME 的格式：
+// <Theme>
+//   <Title>深色主题</Title>
+//   <Editor>
+//     <Color>D4D4D4</Color>
+//     <Background>1E1E1E</Background>
+//     <SelectionColor>D4D4D4</SelectionColor>
+//     <SelectionBackground>0083EC</SelectionBackground>
+//     <LineNumberColor>C1B99B</LineNumberColor>
+//     <LineNumberBackground>1E1E1E</LineNumberBackground>
+//     <OutlineColor>808080</OutlineColor>
+//     <MatchingBracket>FF0033</MatchingBracket>
+//     <Error>FF4444</Error>
+//   </Editor>
+// </Theme>
+
+var __hexToArgb = function(h){
+	if(!h) return null;
+	h = ..string.trim(h);
+	if(..string.startsWith(h, "#")) h = ..string.slice(h, 2);
+	if(..string.startsWith(h, "0x") || ..string.startsWith(h, "0X")) h = ..string.slice(h, 3);
+	if(#h == 6){
+		var n = tonumber(h, 16);
+		if(n === null) return null;
+		return 0xFF000000 + n;
+	}
+	if(#h == 8){
+		return tonumber(h, 16);
+	}
+	var n = tonumber(h, 16);
+	if(n === null) return null;
+	return 0xFF000000 + n;
+};
+
+var __parseTag = function(xml, tag){
+	var open = "<" ++ tag ++ ">";
+	var close = "</" ++ tag ++ ">";
+	var p1 = ..string.indexOf(xml, open);
+	if(!p1) return null;
+	var p2 = ..string.indexOf(xml, close, p1 + #open);
+	if(!p2) return null;
+	return ..string.trim(..string.slice(xml, p1 + #open, p2 - 1));
+};
+
+var __cloneTable = function(t){
+	var res = {};
+	for(k, v in t){
+		res[k] = v;
+	}
+	return res;
+};
+
+loadThemeXml = function(xmlText, customName){
+	if(!xmlText || !#xmlText) return null;
+	var title = __parseTag(xmlText, "Title");
+	var edXml = __parseTag(xmlText, "Editor");
+	if(!edXml) edXml = xmlText;
+
+	var fg = __hexToArgb(__parseTag(edXml, "Color"));
+	var bg = __hexToArgb(__parseTag(edXml, "Background"));
+	var selFg = __hexToArgb(__parseTag(edXml, "SelectionColor"));
+	var selBg = __hexToArgb(__parseTag(edXml, "SelectionBackground"));
+	var lnCol = __hexToArgb(__parseTag(edXml, "LineNumberColor"));
+	var lnBg = __hexToArgb(__parseTag(edXml, "LineNumberBackground"));
+	var outl = __hexToArgb(__parseTag(edXml, "OutlineColor"));
+	var errCol = __hexToArgb(__parseTag(edXml, "Error"));
+	var brkCol = __hexToArgb(__parseTag(edXml, "MatchingBracket"));
+
+	// 依据 Background 亮度选择基底主题（深色 vs 浅色）
+	var base = themeDark;
+	if(bg !== null){
+		var r = (bg >> 16) & 0xFF;
+		var g = (bg >> 8) & 0xFF;
+		var b = bg & 0xFF;
+		var lum = 0.299 * r + 0.587 * g + 0.114 * b;
+		if(lum >= 128) base = themeLight;
+	}
+
+	var th = __cloneTable(base);
+	if(bg !== null){
+		th.bgPrimary = bg;
+		th.canvasBg = bg;
+	}
+	if(fg !== null){
+		th.textPrimary = fg;
+	}
+	if(selBg !== null){
+		th.bgSelected = selBg;
+		th.primary = selBg;
+	}
+	if(lnBg !== null){
+		th.bgSecondary = lnBg;
+		th.bgTertiary = lnBg;
+	}
+	if(lnCol !== null){
+		th.textSecondary = lnCol;
+		th.textDim = lnCol;
+	}
+	if(outl !== null){
+		th.borderPrimary = outl;
+		th.borderSecondary = outl;
+	}
+	if(errCol !== null) th.error = errCol;
+	if(brkCol !== null) th.accent = brkCol;
+
+	var tName = customName : (title : "custom");
+	th.name = tName;
+	th.title = title : tName;
+	themes[tName] = th;
+	if(title && title != tName) themes[title] = th;
+	return th;
+};
+
+loadThemeXmlFile = function(path, customName){
+	if(!path || !..io.exist(path)) return null;
+	var txt = ..string.load(path);
+	if(!txt) return null;
+	var name = customName;
+	if(!name){
+		var pi = ..io.splitpath(path);
+		name = pi ? pi.name : null;
+	}
+	return loadThemeXml(txt, name);
+};
+
+scanThemesDir = function(dir){
+	if(!dir || !..io.exist(dir)) return {};
+	var list = {};
+	var files = ..io.listFiles(dir, "*.xml") : {};
+	for(i=1; #files; 1){
+		var f = files[i];
+		if(f && !f.isDir && f.path){
+			var pi = ..io.splitpath(f.path);
+			var th = loadThemeXmlFile(f.path, pi ? pi.name : null);
+			if(th) ..table.push(list, th);
+		}
+	}
+	return list;
+};
+
 }

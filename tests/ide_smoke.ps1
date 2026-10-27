@@ -466,6 +466,11 @@ if ($out -notmatch 'CMD-PL:1')           { Write-Output 'FAIL: ideCmdImpl.proces
 if ($out -notmatch 'CMD-VER:1')          { Write-Output 'FAIL: ideCmdImpl.updateVersion failed'; exit 1 }
 if ($out -notmatch 'CMD-ICO:1')          { Write-Output 'FAIL: ideCmdImpl.getProjectIcon failed'; exit 1 }
 if ($out -notmatch 'CMD-THR:1')          { Write-Output 'FAIL: ideCmdImpl.createThread failed'; exit 1 }
+
+# 主题 XML + 插件注册机制 + USR.CFG 键名沿用（第七十轮）
+if ($out -notmatch 'THEME-XML:1')        { Write-Output 'FAIL: theme XML parsing/loading failed'; exit 1 }
+if ($out -notmatch 'CFG-ALIAS:1')        { Write-Output 'FAIL: USR.CFG key aliases failed'; exit 1 }
+if ($out -notmatch 'PLUGIN-REG:1')       { Write-Output 'FAIL: plugin registration mechanism failed'; exit 1 }
 # WATCH-TYPE:OK  监视窗输入行打字不被 subclass 吞掉（return 0 vs null 的教训）
 if ($out -notmatch 'WATCH-TYPE:OK')    { Write-Output 'FAIL: watch input swallows text (subclass must return null)'; exit 1 }
 # SHOW-REDRAW:0  连续 show(true) 不再反复整块重画（第五十八轮修的闪烁）

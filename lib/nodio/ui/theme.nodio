@@ -13,8 +13,8 @@ namespace nodio.ui{
 import nodio.gui.theme;
 
 // 语义角色 → 旧字段名
-var __legacy = function(){
-	var th = ..nodio.gui.theme();
+var __legacy = function(customTh){
+	var th = customTh : ..nodio.gui.theme();
 	return {
 		name = th.name;
 
@@ -64,6 +64,21 @@ themeName = function(){
 // richedit 这类原生控件要的是 COLORREF，不是 gdip 的 ARGB。
 themeRef = function(argb){
 	return ..nodio.gui.themeRef(argb);
+}
+
+// 官方 Theme XML 解析与加载
+loadThemeXml = function(xmlText, customName){
+	var th = ..nodio.gui.loadThemeXml(xmlText, customName);
+	return th ? __legacy(th) : null;
+}
+
+loadThemeXmlFile = function(path, customName){
+	var th = ..nodio.gui.loadThemeXmlFile(path, customName);
+	return th ? __legacy(th) : null;
+}
+
+scanThemesDir = function(dir){
+	return ..nodio.gui.scanThemesDir(dir);
 }
 
 // 给原生 common control（treeview / listview）上深色 —— **当前不可用**。

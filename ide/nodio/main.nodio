@@ -19,6 +19,7 @@ import app.designer;
 import app.library;
 import app.lspClient;
 import app.dapClient;
+import app.plugin;
 import nodio.designer.registry;
 import nodio.intellisense;   // 第五十一轮：官方 intellisense 词库（补全并入）
 import nodio.ui.dpi;
@@ -3138,25 +3139,17 @@ ideCmdImpl.killOnExit = function(v){
 	return cfgWrite("killOnExit", tostring(v : ""));
 };
 
+ideCmdImpl.pluginRegister = function(name, path, opt){
+	return app.plugin.register(name, path, opt);
+};
+ideCmdImpl.pluginList = function(){
+	return app.plugin.list();
+};
 ideCmdImpl.pluginViewCreate = function(name, path){
 	if(!name || !path) return false;
 	var container = shell.rightDock.addPluginTab(name);
 	if(!container) return false;
-	var code = ..string.load(path);
-	if(!code) return false;
-	// 宿主契约（官方 pane 同款）：子窗体消息由 IDE 主循环派发，脚本尾部的
-	// win.loopMessage() 机械替换为 null;（独立运行不受影响，只有 IDE 内
-	// 加载走这条路径）
-	var tok = "win.loopMessage()";
-	var p = ..string.indexOf(code, tok);
-	while(p){
-		code = ..string.left(code, p - 1) ++ "null;" ++ ..string.slice(code, p + 17);
-		p = ..string.indexOf(code, tok);
-	}
-	var fn = loadcode(code);
-	if(!fn) return false;
-	fn(container);   // 官方 pane 契约：parent=... 变参注入
-	return true;
+	return app.plugin.createView(name, path, container);
 };
 ideCmdImpl.pluginViewShow = function(name){
 	return shell.rightDock.selectCaption(name);
@@ -3164,11 +3157,12 @@ ideCmdImpl.pluginViewShow = function(name){
 
 app.ideCommand.init(shell.winform, ideCmdImpl);
 
-// 内置插件页（官方 extensions/plugin/pane 的对应物）——注册失败不阻断启动
+// 扫描与注册内置及扩展插件（第七十轮：插件注册机制）
 var __paneErr = null;
 try{
 	var __ideDir = ..io.splitpath(..string.getenv("NODIO_RUN") : "").dir;
 	if(__ideDir){
+		app.plugin.scan(__ideDir ++ "plugins", { type = "pane" });
 		app.ideCommand.dispatch("pluginViewCreate", "助手",
 			__ideDir ++ "plugins\tool.nodio");
 	}
@@ -3725,6 +3719,35 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		io.print("CMD-VER:" ++ tostring(__cmdVerOk));
 		io.print("CMD-ICO:" ++ tostring(__cmdIcoOk));
 		io.print("CMD-THR:" ++ tostring(__cmdThrOk));
+
+		// ⑤ 主题 XML + 插件注册机制 + USR.CFG 键名沿用（第七十轮）
+		var __themeXmlOk = 0;
+		try{
+			var testXml = '<Theme><Title>SmokeTheme</Title><Editor><Background>2A2A2A</Background><Color>F0F0F0</Color><SelectionBackground>112233</SelectionBackground></Editor></Theme>';
+			var th = ..nodio.ui.loadThemeXml(testXml, "smokeTheme");
+			if(th && th.bg == 0xFF2A2A2A && th.text == 0xFFF0F0F0 && th.selBg == 0xFF112233) __themeXmlOk = 1;
+		}catch(e){}
+
+		var __cfgAliasOk = 0;
+		try{
+			cfgWrite("editor_font_size", "14");
+			var vFont = cfgRead("editor.fontSize");
+			cfgWrite("dlg.grid", "1");
+			var vGrid = cfgRead("dlg_grid");
+			if(vFont == "14" && vGrid == "1") __cfgAliasOk = 1;
+		}catch(e){}
+
+		var __pluginRegOk = 0;
+		try{
+			app.plugin.register("testPlugin", ..io._exepath, {type="pane"; title="Test"});
+			var pItem = app.plugin.get("testPlugin");
+			var pList = app.plugin.list();
+			if(pItem && pItem.title == "Test" && #pList >= 1) __pluginRegOk = 1;
+		}catch(e){}
+
+		io.print("THEME-XML:" ++ tostring(__themeXmlOk));
+		io.print("CFG-ALIAS:" ++ tostring(__cfgAliasOk));
+		io.print("PLUGIN-REG:" ++ tostring(__pluginRegOk));
 
 	// ---------- 设计 ↔ 源码同步（switchActiveForm 语义） ----------
 	//
