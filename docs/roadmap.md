@@ -1915,3 +1915,21 @@ x64 ~76 (excluded from the denominator per the boundary), GUI-interactive
 > S3 模块外移（COM/regex/GDI 延迟加载 DLL，-300KB）→ S4 内建家族装配器
 > 改造（-400KB 级战役）→ S5 rdata/杂项。/O1 变体已量出 stub 1,869,312 B
 > （-21%），等 A/B 数据定夺是否切换。UPX 维持否决。
+>
+> **体积线 S1b/S3-lite（续）**。① **/O1 全量变体 A/B 否决**：重建 perf
+> 夹具（`_scratch/ab/` loop5m/call5m/str5m）三轮交替实测，/O1 比 /O2+S1
+> 慢 25~40%（loop 1106→1600ms、call 4600→5750ms、str 5200→6700ms），
+> 解释器热循环吃不起 /O1，体积收益（-264KB）不值，**不切换**。② **S4
+> 侦察反转靶子**：/Z7 obj 逐节测量（23,914 个 lambda 节共 1,231KB）+
+> 注册顺序插值归因，最大 lambda 全是**语言核心件**——table/string/
+> coroutine 的 slice/assign/eachArgs/concat/resume/suspend/status/call
+> （8.4~14.2KB/个，源码 8358~9188 行），热且深耦合，不可下沉 lib。
+> S4 可挪空间大幅缩水（估 -100~200KB 而非 -400KB）。③ **S3-lite 落地**：
+> 冷 TU（com/gdi/regex/debug/import/aardio_chunk/entry/lexer）per-file
+> /O1，热 TU 保持 /O2；stub 2,133,504 → 2,100,224 B（-33KB，LTCG 跨 TU
+> 内联削平部分收益）。④ **500KB 物理核算**：不可下沉核心（parser/lexer/
+> interp/runtime/builtins 核心件/ffi/gc/import/debug/chunk + PE 开销
+> ~350KB）合计地板 ~1.6MB——功能不削减前提下，2.1MB → 地板 1.6MB 是
+> 字节极限；「500KB」只可能是**打包形态**（nodio.exe 薄加载器 ≤500KB +
+> 引擎 DLL 随 payload 分发，总字节守恒）。S3（COM/regex/GDI 外移 DLL）
+> 同时服务两个目标，待用户拍板「总字节 vs 发布 exe 体积」后开工。
