@@ -156,6 +156,13 @@ sh = read()
 check("signatureHelp replies null",
       sh is not None and '"result":null' in sh)
 
+# semanticTokens：语义高亮 full 返回 token 数组
+send({"jsonrpc": "2.0", "method": "textDocument/semanticTokens/full", "params": {
+    "textDocument": {"uri": "file:///d:/probe.nodio"}}, "id": 36})
+st = read()
+check("semanticTokens returns data",
+      st is not None and '"data":[' in st and len(st) > 30)
+
 # unknown request -> null result, no hang
 send({"jsonrpc": "2.0", "method": "textDocument/unknownXyz", "params": {
     "textDocument": {"uri": "file:///d:/probe.nodio"}}, "id": 7})

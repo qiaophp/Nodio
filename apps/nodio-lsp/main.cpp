@@ -1539,6 +1539,207 @@ static std::string FormattingFor(const wstring& text)
     return out;
 }
 
+// ---------------- 语义高亮 / 快速修复 / 参数提示（第六十一轮）----------------
+
+struct RawToken
+{
+    int line0 = 0;
+    int col0 = 0;
+    int len = 0;
+    int type = 0; // 0:comment, 1:keyword, 2:string, 3:number, 4:function, 5:variable, 6:type, 7:parameter, 8:property
+    int modifiers = 0;
+    size_t pos = 0;
+};
+
+static std::string SemanticTokensFor(const wstring& text, int startLine = -1, int endLine = -1)
+{
+    std::vector<size_t> off;
+    ComputeLineOffsets(text, off);
+    if (off.empty()) return "{\"data\":[]}";
+
+    auto posToLineCol = [&](size_t pos, int& l0, int& c0) {
+        auto it = std::upper_bound(off.begin(), off.end(), pos);
+        l0 = (it == off.begin()) ? 0 : (int)(it - off.begin() - 1);
+        c0 = (int)(pos - off[l0]);
+    };
+
+    std::vector<RawToken> tokens;
+
+    // 1. 注释扫描
+    for (size_t i = 0; i < text.size(); i++)
+    {
+        if (text[i] == L'/' && i + 1 < text.size())
+        {
+            if (text[i + 1] == L'/')
+            {
+                size_t start = i;
+                while (i < text.size() && text[i] != L'\n') i++;
+                int l0 = 0, c0 = 0;
+                posToLineCol(start, l0, c0);
+                tokens.push_back({ l0, c0, (int)(i - start), 0, 0, start });
+            }
+            else if (text[i + 1] == L'*')
+            {
+                size_t start = i;
+                i += 2;
+                while (i + 1 < text.size() && !(text[i] == L'*' && text[i + 1] == L'/')) i++;
+                if (i + 1 < text.size()) i += 2;
+                int l0 = 0, c0 = 0;
+                posToLineCol(start, l0, c0);
+                tokens.push_back({ l0, c0, (int)(i - start), 0, 0, start });
+            }
+        }
+    }
+
+    // 2. 词法 token
+    wstring err;
+    std::vector<Tok> toks = Lex(text, &err);
+    for (size_t k = 0; k < toks.size(); k++)
+    {
+        const Tok& t = toks[k];
+        if (t.pos >= text.size() || t.t == TNL || t.t == TEnd || t.t == TPunct) continue;
+        int l0 = 0, c0 = 0;
+        posToLineCol(t.pos, l0, c0);
+        int tokType = 5;
+        int len = (int)t.text.size();
+        if (t.t == TKw) tokType = 1;
+        else if (t.t == TStr)
+        {
+            tokType = 2;
+            len += 2;
+        }
+        else if (t.t == TNum) tokType = 3;
+        else if (t.t == TIdent)
+        {
+            bool isCall = false;
+            size_t nextIdx = k + 1;
+            while (nextIdx < toks.size() && toks[nextIdx].t == TNL) nextIdx++;
+            if (nextIdx < toks.size() && toks[nextIdx].t == TPunct && toks[nextIdx].text == L"(")
+                isCall = true;
+            if (isCall) tokType = 4;
+            else if (!t.text.empty() && t.text[0] >= L'A' && t.text[0] <= L'Z') tokType = 6;
+            else tokType = 5;
+        }
+        if (len <= 0) len = 1;
+        tokens.push_back({ l0, c0, len, tokType, 0, t.pos });
+    }
+
+    // 3. 排序
+    std::sort(tokens.begin(), tokens.end(), [](const RawToken& a, const RawToken& b) {
+        if (a.line0 != b.line0) return a.line0 < b.line0;
+        return a.col0 < b.col0;
+    });
+
+    // 4. 相对增量编码
+    std::string dataStr;
+    int prevLine = 0;
+    int prevCol = 0;
+    bool first = true;
+    for (const auto& tk : tokens)
+    {
+        if (startLine >= 0 && endLine >= 0)
+        {
+            if (tk.line0 < startLine || tk.line0 > endLine) continue;
+        }
+        int dl = tk.line0 - prevLine;
+        int dc = (dl == 0) ? (tk.col0 - prevCol) : tk.col0;
+        if (dc < 0) continue;
+        if (!first) dataStr += ",";
+        first = false;
+        dataStr += std::to_string(dl) + "," + std::to_string(dc) + "," +
+                   std::to_string(tk.len) + "," + std::to_string(tk.type) + "," +
+                   std::to_string(tk.modifiers);
+        prevLine = tk.line0;
+        prevCol = tk.col0;
+    }
+    return "{\"resultId\":\"1\",\"data\":[" + dataStr + "]}";
+}
+
+static std::string CodeActionFor(const wstring& uri, const std::string& msg, const wstring& text)
+{
+    // context.diagnostics 为空时回空数组（契约）
+    size_t diagPos = msg.find("\"diagnostics\":[");
+    bool hasDiag = false;
+    if (diagPos != std::string::npos)
+    {
+        size_t nextChar = diagPos + 15;
+        while (nextChar < msg.size() && (msg[nextChar] == ' ' || msg[nextChar] == '\t' || msg[nextChar] == '\r' || msg[nextChar] == '\n')) nextChar++;
+        if (nextChar < msg.size() && msg[nextChar] != ']') hasDiag = true;
+    }
+    if (!hasDiag) return "[]";
+
+    std::string fmtEdits = FormattingFor(text);
+    return "[{"
+           "\"title\":\"格式化此文档 (Format Document)\","
+           "\"kind\":\"source.fixAll\","
+           "\"edit\":{\"changes\":{" + JStr(uri) + ":" + fmtEdits + "}}"
+           "}]";
+}
+
+static std::string SignatureHelpFor(const wstring& text, int line1, int col0)
+{
+    std::vector<size_t> off;
+    ComputeLineOffsets(text, off);
+    if (line1 < 1 || (size_t)line1 > off.size()) return "null";
+    size_t ls = off[line1 - 1];
+    size_t le = (size_t)line1 < off.size() ? off[line1] : text.size();
+    while (le > ls && (text[le - 1] == L'\n' || text[le - 1] == L'\r')) le--;
+    if (col0 < 0) col0 = 0;
+    if ((size_t)col0 > le - ls) col0 = (int)(le - ls);
+    size_t pos = ls + col0;
+
+    int parenDepth = 0;
+    size_t callParen = std::string::npos;
+    int commas = 0;
+    for (size_t i = pos; i > ls; --i)
+    {
+        wchar_t c = text[i - 1];
+        if (c == L')') parenDepth++;
+        else if (c == L'(')
+        {
+            if (parenDepth == 0)
+            {
+                callParen = i - 1;
+                break;
+            }
+            parenDepth--;
+        }
+        else if (c == L',' && parenDepth == 0)
+        {
+            commas++;
+        }
+    }
+    if (callParen == std::string::npos) return "null";
+
+    size_t fnEnd = callParen;
+    while (fnEnd > ls && (text[fnEnd - 1] == L' ' || text[fnEnd - 1] == L'\t')) fnEnd--;
+    size_t fnStart = fnEnd;
+    while (fnStart > ls && (::iswalnum(text[fnStart - 1]) || text[fnStart - 1] == L'_' || text[fnStart - 1] == L'.')) fnStart--;
+    if (fnStart >= fnEnd) return "null";
+    wstring fnName = text.substr(fnStart, fnEnd - fnStart);
+
+    wstring sig = fnName + L"(...)";
+    for (auto& kv : g_index)
+    {
+        for (auto& s : kv.second.syms)
+        {
+            if (s.name == fnName)
+            {
+                sig = s.qual.empty() ? s.name : s.qual;
+                sig += L"(...)";
+                break;
+            }
+        }
+    }
+    return "{\"signatures\":[{"
+           "\"label\":" + JStr(sig) + ","
+           "\"documentation\":\"Nodio 函数调用\","
+           "\"parameters\":[{\"label\":\"arg0\"},{\"label\":\"arg1\"},{\"label\":\"arg2\"}]"
+           "}],"
+           "\"activeSignature\":0,"
+           "\"activeParameter\":" + std::to_string(commas) + "}";
+}
+
 // 工作区符号搜索（项目符号搜索框）
 static std::string WorkspaceSymbols(const wstring& query)
 {
@@ -1593,7 +1794,10 @@ int main()
                 "\"definitionProvider\":true,"
                 "\"referencesProvider\":true,"
                 "\"renameProvider\":true,"
-                "\"workspaceSymbolProvider\":true"
+                "\"workspaceSymbolProvider\":true,"
+                "\"codeActionProvider\":true,"
+                "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},"
+                "\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"comment\",\"keyword\",\"string\",\"number\",\"function\",\"variable\",\"type\",\"parameter\",\"property\"],\"tokenModifiers\":[\"declaration\",\"definition\",\"readonly\",\"static\"]},\"full\":true,\"range\":true}"
                 "},"
                 "\"serverInfo\":{\"name\":\"nodio-lsp\",\"version\":\"0.3\"}}");
         }
@@ -1773,15 +1977,60 @@ int main()
                 result = FormattingFor(it->second.text);
             Respond(id, result);
         }
+        else if (method == "textDocument/semanticTokens/full")
+        {
+            wstring uri = ParamUri(msg);
+            auto it = g_docs.find(uri);
+            std::string result = "{\"data\":[]}";
+            if (it != g_docs.end())
+                result = SemanticTokensFor(it->second.text);
+            Respond(id, result);
+        }
+        else if (method == "textDocument/semanticTokens/range")
+        {
+            wstring uri = ParamUri(msg);
+            auto it = g_docs.find(uri);
+            std::string result = "{\"data\":[]}";
+            if (it != g_docs.end())
+            {
+                int sl = 0, el = 999999;
+                size_t pRange = msg.find("\"range\":");
+                if (pRange != std::string::npos)
+                {
+                    std::string sStart = JsonNumber(msg.substr(pRange), "line");
+                    if (!sStart.empty()) sl = atoi(sStart.c_str());
+                    size_t pEnd = msg.find("\"end\":", pRange);
+                    if (pEnd != std::string::npos)
+                    {
+                        std::string sEnd = JsonNumber(msg.substr(pEnd), "line");
+                        if (!sEnd.empty()) el = atoi(sEnd.c_str());
+                    }
+                }
+                result = SemanticTokensFor(it->second.text, sl, el);
+            }
+            Respond(id, result);
+        }
         else if (method == "textDocument/codeAction")
         {
-            // v1：无 quick-fix 源，返回空数组（协议完整）
-            Respond(id, "[]");
+            wstring uri = ParamUri(msg);
+            auto it = g_docs.find(uri);
+            std::string result = "[]";
+            if (it != g_docs.end())
+                result = CodeActionFor(uri, msg, it->second.text);
+            Respond(id, result);
         }
         else if (method == "textDocument/signatureHelp")
         {
-            // v1：形参数据源暂缺（客户端悬浮签名/词库承担），返回 null
-            Respond(id, "null");
+            wstring uri = ParamUri(msg);
+            auto it = g_docs.find(uri);
+            std::string result = "null";
+            if (it != g_docs.end())
+            {
+                int line = 1, col = 0;
+                ParamPos(msg, &line, &col);
+                result = SignatureHelpFor(it->second.text, line, col);
+            }
+            Respond(id, result);
         }
         else if (method == "workspace/symbol")
         {

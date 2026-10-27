@@ -460,6 +460,12 @@ if ($out -notmatch 'TERM-HIST:1')       { Write-Output 'FAIL: terminal history r
 if ($out -notmatch 'TIMELINE-LOCAL:1')   { Write-Output 'FAIL: timeline local snapshot failed'; exit 1 }
 if ($out -notmatch 'TIMELINE-GIT:1')     { Write-Output 'FAIL: timeline git history failed'; exit 1 }
 if ($out -notmatch 'TIMELINE-DIFF:1')    { Write-Output 'FAIL: timeline diff execution failed'; exit 1 }
+
+# 外部命令补全（第六十一轮收口）：processList / updateVersion / getProjectIcon / createThread
+if ($out -notmatch 'CMD-PL:1')           { Write-Output 'FAIL: ideCmdImpl.processList failed'; exit 1 }
+if ($out -notmatch 'CMD-VER:1')          { Write-Output 'FAIL: ideCmdImpl.updateVersion failed'; exit 1 }
+if ($out -notmatch 'CMD-ICO:1')          { Write-Output 'FAIL: ideCmdImpl.getProjectIcon failed'; exit 1 }
+if ($out -notmatch 'CMD-THR:1')          { Write-Output 'FAIL: ideCmdImpl.createThread failed'; exit 1 }
 # WATCH-TYPE:OK  监视窗输入行打字不被 subclass 吞掉（return 0 vs null 的教训）
 if ($out -notmatch 'WATCH-TYPE:OK')    { Write-Output 'FAIL: watch input swallows text (subclass must return null)'; exit 1 }
 # SHOW-REDRAW:0  连续 show(true) 不再反复整块重画（第五十八轮修的闪烁）

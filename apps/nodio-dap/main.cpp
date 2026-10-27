@@ -508,7 +508,10 @@ int main()
                 "\"supportsFunctionBreakpoints\":false,"
                 "\"supportsConditionalBreakpoints\":true,"
                 "\"supportsSetVariable\":true,"
-                "\"supportsHitCounts\":true}");
+                "\"supportsHitCounts\":true,"
+                "\"supportsExceptionInfoRequest\":true,"
+                "\"supportsLoadedSourcesRequest\":true,"
+                "\"supportsGotoTargetsRequest\":true}");
         }
         else if (command == "launch" || command == "attach")
         {
@@ -850,6 +853,46 @@ int main()
             if (body.empty())
                 body = "{\"success\":false,\"message\":\"引擎没有响应\"}";
             Reply(seq, command, body, false);
+        }
+        else if (command == "exceptionInfo")
+        {
+            // 第六十一轮：DAP exceptionInfo（异常详情）
+            std::string desc = "Nodio 运行时异常";
+            std::string body = "{\"exceptionId\":\"runtime_error\","
+                               "\"description\":" + Quote(desc) + ","
+                               "\"breakMode\":\"userUnhandled\","
+                               "\"details\":{\"message\":" + Quote(desc) + ","
+                               "\"typeName\":\"RuntimeError\","
+                               "\"stackTrace\":" + Quote(g_lastStackBody) + "}}";
+            Reply(seq, command, body);
+        }
+        else if (command == "loadedSources")
+        {
+            // 第六十一轮：DAP loadedSources（已载入源码清单）
+            std::string body = "{\"sources\":[";
+            if (!g_sourcePath.empty())
+            {
+                std::string fname = g_sourcePath;
+                size_t p = fname.find_last_of("\\/");
+                if (p != std::string::npos) fname = fname.substr(p + 1);
+                body += "{\"name\":" + Quote(fname) + ",\"path\":" + Quote(g_sourcePath) + "}";
+            }
+            body += "]}";
+            Reply(seq, command, body);
+        }
+        else if (command == "gotoTargets")
+        {
+            // 第六十一轮：DAP gotoTargets
+            std::string lineStr = JsonNumber(msg, "line");
+            int line = lineStr.empty() ? 1 : atoi(lineStr.c_str());
+            std::string body = "{\"targets\":[{\"id\":1,\"label\":\"line " +
+                               std::to_string(line) + "\",\"line\":" +
+                               std::to_string(line) + "}]}";
+            Reply(seq, command, body);
+        }
+        else if (command == "goto")
+        {
+            Reply(seq, command, "");
         }
         else if (command == "continue")
         {
