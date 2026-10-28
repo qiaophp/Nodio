@@ -6690,3 +6690,37 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   - 新增 `textDocument/references`（Location 数组≥2 处）、`textDocument/rename`（WorkspaceEdit 双编辑）、非法新名拒绝（null）三项协议断言；IDE 端跨文件链路由 `tests/ide_nav_smoke.ps1` 既有覆盖（NAV SMOKE OK）。
 - **回归**：VM 套件 99/99/0 全绿，IDE 冒烟 `SMOKE OK`（新增 VARS-SETVAR/SNIP-EXPAND/SPLIT-DOC/PUB-WIZARD/PUB-WIZARD-UI），LSP 冒烟 27 项全绿，NAV 冒烟 `NAV SMOKE OK`；发布器端到端实测（版本资源可读 + 补丁清单可启动 + UAC 写入）。
 - 🏁 剩余大项：无。
+
+## 1.82 第六十八轮：文件编码支持（GBK/ANSI/BOM/UTF-16 探测与原样写回）+ 输出面板报错双击跳转
+
+- **文件编码支持**（`ide/nodio/main.nodio`）：
+  - `fileEnc` 表（全路径 → `utf8`/`utf8-bom`/`gbk`/`utf16le`/`utf16be`）+
+    `fileRead()`（探测）+ `fileWrite()`（按编码落盘）三个入口；
+  - 探测口径：① BOM（`EF BB BF` / `FF FE` / `FE FF`）；② 无 BOM 时用
+    `string.load`（严格 UTF-8）与 io 流宽松解码**对比**——一致即合法 UTF-8，
+    不一致则按 GBK 解码，并做**三重往返校验**（text→GBK 字节→再解码 == 原 text，
+    防「GBK 碰巧解出一串假中文」），往返不无损才退宽松 UTF-8 兜底（内容不丢）；
+  - 接线五处：`openTab`（探测入账）、`atomicSaveFile`（按 `fileEnc` 转载荷，
+    大小校验用 `#payload`——GBK 字节串 `#`=原始字节、BOM 文本 `#`=UTF-8 字节，
+    两个口径都等于磁盘字节数）、`saveFileAs`（编码随文档走）、
+    `navApplyRename`（关闭的文件按原编码读+写）、（类视图/资源扫描与行数统计
+    仍走 `string.load`，只取 ASCII 符号与行结构，不做三重解码）；
+  - 引擎侧语义全部探针验证：`io` 流 `read("raw")` 返回**从当前位置到尾**的原始
+    字节（先 `read(4)` 再 `read("raw")` 会截剩尾巴——必须一次读全量）、
+    `read` 对空文件返回 null、`string.fromto` 的 1200/1201 **只能解码不能编码**
+    （`WideCharToMultiByte` 拒绝 1200），故 UTF-16 源文件保存时升级为 UTF-8 BOM。
+- **输出面板报错双击跳转**（`ide/nodio/app/shell.nodio` + `main.nodio`）：
+  - subclass 输出面板 `richedit` 吃 `WM_LBUTTONDBLCLK`：按光标行（第一击已定位光标）
+    取行文本 → `outputParseJump()` 解析 → `hooks.onOutputJump(path, line)`；
+  - 解析口径与引擎落点标记严格对齐（`engine/runtime.cpp` `AppendErrorLocation`）：
+    落点永远是消息里**最后一个** `" @ "`——`@ <file>:<n>` 或 `@ 行 <n>`；
+    文件路径捕获用 `[^@]+` 约束，保证多 `@` 消息取到的是最后一个落点；
+  - 落点有文件则开文件并 `gotoLine`（1 基），只有行号则按当前文档定位
+    （与调试面板同一口径）；相对路径先按进程当前目录、再按工程根兜底；
+  - 已知限制：richedit 的「行」是**显示行**——报错行被软换行拆成多段时，
+    要点到含落点标记的那一段。
+- **回归**：VM 套件 99/99/0 全绿；IDE 冒烟 `IDE-SMOKE-OK`（新增 `ENC:1`、
+  `OUT-JUMP:1`、`OUT-JUMP-UI:1`——其中 OUT-JUMP-UI 是**真发**
+  `WM_LBUTTONDOWN/UP/DBLCLK` 消息到输出面板（2,2）后的端到端断言）；
+  LSP 冒烟 `LSP-SMOKE-OK`；NAV 冒烟 `NAV SMOKE OK`。
+- 🏁 剩余大项：无。

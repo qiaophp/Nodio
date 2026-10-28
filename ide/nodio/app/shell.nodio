@@ -446,6 +446,7 @@ var hooks = {
 	onCloseTab    = null;     // function(path) — 返回 true 才允许关闭
 	onDocChange   = null;     // function(path, text) — 文档内容变了
 	onRun         = null;     // function()
+	onOutputJump  = null;     // function(path, line) — 输出面板双击报错行跳转
 	onDebug       = null;     // function()
 	onDebugStep   = null;     // function() — 单步跳过（F11）
 	onStopDebug   = null;     // function()
@@ -635,6 +636,37 @@ var __imSub = nodio.ui.subclass(imEd.hwnd, function(hwnd, msg, wp, lp){
 	}
 	return null;     // ⚠ 返回 0 = 吞消息（subclass 约定 null = 交回原过程；
 });                    // 写 0 会让立即窗口打不进字，watch 同款教训）
+
+// 输出面板双击跳转（第六十八轮）：双击报错行 → 解析落点 → onOutputJump。
+// 引擎报错的落点标记（engine/runtime.cpp AppendErrorLocation）永远是消息里
+// **最后一个** "@ "：`... @ 行 <n>`（当前文档）或 `... @ <file>:<n>`。
+// 行文本用官方包装 lineText()（EM_GETLINE + raw.buffer 结构初始化）；
+// 第一击已把光标放到点击处，lineFromChar() 不传参取的就是光标行。
+// 已知限制：报错行若被软换行拆成多段，得点到含落点标记的那一段
+// （richedit 的「行」是显示行）。
+// 解析单独导出（裸赋值）供冒烟自检直测：shell.outputParseJump。
+outputParseJump = function(lineText){
+	if(!lineText) return null;
+	// ⚠ 引擎 regex 的 % 是配对定界符语法（%() 等），类只有 \s \d —— 用字面空格
+	var p, n = ..string.match(lineText, "@ ([^@]+):(\d+)\s*$");
+	if(p && n) return { path = ..string.trim(p); line = tonumber(n) };
+	var n2 = ..string.match(lineText, "@ 行 (\d+)\s*$");
+	if(n2) return { path = null; line = tonumber(n2) };
+	return null;
+}
+var __outSub = nodio.ui.subclass(outEd.hwnd, function(hwnd, msg, wp, lp){
+	if(msg == 0x203/*_WM_LBUTTONDBLCLK*/){
+		var j = null;
+		try{
+			j = outputParseJump(outEd.lineText(outEd.lineFromChar()));
+		}catch(eOj){}
+		if(j && hooks.onOutputJump){
+			try{ hooks.onOutputJump(j.path, j.line) }catch(eHj){}
+			return 1;    // 吞掉默认的「双击选词」
+		}
+	}
+	return null;
+});
 // 「AI」页不是原生 richedit 了（是 app.ai 面板），染色由面板自己做
 // 问题列表已改成自绘（nodio.ui.list），不再受原生 listview 的配色限制
 

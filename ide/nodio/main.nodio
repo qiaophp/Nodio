@@ -606,7 +606,16 @@ var navApplyRename = function(edits, newName){
 	for(path, es in byFile){
 		navSortEdits(es);
 		var isOpen = (shell.tabCurPath() == path);
-		var text = isOpen ? shell.tabGetText(path) : ..string.load(path);
+		// 关闭的文件按原编码读（第六十八轮）：GBK 文件改名/改内容不乱码
+		var frEnc = "utf8";
+		var text = null;
+		if(isOpen){
+			text = shell.tabGetText(path);
+		}
+		else{
+			var fr = fileRead(path);
+			if(fr){ text = fr.text; frEnc = fr.enc }
+		}
 		if(!text) continue;
 		var ok = true;
 		for(j=1;#es;1){
@@ -622,7 +631,9 @@ var navApplyRename = function(edits, newName){
 			shell.tabSetDirty(path, true);
 		}
 		else{
-			..string.save(path, text);
+			// 按原编码写回（第六十八轮）：GBK 文件跨文件重命名不变成 UTF-8
+			fileWrite(path, text, frEnc);
+			fileEnc[..io.fullpath(path)] = frEnc;
 		}
 		// 新内容推给 LSP，索引要跟上
 		app.lspClient.pushDoc(path, text);
@@ -1496,13 +1507,78 @@ newFile = function(initialText){
 	return true;
 }
 
+// ---------- 文件编码（第六十八轮） ----------
+//
+// 源文件不止 UTF-8：老代码常是 GBK/ANSI，带 BOM 的 UTF-8、UTF-16 也真实
+// 存在。打开时探测、保存时按原编码写回，让「打开 → 不改 → 保存」对任意
+// 支持的编码都是**字节级无损**的闭环。
+//
+// 探测口径（每一步都在引擎上探针验证过，台账 §1.82）：
+//   · BOM：EF BB BF → utf8-bom；FF FE → utf16le；FE FF → utf16be
+//   · 无 BOM：string.load（严格 UTF-8，非法字节会回退成字节串乱码）对比
+//     io 流的宽松解码 —— 一致 = 合法 UTF-8；不一致 = 非 UTF-8，按 GBK 解码
+//     并做**三重往返校验**（text→GBK 字节→再解码 == 原 text，防「GBK 碰巧
+//     解出一串假中文」）；往返不无损才退宽松 UTF-8 兜底（保内容不丢）。
+//   · UTF-16 只读：fromto 收 1200/1201 解码，但写不回（引擎
+//     WideCharToMultiByte 拒绝 1200）—— 保存时升级为 UTF-8 BOM。
+//
+// ⚠ 类视图/资源扫描与行数统计仍走 string.load：符号和行结构只需要
+//   ASCII 语义，逐文件三重解码太贵（已知限制，台账 §1.82）。
+// ⚠ io 流 read 对空文件返回 null（引擎 all.empty() 短路），一律按 "" 兜底。
+
+fileEnc = {};   // 全路径 → "utf8"|"utf8-bom"|"gbk"|"utf16le"|"utf16be"
+
+// 读文件并探测编码。返回 {text=..; enc=..}，打不开返回 null。
+fileRead = function(path){
+	var h = ..io.open(path, "rb");
+	if(!h) return null;
+	var all = h.read("raw");
+	h.close();
+	if(all === null || all === undefined) all = "";
+	if(#all >= 3 && ..string.indexOf(all, '\xEF\xBB\xBF') == 1){
+		return { text = ..string.load(path); enc = "utf8-bom" };
+	}
+	if(#all >= 2 && ..string.indexOf(all, '\xFF\xFE') == 1){
+		var body = (#all > 2) ? ..string.slice(all, 3, null, true) : "";
+		return { text = ..string.fromto(body, 1200); enc = "utf16le" };
+	}
+	if(#all >= 2 && ..string.indexOf(all, '\xFE\xFF') == 1){
+		var body = (#all > 2) ? ..string.slice(all, 3, null, true) : "";
+		return { text = ..string.fromto(body, 1201); enc = "utf16be" };
+	}
+	// 无 BOM：严格 vs 宽松，不一致 → GBK 候选
+	var strict = ..string.load(path);
+	if(strict === null || strict === undefined) strict = "";
+	var loose = null;
+	var h2 = ..io.open(path, "rb");
+	if(h2){ loose = h2.read("utf8"); h2.close(); }
+	if(loose === null || loose === undefined) loose = strict;
+	if(strict == loose) return { text = strict; enc = "utf8" };
+	var t = ..string.fromto(strict, "gbk");
+	if(t){
+		var back = ..string.fromto(t, "", "gbk");
+		var t2 = back ? ..string.fromto(back, "gbk") : null;
+		if(t2 == t) return { text = t; enc = "gbk" };
+	}
+	// 连 GBK 往返都不无损：宽松解码兜底（至少内容不丢）
+	return { text = loose; enc = "utf8" };
+}
+
+// 按编码写文件（utf16 写回升级为 UTF-8 BOM，见上）。
+fileWrite = function(path, text, enc){
+	if(enc == "gbk") return ..string.save(path, ..string.fromto(text, "", "gbk"));
+	if(enc == "utf8-bom") return ..string.save(path, '\uFEFF' ++ text);
+	return ..string.save(path, text);
+}
+
 // the tree stores absolute paths as node data
 openTab = function(path){
-	// 用 string.load 而不是 io.readFile：
-	// 官方 io.readFile = file.read，读回来的是**原始字节**（每个字节一个字符），
-	// UTF-8 中文源码会整篇乱码；string.load 按 UTF-8 解码（还认 BOM）。
-	var txt = ..string.load(path);
-	if(txt === null) return false;
+	// 编码探测读（第六十八轮）：string.load 的严格 UTF-8 之外，
+	// 还认 GBK / BOM / UTF-16，读回来都是正文文本。
+	var fr = fileRead(path);
+	if(fr === null) return false;
+	var txt = fr.text;
+	fileEnc[..io.fullpath(path)] = fr.enc;
 	shell.tabAdd(path, txt);
 	curFile = path;
 	fillOutline();
@@ -1526,12 +1602,24 @@ openTab = function(path){
 // 杜绝断电/崩溃/磁盘满导致原文件截断损坏。
 var atomicSaveFile = function(dstPath, text){
 	var fullDst = ..io.fullpath(dstPath);
+	// 按该文件自己的编码落盘（第六十八轮）：GBK 文件保存不变成 UTF-8，
+	// 带 BOM 的文件保留 BOM。#payload 各口径都等于磁盘字节数：
+	//   GBK 字节串 # = 原始字节；BOM 文本 # = UTF-8 字节（含 3 字节 BOM）。
+	var enc = fileEnc[fullDst] : "utf8";
+	var payload = text;
+	if(enc == "gbk"){
+		payload = ..string.fromto(text, "", "gbk");
+		if(payload === null || payload === undefined) payload = text;
+	}
+	elseif(enc == "utf8-bom"){
+		payload = '\uFEFF' ++ text;
+	}
 	var tmpPath = fullDst ++ ".nodio.tmp";
-	if(!..string.save(tmpPath, text)){
+	if(!..string.save(tmpPath, payload)){
 		return false;
 	}
 	var fsize = ..io.getSize(tmpPath);
-	if(fsize === null || fsize != #text){
+	if(fsize === null || fsize != #payload){
 		try{ ..io.remove(tmpPath) }catch(e){}
 		return false;
 	}
@@ -1547,7 +1635,7 @@ var atomicSaveFile = function(dstPath, text){
 		}
 	}
 	if(!ok){
-		..string.save(fullDst, text);
+		..string.save(fullDst, payload);
 		try{ ..io.remove(tmpPath) }catch(e){}
 	}
 	return true;
@@ -1608,6 +1696,8 @@ saveFileAs = function(path){
 		shell.setStatus("另存为失败: " ++ np);
 		return false;
 	}
+	// 编码跟着文档走（第六十八轮）：GBK 文件另存后保存仍是 GBK
+	fileEnc[..io.fullpath(np)] = fileEnc[..io.fullpath(path)] : "utf8";
 	curFile = np;
 	atomicSaveFile(np, shell.tabTextForSave(np));
 	shell.tabMarkSaved(np);
@@ -2102,6 +2192,28 @@ shell.searchPanel.onStatus = function(text){
 shell.searchPanel.onOpenFile = function(path, line){
 	if(!openFile(path)) return;
 	if(line) shell.editor.gotoLine(line);
+}
+
+// 输出面板双击报错行 → 跳转（第六十八轮）。
+//   path 为空 = 当前文档（引擎报「@ 行 n」时不知道归属文件；
+//   运行的通常就是当前文档，与调试面板「定位当前文档」同一口径）。
+//   相对路径先按进程当前目录（io.fullpath），再按工程根兜底。
+shell.hooks.onOutputJump = function(path, line){
+	if(!line) return;
+	if(path && !..io.exist(path)){
+		var full = ..io.fullpath(path);
+		if(full && ..io.exist(full)){
+			path = full;
+		}
+		elseif(proj){
+			var cand = proj.root ++ path;
+			if(..io.exist(cand)) path = cand;
+		}
+	}
+	if(path){
+		if(!openFile(path)) return;
+	}
+	shell.editor.gotoLine(line);
 }
 // 文档内容变了：大纲要重建（标个脏，心跳里统一做，别在按键回调里重扫全文）
 var outlineDirty = false;
@@ -3818,6 +3930,91 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 		io.print("PUBWIZ-ERR:" ++ tostring(__wizErr));
 	}
 	io.print("PUB-WIZARD-UI:" ++ tostring(__wizUi));
+
+	// 文件编码（第六十八轮）：GBK/UTF-8 BOM/UTF-16 探测 + 按原编码写回闭环
+	//   ① GBK 读回正文；② fileWrite 落盘字节与原文件一致（无损闭环）；
+	//   ③ BOM 识别；④ UTF-16LE 解码；⑤ openTab 探测入账 + atomicSaveFile
+	//   按原编码落盘（接线）。
+		var __encOk = 0;
+		var __ok1 = 0, __ok2 = 0, __ok3 = 0, __ok4 = 0, __ok5 = 0;
+		try{
+			var __ed = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_enc_"
+				++ ..time.tick());
+			if(!..io.exist(__ed)) ..io.createDir(__ed);
+			var __gbk = ..io.joinpath(__ed, "gbk.nodio");
+			var __gbkBytes = ..string.fromto("中文内容", "", "gbk");
+			..string.save(__gbk, __gbkBytes);
+			var __r1 = fileRead(__gbk);
+			__ok1 = (__r1 && __r1.enc == "gbk" && __r1.text == "中文内容") ? 1 : 0;
+			var __gbk2 = ..io.joinpath(__ed, "gbk2.nodio");
+			fileWrite(__gbk2, __r1.text, __r1.enc);
+			var __h2 = ..io.open(__gbk2, "rb");
+			var __bytes2 = __h2.read("raw");
+			__h2.close();
+			__ok2 = (__bytes2 == __gbkBytes) ? 1 : 0;
+			var __bom = ..io.joinpath(__ed, "bom.nodio");
+			..string.save(__bom, '\uFEFF' ++ "内容");
+			var __r2 = fileRead(__bom);
+			__ok3 = (__r2 && __r2.enc == "utf8-bom" && __r2.text == "内容") ? 1 : 0;
+			var __u16 = ..io.joinpath(__ed, "u16.nodio");
+			// FF FE + “中a”的 UTF-16LE 字节（2D 4E 61 00）
+			..string.save(__u16, '\xFF\xFE\x2D\x4E\x61\x00');
+			var __r3 = fileRead(__u16);
+			__ok4 = (__r3 && __r3.enc == "utf16le" && __r3.text == "中a") ? 1 : 0;
+			// 接线：openTab 探测入账 → 保存按原编码落盘
+			if(openTab(__gbk)){
+				var __fp = ..io.fullpath(__gbk);
+				__ok5 = (fileEnc[__fp] == "gbk") ? 1 : 0;
+				var __t2 = shell.tabGetText(__gbk) ++ "!";
+				if(atomicSaveFile(__gbk, __t2)){
+					var __h3 = ..io.open(__gbk, "rb");
+					var __b3 = __h3.read("raw");
+					__h3.close();
+					if(__b3 != ..string.fromto(__t2, "", "gbk")) __ok5 = 0;
+				}
+				else{ __ok5 = 0 }
+				shell.tabClose(__gbk);
+			}
+					__encOk = (__ok1 && __ok2 && __ok3 && __ok4 && __ok5) ? 1 : 0;
+					}catch(__encErr){
+					io.print("ENC-ERR:" ++ tostring(__encErr));
+				}
+				io.print("ENC:" ++ tostring(__encOk));
+
+	// 输出面板双击跳转（第六十八轮）：解析三例（文件:行 / 行 / 无标记）
+	var __ojOk = 0;
+	try{
+		var __j1 = shell.outputParseJump("错误: xxx @ D:/t/main.nodio:42");
+		var __j2 = shell.outputParseJump("错误: xxx @ 行 7");
+		var __j3 = shell.outputParseJump("没有落点标记");
+		__ojOk = ((__j1 && __j1.path == "D:/t/main.nodio" && __j1.line == 42)
+			&& (__j2 && __j2.path === null && __j2.line == 7)
+			&& (__j3 === null)) ? 1 : 0;
+	}catch(__ojErr){
+		io.print("OUTJ-ERR:" ++ tostring(__ojErr));
+	}
+	io.print("OUT-JUMP:" ++ tostring(__ojOk));
+
+	// 端到端：往输出面板塞一条报错，真发 按下/抬起/双击 消息到 (2,2)
+	//   （第一击把光标放到第一行 → 双击处理器按光标行解析 → 开文件 + 定位）
+	var __ojUi = 0;
+	try{
+		var __jp = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_ide_jump.nodio");
+		..string.save(__jp, "一\r\n二\r\n三\r\n四\r\n五\r\n");
+		outCtl.clear();
+		outCtl.append("运行时错误: 下标越界 @ " ++ __jp ++ ":3");
+		var __lp = 2 + (2 << 16);
+		::SendMessage(shell.outEd.hwnd, 0x201/*_WM_LBUTTONDOWN*/, 0, __lp);
+		::SendMessage(shell.outEd.hwnd, 0x202/*_WM_LBUTTONUP*/, 0, __lp);
+		::SendMessage(shell.outEd.hwnd, 0x203/*_WM_LBUTTONDBLCLK*/, 0, __lp);
+		__ojUi = ((shell.tabCurPath() == __jp)
+			&& (shell.editor.curLine == 3)) ? 1 : 0;
+		shell.tabClose(__jp);
+	}catch(__ojuErr){
+		io.print("OUTJUI-ERR:" ++ tostring(__ojuErr));
+	}
+	io.print("OUT-JUMP-UI:" ++ tostring(__ojUi));
+
 
 	// 资源视图（第五十九轮续）
 	//

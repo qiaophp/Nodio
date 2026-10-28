@@ -428,6 +428,11 @@ if ($out -notmatch 'SPLIT-DOC:1')     { Write-Output 'FAIL: dual-document split 
 # 发布向导（第六十七轮）：buildArgs 装配（版本/公司/UAC/资源/路径归一）+ 浮层开关
 if ($out -notmatch 'PUB-WIZARD:1')    { Write-Output 'FAIL: publish wizard buildArgs assembly broken'; exit 1 }
 if ($out -notmatch 'PUB-WIZARD-UI:1') { Write-Output 'FAIL: publish wizard overlay open/close broken'; exit 1 }
+# 文件编码（第六十八轮）：GBK/UTF-8 BOM/UTF-16 探测 + 按原编码写回闭环 + 保存接线
+if ($out -notmatch 'ENC:1')           { Write-Output 'FAIL: file encoding detect/save round-trip broken'; exit 1 }
+# 输出面板双击跳转（第六十八轮）：@ 文件:行 / @ 行 n 解析 + 真消息端到端
+if ($out -notmatch 'OUT-JUMP:1')      { Write-Output 'FAIL: output panel error location parsing broken'; exit 1 }
+if ($out -notmatch 'OUT-JUMP-UI:1')   { Write-Output 'FAIL: output panel double-click jump broken'; exit 1 }
 # 布局器（第五十九轮续）
 #   ANCHOR-RIGHT:1   只锚右 → 窗体加宽时控件保宽平移（右边距不变）
 #   ANCHOR-STRETCH:1 四边全锚 → 窗体 resize 时宽高拉伸、边距不变
