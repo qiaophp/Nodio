@@ -1,0 +1,163 @@
+// app/diff.nodio — 行级差异（两段文本 → 增删序列）。
+//
+// 给「双栏对比」用：左栏是活文档、右栏是对照文件，
+// 差异行要标色、还要能「上/下一个差异」跳转，所以要的是**行级操作序列**，
+// 不是 git 那种 unified diff 文本。
+//
+// 算法：
+//   ① 先掐掉公共前缀/后缀（真实代码改动通常只动中间一小段，
+//      这一步把 DP 规模从「整篇 × 整篇」压到「改动块 × 改动块」）；
+//   ② 中段做 LCS 动态规划，回溯出增删序列；
+//   ③ DP 规模超过上限时退化成「整块替换」——结果依然对（只是粗），
+//      不会把 IDE 卡死。
+//
+// 输出：
+//   ops    每项 {type="same"|"del"|"add"; a=左行号(1基); b=右行号(1基)}
+//          （del 没有 b，add 没有 a）
+//   blocks 连续增删合并成的差异块 {a=左行号; b=右行号; del=; add=}
+//          —— 导航用
+//   add/del 增删行数
+namespace app.diff{
+
+// DP 单元格上限（na*nb）。aardio 表是哈希表，百万级会很吃内存；
+// 源码对比的常见规模远小于这个数，超了走粗粒度回退。
+var MAX_DP = 400000;
+
+// 文本 → 行数组（去掉行尾 \r，兼容 CRLF/LF 混排）
+// ⚠ 判定行尾 \r 用 endsWith：字符串下标 s[#s] 在本引擎里**不是**末字符
+//   （拿不到字符，拿不到可比较的字符），别用下标去判。
+var __lines = function(text){
+	var out = {};
+	if(text === null || text === undefined) return out;
+	var ls = ..string.split(tostring(text), '\n');
+	for(i=1;#ls;1){
+		var s = ls[i];
+		if(#s > 0 && ..string.endsWith(s, '\r')){
+			s = ..string.slice(s, 1, #s - 1);
+		}
+		..table.push(out, s);
+	}
+	return out;
+}
+
+// 中段的 LCS → 操作序列（从后往前回溯，最后反转）
+var __lcsOps = function(la, a0, na, lb, b0, nb){
+	var ops = {};
+	var i, j;
+	if(na <= 0 && nb <= 0) return ops;
+	if(na == 0){
+		for(j=0;nb-1;1) ..table.push(ops, {type="add"; b=b0+j});
+		return ops;
+	}
+	if(nb == 0){
+		for(i=0;na-1;1) ..table.push(ops, {type="del"; a=a0+i});
+		return ops;
+	}
+	if(na * nb > MAX_DP){
+		for(i=0;na-1;1) ..table.push(ops, {type="del"; a=a0+i});
+		for(j=0;nb-1;1) ..table.push(ops, {type="add"; b=b0+j});
+		return ops;
+	}
+	// dp[i*(nb+1)+j] = la[a0-1+i] 与 lb[b0-1+j] 的 LCS 长度
+	var w = nb + 1;
+	var dp = {};
+	for(i=0;na;1) dp[i*w] = 0;
+	for(j=0;nb;1) dp[j] = 0;
+	for(i=1;na;1){
+		var rowText = la[a0-1+i];
+		var base = i*w;
+		var prev = base - w;
+		for(j=1;nb;1){
+			if(rowText == lb[b0-1+j]){
+				dp[base+j] = dp[prev+j-1] + 1;
+			}
+			else{
+				var x = dp[prev+j];
+				var y = dp[base+j-1];
+				dp[base+j] = (x >= y) ? x : y;
+			}
+		}
+	}
+	// 回溯（逆序收集，最后反转）
+	//
+	// ⚠ 方向别搞反：dp[i-1][j] >= dp[i][j-1] 说明**最优路径在上一行**
+	//   （A 的第 i 行没匹配上 → 记 del，**i 减一**）；
+	//   否则最优路径在左边（B 的第 j 行没匹配上 → 记 add，**j 减一**）。
+	//   写反了会得到「次优」对齐：比如 [X,c,d,Y] vs [Y,c,d,X]
+	//   只会匹配到 1 行（Y↔Y），而不是 2 行（c,d）。
+	var rev = {};
+	i = na; j = nb;
+	while(i > 0 || j > 0){
+		if(i > 0 && j > 0 && la[a0-1+i] == lb[b0-1+j]){
+			..table.push(rev, {type="same"; a=a0+i-1; b=b0+j-1});
+			i = i - 1; j = j - 1;
+		}
+		elseif(i > 0 && (j == 0 || dp[(i-1)*w+j] >= dp[i*w+j-1])){
+			..table.push(rev, {type="del"; a=a0+i-1});
+			i = i - 1;
+		}
+		else{
+			..table.push(rev, {type="add"; b=b0+j-1});
+			j = j - 1;
+		}
+	}
+		for(i=#rev;1;-1){
+			..table.push(ops, rev[i]);
+		}
+		return ops;
+	}
+	
+	// 两段文本的行级差异
+	diffLines = function(textA, textB){
+		var la = __lines(textA);
+		var lb = __lines(textB);
+		var n = #la;
+		var m = #lb;
+		var ops = {};
+		var i;
+		// 公共前缀
+		var p = 0;
+		while(p < n && p < m && la[p+1] == lb[p+1]) p = p + 1;
+		// 公共后缀
+		var s = 0;
+		while(s < (n - p) && s < (m - p) && la[n-s] == lb[m-s]) s = s + 1;
+		for(i=1;p;1){
+			..table.push(ops, {type="same"; a=i; b=i});
+		}
+		var mid = __lcsOps(la, p+1, n-p-s, lb, p+1, m-p-s);
+		for(i=1;#mid;1){
+			..table.push(ops, mid[i]);
+		}
+		for(i=0;s-1;1){
+			..table.push(ops, {type="same"; a=n-s+i+1; b=m-s+i+1});
+		}
+		// 统计 + 差异块（连续的非 same 合成一块）
+		var add = 0, del = 0;
+		var blocks = {};
+		var inBlock = false;
+		for(i=1;#ops;1){
+		var op = ops[i];
+		if(op.type == "same"){
+			inBlock = false;
+			continue;
+		}
+		if(op.type == "add") add = add + 1;
+		else del = del + 1;
+		if(!inBlock){
+			..table.push(blocks, {a = null; b = null; del = 0; add = 0});
+			inBlock = true;
+		}
+		var blk = blocks[#blocks];
+		if(op.type == "del"){
+			blk.del = blk.del + 1;
+			if(blk.a === null) blk.a = op.a;
+		}
+		else{
+			blk.add = blk.add + 1;
+			if(blk.b === null) blk.b = op.b;
+		}
+	}
+	return { ops = ops; blocks = blocks; add = add; del = del };
+}
+
+}

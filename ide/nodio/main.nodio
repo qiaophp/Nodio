@@ -20,7 +20,11 @@ import app.library;
 import app.lspClient;
 import app.dapClient;
 import app.plugin;
+import app.projectWizard;
 import app.publishWizard;
+import app.fileenc;   // 文件编码探测/写回（第六十八轮实现，第六十九轮提成共享模块）
+import app.diff;      // 行级差异算法（第六十九轮：双栏对比）
+import app.todo;      // 待办标记扫描引擎（第六十九轮：TODO/FIXME 待办面板）
 import nodio.designer.registry;
 import nodio.intellisense;   // 第五十一轮：官方 intellisense 词库（补全并入）
 import nodio.ui.dpi;
@@ -1268,25 +1272,29 @@ var searchScopeUpdate = function(){
 }
 
 // ---------- commands ----------
-openProject = function(){
-	var m = app.project.open();
-	if(!m) return;
+loadProject = function(p){
+	if(!p || !..io.exist(p)) return false;
+	var m = app.project.load(p);
+	if(!m) return false;
 	proj = m;
 	projRefresh();
 	shell.setProjectStatus(tostring(m.path));
-	// 记住上次打开的工程：下次启动 IDE 直接回到这个工程
-	// （否则正常启动是一片空白，见下面的 startupProject）
 	cfgWrite("lastProject", m.path);
 	shell.setStatus("工程: " ++ tostring(m.path));
-	// user components join the designer from <project>\components
 	var n = designer.discover(m.root ++ "components");
 	if(n) shell.setStatus("已加载自定义组件: " ++ n ++ " 个");
-	// 资源视图跟着工程走：已在「资源」页就立刻重扫，否则下次切页重扫
-	fillResView();
-	// Git 根 = 工程根（setRoot 相同根短路，不同根才重跑 git）
-	gitSyncRoot();
-	terminalSyncCwd();
-	timelineSyncFile();
+		fillResView();
+		gitSyncRoot();
+		terminalSyncCwd();
+		timelineSyncFile();
+		todoScanAll();
+		return true;
+}
+
+openProject = function(){
+	var m = app.project.open();
+	if(!m) return;
+	loadProject(m.path);
 }
 
 // 打开文件：path 为空 → 弹系统「打开文件」对话框
@@ -1297,11 +1305,12 @@ openFile = function(path){
 	}
 	if(!..io.exist(path)) return false;
 	openTab(path);
-	// 最近文件：打开成功就置顶入队 + 重建「文件」菜单（最近使用的文档，
-	// 工程、搜索跳转、钩子打开的文档都走这里，一处收口）
-	app.settings.recentPush(path);
-	shell.refreshRecentMenu();
-	return true;
+		// 最近文件：打开成功就置顶入队 + 重建「文件」菜单（最近使用的文档，
+		// 工程、搜索跳转、钩子打开的文档都走这里，一处收口）
+		app.settings.recentPush(path);
+		shell.refreshRecentMenu();
+		if(todoScanDoc) todoScanDoc(path);
+		return true;
 }
 
 // 系统「打开文件」对话框
@@ -1524,51 +1533,21 @@ newFile = function(initialText){
 //
 // ⚠ 类视图/资源扫描与行数统计仍走 string.load：符号和行结构只需要
 //   ASCII 语义，逐文件三重解码太贵（已知限制，台账 §1.82）。
-// ⚠ io 流 read 对空文件返回 null（引擎 all.empty() 短路），一律按 "" 兜底。
+//
+// ⚠ 第六十九轮：实现提成 app.fileenc 模块 —— shell 侧的双栏对比右栏
+//   也要按同一口径读文件（探测口径分叉会导致「打开看到的」和
+//   「对比里看到的」不一致）。这里只留薄封装。
 
-fileEnc = {};   // 全路径 → "utf8"|"utf8-bom"|"gbk"|"utf16le"|"utf16be"
+fileEnc = app.fileenc.encs;   // 全路径 → "utf8"|"utf8-bom"|"gbk"|"utf16le"|"utf16be"
 
 // 读文件并探测编码。返回 {text=..; enc=..}，打不开返回 null。
 fileRead = function(path){
-	var h = ..io.open(path, "rb");
-	if(!h) return null;
-	var all = h.read("raw");
-	h.close();
-	if(all === null || all === undefined) all = "";
-	if(#all >= 3 && ..string.indexOf(all, '\xEF\xBB\xBF') == 1){
-		return { text = ..string.load(path); enc = "utf8-bom" };
-	}
-	if(#all >= 2 && ..string.indexOf(all, '\xFF\xFE') == 1){
-		var body = (#all > 2) ? ..string.slice(all, 3, null, true) : "";
-		return { text = ..string.fromto(body, 1200); enc = "utf16le" };
-	}
-	if(#all >= 2 && ..string.indexOf(all, '\xFE\xFF') == 1){
-		var body = (#all > 2) ? ..string.slice(all, 3, null, true) : "";
-		return { text = ..string.fromto(body, 1201); enc = "utf16be" };
-	}
-	// 无 BOM：严格 vs 宽松，不一致 → GBK 候选
-	var strict = ..string.load(path);
-	if(strict === null || strict === undefined) strict = "";
-	var loose = null;
-	var h2 = ..io.open(path, "rb");
-	if(h2){ loose = h2.read("utf8"); h2.close(); }
-	if(loose === null || loose === undefined) loose = strict;
-	if(strict == loose) return { text = strict; enc = "utf8" };
-	var t = ..string.fromto(strict, "gbk");
-	if(t){
-		var back = ..string.fromto(t, "", "gbk");
-		var t2 = back ? ..string.fromto(back, "gbk") : null;
-		if(t2 == t) return { text = t; enc = "gbk" };
-	}
-	// 连 GBK 往返都不无损：宽松解码兜底（至少内容不丢）
-	return { text = loose; enc = "utf8" };
+	return app.fileenc.read(path);
 }
 
 // 按编码写文件（utf16 写回升级为 UTF-8 BOM，见上）。
 fileWrite = function(path, text, enc){
-	if(enc == "gbk") return ..string.save(path, ..string.fromto(text, "", "gbk"));
-	if(enc == "utf8-bom") return ..string.save(path, '\uFEFF' ++ text);
-	return ..string.save(path, text);
+	return app.fileenc.write(path, text, enc);
 }
 
 // the tree stores absolute paths as node data
@@ -2058,7 +2037,17 @@ shell.editor.onToggleBreakpoint = function(line, on){
 	shell.setStatus((on ? "已设断点 行 " : "已取消断点 行 ") ++ line);
 };
 
-shell.hooks.onOpenProject = openProject;
+	shell.hooks.onNewProject  = function(){
+		app.projectWizard.openWizard(shell.winform, shell, function(res){
+			if(res && res.path){
+				loadProject(res.path);
+				if(res.mainFile && ..fsys.exists(res.mainFile)){
+					openFile(res.mainFile);
+				}
+			}
+		});
+	};
+	shell.hooks.onOpenProject = openProject;
 shell.hooks.onOpenFile    = openFile;      // path == "" → 弹「打开文件」对话框
 shell.hooks.onNewFile     = newFile;
 shell.hooks.onSave        = saveFile;
@@ -2194,6 +2183,17 @@ shell.searchPanel.onOpenFile = function(path, line){
 	if(line) shell.editor.gotoLine(line);
 }
 
+// 「与...比较...」：当前文档（左栏）和另一个文件（右栏）做双栏差异对比
+shell.hooks.onCompareWith = function(){
+	var cur = shell.tabCurPath();
+	if(!cur){ shell.setStatus("先打开一个文档再比较"); return }
+	modalBusy = true;
+	var p = shell.fileDlg.open('所有文件|*.*|aardio 源文件|*.aardio;*.nodio|', "选择对照文件");
+	modalBusy = false;
+	if(!p) return;
+	shell.compareWith(p);
+}
+
 // 输出面板双击报错行 → 跳转（第六十八轮）。
 //   path 为空 = 当前文档（引擎报「@ 行 n」时不知道归属文件；
 //   运行的通常就是当前文档，与调试面板「定位当前文档」同一口径）。
@@ -2221,6 +2221,8 @@ shell.hooks.onDocChange   = function(path, text){
 	outlineDirty = true;
 	// 导航栏的层级链也依赖符号树 → 同样标脏
 	symTreeDirty = true;
+	// 待办面板：内容变了同步重扫
+	if(todoScanDoc) todoScanDoc(path, text);
 };
 shell.hooks.onRun         = runScript;
 // 发布为独立 exe（工程 → 发布）：控制台 / 界面程序两条入口
@@ -2400,6 +2402,10 @@ shell.hooks.onDesignerRedo = function(){
 
 // ---------- 差异对比导航 (Diff Navigation) ----------
 shell.hooks.onNextDiff = function(){
+	if(shell.diffCtx && #shell.diffCtx.blocks > 0){
+		shell.compareStep(1);
+		return;
+	}
 	if(!shell.splitDiff || !shell.editor2){
 		shell.setStatus("双栏对比未开启");
 		return;
@@ -2436,6 +2442,10 @@ shell.hooks.onNextDiff = function(){
 };
 
 shell.hooks.onPrevDiff = function(){
+	if(shell.diffCtx && #shell.diffCtx.blocks > 0){
+		shell.compareStep(-1);
+		return;
+	}
 	if(!shell.splitDiff || !shell.editor2){
 		shell.setStatus("双栏对比未开启");
 		return;
@@ -2548,11 +2558,25 @@ if(shell.gitPanel){
 	shell.gitPanel.onBranch = function(b){ shell.setBranchStatus(b) };
 	shell.gitPanel.onOpen = function(p){ openFile(p) };
 	shell.gitPanel.onDiff = function(p, txt){
-		// 对比文本落 TEMP 页签（只读语义，改它也不会进仓库）
-		var dp = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_git_diff.diff");
-		..string.save(dp, txt);
-		openTab(dp);
-		shell.setStatus("Git 对比: " ++ p);
+		// 第六十九轮：升级成**双栏差异对比**——左栏=工作区当前内容，
+		// 右栏=仓库里的版本（git show HEAD:<file>）。
+		// 旧做法是把 unified diff 文本开成 TEMP 页签：看不出文件长什么样，
+		// 也定位不到「改的是哪几行」。
+		var root = shell.gitPanel.root;
+		var rel = p;
+		if(root && ..string.indexOf(rel, root) == 1){
+			rel = ..string.slice(rel, #root + 1);
+		}
+		var rd = shell.gitPanel.git(root, 'show HEAD:"' ++ rel ++ '"');
+		if(rd && rd.ok && rd.out && #rd.out > 0){
+			// git 输出是字节串 → 解成文本（UTF-8）
+			var textB = ..string.fromto(rd.out, "utf8");
+			// invert：左=工作区（新的）右=HEAD（旧的）→ 左侧独有行算「新增」
+			shell.compareWith(p, textB, "仓库版本 HEAD", true);
+			return;
+		}
+		// 仓库里没有这个文件（新增文件）→ 右边是空的 = 全文新增
+		shell.compareWith(p, "", "（仓库中还没有这个文件）", true);
 	};
 	// 首次定位：启动时当前文档 / 打开工程时工程根
 	gitSyncRoot();
@@ -2618,7 +2642,84 @@ shell.leftDock.onSelChange = function(idx, page){
 	if(__origLeftSel) __origLeftSel(idx, page);
 	var cap = page ? page.caption : "";
 	if(cap == "时间线") timelineSyncFile();
+	elseif(cap == "待办") todoScanAll();
 };
+
+// ---------- 待办面板 (TODO/FIXME) ----------
+// 维护工程与已打开文档的待办标记列表（app.todo 驱动），
+// 双击行跳转到对应文件对应行。
+var todoMap = {};
+var todoDirty = false;
+
+var todoScanDoc = function(path, text){
+	if(!path) return;
+	if(text === null || text === undefined){
+		text = shell.tabGetText(path);
+	}
+	if(!text){
+		if(todoMap[path]){
+			todoMap[path] = null;
+			todoDirty = true;
+		}
+		return;
+	}
+	var res = app.todo.scanText(text);
+	todoMap[path] = res;
+	todoDirty = true;
+};
+
+var todoScanAll = function(){
+	todoMap = {};
+	if(proj && projFiles && #projFiles){
+		for(i=1;#projFiles;1){
+			var pf = projFiles[i];
+			var p = pf.full : (proj.root ++ pf.path);
+			var txt = shell.tabGetText(p);
+			if(!txt && ..io.exist(p)){
+				var fr = app.fileenc.read(p);
+				if(fr) txt = fr.text;
+			}
+			if(txt) todoMap[p] = app.todo.scanText(txt);
+		}
+	}
+	else{
+		for(i=1;#shell.tabOrder;1){
+			var p = shell.tabOrder[i];
+			var txt = shell.tabGetText(p);
+			if(txt) todoMap[p] = app.todo.scanText(txt);
+		}
+	}
+	todoDirty = true;
+};
+
+var todoRebuild = function(){
+	var rows = {};
+	for(p, items in todoMap){
+		if(!items || !#items) continue;
+		var short = navShortPath(p);
+		for(i=1;#items;1){
+			var it = items[i];
+			..table.push(rows, {
+				cells = { short; tostring(it.line); it.tag; it.text };
+				tag = { path = p; line = it.line };
+			});
+		}
+	}
+	if(shell.todoList) shell.todoList.setRows(rows);
+};
+
+if(shell.todoList){
+	shell.todoList.onDoubleClick = function(row, index){
+		if(!row || !row.tag) return;
+		var p = row.tag.path;
+		if(!p) return;
+		if(shell.tabCurPath() != p){
+			if(!openFile(p)) return;
+		}
+		if(row.tag.line) shell.editor.gotoLine(row.tag.line);
+		shell.setStatus("跳转至待办: " ++ navShortPath(p) ++ " 第 " ++ tostring(row.tag.line) ++ " 行");
+	};
+}
 
 shell.hooks.onAddWatch = function(){
 	shell.showPrompt("添加监视表达式", "", function(expr){
@@ -3116,6 +3217,11 @@ shell.winform.setInterval(function(){
 			fillOutline();
 			// 类视图的工程模式不被心跳清掉（切页/文档事件才重扫）
 			if(classViewMode == "doc") fillClassView();
+		}
+		// 待办面板刷新（防抖）
+		if(todoDirty){
+			todoDirty = false;
+			todoRebuild();
 		}
 		// 符号树（导航栏面包屑的层级链）同理
 		if(symTreeDirty){
@@ -4015,6 +4121,76 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 	}
 	io.print("OUT-JUMP-UI:" ++ tostring(__ojUi));
 
+	// 双栏差异对比（第六十九轮）：LCS 行级对比 + 标记高亮 + 差异导航
+	var __diffOk = 0;
+	var __diffNavOk = 0;
+	try{
+		var __d1 = 'line 1\r\nline 2\r\nline 3\r\n';
+		var __d2 = 'line 1\r\nline 2 modified\r\nline 3\r\nline 4\r\n';
+		var __res = app.diff.diffLines(__d1, __d2);
+		// __res: ops, blocks, add=2, del=1 (2 处差异块：改第2行 + 新增第4行)
+		var __bDiffOps = (__res && #__res.blocks == 2 && __res.add == 2 && __res.del == 1) ? 1 : 0;
+		// UI 端到端：compareWith
+		var __fB = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_diff_b.nodio");
+		..string.save(__fB, __d2);
+		app.editor.setText(shell.editor, __d1);
+		var __bCnt = shell.compareWith(__fB, __d2, "对照文件");
+		var __bSplit = (shell.splitMode == "diff" && shell.splitDiff) ? 1 : 0;
+		var __bMarks = (shell.editor.lineMarks && shell.editor.lineMarks[2]) ? 1 : 0;
+		__diffOk = (__bDiffOps && __bCnt == 2 && __bSplit && __bMarks) ? 1 : 0;
+
+		// 差异导航：compareStep
+		var __stepOk = shell.compareStep(1);
+		var __curLine = shell.editor.curLine;
+		__diffNavOk = (__stepOk && __curLine == 2) ? 1 : 0;
+		shell.toggleSplitDiff(false);
+		..io.remove(__fB);
+	}catch(__dErr){
+		io.print("DIFF-ERR:" ++ tostring(__dErr));
+	}
+	io.print("DIFF-LCS:" ++ tostring(__diffOk));
+	io.print("DIFF-NAV:" ++ tostring(__diffNavOk));
+
+	// TODO/FIXME 待办面板（第六十九轮）：标记扫描 + 双击跳转
+		var __todoScanOk = 0;
+		var __todoJumpOk = 0;
+		try{
+			var __sampleText = '// TODO: 修复内存泄漏\r\nvar a = 1;\r\n// FIXME: 边界越界问题\r\n/* HACK: 临时规避 */\r\n';
+			var __scanned = app.todo.scanText(__sampleText);
+			var __bScan = (__scanned && #__scanned == 3 && __scanned[1].tag == "TODO" && __scanned[2].tag == "FIXME" && __scanned[3].tag == "HACK") ? 1 : 0;
+			__todoScanOk = __bScan;
+
+			// 面板与双击跳转验证
+			var __tFile = ..io.fullpath(..string.getenv("TEMP") ++ "/nodio_todo_fixture.nodio");
+			..string.save(__tFile, 'line 1\r\n// TODO: 跳到这一行\r\nline 3\r\n');
+		openFile(__tFile);
+		todoScanDoc(__tFile);
+		todoRebuild();
+		var __tRows = shell.todoList.rows;
+		var __bHasRow = (__tRows && #__tRows >= 1) ? 1 : 0;
+		// 模拟双击待办列表
+		var __targetRow = null;
+		for(r=1;#__tRows;1){
+			if(__tRows[r].tag && __tRows[r].tag.path == __tFile){
+				__targetRow = __tRows[r];
+				break;
+			}
+		}
+		if(__targetRow && shell.todoList.onDoubleClick){
+			shell.editor.gotoLine(1); // 先移开光标
+			shell.todoList.onDoubleClick(__targetRow, 1);
+			if(shell.tabCurPath() == __tFile && shell.editor.curLine == 2){
+				__todoJumpOk = 1;
+			}
+		}
+		shell.tabClose(__tFile);
+		..io.remove(__tFile);
+	}catch(__tdErr){
+		io.print("TODO-ERR:" ++ tostring(__tdErr));
+	}
+	io.print("TODO-SCAN:" ++ tostring(__todoScanOk));
+	io.print("TODO-JUMP:" ++ tostring(__todoJumpOk));
+
 
 	// 资源视图（第五十九轮续）
 	//
@@ -4196,9 +4372,39 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 			if(pItem && pItem.title == "Test" && #pList >= 1) __pluginRegOk = 1;
 		}catch(e){}
 
-		io.print("THEME-XML:" ++ tostring(__themeXmlOk));
-		io.print("CFG-ALIAS:" ++ tostring(__cfgAliasOk));
-		io.print("PLUGIN-REG:" ++ tostring(__pluginRegOk));
+			io.print("THEME-XML:" ++ tostring(__themeXmlOk));
+			io.print("CFG-ALIAS:" ++ tostring(__cfgAliasOk));
+			io.print("PLUGIN-REG:" ++ tostring(__pluginRegOk));
+
+		// 新建工程向导全流程断言（PROJ-WIZARD）
+		var __projWizardOk = 0;
+		try{
+			var tpls = app.project.scanTemplates();
+			var tmpTarget = ..io.joinpath(..string.getenv("TEMP"), "_smoke_wz_dir");
+			if(..fsys.exists(tmpTarget)) ..fsys.delete(tmpTarget);
+			var tplItem = (tpls && #tpls && tpls[1].templates) ? tpls[1].templates[1] : null;
+			var created = app.project.createFromTemplate(tplItem, tmpTarget, "SmokeWzProj", { runAs = true; overwrite = true });
+			if(created && created.ok && ..fsys.exists(created.path)){
+				var aTxt = ..string.load(created.path);
+				var mTxt = ..string.load(created.mainFile);
+				var bAproj = (aTxt && ..string.indexOf(aTxt, 'name="SmokeWzProj"') !== null);
+				var bMain = (mTxt && (..string.indexOf(mTxt, "SmokeWzProj") !== null) && (..string.indexOf(mTxt, "//RUNAS//") !== null));
+
+				// 浮层向导验证
+				var wz = app.projectWizard.openWizard(shell.winform, shell);
+				var bWzShow = wz && wz.visible && (#wz.categories >= 5);
+				wz.close();
+				var bWzClose = wz && !wz.visible;
+
+				if(bAproj && bMain && bWzShow && bWzClose){
+					__projWizardOk = 1;
+				}
+			}
+			if(..fsys.exists(tmpTarget)) ..fsys.delete(tmpTarget);
+		}catch(e){
+			io.print("PROJ-WIZARD-ERR:" ++ tostring(e));
+		}
+		io.print("PROJ-WIZARD:" ++ tostring(__projWizardOk));
 
 	// ---------- 设计 ↔ 源码同步（switchActiveForm 语义） ----------
 	//
@@ -4748,9 +4954,9 @@ io.print("DSG-ROUNDTRIP:" ++ tostring(dsg1 == dsg2) ++ " items=" ++ #back);
 				return null;
 			}
 
-			// ---- 阶段 1：失败回包 ----
-			var logErr = shell.aiPanel.getLog();
-			io.print("AI-SEND-ERRUSER:" ++ tostring(..string.indexOf(logErr, "我: 冒烟-失败") ? 1 : 0));
+				// ---- 阶段 1：失败回包 ----
+				var logErr = shell.aiPanel.getLog();
+				io.print("AI-SEND-ERRUSER:" ++ tostring(..string.indexOf(logErr, "我: 冒烟-失败") ? 1 : 0));
 			io.print("AI-SEND-ERR:" ++ tostring(..string.indexOf(logErr, "[错误]") ? 1 : 0));
 			io.print("AI-SEND-ERRMSGS:" ++ tostring(#shell.aiPanel.session.messages));
 			io.print("AI-SEND-TICKS:" ++ tostring(aiTicks));

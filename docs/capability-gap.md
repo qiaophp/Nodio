@@ -6665,6 +6665,72 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
 - **验证**：VM 99/0/0 全部通过，IDE 冒烟 SMOKE OK，全量特性顺利合龙。
 - ❌ 剩余大项：无（全部核心功能收口完成）。
 
+## 1.78 第六十四轮：S-VM 字节码引擎深化——线程跨越闭包桥接 + 全局空指针防御与类型判等收口
+
+- **原生线程与字节码闭包桥接**（`engine/builtins.cpp`）：
+  - `ThreadJob` 新增 `Value fnVal` 字段；`thread.create` 支持接收 `a[0].t == Value::Func && a[0].native` 的原生闭包/S-VM 闭包；
+  - `ThreadWorkerProc` 运行时优先派发 `job->fnVal.native(job->fnVal.nativeCtx.get(), job->args)`，打通字节码闭包跨线程执行通道；
+  - 彻底解决 `NODIO_VM=record` 下 `t28.aardio`（多线程返回值/句柄等待）、`t29.aardio`（并发双线程同步等待）、`t94.aardio`（线程长等待）崩溃的问题。
+- **闭包生命周期与无悬垂模块包装**（`engine/aardio_vm.cpp`）：
+  - `OP_NEW_CLOSURE (0x34)` 生成闭包时，捕获 `AardioChunkModule` 值拷贝副本而非裸指针；
+  - 闭包通过 `CallAardioClosure` 安全执行，彻底消除了跨线程或函数返回后栈变量悬垂野指针风险；
+  - 规范闭包 `fnData` 初始化与类型判等，确保 `type(f)` 对 S-VM 脚本闭包返回一致的 `"function"`。
+- **全引擎空指针保护与类型判等防御**（`engine/builtins.cpp`, `engine/runtime.cpp`, `engine/util.cpp`）：
+  - 修复 `util.cpp:72`、`runtime.cpp:924, 1364, 2465, 4434`、`builtins.cpp:9520, 9815` 中 7 处未判空 `fnData` 即直接解引用 `fnData->fn` 的盲读漏洞；
+  - 在 `ApplyOp` / `ValuesEqual` 的 `Value::Func` 分支中补充 native 与 closure 指针安全比对逻辑，杜绝单侧 native 导致对空指针调用 `fnData->fn` 崩溃。
+- **回归与锁**：
+  - `tests/run_vm_tests.ps1`（99/99 全部 PASS）；
+  - `tests/ide_smoke.ps1`（全量断言通过，SMOKE OK）；
+  - `tests/lsp_smoke.py`（23/23 项全绿，LSP-SMOKE-OK）。
+- ❌ 剩余大项：无。
+
+## 1.79 第六十五轮：新建工程向导多模板脚手架同步（12 大类模板 + 就地浮层向导 + 自动载入）
+
+- **官方模板脚手架扫描与兜底生成**（`ide/nodio/app/project.nodio`）：
+  - 自动检测并扫描官方 `D:/aardio/extensions/wizard/project2/template` 模板仓库（涵盖窗口程序 `winform`、`winform-blank`、`plus`，控制台应用 `console`、`bat`，Web 界面 `view`、`chrome-vue`、`chrome-htmx`，混合编程 `python/py3`、`java`，系统与服务 `service`、`web-server` 等 12 大类别）；
+  - 提供无官方扩展目录时的内置轻量兜底工程模板生成（WinForm / Console / Web / Python / Service）；
+  - `createFromTemplate(tpl, targetParentDir, projName, opt)` 核心生成逻辑：
+    - 递归拷贝脚手架目录结构（`copyTree`）；
+    - 自动解析并替换 `main.aardio` 中的 `${PROJECTNAME}` 占位符；
+    - 自动重命名并更新 `<projectName>.aproj` 中的 `name`、`output`、`ProductName` 等核心项目配置；
+    - 支持管理员权限启动标记（`//RUNAS//` 头部注入）；
+    - 支持 `opt.overwrite` 与目录冲突防呆检测。
+- **就地浮层新建工程向导对话框**（`ide/nodio/app/projectWizard.nodio`）：
+  - 遵循 Nodio 扁平自绘与无次级模态循环规范（`nodio.ui.board` + `nodio.ui.list` + `nodio.ui.addCtrl`）：
+    - 左侧分类列表（`catList`）：5 大主分类直观切换；
+    - 右侧模板列表（`tplList`）：双列展示模板名称与详细说明，支持单击选择与双击直接创建；
+    - 底部工程配置：工程目录（`edDir`，支持浏览选择）、工程名称（`edName`，自动防重名编号递增）、以管理员身份运行（`runAs` 复选框）；
+    - 居中自适应浮层定位与平滑关闭生命周期管理。
+- **IDE 入口接线与快捷键**（`ide/nodio/app/shell.nodio` & `ide/nodio/main.nodio`）：
+  - 注册 `shell.hooks.onNewProject` 钩子并全局监听 `Ctrl+Shift+N` 快捷键（`MOD_CTRL | MOD_SHIFT, 0x4E`）；
+  - 在主菜单「文件 → 新建工程... Ctrl+Shift+N」、「工程 → 新建工程...」、顶部工具栏按钮（`newProj`）、工程树右键菜单无缝挂接；
+  - 创建成功后自动执行 `loadProject(created.path)` 加载新项目并在编辑器中自动打开主入口 `main.aardio`。
+- **回归锁与自动化断言**（`tests/ide_smoke.ps1`）：
+  - 新增 `PROJ-WIZARD:1` 回归断言，覆盖脚手架生成、占位符替换、RUNAS 标记注入、浮层向导展示与关闭全流程；
+  - VM 测试套件 99/0/0 全通；IDE 冒烟 `SMOKE OK`；LSP 协议冒烟 23 项全绿。
+- 🏁 剩余大项：无（官方全品类新建工程能力完全同步完成）。
+
+## 1.80 第六十六轮：组件属性面板事件模块整合（方案 A 属性/事件模式切换 + 双向同步 + 双击事件代码生成）
+
+- **属性网格模式切换与自绘表头（方案 A）**（`lib/nodio/designer/propertyGrid.nodio`）：
+  - 在属性网格（`propertyGrid`）表头行左侧无损集成 **【属性 🔧】** 与 **【事件 ⚡】** 两个模式切换按钮，带悬停与选中高亮底色；
+  - 表头右侧动态适配：属性模式显示「值」，事件模式显示「说明」；
+  - 零破坏原有几何布局约束：保持 `row 0`（表头行）与 `self.rows` 坐标系统一致，完全兼容已有属性分组带探针（`tests/dsg_propgrid_probe.aardio`）的行高与就地编辑框计算；
+  - **事件模式渲染与交互**：
+    - 切换至「事件」模式时，以「事件名称」+「中文说明」双列展示当前组件（或窗体）对齐官方 `win.ui` 的所有事件；
+    - 单击支持高亮选中行；
+    - **双击**事件项即刻触发 `onEventCode(self.curItem, evName)`，自动在源码中生成或跳转到该事件的处理函数桩。
+- **设计器总成与事件联动**（`ide/nodio/app/designer.nodio`）：
+  - `refreshEvents(item)` 同时更新左栏「事件」独立页签（`eventList`）与属性面板（`propGrid.setEvents`）；
+  - `propGrid.onEventCode` 与 `hooks.onEventCode` 无缝接线；
+  - 选中控件或窗体本身时，属性面板与左栏事件列表实时双向同步。
+- **回归锁与自动化断言**（`tests/ide_smoke.ps1` & `ide/nodio/main.nodio`）：
+  - 新增 `PROP-EVENTS:1` 回归断言：验证 `propertyGrid` 初始处于属性模式、切至事件模式、读取有效事件列表、通过属性面板直接触发事件代码生成、以及切回属性模式的全流程；
+  - 现有 `dsg_propgrid_probe.aardio` 与 `PROP-WRITEBACK` / `PROP-TEXT` 100% 通过；
+  - VM 套件 99/99/0 全绿，IDE 冒烟 `SMOKE OK`，LSP 23 项全绿。
+- 🏁 剩余大项：无。
+
+
 ## 1.81 第六十七轮：调试变量改值 + @ 片段展开 + 双文档拆分 + 发布向导 + 引用重命名协议锁
 
 - **调试器变量树右键「修改变量」**（`ide/nodio/app/watch.nodio` + `main.nodio`）：
@@ -6724,3 +6790,25 @@ DynAlloc(0, p)；DynAlloc 拷贝分支补 UnregisterBuffer(pOld)。
   `WM_LBUTTONDOWN/UP/DBLCLK` 消息到输出面板（2,2）后的端到端断言）；
   LSP 冒烟 `LSP-SMOKE-OK`；NAV 冒烟 `NAV SMOKE OK`。
 - 🏁 剩余大项：无。
+
+## 1.83 第六十九轮：双栏差异对比（LCS 行级对齐 + 标记高亮 + 差异导航）+ TODO/FIXME 待办面板
+
+- **双栏差异对比**（`ide/nodio/app/diff.nodio` + `ide/nodio/app/fileenc.nodio` + `lib/nodio/ui/editor.nodio` + `ide/nodio/app/shell.nodio` + `main.nodio`）：
+  - `app.diff.diffLines(textA, textB)` 行级差异比对算法：
+    - 公共前缀与公共后缀修剪（首尾不变部分直接比对，极大缩减中段动态规划求解空间）；
+    - DP 矩阵上限阈值控制（`MAX_DP = 400000`），超过时平滑退化为粗粒度整块替换，防止超大文件哈希暴涨卡死 IDE；
+    - 动态规划与回溯最优对齐：`dp[(i-1)*w+j] >= dp[i*w+j-1]` 优先向上（del/左行），消除次优对齐缺陷；
+    - 连续非 same 增删操作合并为独立差异块 `{a, b, del, add}`；
+  - `app.fileenc` 共享编码模块：将第六十八轮编码探测与原编码写回抽取为独立复用模块；
+  - 编辑器字符背景标记：`CHARFORMAT2` 使用 `__CFM_BACKGROUND = 0x01000000` 掩码与 `backColor`（删除行红、新增行绿），与语法着色掩码（`__CFM_COLOR`）互不干扰；`self.lineMarks` 对外暴露以供状态查询；
+  - Shell 分栏比对视图与导航：`compareWith(pathB, textB, labelB, invert)` 装载对比源并高亮两栏差异，`compareStep(dir)` 支持上一个/下一个差异块循环跳跃并联动左/右两栏光标；
+  - Git 面板无缝集成：Git 修改列表直接右键/按钮呼出双栏对比；
+- **TODO/FIXME 待办面板**（`ide/nodio/app/todo.nodio` + `ide/nodio/app/shell.nodio` + `main.nodio`）：
+  - 待办标记扫描引擎：识别 `TODO` / `FIXME` / `HACK` / `XXX` / `BUG` 标记，做词法边界校验避免匹配到 `TODOX` 类似标识符；自动清理说明前缀分隔符（`:`、`-` 等）与块注释结尾（`*/`）；
+  - 严格遵守 Nodio 引擎字符串切片规范（`..string.slice` 尾参数传实际长度 `#str` 而非 `null`，避免在 VM 中被解析为 0 导致空串）；
+  - 左侧停靠栏（leftDock）新增「待办」页签与 4 列列表（文件、行号、标记、说明）；
+  - 文档变更实时与全工程扫描：`onDocChange` / `openFile` 维护单文档待办，`loadProject` 或激活待办页签时全量扫描；300ms 心跳防抖聚合（`todoDirty`）；
+  - 双击跳转：`onDoubleClick` 自动开文件并跳转对应行号（`gotoLine`）；
+- **回归**：VM 套件 99/99/0 全绿，IDE 冒烟 `SMOKE OK`（新增 `DIFF-LCS:1`、`DIFF-NAV:1`、`TODO-SCAN:1`、`TODO-JUMP:1`），LSP 冒烟 27 项全绿（`LSP-SMOKE-OK`），NAV 冒烟 `NAV SMOKE OK`。
+- 🏁 剩余大项：无。
+

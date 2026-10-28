@@ -421,6 +421,8 @@ if ($out -notmatch 'EVENT-STUB-EV:1')  { Write-Output 'FAIL: designer did not ge
 #   FORM-STUB:1      双击窗体事件 → 生成 winform.onclose = function(){...}（无控件段）
 if ($out -notmatch 'FORM-EVENTS:9/1')  { Write-Output 'FAIL: designer form-level event list is wrong'; exit 1 }
 if ($out -notmatch 'FORM-STUB:1')      { Write-Output 'FAIL: designer did not generate a form-level event stub'; exit 1 }
+# 属性面板事件模式（方案 A：顶部属性/事件切换）
+if ($out -notmatch 'PROP-EVENTS:1')    { Write-Output 'FAIL: property grid events mode or code generation failed'; exit 1 }
 # 代码片段 @ 模板展开（第六十七轮）：@ 前缀识别 → 候选 → 模板落地 + Tab 展开
 if ($out -notmatch 'SNIP-EXPAND:1')   { Write-Output 'FAIL: @ snippet expansion chain broken'; exit 1 }
 # 双文档拆分（第六十七轮）：左右/上下分栏，两个视图各挂文档
@@ -433,6 +435,12 @@ if ($out -notmatch 'ENC:1')           { Write-Output 'FAIL: file encoding detect
 # 输出面板双击跳转（第六十八轮）：@ 文件:行 / @ 行 n 解析 + 真消息端到端
 if ($out -notmatch 'OUT-JUMP:1')      { Write-Output 'FAIL: output panel error location parsing broken'; exit 1 }
 if ($out -notmatch 'OUT-JUMP-UI:1')   { Write-Output 'FAIL: output panel double-click jump broken'; exit 1 }
+# 双栏差异对比（第六十九轮）：LCS 行级对比 + 标记高亮 + 差异导航
+if ($out -notmatch 'DIFF-LCS:1')      { Write-Output 'FAIL: diff LCS algorithm or UI wiring broken'; exit 1 }
+if ($out -notmatch 'DIFF-NAV:1')      { Write-Output 'FAIL: diff navigation step broken'; exit 1 }
+# TODO/FIXME 待办面板（第六十九轮）：标记扫描 + 双击跳转
+if ($out -notmatch 'TODO-SCAN:1')     { Write-Output 'FAIL: todo marker scanner broken'; exit 1 }
+if ($out -notmatch 'TODO-JUMP:1')     { Write-Output 'FAIL: todo double-click navigation broken'; exit 1 }
 # 布局器（第五十九轮续）
 #   ANCHOR-RIGHT:1   只锚右 → 窗体加宽时控件保宽平移（右边距不变）
 #   ANCHOR-STRETCH:1 四边全锚 → 窗体 resize 时宽高拉伸、边距不变
@@ -485,6 +493,8 @@ if ($out -notmatch 'CMD-THR:1')          { Write-Output 'FAIL: ideCmdImpl.create
 if ($out -notmatch 'THEME-XML:1')        { Write-Output 'FAIL: theme XML parsing/loading failed'; exit 1 }
 if ($out -notmatch 'CFG-ALIAS:1')        { Write-Output 'FAIL: USR.CFG key aliases failed'; exit 1 }
 if ($out -notmatch 'PLUGIN-REG:1')       { Write-Output 'FAIL: plugin registration mechanism failed'; exit 1 }
+# 新建工程向导全流程（模板脚手架扫描、创建与浮层向导）
+if ($out -notmatch 'PROJ-WIZARD:1')      { Write-Output 'FAIL: project wizard template instantiation or UI failed'; exit 1 }
 # WATCH-TYPE:OK  监视窗输入行打字不被 subclass 吞掉（return 0 vs null 的教训）
 if ($out -notmatch 'WATCH-TYPE:OK')    { Write-Output 'FAIL: watch input swallows text (subclass must return null)'; exit 1 }
 # SHOW-REDRAW:0  连续 show(true) 不再反复整块重画（第五十八轮修的闪烁）

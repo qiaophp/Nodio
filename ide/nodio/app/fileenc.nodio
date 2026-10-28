@@ -1,0 +1,78 @@
+// app/fileenc.nodio — 源文件编码探测与按原编码写回（第六十八轮）。
+//
+// 单独成模块的原因：shell 侧（双栏对比的右栏快照）也要按同一口径读文件，
+// 不能各写一套探测逻辑 —— 探测口径一旦分叉，「打开看到的」和
+// 「对比里看到的」就会不一样。
+//
+// 探测口径（每一步都在引擎上探针验证过，台账 §1.82）：
+//   · BOM：EF BB BF → utf8-bom；FF FE → utf16le；FE FF → utf16be
+//   · 无 BOM：string.load（严格 UTF-8，非法字节会回退成字节串乱码）对比
+//     io 流的宽松解码 —— 一致 = 合法 UTF-8；不一致 = 非 UTF-8，按 GBK 解码
+//     并做**三重往返校验**（text→GBK 字节→再解码 == 原 text，防「GBK 碰巧
+//     解出一串假中文」）；往返不无损才退宽松 UTF-8 兜底（内容不丢）。
+//   · UTF-16 只读：fromto 收 1200/1201 解码，但写不回（引擎
+//     WideCharToMultiByte 拒绝 1200）—— 保存时升级为 UTF-8 BOM。
+//
+// ⚠ io 流 read 对空文件返回 null（引擎 all.empty() 短路），一律按 "" 兜底。
+// ⚠ read("raw") 是「从当前位置读到尾」——必须一次读全量，
+//   先 read(4) 再 read("raw") 会把主体截剩 4 字节之后的部分。
+namespace app.fileenc{
+
+// 全路径 → "utf8"|"utf8-bom"|"gbk"|"utf16le"|"utf16be"（已打开的文档）
+var encs = {};
+
+// 读文件并探测编码。返回 {text=..; enc=..}，打不开返回 null。
+read = function(path){
+	var h = ..io.open(path, "rb");
+	if(!h) return null;
+	var all = h.read("raw");
+	h.close();
+	if(all === null || all === undefined) all = "";
+	if(#all >= 3 && ..string.indexOf(all, '\xEF\xBB\xBF') == 1){
+		return { text = ..string.load(path); enc = "utf8-bom" };
+	}
+	if(#all >= 2 && ..string.indexOf(all, '\xFF\xFE') == 1){
+		var body = (#all > 2) ? ..string.slice(all, 3, null, true) : "";
+		return { text = ..string.fromto(body, 1200); enc = "utf16le" };
+	}
+	if(#all >= 2 && ..string.indexOf(all, '\xFE\xFF') == 1){
+		var body = (#all > 2) ? ..string.slice(all, 3, null, true) : "";
+		return { text = ..string.fromto(body, 1201); enc = "utf16be" };
+	}
+	// 无 BOM：严格 vs 宽松，不一致 → GBK 候选
+	var strict = ..string.load(path);
+	if(strict === null || strict === undefined) strict = "";
+	var loose = null;
+	var h2 = ..io.open(path, "rb");
+	if(h2){ loose = h2.read("utf8"); h2.close(); }
+	if(loose === null || loose === undefined) loose = strict;
+	if(strict == loose) return { text = strict; enc = "utf8" };
+	var t = ..string.fromto(strict, "gbk");
+	if(t){
+		var back = ..string.fromto(t, "", "gbk");
+		var t2 = back ? ..string.fromto(back, "gbk") : null;
+		if(t2 == t) return { text = t; enc = "gbk" };
+	}
+	// 连 GBK 往返都不无损：宽松解码兜底（至少内容不丢）
+	return { text = loose; enc = "utf8" };
+}
+
+// 按编码写文件（utf16 写回升级为 UTF-8 BOM，见上）。
+write = function(path, text, enc){
+	if(enc == "gbk") return ..string.save(path, ..string.fromto(text, "", "gbk"));
+	if(enc == "utf8-bom") return ..string.save(path, '\uFEFF' ++ text);
+	return ..string.save(path, text);
+}
+
+// 记下某文档的编码（按原编码保存时用）
+setEnc = function(path, enc){
+	encs[path] = enc;
+	return enc;
+}
+
+// 取某文档的编码（没记过按 utf8）
+getEnc = function(path){
+	return encs[path] : "utf8";
+}
+
+}

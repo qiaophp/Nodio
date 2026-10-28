@@ -1,0 +1,58 @@
+// app/todo.nodio — TODO/FIXME 类标记扫描（第六十九轮）。
+//
+// 工程里散落的待办标记（TODO / FIXME / HACK / XXX / BUG）是团队交接的
+// 主要载体，但散在几十个文件里没人找得到 —— 这里把它们汇到一个面板，
+// 双击直接跳到那一行。
+//
+// 只扫**注释里**的标记：命中条件是「标记出现在一行里」，不判断它是不是
+// 注释（aardio 源码里字符串里出现 TODO 的情况极少，误报可接受）；
+// 但会排除明显是标识符一部分的写法（如 TODOX 里的 TODO 不算）。
+namespace app.todo{
+
+// 识别的标记
+var MARKERS = {"TODO"; "FIXME"; "HACK"; "XXX"; "BUG"};
+
+// 扫一段文本 → [{line=1基; tag=标记; text=说明}]
+scanText = function(text){
+	var out = {};
+	if(!text) return out;
+	var ls = ..string.split(tostring(text), '\n');
+	for(i=1;#ls;1){
+		var line = ls[i];
+		if(#line > 0 && ..string.endsWith(line, '\r')){
+			line = ..string.slice(line, 1, #line - 1);
+		}
+		var hit = null;
+		for(k=1;#MARKERS;1){
+			var m = MARKERS[k];
+			var pos = ..string.indexOf(line, m);
+			if(!pos) continue;
+			// 后面紧跟字母/数字 → 是别的词的一部分（如 TODOX / TODOs 不算）
+			var nxt = ..string.slice(line, pos + #m, pos + #m);
+			if(nxt && ..string.match(nxt, "[A-Za-z0-9_]")) continue;
+			if(hit === null || pos < hit.pos){
+				hit = {pos = pos; tag = m};
+			}
+		}
+				if(hit){
+					var desc = ..string.slice(line, hit.pos + #hit.tag, #line);
+					desc = ..string.trim(desc);
+					// 去掉说明开头的分隔符（: - — ：等）
+					while(#desc > 0){
+						var c = ..string.slice(desc, 1, 1);
+						if(c == ":" || c == "-" || c == "=" || c == "：" || c == "—"){
+							desc = ..string.trim(..string.slice(desc, 2, #desc));
+						}
+						else break;
+					}
+					// 去掉块注释结尾 */
+					if(#desc >= 2 && ..string.endsWith(desc, "*/")){
+						desc = ..string.trim(..string.slice(desc, 1, #desc - 2));
+					}
+					..table.push(out, {line = i; tag = hit.tag; text = desc});
+				}
+	}
+	return out;
+}
+
+}

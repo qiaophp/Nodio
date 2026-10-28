@@ -23,6 +23,8 @@
 import win.ui;
 import win.ui.menu;
 import app.editor;
+import app.diff;        // 行级差异算法（第六十九轮：双栏对比）
+import app.fileenc;     // 文件编码探测（第六十九轮：对比右栏按同一口径读文件）
 import nodio.ui.dock;
 import nodio.ui.toolbar;
 import nodio.ui.statusbar;
@@ -167,7 +169,7 @@ darkenRichEdit(winform.ed);
 // 行号栏、aardio 语法着色、当前行高亮、光标行列号回调、Tab/Shift+Tab 缩进、
 // Ctrl+/ 注释切换、查找替换浮条、撤销/重做、脏标记。
 // shell 只负责摆放它、把它的回调接到状态栏/页签上。
-var editor = nodio.ui.editor(winform, {
+editor = nodio.ui.editor(winform, {
 	ctrl = winform.ed;
 	// 字号取设置（app.settings）：用户改过就按用户要的来，
 	// 没改过就是官方默认 11pt Consolas。
@@ -314,6 +316,36 @@ toggleSplitDoc = function(dir){
 	return true;
 };
 
+// ---------- 双栏差异对比（第六十九轮） ----------
+//
+// 左栏 = 当前活文档（**不覆盖**用户正在编辑的内容），右栏 = 对照文件快照。
+// 两侧差异行用背景色标出（红=左有右无，绿=右有左无），
+// 「下一个/上一个差异」在差异块之间跳。
+//
+// ⚠ 对比模式下右栏**不是文档视图**：viewPath[2] 必须置空 ——
+//   否则 ed2.setText 会把内容写进那个文档的缓冲区（= 悄悄改用户的文件）。
+//   旧的空壳实现只复制文本、没置空：从「双文档拆分」切过来就会踩雷。
+diffCtx = null;   // {pathB; labelB; blocks; idx; add; del}
+
+// 两个 COLORREF 按百分比混合（COLORREF = 0x00BBGGRR）
+var __mixColor = function(c1, c2, pct){
+	var r1 = c1 & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = (c1 >> 16) & 0xFF;
+	var r2 = c2 & 0xFF, g2 = (c2 >> 8) & 0xFF, b2 = (c2 >> 16) & 0xFF;
+	var r = r1 + (r2-r1)*pct/100;
+	var g = g1 + (g2-g1)*pct/100;
+	var b = b1 + (b2-b1)*pct/100;
+	return ((b & 0xFF) << 16) | ((g & 0xFF) << 8) | (r & 0xFF);
+}
+// 差异行底色：底色与红/绿混出的淡色（深浅主题都看得清）
+var __diffDelColor = function(){
+	var th = nodio.ui.theme();
+	return __mixColor(nodio.ui.themeRef(th.bg), nodio.ui.themeRef(th.err), 26);
+}
+var __diffAddColor = function(){
+	var th = nodio.ui.theme();
+	return __mixColor(nodio.ui.themeRef(th.bg), nodio.ui.themeRef(th.ok), 26);
+}
+
 toggleSplitDiff = function(flag){
 	if(flag === null || flag === undefined){
 		flag = !(splitMode == "diff");
@@ -324,12 +356,20 @@ toggleSplitDiff = function(flag){
 		if(docStrip2) docStrip2.show(false);
 		var ed2 = getEditor2();
 		ed2.show(true);
-		var t2 = ed2.getText();
-		if(!t2 || #t2 == 0){
-			ed2.setText(editor.getText());
+		// 没有对比上下文时（右栏还没内容）：放一份当前文本的快照，
+		// 两边一样 = 「无差异」，等用户真正发起比较再换成对照文件。
+		if(!diffCtx){
+			viewPath[2] = null;
+			var t = editor.getText();
+			ed2.setText(t);
+			ed2.setSavedText(t);
 		}
 	}
 	else{
+		// 退出对比：两侧的行背景标记都要清掉（否则标记留在正文里）
+		try{ editor.clearLineMarks() }catch(e1){}
+		try{ if(editor2) editor2.clearLineMarks() }catch(e2){}
+		diffCtx = null;
 		splitMode = "none";
 		splitDiff = false;
 		if(editor2) editor2.show(false);
@@ -337,6 +377,72 @@ toggleSplitDiff = function(flag){
 	layout();
 	setStatus("双栏对比: " ++ (splitDiff ? "已开启（左右分栏）" : "已关闭"));
 };
+
+// 与 pathB 对比（textB 为空则按编码探测读文件）。
+// invert = true 表示「右侧是旧版本」（Git 场景：左=工作区新内容、右=HEAD 旧内容），
+// 这时左侧独有行算「新增」（绿）、右侧独有行算「删除」（红）。
+// 返回差异块数（失败返回 0）。
+compareWith = function(pathB, textB, labelB, invert){
+	if(!pathB) return 0;
+	if(textB === null || textB === undefined){
+		var fr = app.fileenc.read(pathB);
+		if(!fr){ setStatus("读不了对照文件: " ++ pathB); return 0 }
+		textB = fr.text;
+	}
+	var textA = editor.getText();
+	var d = app.diff.diffLines(textA, textB);
+	// 切到对比布局（右栏是快照，不是文档视图）
+	toggleSplitDiff(true);
+	var ed2 = getEditor2();
+	viewPath[2] = null;
+	ed2.setText(textB);
+	ed2.setSavedText(textB);      // 快照语义：右栏不算「已修改」
+	// 标色：左栏删/改行标红，右栏新增行标绿
+	var delColor = __diffDelColor();
+	var addColor = __diffAddColor();
+	var delMarks = {}, addMarks = {};
+	for(i=1;#d.ops;1){
+		var op = d.ops[i];
+		if(op.type == "del") delMarks[op.a] = invert ? addColor : delColor;
+		elseif(op.type == "add") addMarks[op.b] = invert ? delColor : addColor;
+	}
+	// 折叠区里的行刷了也看不见（hidden 属性优先）→ 先展开
+	try{ editor.unfoldAll() }catch(e3){}
+	try{ ed2.unfoldAll() }catch(e4){}
+	editor.setLineMarks(delMarks);
+	ed2.setLineMarks(addMarks);
+	diffCtx = {
+		pathB = pathB;
+		labelB = labelB : pathB;
+		blocks = d.blocks;
+		idx = 0;
+		add = d.add;
+		del = d.del;
+	};
+	setStatus("对比: 左=当前文档  右=" ++ diffCtx.labelB ++ "  差异 " ++ tostring(#d.blocks)
+		++ " 处（+" ++ tostring(d.add) ++ "/-" ++ tostring(d.del) ++ "）");
+	return #d.blocks;
+}
+
+// 上/下一个差异（dir = 1 下 / -1 上）
+compareStep = function(dir){
+	if(!diffCtx || !diffCtx.blocks || #diffCtx.blocks == 0){
+		setStatus("没有可跳转的差异");
+		return false;
+	}
+	var n = #diffCtx.blocks;
+	var idx = diffCtx.idx + dir;
+	if(idx < 1) idx = n;
+	if(idx > n) idx = 1;
+	diffCtx.idx = idx;
+	var blk = diffCtx.blocks[idx];
+	var ed2 = getEditor2();
+	if(blk.a) editor.gotoLine(blk.a);
+	if(blk.b) ed2.gotoLine(blk.b);
+	setStatus("差异 " ++ tostring(idx) ++ "/" ++ tostring(n)
+		++ "  左 " ++ tostring(blk.a : 0) ++ " 行 / 右 " ++ tostring(blk.b : 0) ++ " 行");
+	return true;
+}
 
 // ---------- 全屏模式 ----------
 var toggleFullscreen = function(){
@@ -436,8 +542,9 @@ app.editor.contextMenu(winform, editor);
 //
 // 放进表里就绕开了这层遮蔽：表是同一个对象，谁改都看得见。
 // main.nodio 侧写法：`shell.hooks.onX = ...`
-var hooks = {
-	onOpenProject = null;     // function() — 打开工程
+	var hooks = {
+		onNewProject  = null;     // function() — 新建工程向导
+		onOpenProject = null;     // function() — 打开工程
 	onOpenFile    = null;     // function(path) — 打开一个文件
 	onNewFile     = null;     // function() — 新建文档
 	onSave        = null;     // function()
@@ -447,6 +554,7 @@ var hooks = {
 	onDocChange   = null;     // function(path, text) — 文档内容变了
 	onRun         = null;     // function()
 	onOutputJump  = null;     // function(path, line) — 输出面板双击报错行跳转
+	onCompareWith = null;     // function() — 「与…比较」：选一个文件做双栏对比
 	onDebug       = null;     // function()
 	onDebugStep   = null;     // function() — 单步跳过（F11）
 	onStopDebug   = null;     // function()
@@ -517,6 +625,12 @@ leftDock.addTab("资源", resTree, {icon="list"});
 // 文件时间线（第六十一轮）：当前活动文件的 Git 提交历史 + 本地保存快照
 timelinePanel = app.timeline.panel(winform, {});
 leftDock.addTab("时间线", timelinePanel, {icon="clock"});
+// 待办（第六十九轮）：工程里 TODO/FIXME/HACK/XXX/BUG 标记汇总表，
+// 双击跳到那一行（main.nodio 填充 + 跳转）。
+var todoList = nodio.ui.list(winform, {
+	columns={{"文件";150};{"行";40};{"标记";55};{"说明";205}}
+});
+leftDock.addTab("待办", todoList, {icon="list"});
 // 「属性」页留给设计器的属性格（main.nodio 接入）
 
 // ---------- 右栏: 控件 / 语法 / 标准库 / 范例 / 工具 / AI ----------
@@ -634,7 +748,7 @@ var __imSub = nodio.ui.subclass(imEd.hwnd, function(hwnd, msg, wp, lp){
 		}
 		return 1;      // 吃掉回车（单行 richedit 本来也不插换行）
 	}
-	return null;     // ⚠ 返回 0 = 吞消息（subclass 约定 null = 交回原过程；
+		return null;     // ⚠ 返回 0 = 吞消息（subclass 约定 null = 交回原过程；
 });                    // 写 0 会让立即窗口打不进字，watch 同款教训）
 
 // 输出面板双击跳转（第六十八轮）：双击报错行 → 解析落点 → onOutputJump。
@@ -673,9 +787,10 @@ var __outSub = nodio.ui.subclass(outEd.hwnd, function(hwnd, msg, wp, lp){
 // ---------- toolbar ----------
 var toolbar = nodio.ui.toolbar(winform, {
 	height = TOOLBAR_H;
-	buttons = {
-		{text="新建";name="new";icon="file";command=function(){ if(hooks.onNewFile) hooks.onNewFile() }};
-		{text="打开";name="open";icon="folderOpen";command=function(){ if(hooks.onOpenFile) hooks.onOpenFile("") }};
+		buttons = {
+			{text="新建";name="new";icon="file";command=function(){ if(hooks.onNewFile) hooks.onNewFile() }};
+			{text="新建工程";name="newProj";icon="folder";command=function(){ if(hooks.onNewProject) hooks.onNewProject() }};
+			{text="打开";name="open";icon="folderOpen";command=function(){ if(hooks.onOpenFile) hooks.onOpenFile("") }};
 		{text="保存";name="save";icon="save";command=function(){ if(hooks.onSave) hooks.onSave() }};
 		{sep=true};
 		{text="运行";name="run";icon="bolt";command=function(){ if(hooks.onRun) hooks.onRun() }};
@@ -1299,9 +1414,12 @@ install = function(){
 	winform.reghotkey(function(id,mod,vk){
 		if(hooks.onSave) hooks.onSave();
 	}, MOD_CTRL, 0x53); // Ctrl+S
-	winform.reghotkey(function(id,mod,vk){
-		if(hooks.onNewFile) hooks.onNewFile();
-	}, MOD_CTRL, 0x4E); // Ctrl+N
+		winform.reghotkey(function(id,mod,vk){
+			if(hooks.onNewFile) hooks.onNewFile();
+		}, MOD_CTRL, 0x4E); // Ctrl+N
+		winform.reghotkey(function(id,mod,vk){
+			if(hooks.onNewProject) hooks.onNewProject();
+		}, MOD_CTRL + MOD_SHIFT, 0x4E); // Ctrl+Shift+N
 	winform.reghotkey(function(id,mod,vk){
 		if(hooks.onOpenFile) hooks.onOpenFile("");
 	}, MOD_CTRL, 0x4F); // Ctrl+O
@@ -1378,13 +1496,14 @@ install = function(){
 	var mkOpen = function(p){
 		return function(id){ if(hooks.onOpenFile) hooks.onOpenFile(p) };
 	}
-	var buildFileMenuItems = function(){
-		var items = {
-			{ "新建  Ctrl+N"; function(id){ if(hooks.onNewFile) hooks.onNewFile() } };
-			{ "打开文件...  Ctrl+O"; function(id){ if(hooks.onOpenFile) hooks.onOpenFile("") } };
-			{ "快速打开文件...  Ctrl+P"; function(id){ quickOpenFilePrompt() } };
-			{ "打开工程..."; function(id){ if(hooks.onOpenProject) hooks.onOpenProject() } };
-		};
+		var buildFileMenuItems = function(){
+			var items = {
+				{ "新建文档  Ctrl+N"; function(id){ if(hooks.onNewFile) hooks.onNewFile() } };
+				{ "新建工程...  Ctrl+Shift+N"; function(id){ if(hooks.onNewProject) hooks.onNewProject() } };
+				{ "打开文件...  Ctrl+O"; function(id){ if(hooks.onOpenFile) hooks.onOpenFile("") } };
+				{ "快速打开文件...  Ctrl+P"; function(id){ quickOpenFilePrompt() } };
+				{ "打开工程..."; function(id){ if(hooks.onOpenProject) hooks.onOpenProject() } };
+			};
 		var rf = app.settings.recentGet();
 		if(#rf){
 			..table.push(items, { "-"; null });
@@ -1398,6 +1517,7 @@ install = function(){
 		..table.push(items, { "全部保存"; function(id){ if(hooks.onSaveAll) hooks.onSaveAll() } });
 		..table.push(items, { "打印..."; function(id){ if(hooks.onPrint) hooks.onPrint() } });
 		..table.push(items, { "打印预览"; function(id){ if(hooks.onPrintPreview) hooks.onPrintPreview() } });
+		..table.push(items, { "与...比较..."; function(id){ if(hooks.onCompareWith) hooks.onCompareWith() } });
 		..table.push(items, { "-"; null });
 		..table.push(items, { "关闭标签页  Ctrl+W"; function(id){ if(hooks.onCloseTab) hooks.onCloseTab(curTab) } });
 		..table.push(items, { "关闭其他标签页"; function(id){ if(hooks.onCloseOtherTabs) hooks.onCloseOtherTabs(curTab); else closeOtherTabs(curTab); } });
@@ -1413,9 +1533,10 @@ install = function(){
 	// setMenus 原表重挂（titlebar 打开下拉时现读，重建即生效）。
 	var menusDef = {
 		{ "文件"; buildFileMenuItems() };
-		{ "工程";{
-			{ "打开工程..."; function(id){ if(hooks.onOpenProject) hooks.onOpenProject() } };
-			{ "新建文件..."; function(id){ if(hooks.onProjNewFile) hooks.onProjNewFile(null) } };
+			{ "工程";{
+				{ "新建工程...  Ctrl+Shift+N"; function(id){ if(hooks.onNewProject) hooks.onNewProject() } };
+				{ "打开工程..."; function(id){ if(hooks.onOpenProject) hooks.onOpenProject() } };
+				{ "新建文件..."; function(id){ if(hooks.onProjNewFile) hooks.onProjNewFile(null) } };
 			{ "新建目录..."; function(id){ if(hooks.onProjNewDir) hooks.onProjNewDir(null) } };
 			{ "工程属性"; function(id){ if(hooks.onProjProperties) hooks.onProjProperties() } };
 			{ "-"; null };
@@ -1466,9 +1587,10 @@ install = function(){
 			{ "工程树"; function(id){ leftDock.setSelIndex(1) } };
 			{ "属性"; function(id){ leftDock.setSelIndex(2) } };
 			{ "大纲"; function(id){ leftDock.setSelIndex(4) } };
-			{ "时间线"; function(id){ leftDock.selectCaption("时间线") } };
-		} };
-		{ "格式";{
+				{ "时间线"; function(id){ leftDock.selectCaption("时间线") } };
+				{ "待办"; function(id){ leftDock.selectCaption("待办") } };
+			} };
+			{ "格式";{
 			{ "格式化代码  Shift+Alt+F"; function(id){
 				if(editor.formatDocument()) setStatus("代码格式化完成");
 				else setStatus("代码格式无需变更");
@@ -1500,6 +1622,9 @@ install = function(){
 			{ "下一个书签  F2"; function(id){ if(editor.nextBookmark()) setStatus("已跳转到下一书签"); else setStatus("无更多书签") } };
 			{ "上一个书签  Shift+F2"; function(id){ if(editor.prevBookmark()) setStatus("已跳转到上一书签"); else setStatus("无更多书签") } };
 			{ "清除全部书签"; function(id){ editor.clearBookmarks(); setStatus("已清除全部书签") } };
+			{ "-"; null };
+			{ "下一个差异"; function(id){ compareStep(1) } };
+			{ "上一个差异"; function(id){ compareStep(-1) } };
 			{ "-"; null };
 			{ "上一个问题"; function(id){ bottomDock.setSelIndex(1) } };
 			{ "下一个问题"; function(id){ bottomDock.setSelIndex(1) } };
@@ -1547,8 +1672,9 @@ install = function(){
 			{ "立即窗口"; function(id){ bottomDock.selectCaption("立即") } };
 			{ "监视窗口  Ctrl+Shift+W"; function(id){ bottomDock.selectCaption("监视") } };
 			{ "变量窗口"; function(id){ bottomDock.selectCaption("变量") } };
-			{ "时间线"; function(id){ leftDock.selectCaption("时间线") } };
-		{ "-"; null };
+				{ "时间线"; function(id){ leftDock.selectCaption("时间线") } };
+				{ "待办"; function(id){ leftDock.selectCaption("待办") } };
+			{ "-"; null };
 		{ "拆分视图（左右）"; function(id){ toggleSplitDoc("v") } };
 		{ "拆分视图（上下）"; function(id){ toggleSplitDoc("h") } };
 		{ "关闭拆分视图"; function(id){ toggleSplitDoc("none") } };
@@ -1697,25 +1823,29 @@ install = function(){
 	// 自绘树的 nodeAt 定位光标下的节点。
 	// 菜单项：打开 / 复制路径 / 新建文件 / 新建目录 / 重命名 / 删除 / 设为启动文件。
 	// 分隔线：add(null,null) —— 官方 menubase.add 见到空标题就插 MF_SEPARATOR。
-	var treeMenu = win.ui.popmenu(winform);
-	var idTreeOpen = treeMenu.add("打开", null);
-	var idTreeCopy = treeMenu.add("复制路径", null);
-	treeMenu.add(null, null);
-	var idTreeNewFile = treeMenu.add("新建文件...", null);
-	var idTreeNewDir = treeMenu.add("新建目录...", null);
-	treeMenu.add(null, null);
-	var idTreeRename = treeMenu.add("重命名...", null);
-	var idTreeDelete = treeMenu.add("删除", null);
-	treeMenu.add(null, null);
-	var idTreeStart = treeMenu.add("设为启动文件", null);
-	projTree.onContextMenu = function(x,y){
-		var node = projTree.nodeAt(x,y);
-		if(!node) node = projTree.selectedNode();
-		if(!node) return;
-		var path = projTree.pathOf(node);
-		if(!path) return;
-		var id = treeMenu.popId();
-		if(!id) return;
+		var treeMenu = win.ui.popmenu(winform);
+		var idTreeOpen = treeMenu.add("打开", null);
+		var idTreeCopy = treeMenu.add("复制路径", null);
+		treeMenu.add(null, null);
+		var idTreeNewProj = treeMenu.add("新建工程...", null);
+		var idTreeNewFile = treeMenu.add("新建文件...", null);
+		var idTreeNewDir = treeMenu.add("新建目录...", null);
+		treeMenu.add(null, null);
+		var idTreeRename = treeMenu.add("重命名...", null);
+		var idTreeDelete = treeMenu.add("删除", null);
+		treeMenu.add(null, null);
+		var idTreeStart = treeMenu.add("设为启动文件", null);
+		projTree.onContextMenu = function(x,y){
+			var node = projTree.nodeAt(x,y);
+			if(!node) node = projTree.selectedNode();
+			var path = node ? projTree.pathOf(node) : null;
+			var id = treeMenu.popId();
+			if(!id) return;
+			if(id == idTreeNewProj){
+				if(hooks.onNewProject) hooks.onNewProject();
+				return;
+			}
+			if(!path) return;
 		if(id == idTreeOpen){
 			if(hooks.onOpenFile) hooks.onOpenFile(path);
 		}

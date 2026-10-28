@@ -86,6 +86,7 @@ var CHARFORMAT2 = class {
 var __CFM_UNDERLINE = 0x4;          // CFM_UNDERLINE
 var __CFM_UNDERLINETYPE = 0x800000;  // CFM_UNDERLINETYPE = 0x00800000
 var __CFM_COLOR = 0x40000000;        // CFM_COLOR
+var __CFM_BACKGROUND = 0x01000000;   // CFM_BACKGROUND（字符背景色）
 var __CFE_UNDERLINE = 4;             // CFE_UNDERLINE
 // 下划线类型（CFU 枚举）
 var __CFU_NONE = 0;
@@ -534,6 +535,9 @@ editor = function(winform, opt){
 
 	self.setText = function(s, markDirty){
 		if(s === null || s === undefined) s = "";
+		// 换文档 → 旧的行背景标记作废（setText 会重置整篇字符格式，
+		// 留着标记表只会让下一次 clearLineMarks 刷到不相干的行上）
+		try{ self.clearLineMarks() }catch(eM){}
 		self.eol = self.__detectEOL(s);
 		var t = self.__toCRLF(s);
 		// ⚠ 顺序要紧：**先**更新 self.text，**再**写控件。
@@ -1836,6 +1840,79 @@ editor = function(winform, opt){
 		else{
 			try{ ctrl.setSel(mn, mx) }catch(e5){}
 		}
+	}
+
+	// ---------- 行背景标记（差异高亮用） ----------
+	//
+	// marks = { [行号] = COLORREF }（行号 1 基）；传 null = 清空标记。
+	// 用 CFM_BACKGROUND 掩码刷**字符背景**：左侧删除行标红、右侧新增行标绿，
+	// 就是双栏对比的观感。
+	//
+	// ⚠ 清标记时 backColor 传 0xFFFFFFFF（COLORREF(-1)）= 「不设背景」，
+	//   字符背景回到控件底色（不是黑色！）。
+	// ⚠ 语法着色的刷法只带 CFM_COLOR（CFM_BACKGROUND 不在它的掩码里），
+	//   所以打字重着色**不会**抹掉背景标记；但 setText 会重置整篇格式，
+	//   换文档后必须重新标（或先 clearLineMarks）。
+	// ⚠ 折叠区里的行刷了也看不见（hidden 属性优先）——对比前先展开。
+	var __markedLines = {};
+	self.lineMarks = {};
+
+	// 单行刷背景色（内部）
+	self.__markLineBg = function(ln, colorRef){
+		if(!ln || ln < 1) return false;
+		var a = self.__lineStart(ln);
+		var b = self.__lineEnd(ln);
+		if(!a) return false;
+		if(b < a) b = a;
+		var mn = 0;
+		var mx = null;
+		try{ mn,mx = ctrl.getSel() }catch(e0){}
+		var ok = false;
+		try{
+			ctrl.setSel(a, b);
+			var cf = CHARFORMAT2();
+			cf.mask = __CFM_BACKGROUND;
+			cf.backColor = colorRef;
+			::SendMessageByStruct(ctrl.hwnd, 0x444/*_EM_SETCHARFORMAT*/,
+				1/*_SCF_SELECTION*/, cf);
+			ok = true;
+		}catch(e1){}
+		// 还原选区
+		if(mx === null || mx === undefined){
+			try{ ctrl.setSel(mn) }catch(e2){}
+		}
+		else{
+			try{ ctrl.setSel(mn, mx) }catch(e3){}
+		}
+		return ok;
+	}
+
+		// 清掉所有行背景标记，返回清掉的行数
+		self.clearLineMarks = function(){
+			self.lineMarks = {};
+			if(!__markedLines || #__markedLines == 0) return 0;
+			var n = #__markedLines;
+			for(i=1;n;1){
+				self.__markLineBg(__markedLines[i], 0xFFFFFFFF);
+			}
+			__markedLines = {};
+			return n;
+		}
+
+	// 标一批行：marks = { [行号] = COLORREF }。返回标上的行数。
+	self.setLineMarks = function(marks){
+		self.clearLineMarks();
+		self.lineMarks = marks : {};
+		if(!marks) return 0;
+		var n = 0;
+		for(ln, colorRef in marks){
+			if(!ln) continue;
+			if(self.__markLineBg(ln, colorRef)){
+				..table.push(__markedLines, ln);
+				n = n + 1;
+			}
+		}
+		return n;
 	}
 
 	// ---------- 代码折叠 ----------
